@@ -821,8 +821,13 @@ jobs:
           if [ -z "$ASSET" ]; then
             # madeira-bcd: a stub build draws nothing in any D3D12 game (build 180
             # after the release was deleted); fail instead of shipping one.
-            echo "::error::no msc-private release with a .dmg/.pkg asset -- a D3D12 stub build draws nothing; re-create the DRAFT release"
-            exit 1
+            # madeira-DOGE: this fork has no msc-private release (Apple's installer
+            # cannot be redistributed), so carry on with the stub: D3D11 games are
+            # unaffected, D3D12 games draw nothing. The next step already handles
+            # the missing headers. Create a DRAFT release tagged msc-private with
+            # Apple's Metal Shader Converter .dmg/.pkg to get the real converter.
+            echo "::warning::no msc-private release with a .dmg/.pkg asset -- continuing with a D3D12 stub build (D3D12 games draw nothing; D3D11 is unaffected)"
+            exit 0
           fi
           URL=${ASSET%% *}; NAME=${ASSET#* }
           mkdir -p /tmp/msc && cd /tmp/msc
