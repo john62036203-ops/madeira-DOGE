@@ -518,7 +518,7 @@ enum StikJITHelper {
         // derives WriteOffset from the real distance), so send it high, where it
         // lived in every run before ml977, and keep the scarce low gap for RX.
         rwAddr = 0x7000000000
-        let kr1 = vm_remap(
+        var kr1 = vm_remap(
             mach_task_self_,
             &rwAddr,
             vm_size_t(poolSize),
@@ -531,6 +531,24 @@ enum StikJITHelper {
             &maxProt,
             VM_INHERIT_NONE
         )
+
+        // madeira-doge (ported from build 221's ml1640): the 0x7000000000 hint is
+        // above the whole task map on a device without the
+        // extended-virtual-addressing entitlement (TASK_VM_INFO.max_address =
+        // 0xfc0000000, 63 GB), and an ANYWHERE search that starts past the top
+        // never wraps: the alias failed with KERN_NO_SPACE at every pool size and
+        // no pool was ever made ("JIT pool unavailable"). Let the kernel choose
+        // when the hint is out of reach. MADEIRA_RW_ALIAS_RETRY=0 restores
+        // fail-at-the-hint. A device whose map reaches 0x7000000000 never gets
+        // here, so its placement is unchanged.
+        if kr1 == KERN_NO_SPACE && MadeiraConfig.flag("MADEIRA_RW_ALIAS_RETRY") {
+            rwAddr = 0
+            kr1 = vm_remap(mach_task_self_, &rwAddr, vm_size_t(poolSize), 0, VM_FLAGS_ANYWHERE,
+                           mach_task_self_, vm_address_t(bitPattern: rxPtr), 0,
+                           &curProt, &maxProt, VM_INHERIT_NONE)
+            LogStore.shared.log(String(format: "[rw-alias] high hint out of reach; kernel placement kr=%d RW=0x%lx",
+                                       kr1, Int(rwAddr)), level: kr1 == KERN_SUCCESS ? .info : .error)
+        }
 
         guard kr1 == KERN_SUCCESS else {
             LogStore.shared.log("vm_remap failed: \(kr1)", level: .error)
