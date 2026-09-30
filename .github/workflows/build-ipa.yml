@@ -762,10 +762,11 @@ jobs:
                           print(a['url'], a['name']); sys.exit(0)
           ")
           if [ -z "$ASSET" ]; then
-            # madeira-bcd: a stub build draws nothing in any D3D12 game (build 180
-            # after the release was deleted); fail instead of shipping one.
-            echo "::error::no msc-private release with a .dmg/.pkg asset -- a D3D12 stub build draws nothing; re-create the DRAFT release"
-            exit 1
+            # madeira-doge: a fork has no msc-private release (Apple's installer
+            # cannot be redistributed). Continue with the D3D12 stub build; D3D11
+            # games (DXMT) are unaffected, D3D12 games draw nothing.
+            echo "::warning::no msc-private release with a .dmg/.pkg asset -- continuing with a D3D12 stub build (D3D12 games draw nothing; D3D11 is unaffected)"
+            exit 0
           fi
           URL=${ASSET%% *}; NAME=${ASSET#* }
           mkdir -p /tmp/msc && cd /tmp/msc

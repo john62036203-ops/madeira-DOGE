@@ -12082,6 +12082,31 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                 continue;
             }
         }
+        /* madeira-doge: never scan inside __PAGEZERO.
+         *
+         * iOS mandates a 4 GB __PAGEZERO (research/HANDOFF-rdr2-arm64ec-hooks.md:
+         * measured four ways), so every address below 0x100000000 is permanently
+         * unmappable. Mach reports it as a FREE hole, so ios_skip_occupied cannot
+         * jump it and a bottom-up scan from 0x10000 crawled one 64 KB granule at a
+         * time: 17 scans in one DMC5 log cost ~67,000 failed mmaps each (~1.14M
+         * total), all under virtual_mutex; the profiler put try_map_free_area's
+         * Mach calls at ~50% of all CPU with threads parked on virtual_mutex.
+         * Start above the zero page (bottom-up) or give up (top-down).
+         * MADEIRA_NO_PAGEZERO_SKIP=1 restores the old behaviour. */
+        {
+            static int pz_off = -1;
+            if (pz_off < 0) pz_off = getenv( "MADEIRA_NO_PAGEZERO_SKIP" ) != NULL;
+            if (!pz_off && (uintptr_t)start < 0x100000000ULL)
+            {
+                static int pz_logged;
+                if (pz_logged++ < 4)
+                    dprintf( 2, "[va-scan] pagezero-skip: %s scan at %p size=%p clamped to 0x100000000\n",
+                             step < 0 ? "top-down" : "bottom-up", start, (void *)size );
+                if (step <= 0) break;
+                start = (void *)(uintptr_t)((0x100000000ULL + (size_t)step - 1) & ~((uintptr_t)step - 1));
+                continue;
+            }
+        }
         if (ios_in_layerkit( (unsigned long long)(uintptr_t)start, size ))   /* ml900 */
         {
             static int skipped;
