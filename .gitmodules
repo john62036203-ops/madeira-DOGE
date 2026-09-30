@@ -1,0 +1,12 @@
+[submodule "FEX"]
+	path = FEX
+	url = https://github.com/willfaust/FEX.git
+	branch = ios-port-2607
+[submodule "wine"]
+	path = wine
+	url = https://github.com/125hz/wine.git
+	branch = pr/wow64-core
+[submodule "research/dxmt"]
+	path = research/dxmt
+	url = https://github.com/125hz/dxmt.git
+	branch = pr/d3d9
