@@ -17266,7 +17266,20 @@ static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot,
     if (!(vprot & VPROT_WRITE) || (vprot & (VPROT_EXEC | VPROT_WRITECOPY | VPROT_GUARD | VPROT_WRITEWATCH))) return 0;
     if (!view || !is_view_valloc( view ) || (view->protect & (SEC_FILE | SEC_IMAGE | SEC_RESERVE | VPROT_SYSTEM)))
     { if (big) ios_swap_no_kind += size; return 0; }
-    if (b < 0x7000000000ULL || b >= 0x7c00000000ULL) { if (big) ios_swap_no_band += size; return 0; }   /* the guest band only */
+    if (b < 0x7000000000ULL || b >= 0x7c00000000ULL)   /* the guest band only */
+    {
+        /* madeira-doge: a 63 GB map (no extended-virtual-addressing) has no band at
+         * 0x7000000000, so the tier turned away every commit (17.8 GB in one DMC5
+         * session, 0 MB backed) while the footprint sat at ~5.6 GB, above Metal's
+         * recommended 5461 MB, and the GPU then discarded command buffers.
+         * MADEIRA_SWAP_SMALLMAP=1 also accepts plain valloc commits in
+         * [16 GB, 48 GB): above the low window and the JIT pool, below the emulators'
+         * band at 0xc00000000. Opt-in, untested on a device. */
+        static int smallmap = -1;
+        if (smallmap < 0) smallmap = getenv( "MADEIRA_SWAP_SMALLMAP" ) != NULL && getenv( "MADEIRA_SWAP_SMALLMAP" )[0] == '1';
+        if (!(smallmap && b >= 0x400000000ULL && b + size <= 0xc00000000ULL))
+        { if (big) ios_swap_no_band += size; return 0; }
+    }
     if (size < ios_swap_min) { if (big) ios_swap_no_small += size; return 0; }
     return 1;
 }
