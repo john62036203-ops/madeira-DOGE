@@ -12037,6 +12037,20 @@ static inline int ios_in_layerkit( unsigned long long a, size_t size )
 static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                                 void *start, size_t size, int unix_prot )
 {
+    /* madeira-doge: dead-hole memo (bottom-up scans only). A "dead hole" is a
+     * stretch Mach reports as FREE but where the kernel refused every small
+     * mapping we tried (the gap between __PAGEZERO and the app image). After the
+     * pagezero skip a DMC5 scan still paid ~1,200 failed mmaps to cross it, for
+     * every allocation (try_map_free_area was ~30% of sampled CPU). The first
+     * scan that crosses one records it; later scans jump it. MADEIRA_NO_DEAD_HOLE=1
+     * disables this. */
+    static struct { uintptr_t lo, hi; } dead[8];
+    static int ndead, dead_off = -1;
+    void *run_lo = NULL;
+    unsigned run_n = 0;
+
+    if (dead_off < 0) dead_off = getenv( "MADEIRA_NO_DEAD_HOLE" ) != NULL;
+
     while (start && base <= start && (char*)start + size <= (char*)end)
     {
         /* ml253 ROOT-CAUSE FIX: never allocate inside the JIT pool.
@@ -12107,6 +12121,20 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                 continue;
             }
         }
+        if (!dead_off && step > 0)
+        {
+            int k, jumped = 0;
+
+            for (k = 0; k < ndead; k++)
+            {
+                if ((uintptr_t)start >= dead[k].lo && (uintptr_t)start < dead[k].hi)
+                {
+                    void *nx = (void *)((dead[k].hi + (size_t)step - 1) & ~((uintptr_t)step - 1));
+                    if (nx > start) { start = nx; jumped = 1; run_n = 0; break; }
+                }
+            }
+            if (jumped) continue;
+        }
         if (ios_in_layerkit( (unsigned long long)(uintptr_t)start, size ))   /* ml900 */
         {
             static int skipped;
@@ -12148,16 +12176,40 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
          * the range. */
         {
             void *next = start;
+            int fail_errno = errno;
 
             if (step && ios_skip_occupied( start, size, (size_t)(step < 0 ? -step : step) - 1,
                                            step < 0, &next )
                 && next != start)
             {
+                /* The run of failures in a free hole ends at a real region: if it was
+                 * long, only small requests were failing (so overlap with the region is
+                 * not the reason) and every one of them was ENOMEM, the whole stretch
+                 * is a kernel-refused hole. */
+                if (!dead_off && step > 0 && run_n >= 256 && size <= 0x100000 && ndead < 8 &&
+                    (uintptr_t)start > (uintptr_t)run_lo + size)
+                {
+                    dead[ndead].lo = (uintptr_t)run_lo;
+                    dead[ndead].hi = (uintptr_t)start - size;
+                    dprintf( 2, "[va-scan] dead-hole #%d: [%p,%p) refused %u consecutive requests; later scans skip it\n",
+                             ndead, run_lo, (void *)dead[ndead].hi, run_n );
+                    ndead++;
+                }
+                run_n = 0;
                 ios_va_scan_skips++;
                 start = next;
             }
             else
+            {
+                if (fail_errno == ENOMEM && size <= 0x100000)
+                {
+                    if (!run_n) run_lo = start;
+                    run_n++;
+                }
+                else
+                    run_n = 0;
                 start = (char *)start + step;
+            }
         }
     }
 
