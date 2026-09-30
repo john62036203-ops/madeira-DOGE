@@ -21837,6 +21837,26 @@ void ios_reserve_fex_arena(void)
             arena_task_max = (unsigned long long)vmi.max_address;
     }
 
+    /* madeira-doge: no high band on this map => do not reserve an arena.
+     *
+     * Without com.apple.developer.kernel.extended-virtual-addressing the task's
+     * map tops out at 63 GB (0xfc0000000), so the 16 GB "hardware high band"
+     * at 0x7c00000000 can never succeed and the ladder falls through to
+     * "constrained 8GB", which takes the single largest free hole. A DMC5 launch
+     * on such a map (2026-09-30 23:23) reserved 8 GB at 0xba0000000, then the
+     * guest spun at one RIP for ~995M iterations and never loaded the game; the
+     * build that ran the same title on the same phone logged "no high band on
+     * this map: arena not reserved" and let the emulators select their own
+     * bands. Match that. MADEIRA_FEX_ARENA_SMALL=1 still reserves one. */
+    if (arena_task_max && arena_task_max < 0x7c00000000ull && !getenv( "MADEIRA_FEX_ARENA_SMALL" ) &&
+        !(getenv( "MADEIRA_FEX_ARENA" ) && getenv( "MADEIRA_FEX_ARENA" )[0] == '1'))
+    {
+        dprintf( 2, "[fex-arena] madeira-doge: no high band on this map (max=0x%llx): arena not reserved, "
+                    "the emulators select their own bands (MADEIRA_FEX_ARENA_SMALL=1 reserves one)\n",
+                 arena_task_max );
+        return;
+    }
+
     /* ml995: cap the arena size from Documents/madeira-arena-mb.txt.
      *
      * rdr63 measured why this matters. At startup the usable VA below the 63 GB
