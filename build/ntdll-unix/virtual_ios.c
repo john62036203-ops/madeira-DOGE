@@ -14831,6 +14831,47 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             ios_jit_verify_text_exec( ios_pe_module_name( image_base, image_size ),
                                       (char *)jit_rx_base + offset, image_size );
 
+            /* madeira-doge: dump guest code of one image to the log for offline
+             * disassembly. MADEIRA_DUMP_MODULE names the image as this line's
+             * "[jit-pool] image" reports it (the export name, e.g.
+             * runtime_il2cpp.exe for the RE Requiem demo); MADEIRA_DUMP_RVA is
+             * "rva:len[,rva:len...]" (hex, at most 0x4000 bytes each, 8 ranges). */
+            {
+                const char *want = getenv( "MADEIRA_DUMP_MODULE" );
+                const char *ranges = getenv( "MADEIRA_DUMP_RVA" );
+                const char *mn = ios_pe_module_name( image_base, image_size );
+                if (want && *want && ranges && *ranges && mn && !strcasecmp( mn, want ))
+                {
+                    const char *p = ranges;
+                    int n = 0;
+                    while (*p && n++ < 8)
+                    {
+                        char *e;
+                        unsigned long rva = strtoul( p, &e, 16 ), len = 0x100;
+                        if (e == p) break;
+                        p = e;
+                        if (*p == ':') { len = strtoul( p + 1, &e, 16 ); p = e; }
+                        if (len > 0x4000) len = 0x4000;
+                        if (rva < image_size && len)
+                        {
+                            const unsigned char *b = (const unsigned char *)image_base + rva;
+                            unsigned long i, j;
+                            if (rva + len > image_size) len = image_size - rva;
+                            dprintf( 2, "[rva-dump] %s base=%p rva=0x%lx len=0x%lx\n", mn, image_base, rva, len );
+                            for (i = 0; i < len; i += 32)
+                            {
+                                char line[128];
+                                int o = 0;
+                                for (j = i; j < len && j < i + 32; j++)
+                                    o += snprintf( line + o, sizeof(line) - o, "%02x", b[j] );
+                                dprintf( 2, "[rva-dump] +%lx %s\n", rva + i, line );
+                            }
+                        }
+                        while (*p == ',' || *p == ' ') p++;
+                    }
+                }
+            }
+
             /* task #34 [share-probe]: DEFAULT-OFF (set MADEIRA_SHARE_PROBE=1).
              * ml79: running it inline here (pre-detach, on explorer's boot
              * thread) wedged the session — exec-at-alias hangs while the
