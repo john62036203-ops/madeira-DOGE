@@ -4000,6 +4000,107 @@ void ios_pool_watermarks( unsigned long long *size, unsigned long long *head,
  * code in their copies. */
 static void (*ios_jit_alias_pushback_cb)(unsigned long long, unsigned long long, unsigned long long) = NULL;
 
+/* madeira-doge ml2100: ONE CALLBACK PER FEX INSTANCE.
+ *
+ * Every x64 pseudo-process loads its own libarm64ecfex.dll, with its own
+ * IosAliasEntries table, and registers its own push callback.  The single
+ * global above kept only the LAST registrant, so an image loaded later in an
+ * older process was pushed into the NEWEST process's table instead of its own.
+ * Among Us through Madeira Dock: the game spawns crashpad_handler.exe (whose
+ * FEX registers next), then loads cryptnet.dll; the game's FEX never heard of
+ * cryptnet's pool copy, an EC call into it reached FEX at the pool address,
+ * [iOS-xquery] MISSed with rev == addr, NoExec, and the game was killed.
+ *
+ * Now every registrant is kept (keyed by its PEB, replaced on re-registration,
+ * forgotten at process exit) and each new mapping is pushed to all of them --
+ * the same set the catch-up drain at registration already gives a new FEX.
+ * The plain global stays the newest one, for the sub-floor windows, which are
+ * per-process and keep their old routing.  MADEIRA_JIT_ALIAS_PUSH_ALL=0
+ * restores last-registrant-only pushing. */
+#define IOS_JIT_ALIAS_CB_MAX 32
+static struct { void *peb; void (*cb)(unsigned long long, unsigned long long, unsigned long long); }
+    ios_jit_alias_cbs[IOS_JIT_ALIAS_CB_MAX];
+static pthread_mutex_t ios_jit_alias_cb_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ios_jit_alias_push_all = -1;
+
+static int ios_jit_alias_push_all_on(void)
+{
+    if (ios_jit_alias_push_all < 0)
+    {
+        const char *v = getenv( "MADEIRA_JIT_ALIAS_PUSH_ALL" );
+        ios_jit_alias_push_all = !(v && v[0] == '0');
+        dprintf( 2, "[jit-alias] ml2100 push-all=%d (MADEIRA_JIT_ALIAS_PUSH_ALL=0 pushes to the newest FEX only)\n",
+                 ios_jit_alias_push_all );
+    }
+    return ios_jit_alias_push_all;
+}
+
+static void ios_jit_alias_cb_remember( void *peb, void (*cb)(unsigned long long, unsigned long long, unsigned long long) )
+{
+    int i, free_slot = -1;
+    pthread_mutex_lock( &ios_jit_alias_cb_lock );
+    for (i = 0; i < IOS_JIT_ALIAS_CB_MAX; i++)
+    {
+        if (ios_jit_alias_cbs[i].cb && ios_jit_alias_cbs[i].peb == peb)
+        {
+            ios_jit_alias_cbs[i].cb = cb;
+            pthread_mutex_unlock( &ios_jit_alias_cb_lock );
+            return;
+        }
+        if (!ios_jit_alias_cbs[i].cb && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0)
+    {
+        ios_jit_alias_cbs[free_slot].peb = peb;
+        __sync_synchronize();
+        ios_jit_alias_cbs[free_slot].cb = cb;
+    }
+    pthread_mutex_unlock( &ios_jit_alias_cb_lock );
+    dprintf( 2, "[jit-alias] ml2100 FEX alias callback %s peb=%p cb=%p\n",
+             free_slot >= 0 ? "registered" : "NOT KEPT (table full)", peb, (void *)cb );
+}
+
+/* Called from process_exit_wrapper (server_ios.c) before the dead process's
+ * pool copies -- its libarm64ecfex.dll among them -- are reclaimed. */
+void ios_jit_alias_cb_forget( void *peb )
+{
+    int i;
+    if (!peb) return;
+    pthread_mutex_lock( &ios_jit_alias_cb_lock );
+    for (i = 0; i < IOS_JIT_ALIAS_CB_MAX; i++)
+        if (ios_jit_alias_cbs[i].cb && ios_jit_alias_cbs[i].peb == peb)
+        {
+            ios_jit_alias_cbs[i].cb = NULL;
+            __sync_synchronize();
+            ios_jit_alias_cbs[i].peb = NULL;
+        }
+    pthread_mutex_unlock( &ios_jit_alias_cb_lock );
+}
+
+static void ios_jit_alias_push_new( unsigned long long pe, unsigned long long jit, unsigned long long size )
+{
+    void (*cbs[IOS_JIT_ALIAS_CB_MAX])(unsigned long long, unsigned long long, unsigned long long);
+    int i, n = 0;
+
+    if (!ios_jit_alias_push_all_on())
+    {
+        if (ios_jit_alias_pushback_cb) ios_jit_alias_pushback_cb( pe, jit, size );
+        return;
+    }
+    /* Snapshot under the lock, call outside it: a callback is FEX code that may
+     * itself map memory and come back through ios_jit_add_mapping. */
+    pthread_mutex_lock( &ios_jit_alias_cb_lock );
+    for (i = 0; i < IOS_JIT_ALIAS_CB_MAX; i++)
+        if (ios_jit_alias_cbs[i].cb) cbs[n++] = ios_jit_alias_cbs[i].cb;
+    pthread_mutex_unlock( &ios_jit_alias_cb_lock );
+    if (!n)
+    {
+        if (ios_jit_alias_pushback_cb) ios_jit_alias_pushback_cb( pe, jit, size );
+        return;
+    }
+    for (i = 0; i < n; i++) cbs[i]( pe, jit, size );
+}
+
 void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
     int i;
@@ -4083,10 +4184,9 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
      * (via the unix_ios_push_jit_aliases unix-call), forward this new
      * mapping to it too. Early mappings (added before xtajit64 loads) are
      * picked up by the iteration in unix_ios_push_jit_aliases. */
-    if (ios_jit_alias_pushback_cb)
-        ios_jit_alias_pushback_cb((unsigned long long)(uintptr_t)pe_base,
-                                  (unsigned long long)(uintptr_t)jit_base,
-                                  (unsigned long long)size);
+    ios_jit_alias_push_new((unsigned long long)(uintptr_t)pe_base,
+                           (unsigned long long)(uintptr_t)jit_base,
+                           (unsigned long long)size);
 }
 
 /* ml951: hand a sub-floor image window to FEX so QueryGuestExecutableRange can
@@ -4469,6 +4569,7 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     int i;
     if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
     ios_jit_alias_pushback_cb = params->callback;
+    ios_jit_alias_cb_remember( NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL, params->callback );
 
     /* ml951: any sub-floor window registered before xtajit64 loaded has not been
      * pushed yet — the per-registration push above needs this callback. Catch up. */
@@ -13017,6 +13118,7 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
     if (dead_peb)
     {
         extern void ios_jit_reclaim_process( void *peb );
+        ios_jit_alias_cb_forget( dead_peb );   /* ml2100 */
         ios_jit_reclaim_process( dead_peb );
     }
     ios_jit_purge_window( base, IOS_WOW_WINDOW_SIZE );

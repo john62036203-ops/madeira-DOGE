@@ -5402,6 +5402,12 @@ void process_exit_wrapper( int status )
          * (module copies, trampolines, FEX CodeBuffers). Children only —
          * the session (else-branch) lives as long as the app. Reuse is
          * grace-delayed inside the allocator for laggard exit threads. */
+        {
+            /* ml2100: stop pushing image aliases into this process's FEX before
+             * its libarm64ecfex.dll copy is reclaimed. */
+            extern void ios_jit_alias_cb_forget( void *peb );
+            ios_jit_alias_cb_forget( dead_peb );
+        }
         ios_jit_reclaim_process( dead_peb );
         /* WOW64_DESIGN.md §2: and its guest window, if it had one.  Here rather
          * than only in ios_child_thread_entry because THIS is the chokepoint
