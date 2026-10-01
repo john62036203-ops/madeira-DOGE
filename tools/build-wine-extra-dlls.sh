@@ -1,7 +1,11 @@
 #!/bin/bash
 # Build Wine PE DLLs that upstream's arm64ec-windows set does not ship but
 # games import: older VC++ runtimes (Crysis's Bin64\Crysis64.exe needs
-# msvcr80), D3DX9/10/11, d3d10, avifil32, XAudio2, dinput. Configured the way
+# msvcr80), D3DX9/10/11, d3d10, avifil32, XAudio2, dinput.
+# comctl32_v6: Common Controls 6 (TaskDialogIndirect, ordinal 345). Without it
+# the amd64 Common-Controls assembly is never seeded, x64 programs get the v5
+# comctl32, and RE Engine's error dialog died as "Unimplemented function
+# COMCTL32.dll.345" instead of showing its message. Configured the way
 # upstream's build/wine-pe/build-ntdll.sh configures wine/build-arm64ec;
 # stripped and padded by 64 KB past SizeOfImage like the shipped builtins.
 # A DLL upstream already ships is never replaced. Run from the repository
@@ -20,6 +24,7 @@ WANT="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcr110 msvcrt20 msvcrt40 msvcir
       msvcp60 msvcp70 msvcp71 msvcp80 msvcp90 msvcp100 msvcp110 msvcp120
       vcomp vcomp90 vcomp100 vcomp110 vcomp120 vcomp140
       d3d10 d3d10_1 avifil32 msvfw32 dinput
+      comctl32_v6
       xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9
       x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6 x3daudio1_7
       xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4 xapofx1_5
