@@ -21,6 +21,7 @@ struct SteamHubView: View {
     @State private var showSignIn = false
     @State private var search = ""
     @State private var confirmRemove: DockGame?
+    @AppStorage(MadeiraDockLauncher.noDesktopKey) private var noDesktop = false
 
     private var installed: [Int: DockGame] {
         Dictionary(dock.games.filter(\.installed).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
@@ -97,8 +98,10 @@ struct SteamHubView: View {
             if let error = dock.error {
                 Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
             }
+            Toggle("Start games without the virtual desktop (experimental)", isOn: $noDesktop)
         } header: { Text("Steam client") } footer: {
-            Text("Needed once, to start games. Downloaded from Valve's update servers and checked against pinned SHA-256 sums.")
+            Text("Needed once, to start games. Downloaded from Valve's update servers and checked against pinned SHA-256 sums. "
+                 + "Turn the switch on if a game runs but the screen stays black.")
         }
     }
 

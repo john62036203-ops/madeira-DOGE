@@ -64,10 +64,30 @@ enum MadeiraDockLauncher {
         }
         LogStore.shared.log("[madeira-dock] starting the host for app \(game.id); Valve's client authenticates and authorizes the launch")
         MadeiraDockModel.shared.watchReport()
-        var request = LaunchRequest(title: game.name, exe: "explorer.exe",
+        var request: LaunchRequest
+        if noDesktop {
+            // Experimental: no Wine virtual desktop. The host and the game Valve's client
+            // starts run like a directly launched program, so the game's 3D window gets the
+            // full-screen layer the library's own launches use, instead of a sublayer of the
+            // desktop compositor. One-time installs run first through cmd.exe as before.
+            if let installers = DockInstallers.script {
+                request = LaunchRequest(title: game.name, exe: "C:\\windows\\system32\\cmd.exe",
+                                        args: "/c call \(installers) & \(MadeiraDock.executable)", desktop: nil)
+            } else {
+                request = LaunchRequest(title: game.name, exe: MadeiraDock.executable, args: nil, desktop: nil)
+            }
+            LogStore.shared.log("[madeira-dock] no virtual desktop for this launch (Steam page switch)")
+        } else {
+            request = LaunchRequest(title: game.name, exe: "explorer.exe",
                                     args: MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script),
                                     desktop: (w: width, h: height))
+        }
         request.dock = true
         return request
     }
+
+    /// The Steam page's "without virtual desktop" switch (off by default: upstream's Dock
+    /// always runs inside explorer's desktop).
+    nonisolated static let noDesktopKey = "madeira.dock.noDesktop"
+    nonisolated static var noDesktop: Bool { UserDefaults.standard.bool(forKey: noDesktopKey) }
 }
