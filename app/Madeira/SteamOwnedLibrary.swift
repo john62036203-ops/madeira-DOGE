@@ -351,6 +351,44 @@ final class SteamOwnedLibrary: ObservableObject {
         SteamLog.event("[steam-\(context)] failed reason=\(Self.reason(error)) reported=\(report ? 1 : 0)")
     }
 
+    // MARK: Free games (madeira-doge)
+
+    enum FreeLicenseResult: Equatable { case granted, alreadyOwned, refused(String) }
+
+    /// Adds a free-to-play game to the account (Steam's ClientRequestFreeLicense,
+    /// what the store's "Play Game" button does for a free title), then reloads
+    /// the owned list so the game can be installed. Steam only grants free
+    /// packages; a paid game is refused.
+    func requestFreeLicense(_ appID: Int) async -> FreeLicenseResult {
+        guard Self.enabled, signedIn else { return .refused("Sign in to Steam first.") }
+        guard !inSession else { return .refused("Close the running game first.") }
+        guard appID > 0, appID <= Int(UInt32.max) else { return .refused("Invalid App ID.") }
+        if game(appID) != nil { return .alreadyOwned }
+        do {
+            try await session.ensureConnected()
+            let body = CMsgClientRequestFreeLicense(appIDs: [UInt32(appID)]).serialize()
+            let reply = try await session.sendAndWait(eMsg: .clientRequestFreeLicense, body: body,
+                                                      responseEMsg: .clientRequestFreeLicenseResponse, timeout: 20)
+            let response = try CMsgClientRequestFreeLicenseResponse.deserialize(from: reply.body)
+            SteamLog.event("[steam-free] app=\(appID) eresult=\(response.eresult) packages=\(response.grantedPackageIDs) apps=\(response.grantedAppIDs)")
+            guard response.eresult == 1 else {
+                return .refused("Steam refused (code \(response.eresult)).")
+            }
+            if response.grantedPackageIDs.isEmpty && response.grantedAppIDs.isEmpty {
+                // Nothing new: either already on the account or not free to claim.
+                await refreshLibrary(interactive: false)
+                return game(appID) != nil ? .alreadyOwned : .refused("Steam granted nothing: this game cannot be added for free.")
+            }
+            // Steam pushes a new license list after a grant; give it a moment.
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await refreshLibrary(interactive: false)
+            return .granted
+        } catch {
+            handleSessionError(error, context: "free", report: false)
+            return .refused(SteamSignIn.message(error))
+        }
+    }
+
     // MARK: Playtime
 
     /// The account's own Player.GetOwnedGames over the existing connection.

@@ -40,6 +40,10 @@ enum EMsg: UInt32 {
     case clientPICSAccessTokenResponse = 8906
     case clientGetDepotDecryptionKey = 5438
     case clientGetDepotDecryptionKeyResponse = 5439
+    /// Adds a free-to-play game (or a free package) to the account, as the
+    /// store's "Play Game" / "Add to Library" does for a free title.
+    case clientRequestFreeLicense = 5572
+    case clientRequestFreeLicenseResponse = 5573
     case serviceMethod = 146
     case serviceMethodResponse = 147
     case serviceMethodCallFromClient = 151

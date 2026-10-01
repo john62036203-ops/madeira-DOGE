@@ -115,6 +115,7 @@
 		A1000700 /* DockLaunch.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000700 /* DockLaunch.swift */; };
 		A1000701 /* SteamHubView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000701 /* SteamHubView.swift */; };
 		A1000702 /* SteamGameSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000702 /* SteamGameSettings.swift */; };
+		A1000703 /* SteamStoreView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000703 /* SteamStoreView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -240,6 +241,7 @@
 		A2000700 /* DockLaunch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DockLaunch.swift"; sourceTree = "<group>"; };
 		A2000701 /* SteamHubView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamHubView.swift"; sourceTree = "<group>"; };
 		A2000702 /* SteamGameSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamGameSettings.swift"; sourceTree = "<group>"; };
+		A2000703 /* SteamStoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamStoreView.swift"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -316,6 +318,7 @@
 				A2000208 /* GameProfiles.swift */,
 				A2000209 /* StorageSection.swift */,
 				A2000702 /* SteamGameSettings.swift */,
+				A2000703 /* SteamStoreView.swift */,
 				A2000700 /* DockLaunch.swift */,
 				A2000701 /* SteamHubView.swift */,
 				A2000520 /* MadeiraDock.swift */,
@@ -553,6 +556,7 @@
 				A1000208 /* GameProfiles.swift in Sources */,
 				A1000209 /* StorageSection.swift in Sources */,
 				A1000702 /* SteamGameSettings.swift in Sources */,
+				A1000703 /* SteamStoreView.swift in Sources */,
 				A1000700 /* DockLaunch.swift in Sources */,
 				A1000701 /* SteamHubView.swift in Sources */,
 				A1000520 /* MadeiraDock.swift in Sources */,

@@ -80,3 +80,17 @@ GDI shared section's win32u side), which 221 pins at a different wine.
   submodule (`server/thread.c`/`thread.h`) and in the VM code (`virtual_ios.c`)
   where this tree's JIT work lives; porting them would risk the JIT pool fixes
   that make 221 start at all.
+
+## Steam store search, free games, no overlay (madeira-doge)
+
+- Steam page › "Find more games on the Steam store" (`SteamStoreView.swift`):
+  Steam's public store search. Owned games: Install. Free-to-play games: Get,
+  which sends `ClientRequestFreeLicense` (EMsg 5572) over the app's own Steam
+  connection (`SteamOwnedLibrary.requestFreeLicense`), reloads the owned list and
+  starts the download. Paid games: Buy on Steam opens the store page; after
+  buying, refresh the library. Nothing downloads a game the account does not own.
+- Madeira Dock sessions disable the Steam Overlay (`WineProcessBridge.m`,
+  `gameoverlayrenderer,gameoverlayrenderer64=d` appended to WINEDLLOVERRIDES).
+  On iOS its hook search failed ~14,000 times in Among Us and its Present hook
+  cut the frame rate by a third. Per game: Game settings › "Allow the Steam
+  Overlay" (`env.MADEIRA_STEAM_OVERLAY = 1`), or the same line in madeira.cfg.

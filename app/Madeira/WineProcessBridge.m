@@ -959,6 +959,26 @@ static void *wine_process_thread(void *arg) {
                     setenv(k.UTF8String, v.UTF8String, 1);
                     fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);
                 }
+                /* madeira-doge: no Steam Overlay in Madeira Dock sessions. Valve's client
+                 * injects gameoverlayrenderer(64).dll into every game it starts; on iOS its
+                 * hook-trampoline search fails thousands of times (Among Us: ~14,000
+                 * [alloc-fail]) and its Present hook keeps the exception thread busy, so
+                 * games stutter at a third of their frame rate. The overlay cannot be
+                 * used here anyway (no Shift+Tab). Disabled through Wine's load order,
+                 * appended to whatever WINEDLLOVERRIDES madeira.cfg or the game set.
+                 * env.MADEIRA_STEAM_OVERLAY = 1 (madeira.cfg or the game's settings)
+                 * keeps it. */
+                const char *dockSession = getenv("MADEIRA_DOCK_SESSION");
+                const char *overlayOn = getenv("MADEIRA_STEAM_OVERLAY");
+                if (dockSession && !strcmp(dockSession, "1") && !(overlayOn && !strcmp(overlayOn, "1"))) {
+                    const char *cur = getenv("WINEDLLOVERRIDES");
+                    NSString *ov = (cur && *cur)
+                        ? [NSString stringWithFormat:@"%s;gameoverlayrenderer,gameoverlayrenderer64=d", cur]
+                        : @"gameoverlayrenderer,gameoverlayrenderer64=d";
+                    setenv("WINEDLLOVERRIDES", ov.UTF8String, 1);
+                    fprintf(stderr, "[steam-overlay] disabled for this Dock session: WINEDLLOVERRIDES=%s "
+                                    "(env.MADEIRA_STEAM_OVERLAY = 1 keeps the overlay)\n", ov.UTF8String);
+                }
             }
         }
 

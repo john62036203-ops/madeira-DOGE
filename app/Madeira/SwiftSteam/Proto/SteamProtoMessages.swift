@@ -780,6 +780,51 @@ struct CMsgClientGetDepotDecryptionKeyResponse {
     }
 }
 
+// MARK: - Free licenses (madeira-doge)
+
+/// CMsgClientRequestFreeLicense: `repeated uint32 appids = 2`.
+struct CMsgClientRequestFreeLicense {
+    var appIDs: [UInt32] = []
+
+    func serialize() -> Data {
+        var encoder = ProtobufEncoder()
+        for id in appIDs { encoder.writeUInt32(fieldNumber: 2, value: id) }
+        return encoder.data
+    }
+}
+
+/// CMsgClientRequestFreeLicenseResponse: `uint32 eresult = 1 [default = 2]`,
+/// `repeated uint32 granted_packageids = 2`, `repeated uint32 granted_appids = 3`.
+struct CMsgClientRequestFreeLicenseResponse {
+    var eresult: UInt32 = 2
+    var grantedPackageIDs: [UInt32] = []
+    var grantedAppIDs: [UInt32] = []
+
+    static func deserialize(from data: Data) throws -> Self {
+        var decoder = ProtobufDecoder(data)
+        var msg = Self()
+
+        func readRepeated(_ wireType: ProtoWireType, into list: inout [UInt32]) throws {
+            if wireType == .lengthDelimited {   // packed
+                var inner = ProtobufDecoder(try decoder.readBytes())
+                while !inner.isAtEnd { list.append(UInt32(truncatingIfNeeded: try inner.readVarint())) }
+            } else {
+                list.append(UInt32(truncatingIfNeeded: try decoder.readVarint()))
+            }
+        }
+
+        while let tag = try decoder.readTag() {
+            switch tag.fieldNumber {
+            case 1: msg.eresult = UInt32(truncatingIfNeeded: try decoder.readVarint())
+            case 2: try readRepeated(tag.wireType, into: &msg.grantedPackageIDs)
+            case 3: try readRepeated(tag.wireType, into: &msg.grantedAppIDs)
+            default: try decoder.skip(wireType: tag.wireType)
+            }
+        }
+        return msg
+    }
+}
+
 // MARK: - Service Method Wrapper
 
 /// Wraps a service method call for sending via EMsg.serviceMethodCallFromClient

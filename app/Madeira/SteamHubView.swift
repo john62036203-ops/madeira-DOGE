@@ -114,6 +114,15 @@ struct SteamHubView: View {
             }
         } else {
             Section {
+                NavigationLink {
+                    SteamStoreView()
+                } label: {
+                    Label("Find more games on the Steam store", systemImage: "magnifyingglass")
+                }
+            } footer: {
+                Text("Free games can be added to your account and downloaded here. Paid games open on the Steam store.")
+            }
+            Section {
                 if library.owned.isEmpty {
                     Text(library.refreshing ? "Loading your library…" : "No Windows games were found. Pull the refresh button to try again.")
                         .foregroundStyle(.secondary)

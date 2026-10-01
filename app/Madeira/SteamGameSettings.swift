@@ -38,6 +38,7 @@ struct SteamGameSettingsView: View {
     @State private var tess: String
     @State private var submit: String
     @State private var gpuSync: String
+    @State private var overlay: Bool
 
     private var profile: GameProfile { SteamGameOptions.profile(appID) }
 
@@ -56,6 +57,7 @@ struct SteamGameSettingsView: View {
         _tess = State(initialValue: p.get("dxil-tess-max-factor") ?? "")
         _submit = State(initialValue: p.get("async-submit") ?? "")
         _gpuSync = State(initialValue: p.get("fence-chain") ?? "")
+        _overlay = State(initialValue: p.get("env.MADEIRA_STEAM_OVERLAY") == "1")
     }
 
     var body: some View {
@@ -66,8 +68,10 @@ struct SteamGameSettingsView: View {
                     Toggle("Present the GPU as NVIDIA", isOn: $nvidia)
                     Toggle("Safe sync (fastsync off)", isOn: $safeSync)
                     Toggle("Keep Wine's VC++ runtime", isOn: $wineVCRT)
+                    Toggle("Allow the Steam Overlay (slower)", isOn: $overlay)
                 } header: { Text("Compatibility") } footer: {
-                    Text("The same switches as a library game's settings. They apply to the whole Dock session, so Valve's client runs with them too.")
+                    Text("The same switches as a library game's settings. They apply to the whole Dock session, so Valve's client runs with them too. "
+                         + "The Steam Overlay is off by default: on iOS it makes games stutter and cannot be opened anyway.")
                 }
                 Section {
                     picker("MetalFX upscaling", $metalFX, GameProfile.metalFXChoices)
@@ -108,6 +112,7 @@ struct SteamGameSettingsView: View {
         tess = p.get("dxil-tess-max-factor") ?? ""
         submit = p.get("async-submit") ?? ""
         gpuSync = p.get("fence-chain") ?? ""
+        overlay = p.get("env.MADEIRA_STEAM_OVERLAY") == "1"
     }
 
     private func save() {
@@ -123,5 +128,6 @@ struct SteamGameSettingsView: View {
         p.set("dxil-tess-max-factor", tess)
         p.set("async-submit", submit)
         p.set("fence-chain", gpuSync)
+        p.set("env.MADEIRA_STEAM_OVERLAY", overlay ? "1" : nil)
     }
 }
