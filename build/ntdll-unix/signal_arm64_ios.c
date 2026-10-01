@@ -7276,6 +7276,88 @@ skip_reclaim_band: ;
                             }
                         }
 
+                        /* madeira-doge: name the C++ exception behind a terminate().
+                         * A game that dies by __fastfail after an uncaught MSVC C++
+                         * exception (Sekiro: e06d7363 -> unhandled -> int 0x29, status
+                         * c0000409) still has the EXCEPTION_RECORD on its stack. Scan up
+                         * from RSP for it and print the thrown type names and, for
+                         * std::exception-derived objects, what(). First 4 faults. */
+                        {
+                            static int cxx_n, cxx_tries;
+                            if (cxx_n < 4 && cxx_tries++ < 12 && live_rsp >= 0x10000 && live_rsp < 0xfffffff000000000ULL)
+                            {
+                                enum { SCAN = 0x10000 };
+                                static uint64_t sbuf[SCAN / 8];
+                                mach_vm_size_t sg = 0;
+                                size_t want = SCAN, k2;
+                                /* stop at the end of the readable range */
+                                while (want >= 0x1000 &&
+                                       (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)live_rsp, want,
+                                                                (mach_vm_address_t)sbuf, &sg ) != KERN_SUCCESS || sg != want))
+                                    want >>= 1;
+                                if (want >= 0x1000)
+                                {
+                                    int found = 0;
+                                    for (k2 = 0; k2 + 8 < want / 8 && found < 2; k2++)
+                                    {
+                                        uint32_t code = (uint32_t)sbuf[k2], flags = (uint32_t)(sbuf[k2] >> 32);
+                                        uint64_t info0, info1, info2, info3;
+                                        if (code != 0xe06d7363 || (flags & ~1u)) continue;
+                                        if ((uint32_t)sbuf[k2 + 3] != 4) continue;           /* NumberParameters */
+                                        info0 = sbuf[k2 + 4]; info1 = sbuf[k2 + 5];
+                                        info2 = sbuf[k2 + 6]; info3 = sbuf[k2 + 7];
+                                        if ((uint32_t)info0 != 0x19930520 && (uint32_t)info0 != 0x19930521 &&
+                                            (uint32_t)info0 != 0x19930522) continue;
+                                        found++;
+                                        cxx_n++;
+                                        dprintf( STDERR_FILENO, "[cxx-exc] C++ exception record @0x%llx: obj=0x%llx throwinfo=0x%llx imagebase=0x%llx\n",
+                                                 (unsigned long long)(live_rsp + k2 * 8), (unsigned long long)info1,
+                                                 (unsigned long long)info2, (unsigned long long)info3 );
+                                        {
+                                            uint32_t ti[4], cta[6];
+                                            mach_vm_size_t g3 = 0;
+                                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)info2, sizeof(ti),
+                                                                        (mach_vm_address_t)ti, &g3 ) == KERN_SUCCESS && g3 == sizeof(ti) &&
+                                                ti[3] && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(info3 + ti[3]),
+                                                                        sizeof(cta), (mach_vm_address_t)cta, &g3 ) == KERN_SUCCESS)
+                                            {
+                                                uint32_t nt = cta[0] > 5 ? 5 : cta[0], t;
+                                                for (t = 0; t < nt; t++)
+                                                {
+                                                    uint32_t ct[2];
+                                                    char name[96];
+                                                    memset( name, 0, sizeof(name) );
+                                                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(info3 + cta[1 + t]),
+                                                                                sizeof(ct), (mach_vm_address_t)ct, &g3 ) != KERN_SUCCESS) break;
+                                                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(info3 + ct[1] + 16),
+                                                                                sizeof(name) - 1, (mach_vm_address_t)name, &g3 ) != KERN_SUCCESS) break;
+                                                    name[sizeof(name) - 1] = 0;
+                                                    dprintf( STDERR_FILENO, "[cxx-exc]   type[%u] %s\n", t, name );
+                                                }
+                                            }
+                                        }
+                                        {
+                                            uint64_t whatp = 0;
+                                            char what[160];
+                                            mach_vm_size_t g4 = 0;
+                                            memset( what, 0, sizeof(what) );
+                                            if (info1 && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(info1 + 8), 8,
+                                                                                 (mach_vm_address_t)&whatp, &g4 ) == KERN_SUCCESS &&
+                                                whatp >= 0x10000 &&
+                                                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)whatp, sizeof(what) - 1,
+                                                                        (mach_vm_address_t)what, &g4 ) == KERN_SUCCESS)
+                                            {
+                                                size_t q;
+                                                what[sizeof(what) - 1] = 0;
+                                                for (q = 0; what[q]; q++) if ((unsigned char)what[q] < 0x20 || (unsigned char)what[q] > 0x7e) { what[q] = 0; break; }
+                                                if (what[0]) dprintf( STDERR_FILENO, "[cxx-exc]   what(): \"%s\"\n", what );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         /* Thumper-debug: also dump the static singleton slot
                          * at 0x140290a60+0x428. This is the "0x1400793d0
                          * caller" that the DXGI dispatch wrapper reads from.
