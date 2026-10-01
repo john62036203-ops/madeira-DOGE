@@ -863,9 +863,17 @@ jobs:
         shell: bash
         run: |
           INC="$GITHUB_WORKSPACE/build/madeira-d3d12/msc-include"
+          # madeira-doge: without an msc-private release, use the Apache-2.0
+          # headers vendored in-tree (same 4.0b2 package as the tracked iOS
+          # library), after checking them against their SHA256SUMS.
+          VEND="$GITHUB_WORKSPACE/research/madeira-d3d12/third_party/metal-shader-converter"
+          if [ ! -f "$INC/metal_irconverter/metal_irconverter.h" ] && \
+             (cd "$VEND" && shasum -a 256 -c --quiet SHA256SUMS); then
+            INC="$VEND/include"
+          fi
           if [ -f "$INC/metal_irconverter/metal_irconverter.h" ]; then
             echo "MADEIRA_MSC_INCLUDE=$INC" >> "$GITHUB_ENV"
-            echo "::notice::converter headers present -- building the real D3D12 conversion service"
+            echo "::notice::converter headers present ($INC) -- building the real D3D12 conversion service"
           else
             echo "::warning::no Metal Shader Converter headers -- D3D12 shader conversion is a stub in this build"
           fi
