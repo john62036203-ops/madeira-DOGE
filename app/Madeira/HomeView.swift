@@ -517,11 +517,19 @@ struct HomeView: View {
                     rescan()
                     UpdatePacks.shared.refresh(silent: true)
                 }
+                // ml1330 from the library too: StikDebug detaches about a minute
+                // after it attaches, and the JIT pool can only be taken while it is
+                // attached. Taking it here means a game started minutes later (after
+                // a Steam download, say) still finds it. No-op without the debugger.
+                StikJITHelper.prepareEarlyPool(trigger: "home")
             }
             .onChange(of: scenePhase) { _, phase in
                 // StikDebug enables JIT from outside the app, so re-read the
                 // flag whenever we come back to the foreground.
-                if phase == .active { jitOn = jit_check_debugged() }
+                if phase == .active {
+                    jitOn = jit_check_debugged()
+                    StikJITHelper.prepareEarlyPool(trigger: "home-active")
+                }
             }
             .onChange(of: shortcuts.pendingExe) { _, _ in launchPendingShortcut() }
             .onChange(of: scannedOnce) { _, _ in launchPendingShortcut() }
