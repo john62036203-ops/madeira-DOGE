@@ -1609,7 +1609,38 @@ static void *wine_process_thread(void *arg) {
                  * game's "Expose AVX/AVX2" switch never took effect. */
                 const char *dockAvx = getenv("MADEIRA_DOCK_SESSION");
                 BOOL dockSessionAvx = dockAvx && dockAvx[0] == '1';
-                if ((use_arm64ec || dockSessionAvx) && avxEnv && avxEnv[0] == '1') {
+                /* madeira-doge: in a Dock session the AVX module goes to the game
+                 * alone. xtajit64-avx.dll is built from a different FEX source than
+                 * the shipped xtajit64.dll, and swapping it in for the whole session
+                 * also moved dockhost.exe and Valve's client onto it (the first such
+                 * session hung while steamclient64.dll loaded). The unix ntdll
+                 * (build/ntdll-unix/fex_avx_redirect_ios.c) opens xtajit64-avx.dll
+                 * instead only for a process whose image is under
+                 * \steamapps\common\; the file is already in system32 and sysx64
+                 * from the arm64ec-windows links above. */
+                unsetenv("MADEIRA_FEX_AVX_GAME_ONLY");
+                /* An aarch64 (Dock) session cross-links xtajit64.dll into system32
+                 * only when the name is free, so the whole-session swap of an earlier
+                 * build survived into every later Dock session, AVX or not. Point a
+                 * system32 link that still targets the AVX module back at the
+                 * shipped one. */
+                if (!use_arm64ec) {
+                    NSString *s32Fex = [sys32Dir stringByAppendingPathComponent:@"xtajit64.dll"];
+                    NSString *target = [fm destinationOfSymbolicLinkAtPath:s32Fex error:nil];
+                    if ([target.lastPathComponent isEqualToString:@"xtajit64-avx.dll"]) {
+                        NSString *ecSource = [bundlePath stringByAppendingPathComponent:@"arm64ec-windows"];
+                        [fm removeItemAtPath:s32Fex error:nil];
+                        [fm createSymbolicLinkAtPath:s32Fex
+                                 withDestinationPath:madeira_pe_source(ecSource, "arm64ec-windows", @"xtajit64.dll")
+                                               error:nil];
+                        dprintf(STDERR_FILENO, "[WineProc] system32\\xtajit64.dll pointed at the AVX module from an earlier session -- restored\n");
+                    }
+                }
+                if (dockSessionAvx && !use_arm64ec && avxEnv && avxEnv[0] == '1') {
+                    setenv("MADEIRA_FEX_AVX_GAME_ONLY", "1", 1);
+                    dprintf(STDERR_FILENO, "[WineProc] MADEIRA_FEX_AVX=1 (Dock): xtajit64-avx.dll for the game process only; "
+                                           "dockhost and Valve's client keep xtajit64.dll\n");
+                } else if ((use_arm64ec || dockSessionAvx) && avxEnv && avxEnv[0] == '1') {
                     NSString *avxDll = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"]
                                         stringByAppendingPathComponent:@"xtajit64-avx.dll"];
                     if ([fm fileExistsAtPath:avxDll]) {

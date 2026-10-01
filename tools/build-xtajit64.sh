@@ -4,6 +4,9 @@
 # upstream's untouched xtajit64.dll. WineProcessBridge.m links it in as
 # system32\xtajit64.dll only for a game whose settings turn AVX on
 # (MADEIRA_FEX_AVX=1); every other game runs upstream's module.
+# In a Madeira Dock session it is not linked in: the unix ntdll
+# (build/ntdll-unix/fex_avx_redirect_ios.c) opens it for the game process
+# alone, so dockhost.exe and Valve's client stay on the shipped module.
 #
 # build/fex-arm64ec/build.sh does not record everything the committed DLL was
 # built with; the options below reproduce it. FEX_IOS_HOST must reach the

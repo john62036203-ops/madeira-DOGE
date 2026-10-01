@@ -14,6 +14,7 @@ mkdir -p "$OBJ_DIR"
 SUCCEEDED=0
 FAILED=0
 FAILED_FILES=""
+EXTRA_OBJS=()
 
 compile_one() {
     local src=$1
@@ -36,6 +37,7 @@ compile_one() {
         -DWINE_UNIX_LIB -DWINE_IOS=1 \
         -Dget_thread_context=ntdll_get_thread_context \
         -Dset_thread_context=ntdll_set_thread_context \
+        ${EXTRA_CFLAGS:-} \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"
         SUCCEEDED=$((SUCCEEDED + 1))
@@ -206,6 +208,25 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
         thread)
             compile_one "$BUILD_DIR/thread_ios.c" "thread"
             ;;
+        file)
+            # madeira-doge: NtCreateFile/NtOpenFile get a thin wrapper
+            # (fex_avx_redirect_ios.c: the AVX FEX module for a Steam game
+            # only). If either half fails to build, file.c builds as before.
+            FAILED_BEFORE=$FAILED
+            EXTRA_CFLAGS="-DNtCreateFile=wine_impl_NtCreateFile -DNtOpenFile=wine_impl_NtOpenFile" \
+                compile_one "$src" "file"
+            if [ "$FAILED" = "$FAILED_BEFORE" ]; then
+                compile_one "$BUILD_DIR/fex_avx_redirect_ios.c" "fex_avx_redirect"
+            fi
+            if [ "$FAILED" = "$FAILED_BEFORE" ]; then
+                EXTRA_OBJS+=("$OBJ_DIR/fex_avx_redirect.o")
+                echo "  [fex-avx] file.c wrapped: the AVX FEX module can be given to a Steam game only"
+            else
+                FAILED=$FAILED_BEFORE
+                echo "  [fex-avx] wrapper did not build; file.c without it (Dock AVX then applies to the whole session)"
+                compile_one "$src" "file"
+            fi
+            ;;
         *)
             compile_one "$src" "$name"
             ;;
@@ -232,7 +253,8 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \
     "$OBJ_DIR/signal_arm.o" "$OBJ_DIR/signal_arm64.o" "$OBJ_DIR/signal_i386.o" "$OBJ_DIR/signal_x86_64.o" \
     "$OBJ_DIR/socket.o" "$OBJ_DIR/sync.o" "$OBJ_DIR/syscall.o" "$OBJ_DIR/system.o" \
-    "$OBJ_DIR/tape.o" "$OBJ_DIR/thread.o" "$OBJ_DIR/virtual.o"
+    "$OBJ_DIR/tape.o" "$OBJ_DIR/thread.o" "$OBJ_DIR/virtual.o" \
+    ${EXTRA_OBJS[@]+"${EXTRA_OBJS[@]}"}
 
 echo "Copying to app..."
 cp "$OBJ_DIR/libntdll_unix.a" "$APP_LIB"
