@@ -11,6 +11,22 @@ import SwiftUI
 /// environment Valve's client passes on to the game it starts.
 enum SteamGameOptions {
     static func key(_ appID: Int) -> String { "steam:\(appID)" }
+
+    /// madeira-doge: Documents/madeira-exe-window-mb, read by JITAllocator.c at the
+    /// next app start: a 512MB window at 0x140000000 instead of 128MB, for a main
+    /// executable that cannot be relocated and is larger (FFRS-Win64-Shipping.exe).
+    static var bigExeWindowFile: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("madeira-exe-window-mb")
+    }
+    static var bigExeWindow: Bool {
+        get { bigExeWindowFile.map { FileManager.default.fileExists(atPath: $0.path) } ?? false }
+        set {
+            guard let url = bigExeWindowFile else { return }
+            if newValue { try? Data("512\n".utf8).write(to: url, options: .atomic) }
+            else { try? FileManager.default.removeItem(at: url) }
+        }
+    }
     static func profile(_ appID: Int) -> GameProfile { GameProfile(windowsPath: key(appID)) }
 
     static func apply(to request: inout LaunchRequest, appID: Int) {
@@ -40,6 +56,7 @@ struct SteamGameSettingsView: View {
     @State private var gpuSync: String
     @State private var overlay: Bool
     @State private var args: String
+    @State private var bigExe: Bool = SteamGameOptions.bigExeWindow
 
     private var profile: GameProfile { SteamGameOptions.profile(appID) }
 
@@ -71,9 +88,12 @@ struct SteamGameSettingsView: View {
                     Toggle("Safe sync (fastsync off)", isOn: $safeSync)
                     Toggle("Keep Wine's VC++ runtime", isOn: $wineVCRT)
                     Toggle("Allow the Steam Overlay (slower)", isOn: $overlay)
+                    Toggle("Room for a large game executable (restart Madeira)", isOn: $bigExe)
                 } header: { Text("Compatibility") } footer: {
                     Text("The same switches as a library game's settings. They apply to the whole Dock session, so Valve's client runs with them too. "
-                         + "The Steam Overlay is off by default: on iOS it makes games stutter and cannot be opened anyway.")
+                         + "The Steam Overlay is off by default: on iOS it makes games stutter and cannot be opened anyway. "
+                         + "Large executable: keeps 512 MB at the fixed address some big games (Unreal Engine 5) must load at; "
+                         + "it applies to all games and takes effect after Madeira is fully closed and reopened.")
                 }
                 Section {
                     TextField("none", text: $args, axis: .vertical)
@@ -160,6 +180,7 @@ struct SteamGameSettingsView: View {
     }
 
     private func save() {
+        SteamGameOptions.bigExeWindow = bigExe
         let k = SteamGameOptions.key(appID)
         LibraryPrefs.setAVX(avx, for: k)
         LibraryPrefs.setNvidia(nvidia, for: k)

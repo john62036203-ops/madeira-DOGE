@@ -451,7 +451,10 @@ enum StikJITHelper {
         // hole above it ~628MB contiguous. The largest fixed-base image we ship
         // against ends at +117MB; ntdll hands the window to the first fixed map
         // of >=64MB that fits, and reads the size from WINE_IOS_EXE_WINDOW.
-        let exeWinSize: vm_address_t = 0x8000000           // 128MB
+        // madeira-doge: or the larger window JITAllocator.c held at image load
+        // (Documents/madeira-exe-window-mb, for a big non-relocatable game exe).
+        let exeWinSize: vm_address_t = madeira_early_window_base == 0x140000000 && madeira_early_window_size > 0x8000000
+            ? vm_address_t(madeira_early_window_size) : 0x8000000           // 128MB
         var exeWindowActive = !exeWindowSurrendered   // ml1640: see the census below
         func overlapsExeWindow(_ base: vm_address_t, _ len: vm_address_t) -> Bool {
             return exeWindowActive && base < exeWinBase + exeWinSize && base + len > exeWinBase
@@ -463,7 +466,7 @@ enum StikJITHelper {
             // ml1040: already held since image load (JITAllocator.c constructor).
             windowHeld = true
             setenv("WINE_IOS_EXE_WINDOW", String(format: "%lx:%lx", Int(exeWinBase), Int(exeWinSize)), 1)
-            LogStore.shared.log("ml1040: executable window [0x140000000,+128MB) held since image load", level: .success)
+            LogStore.shared.log("ml1040: executable window [0x140000000,+\(exeWinSize >> 20)MB) held since image load", level: .success)
         } else if !skipWindow {
             var winAddr: vm_address_t = exeWinBase
             let krWin = vm_allocate(mach_task_self_, &winAddr, vm_size_t(exeWinSize), 0 /* VM_FLAGS_FIXED */)
