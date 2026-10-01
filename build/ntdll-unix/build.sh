@@ -129,6 +129,53 @@ compile_one "$BUILD_DIR/nsi_ip_ios.c" "nsi_ip"
 # through dlopen, so nothing new is added to the app's final link.
 compile_unixlib "$BUILD_DIR/dnsapi_unixlib_ios.c" "dnsapi_unixlib" "dnsapi" \
     -I"$WINE_SRC/dlls/dnsapi"
+# MADEIRA (from upstream build 270, docs/MEDIA.md): winegstreamer's unix side.
+# Upstream Wine implements it with GStreamer, which does not exist on iOS, so
+# winegstreamer.dll could not load: no WMA decoder for FAudio's xWMA voices
+# (compressed bytes played as PCM = static), no MP3/WAV splitters for quartz,
+# no MP4 source for Media Foundation. winegstreamer_unixlib_ios.c implements
+# the WMA wg_transform subset with libavcodec and the wg_parser with
+# libavformat (wg_parser_av_ios.c, #included); wg_parser_apple_ios.c decodes
+# H.264/HEVC on VideoToolbox and AAC on AudioToolbox. FFmpeg comes from
+# build/ffmpeg/build.sh (LGPL configuration). Bound for 32-bit (WoW64)
+# processes only unless MADEIRA_WG_64BIT=1 (virtual_ios.c).
+# 221 tree: OPTIONAL. If either object fails to compile, neither is archived;
+# winegstreamer_stub_ios.c (two one-entry NULL tables) is archived instead and
+# virtual_ios.c leaves winegstreamer on the generic stub table, exactly as
+# before -- the rest of libntdll_unix.a is unaffected.
+FFMPEG_PREFIX="$REPO_ROOT/toolchains/ffmpeg-ios"
+MEDIA_OBJS=()
+if [ -f "$FFMPEG_PREFIX/include/libavcodec/avcodec.h" ]; then
+    compile_unixlib "$BUILD_DIR/winegstreamer_unixlib_ios.c" "winegstreamer_unixlib" "winegstreamer" \
+        -I"$WINE_SRC/dlls/winegstreamer" -I"$FFMPEG_PREFIX/include"
+    # Its own translation unit with NO Wine header (CoreFoundation and winnt.h
+    # disagree about several names), so no Wine include paths or config.h.
+    echo -n "  wg_parser_apple_ios... "
+    if xcrun -sdk iphoneos clang \
+        -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
+        -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing -Wall -Werror=implicit-function-declaration \
+        -c "$BUILD_DIR/wg_parser_apple_ios.c" -o "$OBJ_DIR/wg_parser_apple_ios.o" 2>"$OBJ_DIR/wg_parser_apple_ios.err"; then
+        echo "OK"
+        SUCCEEDED=$((SUCCEEDED + 1))
+    else
+        echo "FAILED"
+        grep -m 6 -A 3 "error:" "$OBJ_DIR/wg_parser_apple_ios.err" | sed 's/^/      /'
+        FAILED=$((FAILED + 1))
+        FAILED_FILES="$FAILED_FILES wg_parser_apple_ios"
+    fi
+    if [ -f "$OBJ_DIR/winegstreamer_unixlib.o" ] && [ -f "$OBJ_DIR/wg_parser_apple_ios.o" ]; then
+        MEDIA_OBJS=("$OBJ_DIR/winegstreamer_unixlib.o" "$OBJ_DIR/wg_parser_apple_ios.o")
+    else
+        grep -m 6 -A 3 "error:" "$OBJ_DIR/winegstreamer_unixlib.err" 2>/dev/null | sed 's/^/      /'
+        echo "  [media] winegstreamer unix side NOT archived (compile failed); winegstreamer stays on the stub table"
+    fi
+else
+    echo "  [media] no FFmpeg headers under $FFMPEG_PREFIX (build/ffmpeg/build.sh); winegstreamer stays on the stub table"
+fi
+if [ ${#MEDIA_OBJS[@]} -eq 0 ]; then
+    compile_one "$BUILD_DIR/winegstreamer_stub_ios.c" "winegstreamer_stub"
+    MEDIA_OBJS=("$OBJ_DIR/winegstreamer_stub.o")
+fi
 
 for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
     name=$(basename "$src" .c)
@@ -179,6 +226,7 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
     "$OBJ_DIR/dwrite_unixlib.o" "$OBJ_DIR/dnsapi_unixlib.o" \
+    ${MEDIA_OBJS[@]+"${MEDIA_OBJS[@]}"} \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
     "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \

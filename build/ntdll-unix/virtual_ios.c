@@ -10691,6 +10691,40 @@ extern const void *nsi_unix_call_wow64_funcs[];
  * window base rather than as NULL. */
 extern const void *dnsapi_unix_call_wow64_funcs[];
 
+/* MADEIRA (from upstream build 270, docs/MEDIA.md): winegstreamer's unix side
+ * on FFmpeg's libavcodec/libavformat plus VideoToolbox and AudioToolbox
+ * (build/ntdll-unix/winegstreamer_unixlib_ios.c, which includes
+ * wg_parser_av_ios.c).  Without it winegstreamer.dll could not load at all:
+ * CLSID_CWMADecMediaObject -> wmadmod.dll -> CLSID_wg_wma_decoder had no class
+ * object, so FAudio played xWMA voices' COMPRESSED bytes as PCM (static), and
+ * quartz's MP3/WAV splitters and Media Foundation's MP4 source had no parser.
+ *
+ * The wow64 table is written by hand in that file, because
+ * dlls/winegstreamer/unixlib.h carries no 32-bit param structs (the entries
+ * holding a struct wg_media_type or a struct wg_sample * differ).
+ *
+ * 221 tree: build.sh archives the media objects only when both compiled;
+ * otherwise it archives winegstreamer_stub_ios.c, whose two tables are a
+ * single NULL entry, and winegstreamer keeps the generic stub table exactly
+ * as before (ios_wg_unixlib_linked below). */
+extern const void *winegstreamer_unix_call_funcs[];
+extern const void *winegstreamer_unix_call_wow64_funcs[];
+
+/* winegstreamer's unix side is bound for 32-bit (wow64) callers.  A 64-bit
+ * (ARM64EC) caller gets it only with MADEIRA_WG_64BIT=1 (env, or
+ * env.MADEIRA_WG_64BIT = 1 in madeira.cfg); by default it keeps the generic
+ * stub table, as upstream. */
+static BOOL ios_wg_64bit_opted_in(void)
+{
+    const char *e = getenv( "MADEIRA_WG_64BIT" );
+    return e && e[0] == '1';
+}
+
+static BOOL ios_wg_unixlib_linked(void)
+{
+    return winegstreamer_unix_call_funcs[0] != NULL && winegstreamer_unix_call_wow64_funcs[0] != NULL;
+}
+
 /***********************************************************************
  *           ios_module_export_name
  *
@@ -10962,6 +10996,18 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             libname = "dnsapi";
             funcs64 = (const void *)dnsapi_unix_call_funcs;
             funcs_wow64 = (const void *)dnsapi_unix_call_wow64_funcs;
+        } else if (match && strstr(match, "winegstreamer") && ios_wg_unixlib_linked() &&
+                   (wow || ios_wg_64bit_opted_in())) {
+            /* MADEIRA (build 270): matched before the generic fallback so the
+             * DLL loads at all.  Upstream binds "winegstreamer.so"; the PE
+             * export name is "winegstreamer.dll" -- "winegstreamer" is the
+             * substring both spellings share.  64-bit (ARM64EC) callers are
+             * opt-in (MADEIRA_WG_64BIT=1); otherwise they reach the generic
+             * fallback below exactly as before this table existed. */
+            libname = wow ? "winegstreamer (wma + wg_parser, libav*)"
+                          : "winegstreamer (wma + wg_parser, libav*; 64-bit opted in)";
+            funcs64 = (const void *)winegstreamer_unix_call_funcs;
+            funcs_wow64 = (const void *)winegstreamer_unix_call_wow64_funcs;
         } else if (match && strstr(match, "nsi.dll")) {
             libname = "nsi (rev=ml472)";
             funcs64 = (const void *)nsi_unix_call_funcs;

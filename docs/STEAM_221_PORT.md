@@ -54,3 +54,29 @@ outside the WoW64 windows, the x86 side-by-side store every session). Added here
   (PR #66; MADEIRA_DEFER_SECTION_ABORT=0 restores the old exit).
 Not taken: fixes that live in the wine submodule (async I/O APC requeue, the WoW64
 GDI shared section's win32u side), which 221 pins at a different wine.
+
+## More 32-bit work from upstream build 270 (round 4)
+
+- **xtajit.dll (FEX WOW64 module)** rebuilt in CI by `tools/build-xtajit-wow64.sh`
+  with build 270's two fixes: the CPUID brand-string/hybrid leaves index the
+  per-CPU table in range (`patch-fex-ios-cpuid-index.py`; a no-op at the pinned
+  FEX, which bounds it itself), and the WinAPI shims take the TEB from Wine's TSD
+  slot instead of x18, which reads 0 on some iOS threads
+  (`patch-fex-ios-teb-tsd.py`). This tree's FEX submodule predates the iOS WOW64
+  module, so the script builds from its own checkout (`FEX-wow64/`) at the FEX
+  revision build 270 pins (26859e1). The submodule, libFEXCore and xtajit64.dll
+  are not touched. On a failed build, or exports that differ from the committed
+  module, the committed xtajit.dll ships unchanged.
+- **32-bit media** (`docs/MEDIA.md`): winegstreamer's unix side on FFmpeg
+  (WMA/xWMA, MP3, WAV, MP4 demux) and VideoToolbox/AudioToolbox (H.264/HEVC, AAC)
+  in `libntdll_unix.a`, FFmpeg 7.1.1 built by `build/ffmpeg/build.sh` (LGPL-only),
+  and an i386 `winegstreamer.dll` built in CI from the wine submodule (its
+  winegstreamer sources are identical to build 270's pin). Bound for 32-bit
+  processes only; `MADEIRA_WG_64BIT=1` is accepted but 64-bit processes have no
+  arm64ec winegstreamer.dll, as upstream. If the unix side fails to compile, a
+  stub table (`winegstreamer_stub_ios.c`) keeps the old behaviour.
+- Not taken: build 270's lazy 32-bit address windows and the wineserver's
+  resume-time SetThreadContext for 32-bit threads. Both need changes in the wine
+  submodule (`server/thread.c`/`thread.h`) and in the VM code (`virtual_ios.c`)
+  where this tree's JIT work lives; porting them would risk the JIT pool fixes
+  that make 221 start at all.

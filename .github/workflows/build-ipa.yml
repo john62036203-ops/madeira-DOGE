@@ -301,6 +301,37 @@ jobs:
             build/gnutls-ios/src
           key: gnutls-ios-gmp6.3.0-nettle3.10.1-gnutls3.8.9-v1
 
+      # winegstreamer's unix side (build/ntdll-unix, docs/MEDIA.md, from
+      # upstream build 270) compiles against toolchains/ffmpeg-ios, and the app
+      # target links the four archives from app/Madeira/. The source tarball
+      # is tracked; cache the result.
+      - name: Restore FFmpeg iOS
+        id: ffmpegcache
+        uses: actions/cache/restore@v4
+        with:
+          path: toolchains/ffmpeg-ios
+          key: ffmpeg-ios-${{ hashFiles('build/ffmpeg/build.sh', 'build/ffmpeg/src/SHA256SUMS') }}
+
+      - name: Build FFmpeg for iOS
+        shell: bash
+        run: |
+          if [ "${{ steps.ffmpegcache.outputs.cache-hit }}" = "true" ]; then
+            for lib in libavformat libavcodec libswresample libavutil; do
+              cp toolchains/ffmpeg-ios/lib/$lib.a app/Madeira/$lib.a
+            done
+            echo "FFmpeg restored from cache"
+          else
+            bash build/ffmpeg/build.sh || { tail -40 build/ffmpeg/obj/configure.log build/ffmpeg/obj/make.log 2>/dev/null; exit 1; }
+          fi
+          ls -la app/Madeira/libav*.a app/Madeira/libswresample.a
+
+      - name: Save FFmpeg iOS
+        if: steps.ffmpegcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: toolchains/ffmpeg-ios
+          key: ffmpeg-ios-${{ hashFiles('build/ffmpeg/build.sh', 'build/ffmpeg/src/SHA256SUMS') }}
+
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and
         # LLVM). "Verify all linked archives exist" still fails the job before
@@ -609,6 +640,31 @@ jobs:
         with:
           path: FEX/build-arm64ec
           key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-v2
+
+      # xtajit.dll (FEX's aarch64 WOW64 module, the 32-bit x86 CPU backend)
+      # rebuilt with upstream build 270's two 32-bit fixes (CPUID per-CPU
+      # index, TEB without x18). Built from its own FEX checkout at the
+      # revision build 270 pins (FEX-wow64/), because this tree's FEX
+      # submodule predates the iOS WOW64 module; the submodule, libFEXCore and
+      # xtajit64.dll are untouched. On any failure the committed module stays.
+      - name: Restore FEX WOW64 build
+        id: fexwowcache
+        uses: actions/cache/restore@v4
+        with:
+          path: FEX-wow64/build-wow64
+          key: fex-wow64-26859e184ad90f0e811d7f8bbd943a4b1573a2c3-v1
+
+      - name: Build xtajit.dll (WOW64, 32-bit fixes from build 270)
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        run: bash tools/build-xtajit-wow64.sh
+
+      - name: Save FEX WOW64 build
+        if: steps.fexwowcache.outputs.cache-hit != 'true' && hashFiles('FEX-wow64/build-wow64/Bin/libwow64fex.dll') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: FEX-wow64/build-wow64
+          key: fex-wow64-26859e184ad90f0e811d7f8bbd943a4b1573a2c3-v1
 
       - name: Restore LLVM 15.0.7 iOS build
         id: llvmcache
@@ -935,6 +991,41 @@ jobs:
           fi
           echo "::notice::all PE DLLs present"
 
+      # The 32-bit winegstreamer.dll (docs/MEDIA.md, from upstream build 270):
+      # its unix side is in libntdll_unix.a (FFmpeg + VideoToolbox), but the
+      # committed i386 farm never had the PE half -- the farm script skipped
+      # it. Built here from the wine submodule (the PE sources are the same
+      # as upstream's pin) in wine/build-i386 with the native tools, and added
+      # beside the committed farm. Optional: on failure the farm is as before.
+      - name: Restore i386 winegstreamer.dll
+        id: wgi386cache
+        uses: actions/cache/restore@v4
+        with:
+          path: app/Madeira/i386-windows/winegstreamer.dll
+          key: wg-i386-${{ steps.winerev.outputs.sha }}-${{ hashFiles('build/wine-i386/build.sh') }}-v1
+
+      - name: Build i386 winegstreamer.dll (WoW64 media)
+        if: steps.wgi386cache.outputs.cache-hit != 'true' && env.MINGW_OK == '1'
+        id: wgi386build
+        continue-on-error: true
+        shell: bash
+        run: |
+          SKIP_DXMT=1 WINE_TOOLS="$GITHUB_WORKSPACE/wine/build-native" \
+            bash build/wine-i386/build.sh winegstreamer 2>&1 | tail -30; rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ] || [ ! -f app/Madeira/i386-windows/winegstreamer.dll ]; then
+            tail -40 wine/build-i386/madeira-i386-build.log 2>/dev/null
+            echo "::warning::i386 winegstreamer.dll not built; 32-bit media stays unavailable"
+            exit 1
+          fi
+          ls -la app/Madeira/i386-windows/winegstreamer.dll
+
+      - name: Save i386 winegstreamer.dll
+        if: steps.wgi386cache.outputs.cache-hit != 'true' && steps.wgi386build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: app/Madeira/i386-windows/winegstreamer.dll
+          key: wg-i386-${{ steps.winerev.outputs.sha }}-${{ hashFiles('build/wine-i386/build.sh') }}-v1
+
       # tools/fetch-vcruntime.md: the twelve VC++ runtime DLLs are Microsoft's
       # and are not redistributable under this project's license, so they are
       # gitignored and "you supply them yourself". Fetching them straight from
@@ -1105,7 +1196,8 @@ jobs:
           MISSING=""
           for a in libgmp.a libgnutls.a libhogweed.a libnettle.a \
                    libntdll_unix.a libwin32u_unix.a libwineserver.a \
-                   libdxmt_combined.a; do
+                   libdxmt_combined.a \
+                   libavformat.a libavcodec.a libswresample.a libavutil.a; do
             [ -f "app/Madeira/$a" ] || MISSING="$MISSING app/Madeira/$a"
           done
           for a in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a \
@@ -1118,7 +1210,7 @@ jobs:
             echo "::error::archives missing before archive step ::$MISSING"
             exit 1
           fi
-          echo "::notice::all 15 linked archives present"
+          echo "::notice::all 19 linked archives present"
 
       # The Xcode build phase fails when the bundled licence copies are stale.
       - name: Stage licence copies
