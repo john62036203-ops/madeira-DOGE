@@ -39,6 +39,7 @@ struct SteamGameSettingsView: View {
     @State private var submit: String
     @State private var gpuSync: String
     @State private var overlay: Bool
+    @State private var args: String
 
     private var profile: GameProfile { SteamGameOptions.profile(appID) }
 
@@ -58,6 +59,7 @@ struct SteamGameSettingsView: View {
         _submit = State(initialValue: p.get("async-submit") ?? "")
         _gpuSync = State(initialValue: p.get("fence-chain") ?? "")
         _overlay = State(initialValue: p.get("env.MADEIRA_STEAM_OVERLAY") == "1")
+        _args = State(initialValue: p.get("env.MADEIRA_DOCK_GAME_ARGS") ?? "")
     }
 
     var body: some View {
@@ -72,6 +74,26 @@ struct SteamGameSettingsView: View {
                 } header: { Text("Compatibility") } footer: {
                     Text("The same switches as a library game's settings. They apply to the whole Dock session, so Valve's client runs with them too. "
                          + "The Steam Overlay is off by default: on iOS it makes games stutter and cannot be opened anyway.")
+                }
+                Section {
+                    TextField("none", text: $args, axis: .vertical)
+                        .font(.body.monospaced())
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .lineLimit(1...3)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(["-dx11", "-dx12", "-d3d11", "-d3d12", "-windowed", "-fullscreen", "-nosplash"], id: \.self) { flag in
+                                Button(flag) { toggleFlag(flag) }
+                                    .buttonStyle(.bordered)
+                                    .tint(hasFlag(flag) ? Color.accentColor : Color.gray)
+                                    .font(.caption.monospaced())
+                            }
+                        }
+                    }
+                } header: { Text("Launch arguments") } footer: {
+                    Text("Passed to the game when Steam starts it, like Steam's own Launch Options. "
+                         + "Unreal Engine games: -dx11 or -dx12. Some games use -d3d11 / -d3d12 instead.")
                 }
                 Section {
                     picker("MetalFX upscaling", $metalFX, GameProfile.metalFXChoices)
@@ -113,6 +135,28 @@ struct SteamGameSettingsView: View {
         submit = p.get("async-submit") ?? ""
         gpuSync = p.get("fence-chain") ?? ""
         overlay = p.get("env.MADEIRA_STEAM_OVERLAY") == "1"
+        args = p.get("env.MADEIRA_DOCK_GAME_ARGS") ?? ""
+    }
+
+    private func hasFlag(_ flag: String) -> Bool {
+        args.split(separator: " ").contains { $0.caseInsensitiveCompare(flag) == .orderedSame }
+    }
+
+    /// Adds or removes one flag; the DirectX flags and windowed/fullscreen exclude each other.
+    private func toggleFlag(_ flag: String) {
+        var parts = args.split(separator: " ").map(String.init)
+        if hasFlag(flag) {
+            parts.removeAll { $0.caseInsensitiveCompare(flag) == .orderedSame }
+        } else {
+            let lower = flag.lowercased()
+            if lower.hasPrefix("-dx") || lower.hasPrefix("-d3d") {
+                parts.removeAll { $0.lowercased().hasPrefix("-dx") || $0.lowercased().hasPrefix("-d3d") }
+            }
+            if lower == "-windowed" { parts.removeAll { $0.lowercased() == "-fullscreen" } }
+            if lower == "-fullscreen" { parts.removeAll { $0.lowercased() == "-windowed" } }
+            parts.append(flag)
+        }
+        args = parts.joined(separator: " ")
     }
 
     private func save() {
@@ -129,5 +173,8 @@ struct SteamGameSettingsView: View {
         p.set("async-submit", submit)
         p.set("fence-chain", gpuSync)
         p.set("env.MADEIRA_STEAM_OVERLAY", overlay ? "1" : nil)
+        // One line, no "=" games would never need; the Dock host passes it to Steam.
+        let cleaned = args.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        p.set("env.MADEIRA_DOCK_GAME_ARGS", cleaned.isEmpty ? nil : cleaned)
     }
 }

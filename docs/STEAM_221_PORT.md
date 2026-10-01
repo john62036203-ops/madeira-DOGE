@@ -94,3 +94,11 @@ GDI shared section's win32u side), which 221 pins at a different wine.
   On iOS its hook search failed ~14,000 times in Among Us and its Present hook
   cut the frame rate by a third. Per game: Game settings › "Allow the Steam
   Overlay" (`env.MADEIRA_STEAM_OVERLAY = 1`), or the same line in madeira.cfg.
+- Launch arguments for Steam games (Game settings › Launch arguments, with
+  -dx11/-dx12/-d3d11/-d3d12/-windowed chips), stored as
+  `env.MADEIRA_DOCK_GAME_ARGS`. `build/madeira-dock/build.sh` builds Dock from a
+  copy whose two `LaunchApp` calls pass that variable as the user-arguments
+  string instead of `""` (falls back to the unmodified sources if the patch or
+  the build fails). The bridge now unsets every variable an earlier launch took
+  from madeira.cfg or a game's settings, so a game's overrides no longer leak
+  into the next launch in the same app run.
