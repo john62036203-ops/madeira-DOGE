@@ -25,6 +25,7 @@ struct SteamStoreView: View {
     @State private var busy = Set<Int>()
     @State private var notes: [Int: String] = [:]
     @State private var searchTask: Task<Void, Never>?
+    @FocusState private var fieldFocused: Bool
 
     struct StoreItem: Identifiable, Hashable {
         let id: Int
@@ -36,14 +37,31 @@ struct SteamStoreView: View {
 
     var body: some View {
         List {
+            // A plain text field, not .searchable: the Steam page this is pushed from
+            // already owns a search bar ("Search your games"), and a second
+            // .searchable in the same navigation stack did not take typing.
+            Section {
+                HStack {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Search Steam games", text: $query)
+                        .focused($fieldFocused)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.search)
+                        .onSubmit { runSearch() }
+                    if !query.isEmpty {
+                        Button { query = ""; results = [] } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        }.buttonStyle(.plain)
+                    }
+                }
+            }
             if let message {
                 Text(message).foregroundStyle(.secondary)
             }
             ForEach(results) { item in row(item) }
         }
         .navigationTitle("Steam store").navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search Steam games")
-        .onSubmit(of: .search) { runSearch() }
         .onChange(of: query) { _, new in
             // Search as you type, after a short pause.
             searchTask?.cancel()
@@ -57,6 +75,7 @@ struct SteamStoreView: View {
         .overlay { if searching && results.isEmpty { ProgressView() } }
         .onAppear {
             library.start()
+            fieldFocused = true
             if results.isEmpty && message == nil {
                 message = "Type a game's name. Free games can be added to your account; paid games open on the Steam store."
             }
