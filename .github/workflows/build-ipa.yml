@@ -666,6 +666,32 @@ jobs:
           path: FEX-wow64/build-wow64
           key: fex-wow64-26859e184ad90f0e811d7f8bbd943a4b1573a2c3-v1
 
+      # madeira-doge: xtajit64-avx.dll rebuilt the way build 270 builds its
+      # xtajit64.dll (FEX 26859e1 + its FEX fixes: IRCapRIP no longer zeroes
+      # the game's TLS[0]+8, two lock self-deadlocks) plus the AVX opt-in.
+      # The RE Engine demos crashed in std::map walks on the submodule-built
+      # AVX module. Replaces only xtajit64-avx.dll; on failure the one built
+      # above stays.
+      - name: Restore FEX ARM64EC build (build-270 AVX)
+        id: fexavx270cache
+        uses: actions/cache/restore@v4
+        with:
+          path: FEX-wow64/build-arm64ec
+          key: fex-arm64ec-avx270-26859e184ad90f0e811d7f8bbd943a4b1573a2c3-v1
+
+      - name: Build xtajit64-avx.dll (FEX of build 270 + its fixes + AVX)
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        run: bash tools/build-xtajit64-avx-270.sh
+
+      - name: Save FEX ARM64EC build (build-270 AVX)
+        if: steps.fexavx270cache.outputs.cache-hit != 'true' && hashFiles('FEX-wow64/build-arm64ec/Bin/libarm64ecfex.dll') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: FEX-wow64/build-arm64ec
+          key: fex-arm64ec-avx270-26859e184ad90f0e811d7f8bbd943a4b1573a2c3-v1
+
       - name: Restore LLVM 15.0.7 iOS build
         id: llvmcache
         uses: actions/cache/restore@v4
