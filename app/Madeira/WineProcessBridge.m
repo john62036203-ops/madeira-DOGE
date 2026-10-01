@@ -1603,7 +1603,13 @@ static void *wine_process_thread(void *arg) {
              * C:\windows\system32\xtajit64.dll, one of the links made above. */
             {
                 const char *avxEnv = getenv("MADEIRA_FEX_AVX");
-                if (use_arm64ec && avxEnv && avxEnv[0] == '1') {
+                /* madeira-doge: a Madeira Dock session starts explorer.exe (aarch64),
+                 * so use_arm64ec is false there, but the game Valve's client starts
+                 * is x64 and loads the same xtajit64.dll. Without this, a Steam
+                 * game's "Expose AVX/AVX2" switch never took effect. */
+                const char *dockAvx = getenv("MADEIRA_DOCK_SESSION");
+                BOOL dockSessionAvx = dockAvx && dockAvx[0] == '1';
+                if ((use_arm64ec || dockSessionAvx) && avxEnv && avxEnv[0] == '1') {
                     NSString *avxDll = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"]
                                         stringByAppendingPathComponent:@"xtajit64-avx.dll"];
                     if ([fm fileExistsAtPath:avxDll]) {
