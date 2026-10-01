@@ -6813,6 +6813,31 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
     case D3D12_FEATURE_DISPLAYABLE: { D3D12_FEATURE_DATA_DISPLAYABLE *e = data; if (size < sizeof *e) return E_INVALIDARG; memset(e, 0, sizeof *e); return S_OK; }
     case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT: { D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_SUPPORT *e = data; if (size < sizeof *e) return E_INVALIDARG; e->Support = D3D12_PROTECTED_RESOURCE_SESSION_SUPPORT_FLAG_NONE; return S_OK; }
     case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_TYPE_COUNT: { D3D12_FEATURE_DATA_PROTECTED_RESOURCE_SESSION_TYPE_COUNT *e = data; if (size < sizeof *e) return E_INVALIDARG; e->Count = 0; return S_OK; }
+    /* madeira-doge: OPTIONS19 (48), OPTIONS20 (49), PREDICATION (50),
+     * HARDWARE_COPY (52), OPTIONS21 (53) -- Agility SDK features the RE Engine
+     * demos query. Refusing them left their structures unwritten; answer with
+     * "not supported" (zero) and, for OPTIONS19, the heap sizes this runtime
+     * really has. Numbers, not names: older headers lack these enumerators. */
+    case 48: {
+        UINT *u = data;
+        if (size < 40) return E_INVALIDARG;
+        memset(data, 0, size);
+        u[6] = 2048;      /* MaxSamplerDescriptorHeapSize */
+        u[7] = 2048;      /* MaxSamplerDescriptorHeapSizeWithStaticSamplers */
+        u[8] = 1000000;   /* MaxViewDescriptorHeapSize */
+        return S_OK;
+    }
+    case 49: case 50: case 52:
+        if (size < 4) return E_INVALIDARG;
+        memset(data, 0, size);
+        return S_OK;
+    case 53: {
+        UINT *u = data;
+        if (size < 16) return E_INVALIDARG;
+        memset(data, 0, size);
+        u[1] = 10;        /* D3D12_EXECUTE_INDIRECT_TIER_1_0; work graphs not supported */
+        return S_OK;
+    }
     default: {
         static UINT seen[32]; static unsigned nseen; unsigned i;
         for (i = 0; i < nseen; i++) if (seen[i] == (UINT)feature) return E_INVALIDARG;
