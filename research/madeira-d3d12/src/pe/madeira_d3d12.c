@@ -12662,6 +12662,23 @@ static HRESULT STDMETHODCALLTYPE pso_GetDevice(ID3D12PipelineState *This, REFIID
 static HRESULT STDMETHODCALLTYPE rootsig_GetDevice(ID3D12RootSignature *This, REFIID riid, void **out) {
     (void)This; return mad_child_get_device(NULL, riid, out);
 }
+/* madeira-doge: ID3D12PipelineState::GetCachedBlob (was the E_NOTIMPL stub).
+ * RE Engine (Resident Evil Requiem demo) stores every pipeline's cached blob
+ * and stops with "Fatal D3D error (3, E_NOTIMPL, 0x80004001)" when the first
+ * one is refused. Pipelines here are rebuilt from their bytecode (with the
+ * shader cache) and a CACHED_PSO handed back at creation is ignored, so the
+ * blob only has to be a valid, stable, non-empty blob: a fixed tag. */
+static HRESULT mad_make_blob(const void *bytes, SIZE_T n, ID3D10Blob **out);
+static HRESULT STDMETHODCALLTYPE pso_GetCachedBlob(ID3D12PipelineState *This, ID3DBlob **blob) {
+    static const char tag[16] = "MADEIRA-PSO-1";
+    static LONG said;
+    (void)This;
+    if (!blob) return E_POINTER;
+    if (InterlockedIncrement(&said) == 1)
+        d3d12_log("[madeira-d3d12] PipelineState::GetCachedBlob: handing back a %u-byte tag blob (CACHED_PSO is ignored at creation)\n",
+                  (unsigned)sizeof tag);
+    return mad_make_blob(tag, sizeof tag, (ID3D10Blob **)blob);
+}
 
 /* ---- vtable construction ------------------------------------------------- */
 /* madeira-bcd: ID3D12Device::GetDeviceRemovedReason (was the E_NOTIMPL stub).
@@ -12850,6 +12867,7 @@ static void build_vtables(void) {
     g_pso_vtbl.QueryInterface = pso_QI;
     g_pso_vtbl.AddRef = pso_AddRef;
     g_pso_vtbl.Release = pso_Release;
+    g_pso_vtbl.GetCachedBlob = pso_GetCachedBlob;
 
     madeira_fill_ID3D12DescriptorHeap(&g_heap_vtbl);
     g_heap_vtbl.GetDevice = heap_GetDevice;
