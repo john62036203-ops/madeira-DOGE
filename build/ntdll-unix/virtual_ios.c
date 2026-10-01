@@ -26029,6 +26029,105 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                     uintptr_t text_abs_start = pe_start + text_off;
                     uintptr_t text_abs_end   = text_abs_start + text_sz;
 
+                    /* madeira-doge: only translate slots that can hold a pointer.
+                     *
+                     * The loop below used to rewrite EVERY 8-byte value that fell
+                     * inside some module's range. Constant data is not exempt:
+                     * fmt's count_digits table in FEX holds (4<<32)-1000 =
+                     * 0x3fffffc18, and when ntdll lands at 0x3ffef0000+0x110000
+                     * that constant sits "inside ntdll" and got rewritten to a
+                     * pool address. count_digits(2048) then returned 3, and the
+                     * one-time "[ir-topo] ... min-ssa=2048" log wrote at buf[-1]:
+                     * dockhost dies at libarm64ecfex+0x132788 in exactly the runs
+                     * where ntdll sits at 0x3ffef0000 (3/3 crash logs vs 0/3 good
+                     * logs at 0x3ffcf0000).
+                     *
+                     * In an image with a relocation directory a stored address
+                     * either has a DIR64 relocation or was written after load (IAT,
+                     * ARM64EC dispatch slots, ...), i.e. differs from what the pool
+                     * copy held before this sync. Anything else is a constant.
+                     * MADEIRA_IATSYNC_ALLSLOTS=1 restores the old behaviour. */
+                    uint64_t *ptrok_old = NULL;   /* pool contents before the copy */
+                    unsigned char *ptrok_rel = NULL; /* 1 bit per slot: has DIR64 reloc */
+                    size_t ptrok_old_sz = 0, ptrok_rel_sz = 0;
+                    {
+                        static int allslots = -1;
+                        if (allslots < 0)
+                        {
+                            const char *e = getenv( "MADEIRA_IATSYNC_ALLSLOTS" );
+                            allslots = (e && *e == '1');
+                        }
+                        unsigned int r_rva = ios_jit_mappings[idx].reloc_rva;
+                        unsigned int r_sz  = ios_jit_mappings[idx].reloc_size;
+                        size_t img_size    = ios_jit_mappings[idx].size;
+                        size_t nslots      = size / 8;
+                        unsigned int hdr_off = *(const unsigned int *)((const char *)pe_start + 0x3c);
+                        int is_pe64 = hdr_off && hdr_off + 0x100 <= img_size &&
+                                      *(const unsigned short *)((const char *)pe_start + hdr_off + 0x18) == 0x20b;
+                        if (!allslots && is_pe64 && r_rva && r_sz && nslots &&
+                            (size_t)r_rva + r_sz <= img_size)
+                        {
+                            ptrok_old_sz = (nslots * 8 + 0x3fff) & ~(size_t)0x3fff;
+                            ptrok_rel_sz = ((nslots + 7) / 8 + 0x3fff) & ~(size_t)0x3fff;
+                            void *a = mmap( NULL, ptrok_old_sz, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANON, -1, 0 );
+                            void *b = mmap( NULL, ptrok_rel_sz, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANON, -1, 0 );
+                            if (a == MAP_FAILED || b == MAP_FAILED)
+                            {
+                                if (a != MAP_FAILED) munmap( a, ptrok_old_sz );
+                                if (b != MAP_FAILED) munmap( b, ptrok_rel_sz );
+                            }
+                            else
+                            {
+                                ptrok_old = a;
+                                ptrok_rel = b;
+                                memcpy( ptrok_old, jit_rw_dest, nslots * 8 );
+                                /* reloc table read from the PE view (never rewritten
+                                 * by us; .reloc carries no pointers). */
+                                const char *blk = (const char *)pe_start + r_rva;
+                                const char *blk_end = blk + r_sz;
+                                while (blk + 8 <= blk_end)
+                                {
+                                    unsigned int b_rva = *(const unsigned int *)blk;
+                                    unsigned int b_sz  = *(const unsigned int *)(blk + 4);
+                                    if (b_sz < 8 || blk + b_sz > blk_end) break;
+                                    if ((size_t)b_rva + 0x1000 + 8 > off && b_rva < off + size)
+                                    {
+                                        const unsigned short *ent = (const unsigned short *)(blk + 8);
+                                        unsigned int ne = (b_sz - 8) / 2, k;
+                                        for (k = 0; k < ne; k++)
+                                        {
+                                            if ((ent[k] >> 12) != 10) continue;   /* DIR64 */
+                                            size_t frva = (size_t)b_rva + (ent[k] & 0xfff);
+                                            if (frva < off || frva + 8 > off + size) continue;
+                                            size_t rel = frva - off;
+                                            if (rel & 7) continue;   /* loop walks aligned slots */
+                                            rel >>= 3;
+                                            ptrok_rel[rel >> 3] |= (unsigned char)(1u << (rel & 7));
+                                        }
+                                    }
+                                    blk += b_sz;
+                                }
+                                /* The IAT always holds pointers once bound, even if
+                                 * it was bound before the pool copy was taken. */
+                                {
+                                    unsigned int pe_off = *(const unsigned int *)((const char *)pe_start + 0x3c);
+                                    if (pe_off && pe_off + 0xF0 <= img_size)
+                                    {
+                                        unsigned int iat_rva = *(const unsigned int *)((const char *)pe_start + pe_off + 0xE8);
+                                        unsigned int iat_sz  = *(const unsigned int *)((const char *)pe_start + pe_off + 0xEC);
+                                        size_t a0 = iat_rva, a1 = (size_t)iat_rva + iat_sz;
+                                        if (a0 < off) a0 = off;
+                                        if (a1 > off + size) a1 = off + size;
+                                        for (size_t s = (a0 - off + 7) >> 3; iat_rva && s < nslots && off + s * 8 + 8 <= a1; s++)
+                                            ptrok_rel[s >> 3] |= (unsigned char)(1u << (s & 7));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if (text_sz == 0 || text_abs_end <= rgn_start || text_abs_start >= rgn_end)
                     {
                         /* No overlap with .text — safe to copy whole region */
@@ -26169,8 +26268,8 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                          * 6006/18029, 161/2240), which is what distinguishes
                          * this from the earlier EcCodeBitMap probe that reported
                          * a meaningless 100%. */
-                        int x86skip = 0, execskip = 0;
-                        uint64_t x86_first = 0, exec_first = 0;
+                        int x86skip = 0, execskip = 0, constkept = 0;
+                        uint64_t x86_first = 0, exec_first = 0, const_first = 0;
                         /* ml1017: ONE section lookup per region, not per slot.
                          *
                          * The first version called a PE-header parse plus a full
@@ -26211,7 +26310,17 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                             {
                                 void *nv = ios_jit_translate_addr_for_owner(
                                         (void *)(uintptr_t)val, sync_owner);
-                                if (nv != (void *)(uintptr_t)val)
+                                size_t ptrok_i = (size_t)(p - (uint64_t *)jit_rw_dest);
+                                if (nv != (void *)(uintptr_t)val && ptrok_old &&
+                                    ptrok_old[ptrok_i] == val &&
+                                    !(ptrok_rel[ptrok_i >> 3] & (1u << (ptrok_i & 7))))
+                                {
+                                    /* madeira-doge: unchanged since load, no reloc:
+                                     * a constant that only looks like an address. */
+                                    if (!constkept) const_first = val;
+                                    constkept++;
+                                }
+                                else if (nv != (void *)(uintptr_t)val)
                                 {
                                     if (ios_va_is_x86_code( val ))
                                     {
@@ -26259,7 +26368,15 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         if (fixup_count && ml1051_say)
                             dprintf(2, "[iat-sync] region %p+0x%lx: translated %d pointers (owner=%p) [#%lu]\n",
                                     base, (unsigned long)size, fixup_count, sync_owner, ml1051_k);
+                        static int constkept_said;
+                        if (constkept && constkept_said++ < 24)
+                            dprintf(2, "[iat-sync] region %p+0x%lx: KEPT %d address-looking constants "
+                                       "(no reloc, unchanged since load; first 0x%llx)\n",
+                                    base, (unsigned long)size, constkept,
+                                    (unsigned long long)const_first);
                     }
+                    if (ptrok_old) munmap( ptrok_old, ptrok_old_sz );
+                    if (ptrok_rel) munmap( ptrok_rel, ptrok_rel_sz );
                     break;
                 }
             }
