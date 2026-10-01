@@ -4594,6 +4594,36 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
                          (unsigned long long)(uintptr_t)ios_jit_mappings[i].jit_base,
                          (unsigned long long)ios_jit_mappings[i].size);
     }
+    /* madeira-doge: then this process's OWN copies (its child ntdll), pushed
+     * after the parent entries so FEX's overlap-retire replaces the parent
+     * entry for the same PE range. Without this the x64 child's FEX knows only
+     * the PARENT's ntdll copy:
+     *  - every x64->EC call into ntdll ran the parent's copy, i.e. the parent
+     *    process's ntdll globals. RE Requiem's CrashHandler.dll called
+     *    AddVectoredExceptionHandler and landed in STEAM's VEH list; Steam's
+     *    next OutputDebugString dispatched into the game's handler and the
+     *    Steam thread died (NoExec at CrashHandler+0x1070).
+     *  - a pointer into the child copy reaching FEX as a guest RIP (the x64
+     *    syscall stub's jmp to invoke_arm64ec_syscall, relocated to the child
+     *    copy) missed pool-rip-fix: NoExec at 0x316260050, game killed.
+     * MADEIRA_CHILD_ALIAS_PUSH=0 restores parent-only. */
+    {
+        const char *e = getenv( "MADEIRA_CHILD_ALIAS_PUSH" );
+        void *me = NtCurrentTeb() ? NtCurrentTeb()->Peb : NULL;
+        if (me && !(e && e[0] == '0'))
+        {
+            for (i = 0; i < ios_jit_mapping_count; i++)
+            {
+                if (!ios_jit_mappings[i].pe_base || ios_jit_mappings[i].owner_peb != me) continue;
+                dprintf( 2, "[jit-alias] child copy pushed to its own FEX: pe=%p -> %p +0x%lx peb=%p\n",
+                         ios_jit_mappings[i].pe_base, ios_jit_mappings[i].jit_base,
+                         (unsigned long)ios_jit_mappings[i].size, me );
+                params->callback((unsigned long long)(uintptr_t)ios_jit_mappings[i].pe_base,
+                                 (unsigned long long)(uintptr_t)ios_jit_mappings[i].jit_base,
+                                 (unsigned long long)ios_jit_mappings[i].size);
+            }
+        }
+    }
     /* ml613: the guaranteed init path — resolve both FEX exports here, where the
      * emulator module is certainly mapped, instead of from a diagnostic probe
      * (ml612's mistake) or from a dying thread inside pthread_exit (needlessly
