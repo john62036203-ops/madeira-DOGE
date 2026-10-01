@@ -170,6 +170,12 @@ struct SteamHubView: View {
                             Button("Update") { library.install(game.id) }
                         }
                         Button("Verify files") { library.repair(game.id) }
+                        if let count = dock.installPrograms[game.id] {
+                            // The game's Steam install script programs (runtime setups); see DockInstallers.
+                            Toggle("Run \(count) one-time install(s) at next start",
+                                   isOn: Binding(get: { dock.installRunNext[game.id] ?? true },
+                                                 set: { dock.setRunsInstallers(game.id, $0) }))
+                        }
                         if SteamInstallPaths.isManaged(library: local.library) {
                             Button("Remove files", role: .destructive) { confirmRemove = local }
                         }
