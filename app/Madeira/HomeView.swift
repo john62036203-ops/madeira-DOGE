@@ -56,6 +56,9 @@ struct LaunchRequest {
     /// The game's own settings file (GameProfiles.swift), exported as
     /// MADEIRA_CFG_GAME when it sets anything.
     var profile: GameProfile?
+    /// Madeira Dock: Valve's client runs in the session and gives each game its
+    /// own Steam identity (WineProcessBridge.m reads MADEIRA_DOCK_SESSION).
+    var dock = false
     private static var forcedFastsyncOff = false
 
     func apply() {
@@ -79,6 +82,7 @@ struct LaunchRequest {
                 unsetenv("MADEIRA_SCREEN_SRC")
             }
         }
+        if dock { setenv("MADEIRA_DOCK_SESSION", "1", 1) } else { unsetenv("MADEIRA_DOCK_SESSION") }
         if avx { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
         if wineVCRT { setenv("MADEIRA_WINE_VCRT", "1", 1) } else { unsetenv("MADEIRA_WINE_VCRT") }
         var dxmtExtra: [String] = []
@@ -445,6 +449,8 @@ struct HomeView: View {
     @State private var showJITAlert = false
     @State private var editing: LibraryGame?
     @State private var showSettings = false
+    @State private var showSteam = false
+    @State private var dockError: String?
     @State private var coverTick = 0
     @AppStorage("madeira.library.everyExe") private var everyExe = false
 
@@ -498,7 +504,12 @@ struct HomeView: View {
                     .disabled(scanning)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    HStack(spacing: 16) {
+                        if MadeiraDock.enabled || SteamSignIn.isEnabled {
+                            Button { showSteam = true } label: { Image(systemName: "cloud") }
+                        }
+                        Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    }
                 }
             }
             .onAppear {
@@ -522,6 +533,17 @@ struct HomeView: View {
             .sheet(isPresented: $showSettings) {
                 AppSettingsSheet(onDeveloper: onDeveloper)
             }
+            .sheet(isPresented: $showSteam) {
+                SteamHubView(play: { launchDock($0) })
+            }
+            .background(
+                // Its own host view: a second .alert on the same view as the JIT alert can swallow one of them.
+                Color.clear.alert("Steam", isPresented: Binding(get: { dockError != nil }, set: { if !$0 { dockError = nil } })) {
+                    Button("OK", role: .cancel) { dockError = nil }
+                } message: {
+                    Text(dockError ?? "")
+                }
+            )
             .alert("JIT is not enabled", isPresented: $showJITAlert) {
                 Button("Enable JIT") { enableJIT() }
                 Button("Cancel", role: .cancel) { pendingAfterJIT = nil }
@@ -794,6 +816,33 @@ struct HomeView: View {
         request.profile = GameProfile(windowsPath: exe.windowsPath)
         LibraryPrefs.markPlayed(game.title)
         start(request)
+    }
+
+    /// Madeira Dock: a Steam game the account's downloads or Steam's own client
+    /// installed in the prefix starts through Valve's client (SteamHubView).
+    /// JIT first, so the one-use sign-in transfer is only written right before
+    /// the session starts.
+    private func launchDock(_ game: DockGame) {
+        func go() {
+            Task { @MainActor in
+                do {
+                    let request = try await MadeiraDockLauncher.prepare(game)
+                    onLaunch(request)
+                } catch {
+                    dockError = error.localizedDescription
+                }
+            }
+        }
+        jitOn = jit_check_debugged()
+        if jitOn { go(); return }
+        enablingJIT = true
+        StikJITHelper.enableJIT { success in
+            DispatchQueue.main.async {
+                enablingJIT = false
+                jitOn = success || jit_check_debugged()
+                if jitOn { go() } else { dockError = "JIT is not enabled. Enable JIT with StikDebug and try again." }
+            }
+        }
     }
 
     /// Every launch goes through here, so none can start without JIT: without

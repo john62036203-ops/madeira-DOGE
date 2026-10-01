@@ -1071,6 +1071,19 @@ jobs:
               print(('  signed  ' if ok else '  UNSIGNED'), path.split('/')[-1])
           PYEOF
 
+      # Madeira Dock (Steam library helper, research/madeira-dock): dockhost.exe is a
+      # build output staged into arm64ec-windows. Without it the Steam page can still
+      # sign in and download, but Play stays disabled, so a failure here only warns.
+      - name: Build Madeira Dock host
+        shell: bash
+        continue-on-error: true
+        run: |
+          if [ ! -f research/madeira-dock/src/main.c ]; then
+            echo "::warning::research/madeira-dock submodule is missing -- no Madeira Dock host in this build"
+            exit 0
+          fi
+          bash build/madeira-dock/build.sh || echo "::warning::Madeira Dock host did not build -- Steam games cannot start in this build"
+
       # The directory has to exist or xcodebuild fails the archive outright,
       # but the DLLs themselves are Microsoft's and cannot be committed.
       - name: Report vcruntime contents

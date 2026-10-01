@@ -157,3 +157,6 @@ app/Madeira/arm64ec-windows/xtajit64-avx.dll
 build/dxmt-nvapi/
 app/Madeira/arm64ec-windows/nvapi64.dll
 __pycache__/
+# Madeira Dock host: a build output (build/madeira-dock/build.sh)
+app/Madeira/arm64ec-windows/dockhost.exe
+app/Madeira/arm64ec-windows/dock-notices.txt
