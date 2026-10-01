@@ -1974,6 +1974,27 @@ static void queue_hardware_message( struct desktop *desktop, struct message *msg
 
     win = find_hardware_message_window( desktop, input, msg, &msg_code, &thread );
     flags = thread ? get_rawinput_device_flags( thread->process, msg ) : 0;
+    /* madeira-doge ml2110: name where every typed key goes. The iOS keyboard posts
+     * keys with hwnd = NULL, so a key lands on the FOREGROUND input's focus (else
+     * active) window -- which in a Madeira Dock session can be the host's console,
+     * Valve's client or the desktop instead of the game the user is tapping in.
+     * First 96 key messages: the window, its process, the foreground's focus and
+     * active windows, and whether the key was dropped (no window / RIDEV_NOLEGACY). */
+    if (msg_bit == QS_KEY)
+    {
+        static unsigned int key_diag;
+        if (key_diag++ < 96)
+        {
+            const input_shm_t *fg = desktop->foreground_input ? desktop->foreground_input->shared : NULL;
+            fprintf( stderr, "[srv-key] ml2110 msg=0x%x vk=0x%lx -> win=%08x pid=%04x tid=%04x | fg focus=%08x active=%08x "
+                     "fg_pid=%04x | %s%s\n",
+                     msg_code, (unsigned long)msg->wparam, win,
+                     thread ? thread->process->id : 0, thread ? thread->id : 0,
+                     fg ? fg->focus : 0, fg ? fg->active : 0, desktop->foreground_pid,
+                     (!win || !thread) ? "DROPPED (no window)" : "queued",
+                     (flags & RIDEV_NOLEGACY) ? " DROPPED (RIDEV_NOLEGACY: raw input only)" : "" );
+        }
+    }
     if (thread) input = thread->queue->input;
     if (input && (get_hardware_msg_bit( msg->msg ) & (QS_KEY | QS_MOUSEBUTTON)))
         input->user_time = monotonic_time;
@@ -2655,6 +2676,22 @@ static int queue_keyboard_message( struct desktop *desktop, user_handle_t win, c
                           raw_msg.flags, message_code, input->kbd.info );
 
         dispatch_rawinput_message( desktop, &raw_msg );
+        {
+            /* ml2110: which processes take the keyboard as raw input (WM_INPUT). */
+            static unsigned int raw_diag;
+            if (raw_diag++ < 8)
+            {
+                struct process *p;
+                fprintf( stderr, "[srv-key] ml2110 raw keyboard: foreground pid=%04x tid=%04x; registered:",
+                         foreground->process->id, foreground->id );
+                LIST_FOR_EACH_ENTRY( p, &rawinput_processes, struct process, rawinput_entry )
+                {
+                    struct rawinput_device *d = find_rawinput_device( p, MAKELONG(HID_USAGE_GENERIC_KEYBOARD, HID_USAGE_PAGE_GENERIC) );
+                    if (d) fprintf( stderr, " pid=%04x flags=0x%x target=%08x", p->id, d->flags, d->target );
+                }
+                fprintf( stderr, "\n" );
+            }
+        }
         release_object( foreground );
     }
 
