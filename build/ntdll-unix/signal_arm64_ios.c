@@ -116,6 +116,39 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
 
+/* madeira-doge: MADEIRA_FAULT_CHAIN helper. If `vt` looks like a vtable in the
+ * faulting module (within 256MB of the faulting RIP), print its first 16 slots
+ * and 0x100 bytes of code at each, so the class's methods can be disassembled
+ * from the log without having the game's executable. */
+static void ios_fault_vt_dump( uint64_t vt, uint64_t rip )
+{
+    uint64_t slots[16];
+    mach_vm_size_t g = 0;
+    int i, j;
+    if (vt < 0x10000 || (vt > rip ? vt - rip : rip - vt) > 0x10000000ULL) return;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)vt, sizeof(slots),
+                                (mach_vm_address_t)slots, &g ) != KERN_SUCCESS || g != sizeof(slots)) return;
+    dprintf( STDERR_FILENO, "[fault-vt] vtable 0x%llx\n", (unsigned long long)vt );
+    for (i = 0; i < 16; i++)
+    {
+        unsigned char code[0x100];
+        char hex[0x200 + 1];
+        uint64_t f = slots[i];
+        if (f < 0x10000 || (f > rip ? f - rip : rip - f) > 0x10000000ULL) break;
+        g = 0;
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)f, sizeof(code),
+                                    (mach_vm_address_t)code, &g ) != KERN_SUCCESS || g != sizeof(code)) continue;
+        for (j = 0; j < 0x100; j++)
+        {
+            hex[j * 2]     = "0123456789abcdef"[code[j] >> 4];
+            hex[j * 2 + 1] = "0123456789abcdef"[code[j] & 15];
+        }
+        hex[0x200] = 0;
+        dprintf( STDERR_FILENO, "[fault-vt]   slot %d = 0x%llx: %s\n", i, (unsigned long long)f, hex );
+    }
+}
+
+
 /* ml649: runtime diagnostic switch, defined in virtual_ios.c. Default OFF.
  * Gate the WORK, not the print — several probes do expensive reads first. */
 extern volatile int madeira_diag_enabled;
@@ -7242,6 +7275,19 @@ skip_reclaim_band: ;
                                     const char *s = colon + 1;
                                     int depth = 0;
                                     chain_n++;
+                                    if (chain_n == 1)
+                                    {
+                                        uint64_t o0[20]; mach_vm_size_t g0 = 0; int q;
+                                        if (cur >= 0x10000 && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)cur,
+                                                sizeof(o0), (mach_vm_address_t)o0, &g0 ) == KERN_SUCCESS && g0 == sizeof(o0))
+                                        {
+                                            for (q = 0; q < 20; q += 4)
+                                                dprintf( STDERR_FILENO, "[fault-chain]   %s+%02x: %016llx %016llx %016llx %016llx\n", rn[ri], q * 8,
+                                                         (unsigned long long)o0[q], (unsigned long long)o0[q+1],
+                                                         (unsigned long long)o0[q+2], (unsigned long long)o0[q+3] );
+                                            ios_fault_vt_dump( o0[0], state_rip );
+                                        }
+                                    }
                                     dprintf( STDERR_FILENO, "[fault-chain] #%d %s=0x%llx rip=0x%llx\n",
                                              chain_n, rn[ri], (unsigned long long)cur, (unsigned long long)state_rip );
                                     while (*s && depth < 8)
@@ -7267,6 +7313,7 @@ skip_reclaim_band: ;
                                                 dprintf( STDERR_FILENO, "[fault-chain]     +%02x: %016llx %016llx %016llx %016llx\n",
                                                          k * 8, (unsigned long long)d[k], (unsigned long long)d[k+1],
                                                          (unsigned long long)d[k+2], (unsigned long long)d[k+3] );
+                                        if (chain_n == 1 && g == sizeof(d)) ios_fault_vt_dump( d[0], state_rip );
                                         cur = v;
                                         depth++;
                                         s = e2;
