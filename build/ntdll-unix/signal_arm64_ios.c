@@ -7217,6 +7217,65 @@ skip_reclaim_band: ;
                                     (unsigned long long)obj[6]);
                         }
 
+                        /* madeira-doge: MADEIRA_FAULT_CHAIN="reg:off1,off2,..."
+                         * follows a pointer chain from a live x86 register at the
+                         * fault: v=[reg+off1], dump 0x80 bytes at v, v=[v+off2], ...
+                         * (offsets hex). For RE Requiem's NULL-bucket hash table:
+                         * "r12:108,8" = the table its caller passed. First 6 faults. */
+                        {
+                            static int chain_n;
+                            const char *ch = getenv( "MADEIRA_FAULT_CHAIN" );
+                            if (ch && *ch && chain_n < 6)
+                            {
+                                static const char *const rn[16] = { "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                                                    "r8","r9","r10","r11","r12","r13","r14","r15" };
+                                uint64_t rv[16] = { live_rax, live_rcx, live_rdx, live_rbx, live_rsp, live_rbp,
+                                                    live_rsi, live_rdi, live_r8, live_r9, live_r10, live_r11,
+                                                    live_r12, live_r13, live_r14, live_r15 };
+                                const char *colon = strchr( ch, ':' );
+                                int ri = -1, k;
+                                for (k = 0; colon && k < 16; k++)
+                                    if ((size_t)(colon - ch) == strlen( rn[k] ) && !strncmp( ch, rn[k], colon - ch )) ri = k;
+                                if (ri >= 0)
+                                {
+                                    uint64_t cur = rv[ri];
+                                    const char *s = colon + 1;
+                                    int depth = 0;
+                                    chain_n++;
+                                    dprintf( STDERR_FILENO, "[fault-chain] #%d %s=0x%llx rip=0x%llx\n",
+                                             chain_n, rn[ri], (unsigned long long)cur, (unsigned long long)state_rip );
+                                    while (*s && depth < 8)
+                                    {
+                                        char *e2;
+                                        unsigned long long off = strtoull( s, &e2, 16 );
+                                        uint64_t v = 0, d[16];
+                                        mach_vm_size_t g = 0;
+                                        if (e2 == s) break;
+                                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cur + off), 8,
+                                                                    (mach_vm_address_t)&v, &g ) != KERN_SUCCESS || g != 8)
+                                        {
+                                            dprintf( STDERR_FILENO, "[fault-chain]   [0x%llx+0x%llx] unreadable\n",
+                                                     (unsigned long long)cur, off );
+                                            break;
+                                        }
+                                        dprintf( STDERR_FILENO, "[fault-chain]   [0x%llx+0x%llx] = 0x%llx\n",
+                                                 (unsigned long long)cur, off, (unsigned long long)v );
+                                        g = 0;
+                                        if (v >= 0x10000 && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)v,
+                                                sizeof(d), (mach_vm_address_t)d, &g ) == KERN_SUCCESS && g == sizeof(d))
+                                            for (k = 0; k < 16; k += 4)
+                                                dprintf( STDERR_FILENO, "[fault-chain]     +%02x: %016llx %016llx %016llx %016llx\n",
+                                                         k * 8, (unsigned long long)d[k], (unsigned long long)d[k+1],
+                                                         (unsigned long long)d[k+2], (unsigned long long)d[k+3] );
+                                        cur = v;
+                                        depth++;
+                                        s = e2;
+                                        if (*s == ',') s++;
+                                    }
+                                }
+                            }
+                        }
+
                         /* Thumper-debug: also dump the static singleton slot
                          * at 0x140290a60+0x428. This is the "0x1400793d0
                          * caller" that the DXGI dispatch wrapper reads from.
