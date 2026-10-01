@@ -1,0 +1,37 @@
+name: SDK probe
+
+# madeira-bcd: prints what the CI Xcode's iOS SDK declares for a framework, so
+# code against a new API (MetalFX frame interpolation) is written from the real
+# headers instead of guessed and fixed one 18-minute IPA build at a time.
+# Read-only: builds nothing, publishes nothing.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/madeira-bcd-repo-ymg5cb]
+    paths:
+      - .github/workflows/sdk-probe.yml
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Select newest Xcode
+        shell: bash
+        run: |
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$NEWEST" ] && sudo xcode-select -s "$NEWEST/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: MetalFX headers
+        shell: bash
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          H="$SDK/System/Library/Frameworks/MetalFX.framework/Headers"
+          ls -la "$H"
+          for f in "$H"/*.h; do
+            case "$f" in *Interpolat*|*MTLFXFrame*) echo "=================== $f"; cat "$f";; esac
+          done
+          echo "=================== grep"
+          grep -n -i "interpolat" "$H"/*.h | head -80
