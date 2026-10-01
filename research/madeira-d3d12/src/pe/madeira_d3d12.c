@@ -4234,6 +4234,47 @@ static int exec_capture_texels(struct mad_exec *e, const char *label, struct mad
  * texture descriptor in every table (resolved to its resource and view), a
  * 4x4 centre block of the first few inputs BEFORE the draw, the root CBVs,
  * and (from exec_draw) a 4x4 centre block of the output AFTER the draw. */
+/* madeira-bcd K15: the textures a layered draw SAMPLES, captured right after it
+ * (the draw does not write them, so this is what it read). Octopath Traveler 0
+ * (UE) writes its 48^3 colour-grading LUT with a layered draw that samples two
+ * 48^3 RGBA16F volumes a compute kernel wrote just before; the LUT came out
+ * zero in every slice. These values say whether the kernel's 3D UAV writes
+ * landed (inputs non-zero -> the layered draw is at fault) or not. For each
+ * texture in the bound tables: texel (0,0,0), a 4x4 block at the centre of the
+ * middle z-slice (3D) or of slice 0. */
+static void exec_capture_layered_inputs(struct mad_exec *e) {
+    struct mad_device *d = e->q->device;
+    unsigned i, k, grabbed = 0; char lab[160];
+    if (!e->rs || !e->srv || !e->srv->cpu) { d3d12_log("[cap] K15 layered inputs: no SRV heap bound\n"); return; }
+    for (i = 0; i < e->rs->nparams && i < MAD_ROOT_PARAM_MAX && grabbed < 6; i++) {
+        UINT64 va = e->root[i]; unsigned idx, cnt;
+        if (e->rs->params[i].type != MADEIRA_IR_PARAM_TABLE || !va) continue;
+        if (va < e->srv->gpu_address || va >= e->srv->gpu_address + (UINT64)e->srv->count * sizeof(struct mad_descriptor)) continue;
+        idx = (unsigned)((va - e->srv->gpu_address) / sizeof(struct mad_descriptor));
+        cnt = mad_table_count(e->rs, i, 8);
+        for (k = 0; k < cnt && idx + k < e->srv->count && grabbed < 6; k++) {
+            const struct mad_descriptor *de = &e->srv->cpu[idx + k];
+            int xv; struct mad_resource *r;
+            if (!de->texture_view_id || (de->metadata >> 63)) continue;
+            r = mad_texture_of_view(d, de->texture_view_id, &xv);
+            if (!r) { d3d12_log("[cap] K15 p%u[%u] view %llx resolves to no texture\n", i, k, (unsigned long long)de->texture_view_id); continue; }
+            d3d12_log("[cap] K15 p%u[%u] %s %ux%ux%u pf%u t%u mips %u%s\n", i, k, r->name ? r->name : "?", r->width, r->height,
+                      r->tex_type == WMTTextureType3D ? r->tex_depth : r->tex_layers, (unsigned)r->tex_pf, (unsigned)r->tex_type,
+                      r->tex_mips, xv >= 0 ? " (view)" : "");
+            if (r->is_depth) continue;
+            snprintf(lab, sizeof lab, "K15 IN p%u[%u] %s %ux%u pf%u origin", i, k, r->name ? r->name : "?", r->width, r->height, (unsigned)r->tex_pf);
+            exec_capture_region(e, lab, r, 0, 0, 0, 0, 1, 1, 1);
+            {
+                UINT sl = r->tex_type == WMTTextureType3D ? r->tex_depth / 2 : 0;
+                snprintf(lab, sizeof lab, "K15 IN p%u[%u] %s %ux%u pf%u slice%u centre", i, k, r->name ? r->name : "?", r->width, r->height, (unsigned)r->tex_pf, sl);
+                exec_capture_texels(e, lab, r, sl, 0);
+            }
+            grabbed++;
+        }
+    }
+    if (!grabbed) d3d12_log("[cap] K15 layered inputs: the bound tables name no sampled texture\n");
+}
+
 static void exec_capture_pp(struct mad_exec *e, unsigned kind) {
     struct mad_device *d = e->q->device;
     unsigned i, k, grabbed = 0; char lab[160];
@@ -5175,6 +5216,7 @@ tess_go:
             exec_capture_texels(e, lab, e->rt[0], 0, 0);
             snprintf(lab, sizeof lab, "K14 OUT after layered '%s' %s %ux%u pf%u slice%u", e->pso ? e->pso->vs_name : "?", e->rt[0]->name, e->rt[0]->width, e->rt[0]->height, (unsigned)e->rt[0]->tex_pf, mid);
             exec_capture_texels(e, lab, e->rt[0], mid, 0);
+            exec_capture_layered_inputs(e);   /* madeira-bcd K15 */
         }
     }
     if (e->cap_after) {   /* ml918: the output of this draw, before anything else touches it */
