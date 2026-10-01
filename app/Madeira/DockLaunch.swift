@@ -83,6 +83,8 @@ enum MadeiraDockLauncher {
                                     desktop: (w: width, h: height))
         }
         request.dock = true
+        // The game's own options (Steam page › Game settings), as a library game gets them.
+        SteamGameOptions.apply(to: &request, appID: game.id)
         return request
     }
 

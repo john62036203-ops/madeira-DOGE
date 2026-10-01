@@ -21,6 +21,7 @@ struct SteamHubView: View {
     @State private var showSignIn = false
     @State private var search = ""
     @State private var confirmRemove: DockGame?
+    @State private var settingsFor: SteamOwnedGame?
     @AppStorage(MadeiraDockLauncher.noDesktopKey) private var noDesktop = false
 
     private var installed: [Int: DockGame] {
@@ -60,6 +61,7 @@ struct SteamHubView: View {
                 library.reconcileSession()
             }
             .sheet(isPresented: $showSignIn) { SteamSignInView() }
+            .sheet(item: $settingsFor) { game in SteamGameSettingsView(appID: game.id, name: game.name) }
             .confirmationDialog("Remove this game's files?", isPresented: Binding(get: { confirmRemove != nil },
                                                                                   set: { if !$0 { confirmRemove = nil } }),
                                 titleVisibility: .visible) {
@@ -139,6 +141,14 @@ struct SteamHubView: View {
         let local = installed[game.id]
         VStack(alignment: .leading, spacing: 6) {
             HStack {
+                // Steam's store header image (public CDN); a grey box until it loads or if it is missing.
+                AsyncImage(url: URL(string: "https://cdn.cloudflare.steamstatic.com/steam/apps/\(game.id)/header.jpg")) { image in
+                    image.resizable().aspectRatio(contentMode: .fill)
+                } placeholder: {
+                    Color.gray.opacity(0.25)
+                }
+                .frame(width: 92, height: 43)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(game.name)
                     if let summary = library.playtime[game.id]?.summary {
@@ -172,6 +182,7 @@ struct SteamHubView: View {
                         if library.updateAvailable(appID: game.id, installedBuild: SteamInstallFiles.buildID(appID: game.id, steamApps: SteamOwnedLibrary.steamApps)) {
                             Button("Update") { library.install(game.id) }
                         }
+                        Button("Game settings…") { settingsFor = game }
                         Button("Verify files") { library.repair(game.id) }
                         if let count = dock.installPrograms[game.id] {
                             // The game's Steam install script programs (runtime setups); see DockInstallers.
