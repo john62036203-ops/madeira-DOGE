@@ -58,8 +58,10 @@ struct mad_gui_params {
     uint x0, y0, w, h;
 };
 
-kernel void mad_gui_over(texture2d<float> gui [[texture(0)]],
-                         texture2d<float> bb [[texture(1)]],
+// D3D12 2D textures are created as 2D ARRAY textures here (one slice): binding
+// one to a plain texture2d parameter reads a single constant colour.
+kernel void mad_gui_over(texture2d_array<float> gui [[texture(0)]],
+                         texture2d_array<float> bb [[texture(1)]],
                          texture2d<float, access::write> dst [[texture(2)]],
                          constant mad_gui_params &p [[buffer(0)]],
                          uint2 gid [[thread_position_in_grid]])
@@ -67,10 +69,10 @@ kernel void mad_gui_over(texture2d<float> gui [[texture(0)]],
     constexpr sampler smp(filter::linear, address::clamp_to_edge);
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height())
         return;
-    float4 s = bb.read(gid);
+    float4 s = bb.read(gid, 0);
     if (p.w != 0 && p.h != 0 && gid.x >= p.x0 && gid.y >= p.y0 && gid.x < p.x0 + p.w && gid.y < p.y0 + p.h) {
         float2 uv = (float2(gid - uint2(p.x0, p.y0)) + 0.5f) / float2(p.w, p.h);
-        float4 g = gui.sample(smp, uv, level(0));     // sRGB target: linear, premultiplied
+        float4 g = gui.sample(smp, uv, 0, level(0));     // sRGB target: linear, premultiplied
         float a = saturate(g.a);
         float3 c = a > 1e-5f ? saturate(g.rgb / a) : float3(0.0f);
         float3 lo = c * 12.92f;
