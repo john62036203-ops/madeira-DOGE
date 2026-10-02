@@ -1002,6 +1002,7 @@ struct ContentView: View {
                     sessionPortraitBody
                 } else {
                     portraitBody
+                        .onAppear { TouchControlsModel.shared.setPortraitPad(.zero) }
                 }
             }
             // Rotation destroys/recreates the UIViewRepresentable across
@@ -1132,7 +1133,11 @@ struct ContentView: View {
                 Color.clear
                     .onAppear { TouchControlsModel.shared.setPortraitPad(g.frame(in: .global)) }
                     .onChange(of: g.frame(in: .global)) { _, f in TouchControlsModel.shared.setPortraitPad(f) }
-                    .onDisappear { TouchControlsModel.shared.setPortraitPad(.zero) }
+                // No onDisappear here: rotating back to portrait builds the new
+                // body before SwiftUI tears the old one down, so a reset on
+                // disappear ran AFTER the new onAppear and wiped the controller
+                // for good. Landscape ignores the rect; leaving the session
+                // clears it (portraitBody.onAppear).
             }
             Label("Rotate for full screen", systemImage: "rotate.right")
                 .font(.footnote)
@@ -1153,6 +1158,9 @@ struct ContentView: View {
             SessionPanelView(onClose: { sessionPanelOpen = false })
         }
         .onChange(of: sessionPanelOpen) { _, open in TouchControlsModel.shared.portraitSuspended = open }
+        // A rotation while the sheet was up dropped this view without the
+        // change above ever reporting "closed", leaving the controller hidden.
+        .onAppear { TouchControlsModel.shared.portraitSuspended = sessionPanelOpen }
     }
 
     private func sessionBarButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
@@ -3139,8 +3147,14 @@ final class TouchControlsModel: ObservableObject {
         guard r != portraitRect else { return }
         portraitRect = r
         let pad = MainActor.assumeIsolated { GamepadInput.touchEnabled }
-        portraitControls = (r.isEmpty || !pad) ? []
+        var next = (r.isEmpty || !pad) ? []
             : ControlPresetLayout.portraitPad(width: Double(r.width), height: Double(r.height))
+        // Keep each control's identity across a re-layout: fresh ids rebuilt
+        // every button view and re-registered the pad, dropping a held press.
+        if next.count == portraitControls.count {
+            for i in next.indices { next[i].id = portraitControls[i].id }
+        }
+        portraitControls = next
         fputs("[controls] portrait pad rect=\(r) controls=\(portraitControls.count)\n", stderr)
     }
 
