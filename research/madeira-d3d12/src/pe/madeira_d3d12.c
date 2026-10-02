@@ -5429,11 +5429,24 @@ static void exec_indirect_probe(struct mad_exec *e, const struct mad_cmd *c) {
     const struct mad_pso *p = c->kind == MC_DISPATCH_INDIRECT ? e->cpso : e->pso;
     struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_setbuffer sb[2]; struct wmtcmd_compute_setbytes sby; struct wmtcmd_compute_dispatch dsp;
     UINT32 n = c->kind == MC_DISPATCH_INDIRECT ? 3 : c->kind == MC_DRAW_INDEXED_INDIRECT ? 5 : 4;
-    DWORD now = GetTickCount();
+    DWORD now;
     unsigned k, slot = ~0u;
     UINT64 off;
-    if (on < 0) on = (int)mad_cfg_int_pe("ind-probe", 1);
+    /* madeira-doge: this ran GetTickCount() before every test below, once per
+     * indirect draw or dispatch. kernel32's GetTickCount reads the shared user
+     * page at 0x7ffe0320, which cannot be mapped on iOS: each read is a Mach
+     * exception emulated on another thread (~2 ms). RE Requiem's meshlet
+     * renderer issues ~3500 indirect commands a frame, so a frame took 6-12 s
+     * (0.2 fps, the exception thread at 50% of all CPU) while the GPU needed
+     * 100 ms. The probe is a diagnostic: off unless ind-probe = 1, and it
+     * reads the performance counter, which does not touch that page. */
+    if (on < 0) on = (int)mad_cfg_int_pe("ind-probe", 0);
     if (!on || !p || (c->u.ind.off & 3) || said >= 1500 || !mad_kernels_ready(d) || !d->k_probe_pso || !d->k_ring_cpu) return;
+    {
+        static LONG64 freq;
+        if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 1; }
+        now = (DWORD)(mad_qpc() * 1000 / freq);
+    }
     AcquireSRWLockExclusive(&g_iprobe_lock);
     for (k = 0; k < sizeof g_iprobe / sizeof g_iprobe[0]; k++) {
         if (g_iprobe[k].pso == p) { slot = k; break; }
