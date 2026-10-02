@@ -219,20 +219,47 @@ int madsync_close( int fd )
 }
 
 /* ---- server -> client hand-off ------------------------------------------- */
-static struct { unsigned pid, handle; int fd; } g_post[256];
+static struct { unsigned pid, handle; int fd; unsigned long long seq; } g_post[256];
+static unsigned long long g_post_seq, g_post_replaced, g_post_evicted;
 
+/* madeira-doge: a posted entry is only removed by madsync_take, but not every
+ * get_inproc_sync_fd caller takes: the fastsync cache's lookup
+ * (madeira_fast_lookup) asks the same question just to learn the object type
+ * and leaves the entry behind. Sekiro filled all 256 slots within seconds
+ * ("hand-off table full ... dropped", 66 k times for one handle), after which
+ * every real hand-off was dropped and the game stopped at its first wait.
+ * So: a new post for the same (pid, handle) replaces the old one, and when the
+ * table is still full the oldest entry goes. A take follows its post within
+ * one request round trip, so the oldest of 256 is never one still wanted. */
 void madsync_post( unsigned int pid, unsigned int handle, int fd )
 {
     sigset_t ms_old;
-    unsigned i;
+    unsigned i, slot = 256, oldest = 0;
     ms_lock( &ms_old );
-    for (i = 0; i < 256; i++) if (!g_post[i].fd) break;
-    if (i < 256)
+    for (i = 0; i < 256; i++)
+    {
+        if (!g_post[i].fd) { if (slot == 256) slot = i; continue; }
+        if (g_post[i].pid == pid && g_post[i].handle == handle) { slot = i; break; }
+        if (g_post[i].seq < g_post[oldest].seq || !g_post[oldest].fd) oldest = i;
+    }
+    if (slot == 256) { slot = oldest; g_post_evicted++; }
     {
         struct ms_obj *o = obj_of( fd );
-        if (o) { o->refs++; g_post[i].pid = pid; g_post[i].handle = handle; g_post[i].fd = fd; }
+        if (o)
+        {
+            int old = g_post[slot].fd;
+            o->refs++;
+            g_post[slot].pid = pid; g_post[slot].handle = handle; g_post[slot].fd = fd;
+            g_post[slot].seq = ++g_post_seq;
+            if (old)
+            {
+                if (obj_of( old )) obj_unref_locked( (unsigned)old & 0x0fffffffu );
+                if (!(++g_post_replaced & 0xffff))
+                    dprintf( 2, "[madsync] hand-off: %llu stale posts replaced, %llu evicted\n",
+                             g_post_replaced, g_post_evicted );
+            }
+        }
     }
-    else dprintf( 2, "[madsync] hand-off table full; pid %04x handle %#x dropped\n", pid, handle );
     ms_unlock( &ms_old );
 }
 
