@@ -11421,13 +11421,26 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         snprintf(ge.vertex_function, sizeof ge.vertex_function, "%s", p->vs_name);
         snprintf(ge.geometry_function, sizeof ge.geometry_function, "%s", p->gs_name);
         if (p->ps_fn) snprintf(ge.fragment_function, sizeof ge.fragment_function, "%s", p->ps_name);
+        else {   /* madeira-doge: depth-only geometry/tessellation pipeline. Metal ABORTS the app on a mesh
+                  * pipeline with no fragment function (Onimusha, "fragmentFunction must not be nil"), so
+                  * give it the empty one from the helper kernels. */
+            static LONG said_nofs;
+            mad_kernels_ready(d);
+            if (d->k_lib && d->k_null_fs) {
+                ge.fragment_library = d->k_lib;
+                snprintf(ge.fragment_function, sizeof ge.fragment_function, "%s", "mad_null_fragment");
+            }
+            if (InterlockedIncrement(&said_nofs) <= 4)
+                d3d12_log("[madeira-d3d12] geometry pipeline without a pixel shader (vs '%s'): %s\n", p->vs_name,
+                          ge.fragment_function[0] ? "using the empty fragment function" : "no empty fragment function available");
+        }
         ge.gs_vertex_size_bytes = p->gs_vertex_size; ge.gs_max_input_primitives = p->gs_max_prims;
         if (p->gs_emu == 2) {   /* madeira-bcd: DXIL tessellation (tools/patch-dxmt-dxil-tess.py) */
             ge.hull_library = p->hs_lib; ge.domain_library = p->gs_lib;
             ge.max_tessellation_factor = p->dt.max_factor; ge.tessellation = 1;
             ge.gs_max_input_primitives = p->dt.mesh_prims;
         }
-        p->rps = MTLDevice_newGeometryEmulationPipelineState(d->mtl_device, &mp, &ge, &err);
+        if (ge.fragment_function[0]) p->rps = MTLDevice_newGeometryEmulationPipelineState(d->mtl_device, &mp, &ge, &err);
         if (err) mad_log_nserror("geometry-emulation pipeline", err);
         { static unsigned said; if (said++ < 8) d3d12_log("[madeira-d3d12] geometry pipeline %s: vs '%s' gs '%s' ps '%s' (vertex %u B, %u prims/tg, %u targets)\n",
                                                         p->rps ? "created" : "FAILED", ge.vertex_function, ge.geometry_function, ge.fragment_function,
