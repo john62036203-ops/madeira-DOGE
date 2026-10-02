@@ -6623,6 +6623,25 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         memset(o, 0, sizeof *o);
         o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_2;
         o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;   /* heaps here are descriptions; any mix is fine */
+        /* madeira-doge: per-game overrides (game config keys d3d12-binding-tier = 1..3,
+         * d3d12-heap-tier = 1..2). RE Engine (RE Requiem) forks its renderer on
+         * ResourceBindingTier >= 3 and ResourceHeapTier >= 2; every desktop GPU it
+         * ships on reports tier 3, so the tier-2 branch this runtime selects is one
+         * the game is rarely run on. The values are what the game is TOLD, not new
+         * capability, so they stay opt-in. */
+        {
+            static int bt = -1, ht = -1;
+            if (bt < 0) {
+                bt = (int)mad_cfg_int_pe("d3d12-binding-tier", 2);
+                ht = (int)mad_cfg_int_pe("d3d12-heap-tier", 2);
+                if (bt < 1 || bt > 3) bt = 2;
+                if (ht < 1 || ht > 2) ht = 2;
+                if (bt != 2 || ht != 2)
+                    d3d12_log("[madeira-d3d12] D3D12_OPTIONS override: ResourceBindingTier %d, ResourceHeapTier %d\n", bt, ht);
+            }
+            o->ResourceBindingTier = (D3D12_RESOURCE_BINDING_TIER)bt;
+            o->ResourceHeapTier = (D3D12_RESOURCE_HEAP_TIER)ht;
+        }
         o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
         return S_OK;
     }
