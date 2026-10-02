@@ -6698,6 +6698,8 @@ struct file_view
     unsigned int  protect;       /* protection for all pages at allocation time and SEC_* flags */
     unsigned int  madeira_creator_tid; /* ml1950: creation attribution, not current ownership */
     unsigned int  madeira_parked;      /* madeira-doge: nonzero token while the view sits in ios_vpark[] */
+    void         *madeira_rw_base;     /* madeira-doge: span a reused parked view left host-RW and zeroed; */
+    size_t        madeira_rw_size;     /*   valid for the first commit after the reuse only */
 };
 static int madeira_va_diagnostics;
 
@@ -13017,6 +13019,8 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     view->madeira_creator_tid = madeira_va_diagnostics && NtCurrentTeb()
         ? (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
     view->madeira_parked = 0;
+    view->madeira_rw_base = NULL;
+    view->madeira_rw_size = 0;
     if (use_kernel_writewatch) vprot &= ~VPROT_WRITEWATCH;
     set_page_vprot( base, size, vprot );
 
@@ -18032,6 +18036,10 @@ static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size
         new_view->protect = view->protect;
         new_view->madeira_creator_tid = view->madeira_creator_tid;
         new_view->madeira_parked = 0;
+        new_view->madeira_rw_base = NULL;
+        new_view->madeira_rw_size = 0;
+        view->madeira_rw_base = NULL;
+        view->madeira_rw_size = 0;
 
         unregister_view( view );
         view->size = base - (char *)view->base;
@@ -22564,7 +22572,13 @@ void virtual_set_large_address_space(void)
  *   MADEIRA_VALLOC_PARK=1  empty the view with decommit_pages (memory returned).
  *   MADEIRA_VALLOC_PARK=2  zero the committed pages in place and keep them
  *                          resident (no kernel call at all), for at most
- *                          24 MB parked; beyond that, as mode 1.
+ *                          24 MB parked; beyond that, as mode 1. The zeroing
+ *                          runs AFTER virtual_mutex is dropped (the entry is
+ *                          `busy` meanwhile), and the first commit after a
+ *                          reuse skips mprotect and the zero probe because
+ *                          the span is already host-RW and zero: with both
+ *                          under the lock, commit and release held it for
+ *                          300-570 us a call and every worker queued on it.
  * A parked view is released for real after 2 s, when the table is full, or
  * when a fixed-address reservation wants its range. Until then VirtualQuery
  * reports it as reserved rather than free. virtual_mutex is held by all callers. */
@@ -22572,7 +22586,9 @@ void virtual_set_large_address_space(void)
 static struct
 {
     void *peb; struct file_view *view; void *base; size_t size, resident;
+    char *zero_base;            /* committed run still to be zeroed (mode 2) */
     unsigned int protect, token, ms;
+    int busy;                   /* being zeroed outside virtual_mutex: not to be reused or released yet */
 } ios_vpark[IOS_VPARK_N];
 static size_t ios_vpark_resident;
 static unsigned int ios_vpark_next_token;
@@ -22616,7 +22632,9 @@ static void ios_vpark_drop( int i )
 
 static void ios_vpark_evict( int i )
 {
-    struct file_view *v = ios_vpark_live( i );
+    struct file_view *v;
+    if (__atomic_load_n( &ios_vpark[i].busy, __ATOMIC_ACQUIRE )) return;
+    v = ios_vpark_live( i );
     ios_vpark_drop( i );
     if (v)
     {
@@ -22636,14 +22654,18 @@ static void ios_vpark_make_room( const void *base, size_t size )
             ios_vpark_evict( i );
 }
 
-/* 1 = the view was parked instead of deleted */
-static int ios_vpark_put( struct file_view *view )
+/* 1 = the view was parked instead of deleted. *zero_slot >= 0 means the caller
+ * must call ios_vpark_zero( slot ) once it has left virtual_mutex. */
+static int ios_vpark_put( struct file_view *view, int *zero_slot )
 {
     extern int ios_swap_overlaps_probe( const void *, size_t );
     TEB *teb = NtCurrentTeb();
     unsigned int now;
-    int i, slot = -1, oldest = 0, aged = 0, mode = ios_vpark_mode();
+    int i, slot = -1, oldest = -1, aged = 0, mode = ios_vpark_mode();
     size_t resident = 0;
+    char *zero_base = NULL;
+
+    *zero_slot = -1;
 
     if (!mode || !teb || !teb->Peb) return 0;
     if (view->size < (1u << 20) || view->size >= (4u << 20)) return 0;
@@ -22654,6 +22676,7 @@ static int ios_vpark_put( struct file_view *view )
     for (i = 0; i < IOS_VPARK_N; i++)
     {
         if (!ios_vpark[i].base) { if (slot < 0) slot = i; continue; }
+        if (__atomic_load_n( &ios_vpark[i].busy, __ATOMIC_ACQUIRE )) continue;
         if ((int)(now - ios_vpark[i].ms) >= 2000 && aged < 2)
         {
             ios_vpark_evict( i );
@@ -22661,23 +22684,31 @@ static int ios_vpark_put( struct file_view *view )
             if (slot < 0) slot = i;
             continue;
         }
-        if ((int)(now - ios_vpark[i].ms) > (int)(now - ios_vpark[oldest].ms) || !ios_vpark[oldest].base) oldest = i;
+        if (oldest < 0 || (int)(now - ios_vpark[i].ms) > (int)(now - ios_vpark[oldest].ms)) oldest = i;
     }
-    if (slot < 0) { ios_vpark_evict( oldest ); slot = oldest; }
+    if (slot < 0)
+    {
+        if (oldest < 0) return 0;
+        ios_vpark_evict( oldest );
+        slot = oldest;
+    }
 
     if (mode == 2 && ios_vpark_resident + view->size <= (24u << 20))
     {
-        char *p, *end = (char *)view->base + view->size;
+        /* one contiguous run of plain read/write committed pages, or nothing committed */
+        char *p, *end = (char *)view->base + view->size, *lo = NULL, *hi = NULL;
         int plain = 1;
         for (p = view->base; p < end; p += page_size)
         {
             BYTE vp = get_page_vprot( p );
-            if ((vp & VPROT_COMMITTED) && vp != (VPROT_COMMITTED | VPROT_READ | VPROT_WRITE)) { plain = 0; break; }
+            if (!(vp & VPROT_COMMITTED)) continue;
+            if (vp != (VPROT_COMMITTED | VPROT_READ | VPROT_WRITE) || (hi && hi != p)) { plain = 0; break; }
+            if (!lo) lo = p;
+            hi = p + page_size;
         }
         if (plain)
         {
-            for (p = view->base; p < end; p += page_size)
-                if (get_page_vprot( p ) & VPROT_COMMITTED) { memset( p, 0, page_size ); resident += page_size; }
+            if (lo) { zero_base = lo; resident = hi - lo; }
             set_page_vprot_bits( view->base, view->size, 0, VPROT_COMMITTED );
         }
         else mode = 1;
@@ -22689,10 +22720,38 @@ static int ios_vpark_put( struct file_view *view )
     view->madeira_parked = ios_vpark_next_token;
     ios_vpark[slot].peb = teb->Peb; ios_vpark[slot].view = view; ios_vpark[slot].base = view->base;
     ios_vpark[slot].size = view->size; ios_vpark[slot].resident = resident;
+    ios_vpark[slot].zero_base = zero_base;
+    if (zero_base)
+    {
+        __atomic_store_n( &ios_vpark[slot].busy, 1, __ATOMIC_RELEASE );
+        *zero_slot = slot;
+    }
     ios_vpark[slot].protect = view->protect; ios_vpark[slot].token = view->madeira_parked;
     ios_vpark[slot].ms = now;
     ios_vpark_resident += resident;
     ios_vpark_n_park++;
+    return 1;
+}
+
+/* Called WITHOUT virtual_mutex by the thread that parked the entry. A busy entry
+ * is skipped by take, evict and the slot search, so its fields are stable here. */
+static void ios_vpark_zero( int slot )
+{
+    memset( ios_vpark[slot].zero_base, 0, ios_vpark[slot].resident );
+    __atomic_store_n( &ios_vpark[slot].busy, 0, __ATOMIC_RELEASE );
+}
+
+/* First commit after a reuse: the requested span is already host-RW and zero. */
+static int ios_vpark_fast_commit( struct file_view *view, char *base, size_t size, ULONG protect, int any_committed )
+{
+    char *rw = view->madeira_rw_base;
+    size_t rw_size = view->madeira_rw_size;
+
+    view->madeira_rw_base = NULL;
+    view->madeira_rw_size = 0;
+    if (!rw || any_committed || protect != PAGE_READWRITE) return 0;
+    if (base < rw || base + size > rw + rw_size) return 0;
+    set_page_vprot( base, size, VPROT_COMMITTED | VPROT_READ | VPROT_WRITE );
     return 1;
 }
 
@@ -22706,12 +22765,18 @@ static struct file_view *ios_vpark_take( size_t size, unsigned int vprot )
     for (i = 0; i < IOS_VPARK_N; i++)
     {
         struct file_view *v;
+        char *zb;
+        size_t zs;
         if (!ios_vpark[i].base || ios_vpark[i].size != size || ios_vpark[i].peb != peb ||
             ios_vpark[i].protect != vprot) continue;
+        if (__atomic_load_n( &ios_vpark[i].busy, __ATOMIC_ACQUIRE )) continue;
         v = ios_vpark_live( i );
+        zb = ios_vpark[i].zero_base; zs = ios_vpark[i].resident;
         ios_vpark_drop( i );
         if (!v) continue;
         v->madeira_parked = 0;
+        v->madeira_rw_base = zb;
+        v->madeira_rw_size = zb ? zs : 0;
         set_page_vprot( v->base, v->size, vprot );
         if (!(++ios_vpark_n_hit % 20000))
             dprintf( 2, "[valloc-park] %lu reused, %lu parked, %lu released late, %lu KB kept resident now\n",
@@ -22923,11 +22988,13 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     {
         int was_committed = (get_page_vprot( base ) & VPROT_COMMITTED) != 0;
         int any_committed = 0;   /* ml1077: only FRESH commits may be file-backed (a hole reads as zero) */
+        int fast_commit = 0;
         { const char *pg; for (pg = base; pg < (const char *)base + size; pg += page_size) if (get_page_vprot( pg ) & VPROT_COMMITTED) { any_committed = 1; break; } }
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
         else if (view->protect & SEC_FILE) status = STATUS_ALREADY_COMMITTED;
         else if (view->protect & VPROT_FREE_PLACEHOLDER) status = STATUS_CONFLICTING_ADDRESSES;
-        else if (!(status = set_protection( view, base, size, protect )))
+        else if ((fast_commit = ios_vpark_fast_commit( view, base, size, protect, any_committed )) ||
+                 !(status = set_protection( view, base, size, protect )))
         {
             unsigned int sv = 0;
             ios_swap_init();
@@ -22946,7 +23013,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             SERVER_END_REQ;
         }
         /* ml293 (task #52): PA-arena recommit must read back as zero. */
-        if (!status) ios_verify_commit_zero( base, size, protect, was_committed );
+        if (!status && !fast_commit) ios_verify_commit_zero( base, size, protect, was_committed );
     }
 
     if (!status && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE))
@@ -26002,6 +26069,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     const int va_stats = ios_valloc_stats();
     const unsigned long long va_t0 = va_stats ? ios_va_now_ns() : 0;
     unsigned long long va_lock_ns = 0;
+    int vpark_zero = -1;
 
     if (size) size = ROUND_SIZE( addr, size, page_mask );
     base = ROUND_ADDR( addr, page_mask );
@@ -26097,7 +26165,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         if (!size) size = view->size;
         if (base == view->base && size == view->size)
         {
-            if (ios_vpark_put( view )) { status = STATUS_SUCCESS; break; }
+            if (ios_vpark_put( view, &vpark_zero )) { status = STATUS_SUCCESS; break; }
             ios_vh_capture_free_site( view, __builtin_return_address(0) );
         }
         status = free_pages( view, base, size );
@@ -26123,6 +26191,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         *size_ptr = size;
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (vpark_zero >= 0) ios_vpark_zero( vpark_zero );
     if (va_stats)
     {
         unsigned long long now = ios_va_now_ns();
