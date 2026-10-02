@@ -17684,7 +17684,15 @@ static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot,
          * EVERY process: Valve's client hung before it started the game. So:
          * the game process only, and [4 GB, 48 GB) -- guest reservations sit at
          * 0x13.. - 0x14.. and 0xb5.., FEX's band above 48 GB stays anonymous. */
-        if (!(smallmap && b >= 0x100000000ULL && b + size <= 0xc00000000ULL && ios_swap_proc_is_game()))
+        /* madeira-doge: RE Requiem dies at the 6144 MB limit with 1.6 GB backed
+         * and 2.9 GB still compressed: its heap blocks (0x3ff000, 19k of them)
+         * are placed above 48 GB, inside the emulators' band, where this test
+         * turned them away. MADEIRA_SWAP_HIGH=1 lifts the ceiling for the game
+         * process, except for exact 16 MB commits up there (FEX's arenas). */
+        static int high = -1;
+        if (high < 0) high = getenv( "MADEIRA_SWAP_HIGH" ) != NULL && getenv( "MADEIRA_SWAP_HIGH" )[0] == '1';
+        if (!(smallmap && b >= 0x100000000ULL && ios_swap_proc_is_game() &&
+              (b + size <= 0xc00000000ULL || (high && size != (16u << 20)))))
         { if (big) ios_swap_no_band += size; return 0; }
     }
     if (size < ios_swap_min) { if (big) ios_swap_no_small += size; return 0; }
