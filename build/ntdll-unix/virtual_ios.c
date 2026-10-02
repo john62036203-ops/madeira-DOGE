@@ -12720,6 +12720,57 @@ static void unregister_view( struct file_view *view )
 }
 
 
+/* madeira-doge: re-use the address of a just-released reservation.
+ *
+ * Sekiro reserves, commits and releases 2 MB blocks in a loop (225 GB of them
+ * in a ten-minute session). Every reservation ran the free-area search --
+ * mach_vm_region probes and a vm_map per candidate, all under virtual_mutex --
+ * which was 8-14% of all CPU and serialised the game's worker threads.
+ * A released plain-valloc view of 1..16 MB is remembered (per pseudo-process);
+ * an unplaced request of the same size tries that address first and falls back
+ * to the normal search. Fresh anonymous memory either way, so still zero-filled.
+ * Opt-in: MADEIRA_VALLOC_REUSE=1. virtual_mutex is held by both callers. */
+static struct { void *peb; void *base; size_t size; } ios_vreuse[32];
+static unsigned long ios_vreuse_hits, ios_vreuse_miss;
+static int ios_vreuse_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_VALLOC_REUSE" );
+        on = (e && e[0] == '1');
+        if (on) dprintf( 2, "[valloc-reuse] ON: released 1-16 MB reservations are offered to the next same-size request\n" );
+    }
+    return on;
+}
+static void ios_vreuse_note( struct file_view *view )
+{
+    static unsigned next;
+    TEB *teb;
+    if (!ios_vreuse_on()) return;
+    if (view->size < (1u << 20) || view->size > (16u << 20)) return;
+    if (!is_view_valloc( view ) || (view->protect & (SEC_FILE | SEC_IMAGE | VPROT_SYSTEM))) return;
+    if (!(teb = NtCurrentTeb()) || !teb->Peb) return;
+    ios_vreuse[next].peb = teb->Peb; ios_vreuse[next].base = view->base; ios_vreuse[next].size = view->size;
+    next = (next + 1) % 32;
+}
+static void *ios_vreuse_take( size_t size )
+{
+    TEB *teb = NtCurrentTeb();
+    void *peb = teb ? teb->Peb : NULL, *base;
+    int i;
+    if (!peb) return NULL;
+    for (i = 0; i < 32; i++)
+        if (ios_vreuse[i].base && ios_vreuse[i].size == size && ios_vreuse[i].peb == peb)
+        {
+            base = ios_vreuse[i].base;
+            ios_vreuse[i].base = NULL;
+            return base;
+        }
+    return NULL;
+}
+
+
 /***********************************************************************
  *           delete_view
  *
@@ -12888,6 +12939,7 @@ static void ios_vh_dump( const void *addr )
 static void delete_view( struct file_view *view ) /* [in] View */
 {
     ios_vh_note( 'd', view );   /* madeira-bcd: view history */
+    ios_vreuse_note( view );
     /* ml989: entered BEFORE any field of `view` is read, so "call never
      * entered" is distinguishable from "died reading the view". */
     if (ios_retire_trace_armed) ios_retire_mark( "D0>\n" );
@@ -16658,6 +16710,20 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
         size_t unmap_size, view_size = host_size + align_mask + 1;
         int spill_tries = 0;
+
+        if (!limit_low && !limit_high && !top_down && align_mask == granularity_mask &&
+            size >= (1u << 20) && size <= (16u << 20) && ios_vreuse_on())
+        {
+            void *cand = ios_vreuse_take( size );
+            if (cand && !((UINT_PTR)cand & align_mask) && !map_fixed_area( cand, size, unix_prot ))
+            {
+                ptr = cand;
+                if (!(++ios_vreuse_hits % 20000))
+                    dprintf( 2, "[valloc-reuse] %lu reused, %lu searched\n", ios_vreuse_hits, ios_vreuse_miss );
+                goto done;
+            }
+            ios_vreuse_miss++;
+        }
 
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
