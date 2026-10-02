@@ -2349,6 +2349,15 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
     memset(&v0, 0, sizeof v0); v0.layers = 1;
     d3d12_log("[capture-draw] ml1106 ===== draw with ps='%s' vs='%s' after enc#%u: kind=%d topo=%u inputs follow =====\n",
               e->pso->ps_name, e->pso->vs_name, seq, (int)c->kind, (unsigned)e->topo);
+    if (e->rs) {   /* madeira-doge: the root arguments this draw runs with */
+        for (k = 0; k < e->rs->nparams && k < MAD_ROOT_PARAM_MAX; k++) {
+            const struct madeira_ir_root_param *pp = &e->rs->params[k];
+            d3d12_log("[capture-draw] root %u: type %u reg %u space %u vis %u ranges %u value %#llx%s\n", k, (unsigned)pp->type,
+                      pp->shader_register, pp->register_space, (unsigned)pp->visibility, pp->num_ranges,
+                      (unsigned long long)e->root[k], pp->type != MADEIRA_IR_PARAM_CONSTANTS && !e->root[k] ? "  <== NEVER SET" : "");
+        }
+        d3d12_log("[capture-draw] pixel stage declares %u argument range(s); srv heap %s\n", e->pso->ps_nair, e->srv ? "bound" : "NOT BOUND");
+    }
     for (k = 0; k < 16; k++) if (e->vb[k].res) mad_capture_buffer(e, benc, e->vb[k].res, e->vb[k].off, 65536, "vb", k, seq);
     if (e->ib) mad_capture_buffer(e, benc, e->ib, e->ib_off, 65536, "ib", 0, seq);
     if ((c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT) && c->u.ind.args)
@@ -2357,7 +2366,12 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
         const struct madeira_ir_air_range *rg = &e->pso->ps_air[k]; struct mad_descriptor de; UINT64 direct = 0; const char *why = "?";
         struct mad_resource *r; int xv = -1;
         if (rg->type != MADEIRA_IR_AIR_SRV && rg->type != MADEIRA_IR_AIR_CBV) continue;
-        if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg, ~0u, &de, &direct, &why)) continue;
+        if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg, ~0u, &de, &direct, &why)) {
+            /* madeira-doge: say so -- an input that does not resolve is the answer to "why is this draw black" */
+            d3d12_log("[capture-draw] %s%u space %u flags %#x: NOT RESOLVED (%s)\n", rg->type == MADEIRA_IR_AIR_CBV ? "b" : "t",
+                      rg->lower_bound, rg->space, (unsigned)rg->flags, why ? why : "?");
+            continue;
+        }
         if (rg->type == MADEIRA_IR_AIR_CBV || !(rg->flags & MADEIRA_IR_AIR_F_TEXTURE) || (de.metadata & (1ull << 63))) {
             /* ml1107: constant buffers and buffer SRVs (raw / structured / typed):
              * the first 4 KB from the descriptor's address, as kind cb / buf. */
@@ -2369,7 +2383,12 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
             continue;
         }
         r = mad_texture_of_view(e->q->device, de.texture_view_id, &xv);
-        if (!r || !r->texture) continue;
+        if (!r || !r->texture) {
+            d3d12_log("[capture-draw] t%u -> view %llu (gpu_va %#llx, metadata %#llx): %s\n", rg->lower_bound,
+                      (unsigned long long)de.texture_view_id, (unsigned long long)de.gpu_va, (unsigned long long)de.metadata,
+                      !de.texture_view_id ? "NULL DESCRIPTOR (nothing was ever written to this heap slot)" : r ? "resource has no texture" : "no live texture has this view");
+            continue;
+        }
         d3d12_log("[capture-draw] t%u -> view %llu = %s %ux%u pf%u dx%u mips %u layers %u (subview %d)\n", rg->lower_bound,
                   (unsigned long long)de.texture_view_id, r->name ? r->name : "?", r->width, r->height, (unsigned)r->tex_pf, (unsigned)r->desc.Format, r->tex_mips, r->tex_layers, xv);
         if (said_tex++ < 64) mad_capture_one(e, benc, r, &v0, seq, 100 + rg->lower_bound, "tex", 0, NULL);
