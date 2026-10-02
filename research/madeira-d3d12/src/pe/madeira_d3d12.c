@@ -11296,6 +11296,32 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             nl = 0;
             p->ps_fn = mad_convert_stage_opts(d, rs, desc->PS.pShaderBytecode, desc->PS.BytecodeLength, NULL, &p->ps_lib, "PS",
                                               NULL, 0, NULL, NULL, locs, &nl, &op);
+            {   /* madeira-doge: madeira.cfg capture-ps also writes the named pixel shaders' bytecode to the
+                 * log as base64 when their pipelines are created (the first 6), to read what they sample. */
+                static char want[512]; static int loaded; static LONG dumped;
+                if (!loaded) { loaded = 1; mad_cfg_str_pe("capture-ps", want, sizeof want); }
+                if (want[0] && p->ps_name[0] && strstr(want, p->ps_name) && desc->PS.BytecodeLength <= 65536 &&
+                    InterlockedIncrement(&dumped) <= 6) {
+                    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                    const unsigned char *q = desc->PS.pShaderBytecode; UINT len = (UINT)desc->PS.BytecodeLength, bi = 0, k; char line[720];
+                    d3d12_log("[madeira-d3d12] ps-dump '%s': %u bytes follow as base64\n", p->ps_name, len);
+                    while (bi < len) {
+                        UINT n = 0;
+                        for (k = 0; k < 175 && bi < len; k++) {
+                            UINT32 v = (UINT32)q[bi] << 16; UINT got = 1;
+                            if (bi + 1 < len) { v |= (UINT32)q[bi + 1] << 8; got++; }
+                            if (bi + 2 < len) { v |= q[bi + 2]; got++; }
+                            line[n++] = b64[(v >> 18) & 63]; line[n++] = b64[(v >> 12) & 63];
+                            line[n++] = got > 1 ? b64[(v >> 6) & 63] : '=';
+                            line[n++] = got > 2 ? b64[v & 63] : '=';
+                            bi += got;
+                        }
+                        line[n] = 0;
+                        d3d12_log("[psb64 %s] %s\n", p->ps_name, line);
+                    }
+                    d3d12_log("[madeira-d3d12] ps-dump '%s': end\n", p->ps_name);
+                }
+            }
             if (p->ps_fn) {
                 if (air_ps.backend == MADEIRA_IR_BACKEND_AIRCONV) {   /* ml1011 */
                     p->ps_cb_bind = air_ps.cb_bind; p->ps_arg_bind = air_ps.arg_bind;
