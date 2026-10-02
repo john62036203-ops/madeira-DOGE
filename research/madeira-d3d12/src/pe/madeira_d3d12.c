@@ -313,6 +313,7 @@ struct mad_device {
     struct { UINT32 value[4]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 16-byte period) */
     obj_handle_t k_lib, k_tind_pso, k_ring, k_null_fs; UINT64 k_ring_pos; int k_state; SRWLOCK k_lock;   /* madeira-bcd: helper kernels (mad_kernels.metal) */
     obj_handle_t k_probe_pso; unsigned char *k_ring_cpu;   /* madeira-bcd: indirect-argument probes */
+    obj_handle_t k_gui_pso, gui_tmp; UINT gui_tmp_w, gui_tmp_h, gui_tmp_pf;   /* madeira-doge: gui-overlay (mad_gui_over) */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
     LUID adapter_luid;   /* madeira-bcd: GetAdapterLuid, the DXGI adapter it was created on */
 };
@@ -1523,6 +1524,7 @@ struct mad_exec {
     obj_handle_t ud_enc; unsigned ud_n, ud_committed;
     struct { obj_handle_t h; UINT32 usage, stages; } ud[96];
     /* madeira-bcd: GPU fault attribution (mad_fault_*), only after a first fault */
+    struct mad_resource *gui_rt;   /* madeira-doge: the interface target this list drew into (gui-overlay) */
     struct mad_pso *cenc_pso;   /* the one pipeline the open compute encoder runs */
     unsigned cenc_seq;          /* its label's C#<seq> */
     struct mad_pso *diag_pso[6]; unsigned diag_npso; int diag_more;   /* pipelines the open render pass drew with */
@@ -3434,6 +3436,13 @@ static int mad_kernels_ready(struct mad_device *d) {
             memset(&ci, 0, sizeof ci); ci.compute_function = fn; err = 0;
             d->k_probe_pso = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
             if (err) mad_log_nserror("mad_probe_words", err);
+            NSObject_release(fn);
+        }
+        fn = d->k_lib ? MTLLibrary_newFunction(d->k_lib, "mad_gui_over") : 0;   /* madeira-doge */
+        if (fn) {
+            memset(&ci, 0, sizeof ci); ci.compute_function = fn; err = 0;
+            d->k_gui_pso = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
+            if (err) mad_log_nserror("mad_gui_over", err);
             NSObject_release(fn);
         }
         memset(&bi, 0, sizeof bi); bi.length = MAD_KRING_BYTES; bi.options = WMTResourceStorageModeShared;
@@ -5568,6 +5577,64 @@ static int exec_tess_indirect_prep(struct mad_exec *e, const struct mad_cmd *c, 
     *out_off = off;
     return 1;
 }
+/* madeira-doge: gui-overlay = 1. After the engine's final blit to the swapchain
+ * buffer, lay the interface target this list drew (PS2D / PS_GUIMaterial into an
+ * R8G8B8A8_UNORM_SRGB target that nothing composites) over it: one compute pass
+ * backbuffer + interface -> scratch texture, then a copy back. */
+static int g_gui_overlay = -1;
+static void exec_gui_overlay(struct mad_exec *e) {
+    struct mad_device *d = e->q->device; struct mad_resource *bb = e->rt[0], *gui = e->gui_rt;
+    struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_settexture st[3]; struct wmtcmd_compute_setbytes sby; struct wmtcmd_compute_dispatch dsp;
+    struct wmtcmd_blit_copy_from_texture_to_texture k;
+    struct { UINT32 x0, y0, w, h; } prm;
+    static LONG said;
+    if (!bb || !gui || !bb->texture || !gui->texture || bb->samples > 1 || gui->samples > 1) return;
+    mad_kernels_ready(d);
+    if (!d->k_gui_pso) { if (InterlockedIncrement(&said) <= 2) d3d12_log("[madeira-d3d12] gui-overlay: kernel not available\n"); return; }
+    if (!d->gui_tmp || d->gui_tmp_w != bb->width || d->gui_tmp_h != bb->height || d->gui_tmp_pf != (UINT)bb->tex_pf) {
+        struct WMTTextureInfo ti;
+        if (d->gui_tmp) { NSObject_release(d->gui_tmp); d->gui_tmp = 0; }
+        memset(&ti, 0, sizeof ti);
+        ti.pixel_format = bb->tex_pf; ti.width = bb->width; ti.height = bb->height; ti.depth = 1; ti.array_length = 1;
+        ti.type = WMTTextureType2D; ti.mipmap_level_count = 1; ti.sample_count = 1;
+        ti.usage = (enum WMTTextureUsage)(WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+        ti.options = WMTResourceStorageModePrivate;
+        d->gui_tmp = MTLDevice_newTexture(d->mtl_device, &ti);
+        d->gui_tmp_w = bb->width; d->gui_tmp_h = bb->height; d->gui_tmp_pf = (UINT)bb->tex_pf;
+        d3d12_log("[madeira-d3d12] gui-overlay: scratch texture %ux%u pf%u %s\n", bb->width, bb->height, (unsigned)bb->tex_pf, d->gui_tmp ? "created" : "FAILED");
+    }
+    if (!d->gui_tmp) return;
+    prm.x0 = 0; prm.y0 = 0; prm.w = bb->width; prm.h = bb->height;
+    if (e->has_vp && e->vp.Width >= 1.0f && e->vp.Height >= 1.0f) {
+        float x = e->vp.TopLeftX < 0 ? 0 : e->vp.TopLeftX, y = e->vp.TopLeftY < 0 ? 0 : e->vp.TopLeftY;
+        prm.x0 = (UINT32)x; prm.y0 = (UINT32)y; prm.w = (UINT32)e->vp.Width; prm.h = (UINT32)e->vp.Height;
+    }
+    exec_end(e);
+    e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false);
+    if (!e->cenc) return;
+    g_enc_seq++; e->cenc_pso = NULL; e->cenc_seq = g_enc_seq;
+    exec_fence_compute(e, e->cenc, 0);
+    e->wr_all = 1;
+    memset(&sp, 0, sizeof sp); memset(st, 0, sizeof st); memset(&sby, 0, sizeof sby); memset(&dsp, 0, sizeof dsp);
+    sp.type = WMTComputeCommandSetPSO; sp.pso = d->k_gui_pso;
+    sp.threadgroup_size.width = 16; sp.threadgroup_size.height = 16; sp.threadgroup_size.depth = 1;
+    st[0].type = WMTComputeCommandSetTexture; st[0].texture = gui->texture; st[0].index = 0;
+    st[1].type = WMTComputeCommandSetTexture; st[1].texture = bb->texture; st[1].index = 1;
+    st[2].type = WMTComputeCommandSetTexture; st[2].texture = d->gui_tmp; st[2].index = 2;
+    sby.type = WMTComputeCommandSetBytes; sby.bytes.ptr = &prm; sby.length = sizeof prm; sby.index = 0;
+    dsp.type = WMTComputeCommandDispatch; dsp.size.width = (bb->width + 15) / 16; dsp.size.height = (bb->height + 15) / 16; dsp.size.depth = 1;
+    sp.next.ptr = &st[0]; st[0].next.ptr = &st[1]; st[1].next.ptr = &st[2]; st[2].next.ptr = &sby; sby.next.ptr = &dsp;
+    MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&sp);
+    if (!exec_begin_blit(e)) return;
+    memset(&k, 0, sizeof k);
+    k.type = WMTBlitCommandCopyFromTextureToTexture;
+    k.src = d->gui_tmp; k.src_size.width = bb->width; k.src_size.height = bb->height; k.src_size.depth = 1;
+    k.dst = bb->texture;
+    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+    if (InterlockedIncrement(&said) <= 4)
+        d3d12_log("[madeira-d3d12] gui-overlay: interface target '%s' %ux%u pf%u laid over the backbuffer %ux%u at %u,%u %ux%u\n",
+                  gui->name ? gui->name : "?", gui->width, gui->height, (unsigned)gui->tex_pf, bb->width, bb->height, prm.x0, prm.y0, prm.w, prm.h);
+}
 static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_compute_setpso c_pso;
     e->wr_all = 1;   /* ml1116: a dispatch writes through UAVs we do not enumerate here */
@@ -5830,7 +5897,23 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_QUERY_BEGIN: exec_query_begin(&e, c); break;     /* ml1088 */
         case MC_QUERY_END: exec_query_end(&e, c); break;
         case MC_QUERY_RESOLVE: exec_query_resolve(&e, c); break;
-        case MC_DRAW: case MC_DRAW_INDEXED: exec_draw(&e, c); break;
+        case MC_DRAW: case MC_DRAW_INDEXED:
+            if (g_gui_overlay < 0) {
+                g_gui_overlay = mad_cfg_int_pe("gui-overlay", 0) ? 1 : 0;
+                if (g_gui_overlay) d3d12_log("[madeira-d3d12] gui-overlay on (madeira.cfg gui-overlay = 1)\n");
+            }
+            if (g_gui_overlay && e.pso && e.nrt == 1 && e.rt[0] && e.rt[0]->texture &&
+                e.rt[0]->desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+                !(e.rt[0]->name && !strcmp(e.rt[0]->name, "Backbuffer")) &&
+                (!strcmp(e.pso->ps_name, "PS2D") || !strcmp(e.pso->ps_name, "PS_GUIMaterial")))
+                e.gui_rt = e.rt[0];
+            exec_draw(&e, c);
+            if (g_gui_overlay && e.gui_rt && e.pso && !strcmp(e.pso->ps_name, "StretchBlt") && e.nrt == 1 && e.rt[0] &&
+                e.rt[0] != e.gui_rt && e.rt[0]->name && !strcmp(e.rt[0]->name, "Backbuffer")) {
+                exec_gui_overlay(&e);
+                e.gui_rt = NULL;
+            }
+            break;
         case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: {
             struct mad_cmd t = *c; UINT k; UINT64 toff = 0;
             int tess = 0;

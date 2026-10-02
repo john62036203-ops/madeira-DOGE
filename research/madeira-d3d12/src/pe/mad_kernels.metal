@@ -47,3 +47,36 @@ kernel void mad_probe_words(device const uint *src [[buffer(0)]],
 fragment void mad_null_fragment()
 {
 }
+
+// madeira-doge: the RE Engine draws its interface (menus, text, movies) into a
+// separate premultiplied-alpha sRGB target and, with an upscaler / frame
+// generation configured, leaves putting it on screen to a vendor component
+// that does not run here; the final blit then carries only the scene. This
+// kernel lays that target over the backbuffer inside the blit's viewport.
+// Opt-in: madeira.cfg gui-overlay = 1.
+struct mad_gui_params {
+    uint x0, y0, w, h;
+};
+
+kernel void mad_gui_over(texture2d<float> gui [[texture(0)]],
+                         texture2d<float> bb [[texture(1)]],
+                         texture2d<float, access::write> dst [[texture(2)]],
+                         constant mad_gui_params &p [[buffer(0)]],
+                         uint2 gid [[thread_position_in_grid]])
+{
+    constexpr sampler smp(filter::linear, address::clamp_to_edge);
+    if (gid.x >= dst.get_width() || gid.y >= dst.get_height())
+        return;
+    float4 s = bb.read(gid);
+    if (p.w != 0 && p.h != 0 && gid.x >= p.x0 && gid.y >= p.y0 && gid.x < p.x0 + p.w && gid.y < p.y0 + p.h) {
+        float2 uv = (float2(gid - uint2(p.x0, p.y0)) + 0.5f) / float2(p.w, p.h);
+        float4 g = gui.sample(smp, uv, level(0));     // sRGB target: linear, premultiplied
+        float a = saturate(g.a);
+        float3 c = a > 1e-5f ? saturate(g.rgb / a) : float3(0.0f);
+        float3 lo = c * 12.92f;
+        float3 hi = 1.055f * pow(c, float3(1.0f / 2.4f)) - 0.055f;
+        float3 enc = float3(c.x <= 0.0031308f ? lo.x : hi.x, c.y <= 0.0031308f ? lo.y : hi.y, c.z <= 0.0031308f ? lo.z : hi.z);
+        s.rgb = enc * a + s.rgb * (1.0f - a);
+    }
+    dst.write(s, gid);
+}
