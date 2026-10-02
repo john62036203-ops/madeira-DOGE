@@ -7203,6 +7203,16 @@ static D3D12_RESOURCE_DESC1 * STDMETHODCALLTYPE res_GetDesc1(ID3D12Resource2 *Th
     memcpy(ret, &((struct mad_resource *)This)->desc, sizeof(D3D12_RESOURCE_DESC));   /* DESC is a prefix of DESC1 */
     return ret;
 }
+static HRESULT STDMETHODCALLTYPE res_GetHeapProperties(ID3D12Resource *This, D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS *flags) {
+    struct mad_resource *r = (struct mad_resource *)This;
+    if (props) {
+        memset(props, 0, sizeof *props);
+        props->Type = r->heap ? r->heap : D3D12_HEAP_TYPE_DEFAULT;
+        props->CreationNodeMask = 1; props->VisibleNodeMask = 1;
+    }
+    if (flags) *flags = D3D12_HEAP_FLAG_NONE;
+    return S_OK;
+}
 static D3D12_RESOURCE_DESC * STDMETHODCALLTYPE res_GetDesc(ID3D12Resource *This, D3D12_RESOURCE_DESC *ret) {
     *ret = ((struct mad_resource *)This)->desc;
     return ret;
@@ -12472,6 +12482,19 @@ static HRESULT STDMETHODCALLTYPE device_SetResidencyPriority(ID3D12Device10 *Thi
     (void)This; (void)n; (void)objs; (void)prio;
     return S_OK;                     /* unified memory: everything is resident */
 }
+/* RE Requiem evicts and re-admits its streaming buffers; E_NOTIMPL from Evict
+ * was fatal ("Fatal D3D error (3, E_NOTIMPL, 0x80004001)"). Nothing to do on
+ * unified memory: the objects stay where they are. */
+static HRESULT STDMETHODCALLTYPE device_MakeResident(ID3D12Device10 *This, UINT n, ID3D12Pageable *const *objs) {
+    (void)This; (void)n; (void)objs;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE device_Evict(ID3D12Device10 *This, UINT n, ID3D12Pageable *const *objs) {
+    static LONG said;
+    (void)This; (void)objs;
+    if (InterlockedIncrement(&said) == 1) d3d12_log("[madeira-d3d12] Evict(%u objects): accepted, nothing is paged out on unified memory\n", n);
+    return S_OK;
+}
 static HRESULT STDMETHODCALLTYPE device_EnqueueMakeResident(ID3D12Device10 *This, D3D12_RESIDENCY_FLAGS flags,
         UINT n, ID3D12Pageable *const *objs, ID3D12Fence *fence, UINT64 value) {
     (void)This; (void)flags; (void)n; (void)objs;
@@ -12760,6 +12783,8 @@ static void build_vtables(void) {
     g_device_vtbl.CreateCommandQueue1                = device_CreateCommandQueue1;
     g_device_vtbl.SetResidencyPriority               = device_SetResidencyPriority;
     g_device_vtbl.EnqueueMakeResident                = device_EnqueueMakeResident;
+    g_device_vtbl.MakeResident                       = device_MakeResident;
+    g_device_vtbl.Evict                              = device_Evict;
     g_device_vtbl.RemoveDevice                       = device_RemoveDevice;
     g_device_vtbl.SetBackgroundProcessingMode        = device_SetBackgroundProcessingMode;
     g_device_vtbl.SetEventOnMultipleFenceCompletion  = device_SetEventOnMultipleFenceCompletion;
@@ -12849,6 +12874,7 @@ static void build_vtables(void) {
     g_res_vtbl.Unmap = (void *)res_Unmap;
     g_res_vtbl.GetGPUVirtualAddress = (void *)res_GetGPUVirtualAddress;
     g_res_vtbl.GetDesc = (void *)res_GetDesc;
+    g_res_vtbl.GetHeapProperties = (void *)res_GetHeapProperties;
 
     madeira_fill_ID3D12GraphicsCommandList7(&g_list_vtbl);
     g_list_vtbl.GetDevice = (void *)list_GetDevice;
