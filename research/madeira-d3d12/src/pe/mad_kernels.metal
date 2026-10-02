@@ -40,3 +40,10 @@ kernel void mad_probe_words(device const uint *src [[buffer(0)]],
     if (i < n)
         dst[i] = src[i];
 }
+
+// A mesh render pipeline must have a fragment function even when the D3D12
+// pipeline has no pixel shader (depth-only tessellated or geometry draws):
+// Metal asserts "fragmentFunction must not be nil" and aborts the process.
+fragment void mad_null_fragment()
+{
+}

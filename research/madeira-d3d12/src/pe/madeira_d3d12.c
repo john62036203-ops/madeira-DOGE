@@ -311,7 +311,7 @@ struct mad_device {
     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
     struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
     struct { UINT32 value[4]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 16-byte period) */
-    obj_handle_t k_lib, k_tind_pso, k_ring; UINT64 k_ring_pos; int k_state; SRWLOCK k_lock;   /* madeira-bcd: helper kernels (mad_kernels.metal) */
+    obj_handle_t k_lib, k_tind_pso, k_ring, k_null_fs; UINT64 k_ring_pos; int k_state; SRWLOCK k_lock;   /* madeira-bcd: helper kernels (mad_kernels.metal) */
     obj_handle_t k_probe_pso; unsigned char *k_ring_cpu;   /* madeira-bcd: indirect-argument probes */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
     LUID adapter_luid;   /* madeira-bcd: GetAdapterLuid, the DXGI adapter it was created on */
@@ -3379,6 +3379,7 @@ static int mad_kernels_ready(struct mad_device *d) {
             if (err) mad_log_nserror("mad_tess_indirect_args", err);
             NSObject_release(fn);
         }
+        if (d->k_lib) d->k_null_fs = MTLLibrary_newFunction(d->k_lib, "mad_null_fragment");   /* kept: mesh pipelines without a pixel shader */
         fn = d->k_lib ? MTLLibrary_newFunction(d->k_lib, "mad_probe_words") : 0;
         if (fn) {
             memset(&ci, 0, sizeof ci); ci.compute_function = fn; err = 0;
@@ -10776,6 +10777,15 @@ static int mad_tess_build(struct mad_device *d, struct mad_rootsig *rs, struct m
         mp.raster_sample_count = rp->raster_sample_count;
         mp.depth_pixel_format = rp->depth_pixel_format; mp.stencil_pixel_format = rp->stencil_pixel_format;
         mp.object_function = t->obj[fmt].fn; mp.mesh_function = t->ds_fn; mp.fragment_function = p->ps_fn;
+        if (!mp.fragment_function) {   /* madeira-doge: Onimusha's depth-only tessellated draws; Metal aborts on a nil fragment function */
+            static LONG said_nofs;
+            mad_kernels_ready(d);
+            mp.fragment_function = d->k_null_fs;
+            if (InterlockedIncrement(&said_nofs) <= 4)
+                d3d12_log("[madeira-d3d12] mesh pipeline without a pixel shader (vs '%s'): %s\n", t->obj_name,
+                          mp.fragment_function ? "using the empty fragment function" : "no empty fragment function available, variant dropped");
+            if (!mp.fragment_function) continue;
+        }
         /* The compiler's fixed bindings (DXMT d3d11_pipeline_ts.cpp): vertex-buffer
          * table 16, draw arguments 21, vertex tables 27/28, hull tables 29/30 on
          * the object stage; domain tables 29/30 on the mesh stage. */
@@ -10885,6 +10895,15 @@ static int mad_gsx_build(struct mad_device *d, struct mad_rootsig *rs, struct ma
         mp.raster_sample_count = rp->raster_sample_count;
         mp.depth_pixel_format = rp->depth_pixel_format; mp.stencil_pixel_format = rp->stencil_pixel_format;
         mp.object_function = t->obj[fmt].fn; mp.mesh_function = t->ds_fn; mp.fragment_function = p->ps_fn;
+        if (!mp.fragment_function) {   /* madeira-doge: Onimusha's depth-only tessellated draws; Metal aborts on a nil fragment function */
+            static LONG said_nofs;
+            mad_kernels_ready(d);
+            mp.fragment_function = d->k_null_fs;
+            if (InterlockedIncrement(&said_nofs) <= 4)
+                d3d12_log("[madeira-d3d12] mesh pipeline without a pixel shader (vs '%s'): %s\n", t->obj_name,
+                          mp.fragment_function ? "using the empty fragment function" : "no empty fragment function available, variant dropped");
+            if (!mp.fragment_function) continue;
+        }
         /* DXMT's fixed bindings for a geometry pipeline: vertex-buffer table 16,
          * draw arguments 21, vertex tables 29/30 on the object stage; geometry
          * tables 29/30 on the mesh stage; the pixel stage's 29/30. The payload
