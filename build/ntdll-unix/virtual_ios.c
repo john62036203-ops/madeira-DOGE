@@ -11629,6 +11629,34 @@ static inline UINT64 maskbits( size_t idx )
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot );  /* fwd-decl */
 static void ios_swap_release_range( void *base, size_t size, int copy_back );   /* ml1077 fwd-decls */
 static void ios_swap_init( void );
+/* madeira-doge: is the calling pseudo-process a Steam game (image under
+ * \steamapps\common\)? Cached per PEB. */
+static int ios_swap_proc_is_game(void)
+{
+    static void *last_peb; static int last_res;
+    TEB *teb = NtCurrentTeb();
+    PEB *peb = teb ? teb->Peb : NULL;
+    RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+    static const char needle[] = "\\steamapps\\common\\";
+    const WCHAR *path; size_t len, i, j, n = sizeof(needle) - 1; int res = 0;
+    if (!peb) return 0;
+    if (peb == last_peb) return last_res;
+    if (!pp || !(path = pp->ImagePathName.Buffer)) return 0;   /* not cached: params not set yet */
+    if (!(pp->Flags & PROCESS_PARAMS_FLAG_NORMALIZED)) path = (const WCHAR *)((const char *)pp + (ULONG_PTR)path);
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (i = 0; !res && i + n <= len; i++)
+    {
+        for (j = 0; j < n; j++)
+        {
+            WCHAR c = path[i + j];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (WCHAR)needle[j]) break;
+        }
+        if (j == n) res = 1;
+    }
+    last_res = res; last_peb = peb;
+    return res;
+}
 static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot, struct file_view *view );
 static void ios_swap_back( void *base, size_t size, unsigned int vprot );
 
@@ -17496,10 +17524,12 @@ static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot,
          * band at 0xc00000000. Opt-in, untested on a device. */
         static int smallmap = -1;
         if (smallmap < 0) smallmap = getenv( "MADEIRA_SWAP_SMALLMAP" ) != NULL && getenv( "MADEIRA_SWAP_SMALLMAP" )[0] == '1';
-        /* Sekiro on a 63 GB map: every large commit landed at 0xc00000000 and up
-         * (3.3 GB there, 0 below), so the 48 GB ceiling turned all of it away and
-         * the app was jetsammed at 6132 MB. The ceiling is now the top of the map. */
-        if (!(smallmap && b >= 0x400000000ULL && b + size <= 0xfc0000000ULL))
+        /* Build 34 raised the ceiling to the top of the map and that file-backed
+         * FEX's own 16 MB arenas at 0xc00000000+ (backed/released per compile) in
+         * EVERY process: Valve's client hung before it started the game. So:
+         * the game process only, and [4 GB, 48 GB) -- guest reservations sit at
+         * 0x13.. - 0x14.. and 0xb5.., FEX's band above 48 GB stays anonymous. */
+        if (!(smallmap && b >= 0x100000000ULL && b + size <= 0xc00000000ULL && ios_swap_proc_is_game()))
         { if (big) ios_swap_no_band += size; return 0; }
     }
     if (size < ios_swap_min) { if (big) ios_swap_no_small += size; return 0; }
