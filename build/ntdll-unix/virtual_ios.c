@@ -13927,6 +13927,14 @@ static int ios_guest_rwx_is_host_data( const void *base, size_t size )
 #endif
 }
 
+static int ios_hexval( char c )
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
 #ifdef WINE_IOS
@@ -14977,6 +14985,65 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                 dprintf( 2, "[rva-dump] +%lx %s\n", rva + i, line );
                             }
                         }
+                        while (*p == ',' || *p == ' ') p++;
+                    }
+                }
+            }
+
+            /* madeira-doge: byte-patch guest code of an image at load.
+             * MADEIRA_PATCH_RVA is "rva:oldhex>newhex[,rva:oldhex>newhex...]"
+             * (at most 8 patches of 64 bytes). A patch applies to any image
+             * whose bytes at rva equal oldhex, so no module name is needed and
+             * a different build of the game is left alone. Both the mapped
+             * image and its pool copy are written so whichever one the
+             * translator reads sees the patch. */
+            {
+                const char *spec = getenv( "MADEIRA_PATCH_RVA" );
+                if (spec && *spec)
+                {
+                    const char *p = spec;
+                    int n = 0;
+                    while (*p && n++ < 8)
+                    {
+                        char *e;
+                        unsigned char ob[64], nb[64];
+                        unsigned long rva = strtoul( p, &e, 16 ), olen = 0, nlen = 0;
+                        int part;
+                        if (e == p || *e != ':') break;
+                        p = e + 1;
+                        for (part = 0; part < 2; part++)
+                        {
+                            unsigned char *dst = part ? nb : ob;
+                            unsigned long *cnt = part ? &nlen : &olen;
+                            for (;;)
+                            {
+                                int hi = ios_hexval( p[0] ), lo = hi < 0 ? -1 : ios_hexval( p[1] );
+                                if (lo < 0 || *cnt >= 64) break;
+                                dst[(*cnt)++] = (unsigned char)(hi << 4 | lo);
+                                p += 2;
+                            }
+                            if (!part) { if (*p != '>') break; p++; }
+                        }
+                        if (olen && olen == nlen && rva + olen <= image_size &&
+                            !memcmp( (char *)image_base + rva, ob, olen ))
+                        {
+                            char *img = (char *)image_base + rva;
+                            char *pg = (char *)((uintptr_t)img & ~(uintptr_t)page_mask);
+                            size_t pgsz = ROUND_SIZE( img, olen, page_mask );
+                            int img_ok = 0;
+                            if (!mprotect( pg, pgsz, PROT_READ | PROT_WRITE ))
+                            {
+                                memcpy( img, nb, nlen );
+                                mprotect( pg, pgsz, PROT_READ );
+                                img_ok = 1;
+                            }
+                            memcpy( (char *)jit_rw_base + offset + rva, nb, nlen );
+                            sys_icache_invalidate( (char *)jit_rx_base + offset + rva, nlen );
+                            dprintf( 2, "[rva-patch] %s rva=0x%lx len=%lu APPLIED image=%s pool=ok\n",
+                                     ios_pe_module_name( image_base, image_size ), rva, nlen,
+                                     img_ok ? "ok" : "FAILED" );
+                        }
+                        while (*p && *p != ',') p++;
                         while (*p == ',' || *p == ' ') p++;
                     }
                 }
