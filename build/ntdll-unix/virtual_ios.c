@@ -15030,20 +15030,36 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                             !memcmp( (char *)image_base + rva, ob, olen ))
                         {
                             char *img = (char *)image_base + rva;
-                            char *pg = (char *)((uintptr_t)img & ~(uintptr_t)page_mask);
-                            size_t pgsz = ROUND_SIZE( img, olen, page_mask );
-                            int img_ok = 0;
-                            if (!mprotect( pg, pgsz, PROT_READ | PROT_WRITE ))
+                            /* host pages are 16 KB: aligning to the 4 KB guest page made
+                             * mprotect fail (EINVAL) and left the mapped image unpatched. */
+                            char *pg = (char *)((uintptr_t)img & ~(uintptr_t)host_page_mask);
+                            size_t pgsz = ROUND_SIZE( img, olen, host_page_mask );
+                            int img_ok = 0, img_err = 0, restore = PROT_READ;
+                            {
+                                mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)pg;
+                                mach_vm_size_t rs = 0;
+                                vm_region_basic_info_data_64_t ri;
+                                mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+                                mach_port_t ro = MACH_PORT_NULL;
+                                if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                                    (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS &&
+                                    ra <= (mach_vm_address_t)(uintptr_t)pg)
+                                    restore = ri.protection & (PROT_READ | PROT_WRITE);
+                            }
+                            if (!mprotect( pg, pgsz, PROT_READ | PROT_WRITE ) ||
+                                vm_protect( mach_task_self(), (vm_address_t)pg, pgsz, FALSE,
+                                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY ) == KERN_SUCCESS)
                             {
                                 memcpy( img, nb, nlen );
-                                mprotect( pg, pgsz, PROT_READ );
+                                mprotect( pg, pgsz, restore );
                                 img_ok = 1;
                             }
+                            else img_err = errno;
                             memcpy( (char *)jit_rw_base + offset + rva, nb, nlen );
                             sys_icache_invalidate( (char *)jit_rx_base + offset + rva, nlen );
-                            dprintf( 2, "[rva-patch] %s rva=0x%lx len=%lu APPLIED image=%s pool=ok\n",
+                            dprintf( 2, "[rva-patch] %s rva=0x%lx len=%lu APPLIED image=%s(errno %d, prot %d) pool=ok\n",
                                      ios_pe_module_name( image_base, image_size ), rva, nlen,
-                                     img_ok ? "ok" : "FAILED" );
+                                     img_ok ? "ok" : "FAILED", img_err, restore );
                         }
                         while (*p && *p != ',') p++;
                         while (*p == ',' || *p == ' ') p++;
