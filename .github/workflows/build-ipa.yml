@@ -982,7 +982,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: wine/build-arm64ec
-          key: wine-arm64ec-${{ steps.winerev.outputs.sha }}-v1
+          key: wine-arm64ec-${{ steps.winerev.outputs.sha }}-v2-wg
 
       - name: Build extra Wine DLLs for arm64ec
         continue-on-error: true
@@ -994,7 +994,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: wine/build-arm64ec
-          key: wine-arm64ec-${{ steps.winerev.outputs.sha }}-v1
+          key: wine-arm64ec-${{ steps.winerev.outputs.sha }}-v2-wg
 
       # d3d10/avifil32/vulkan-1 stand-ins from Wine's .spec export lists:
       # Crysis Remastered imports all three and fails to load without them.
