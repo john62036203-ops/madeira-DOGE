@@ -17496,7 +17496,10 @@ static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot,
          * band at 0xc00000000. Opt-in, untested on a device. */
         static int smallmap = -1;
         if (smallmap < 0) smallmap = getenv( "MADEIRA_SWAP_SMALLMAP" ) != NULL && getenv( "MADEIRA_SWAP_SMALLMAP" )[0] == '1';
-        if (!(smallmap && b >= 0x400000000ULL && b + size <= 0xc00000000ULL))
+        /* Sekiro on a 63 GB map: every large commit landed at 0xc00000000 and up
+         * (3.3 GB there, 0 below), so the 48 GB ceiling turned all of it away and
+         * the app was jetsammed at 6132 MB. The ceiling is now the top of the map. */
+        if (!(smallmap && b >= 0x400000000ULL && b + size <= 0xfc0000000ULL))
         { if (big) ios_swap_no_band += size; return 0; }
     }
     if (size < ios_swap_min) { if (big) ios_swap_no_small += size; return 0; }
