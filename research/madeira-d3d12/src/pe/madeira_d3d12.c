@@ -2357,6 +2357,36 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
                       (unsigned long long)e->root[k], pp->type != MADEIRA_IR_PARAM_CONSTANTS && !e->root[k] ? "  <== NEVER SET" : "");
         }
         d3d12_log("[capture-draw] pixel stage declares %u argument range(s); srv heap %s\n", e->pso->ps_nair, e->srv ? "bound" : "NOT BOUND");
+        /* each table's descriptors, as the draw will see them (this backend binds
+         * through the root signature, so there are no per-stage ranges to walk) */
+        for (k = 0; k < e->rs->nparams && k < MAD_ROOT_PARAM_MAX; k++) {
+            const struct madeira_ir_root_param *pp = &e->rs->params[k]; unsigned j, running = 0;
+            if (pp->type != MADEIRA_IR_PARAM_TABLE || !e->root[k]) continue;
+            for (j = 0; j < pp->num_ranges && pp->first_range + j < e->rs->nranges; j++) {
+                const struct madeira_ir_root_range *rr = &e->rs->ranges[pp->first_range + j];
+                unsigned off = rr->table_offset == 0xffffffffu ? running : rr->table_offset, q, nq;
+                struct mad_heap *h = rr->range_type == 3 ? e->smp : e->srv;
+                if (rr->num_descriptors != ~0u) running = off + rr->num_descriptors;
+                nq = rr->num_descriptors == ~0u ? 2 : rr->num_descriptors > 4 ? 4 : rr->num_descriptors;
+                if (!h || !h->cpu || e->root[k] < h->gpu_address) {
+                    d3d12_log("[capture-draw]   root %u range %u (type %u reg %u space %u x%u): heap not bound or table outside it\n",
+                              k, j, (unsigned)rr->range_type, rr->base_register, rr->register_space, rr->num_descriptors);
+                    continue;
+                }
+                for (q = 0; q < nq; q++) {
+                    UINT64 idx = (e->root[k] - h->gpu_address) / sizeof(struct mad_descriptor) + off + q; int xv = -1;
+                    const struct mad_descriptor *de; struct mad_resource *tr;
+                    if (idx >= h->count) { d3d12_log("[capture-draw]   root %u range %u [%u]: past the end of the heap\n", k, j, q); break; }
+                    de = &h->cpu[idx];
+                    tr = de->texture_view_id ? mad_texture_of_view(e->q->device, de->texture_view_id, &xv) : NULL;
+                    d3d12_log("[capture-draw]   root %u range %u (type %u reg %u space %u) [%u]: view %llu va %#llx meta %#llx -> %s %ux%u pf%u dx%u\n",
+                              k, j, (unsigned)rr->range_type, rr->base_register + q, rr->register_space, q,
+                              (unsigned long long)de->texture_view_id, (unsigned long long)de->gpu_va, (unsigned long long)de->metadata,
+                              tr ? (tr->name ? tr->name : "texture") : de->texture_view_id ? "NO LIVE TEXTURE" : de->gpu_va ? "buffer" : "NULL DESCRIPTOR",
+                              tr ? tr->width : 0, tr ? tr->height : 0, tr ? (unsigned)tr->tex_pf : 0, tr ? (unsigned)tr->desc.Format : 0);
+                }
+            }
+        }
     }
     for (k = 0; k < 16; k++) if (e->vb[k].res) mad_capture_buffer(e, benc, e->vb[k].res, e->vb[k].off, 65536, "vb", k, seq);
     if (e->ib) mad_capture_buffer(e, benc, e->ib, e->ib_off, 65536, "ib", 0, seq);
