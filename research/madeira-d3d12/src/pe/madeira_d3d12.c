@@ -11994,8 +11994,22 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
                       what, why, u.res->name ? u.res->name : "?", u.res->width, u.res->height, u.level, (unsigned)u.fmt);
     }
     bpp = u.res->samples > 1 ? 0 : mad_pack_clear(u.fmt, v, is_float, px);
-    if (bpp) mad_format_info(u.res->desc.Format, &rbytes, &rblock);
-    if (bpp && rblock == 1 && rbytes && rbytes != bpp) bpp = 0;   /* the view must cover whole texels */
+    if (u.res->samples <= 1) mad_format_info(u.res->desc.Format, &rbytes, &rblock);
+    if (rblock == 1 && rbytes && rbytes != bpp) {
+        /* madeira-doge: the view's format does not describe this resource's
+         * texels -- a view recorded for another resource (Onimusha clears a
+         * 256x144 texture every frame through one, and the clear was skipped,
+         * so the texture kept accumulating), or a format the packer does not
+         * know. Pack with the resource's own format; and a clear to all zeros
+         * is the same bytes in every uncompressed format. */
+        bpp = mad_pack_clear(u.res->desc.Format, v, is_float, px);
+        if (bpp != rbytes) {
+            bpp = 0;
+            if (!(v[0] | v[1] | v[2] | v[3]) && (rbytes == 1 || rbytes == 2 || rbytes == 4 || rbytes == 8 || rbytes == 16)) {
+                memset(px, 0, 16); bpp = rbytes;
+            }
+        }
+    }
     memcpy(w, px, 16);
     if (bpp == 1) pat = px[0] * 0x01010101u;
     else if (bpp == 2) { pat = (UINT32)px[0] | ((UINT32)px[1] << 8); pat |= pat << 16; }
