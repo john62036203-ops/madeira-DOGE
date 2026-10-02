@@ -1171,6 +1171,34 @@ static int get_next_timeout( struct timespec *ts )
     return ret;
 }
 
+/* madeira-doge: is this poll user's fd a pipe?  Cached per (user,fd) like
+ * ios_fd_is_inet below; one fstat per new pairing. */
+static signed char ios_fd_is_fifo( int user, int fd )
+{
+    static int *cache_fd;
+    static signed char *cache_val;
+    static int cache_size;
+
+    if (user >= cache_size)
+    {
+        int newsize = (user + 64) & ~63;
+        int *nfd = realloc( cache_fd, newsize * sizeof(*nfd) );
+        signed char *nval = realloc( cache_val, newsize );
+        if (nfd) cache_fd = nfd;
+        if (nval) cache_val = nval;
+        if (!nfd || !nval) return 0;
+        memset( nfd + cache_size, 0xff, (newsize - cache_size) * sizeof(*nfd) );
+        cache_size = newsize;
+    }
+    if (cache_fd[user] != fd)
+    {
+        struct stat st;
+        cache_fd[user] = fd;
+        cache_val[user] = !fstat( fd, &st ) && S_ISFIFO( st.st_mode );
+    }
+    return cache_val[user];
+}
+
 /* server main poll() loop */
 /* iOS-Madeira 2026-07-05 (Steam S0): the sandbox poll() limitation is
  * specific to the AF_UNIX master socketpair — real INET sockets (TCP/
@@ -1275,6 +1303,12 @@ void main_loop(void)
         int session_processes = -1;
         unsigned int session_notes = 0;
         unsigned long long ios_next_timer_ns = ~0ull;  /* ns until next timer (deadline-aware sleep) */
+        /* madeira-doge: see the pipe poll before the client-fd scan below. */
+        static int ios_pipe_poll = -1;
+        static short *ios_pipe_rev;
+        static int ios_pipe_rev_size;
+        static unsigned long long ios_c_pipe_polled, ios_c_pipe_ready, ios_c_pipe_full;
+        int ios_pipe_idle = 1, ios_pipe_n = 0;
 
         /* iOS socketpair bypass: check for injected client fd from app bridge */
         extern volatile int g_injected_client_fd;
@@ -1499,8 +1533,8 @@ void main_loop(void)
                         wts.tv_sec = (unsigned int)(sleep_ns / 1000000000ull);
                         wts.tv_nsec = (int)(sleep_ns % 1000000000ull);
                         wkr = semaphore_timedwait( ios_srv_wake_sem, wts );
-                        if (wkr == KERN_OPERATION_TIMED_OUT) ios_c_semto++;
-                        else ios_c_semret++;
+                        if (wkr == KERN_OPERATION_TIMED_OUT) { ios_c_semto++; ios_pipe_idle = 1; }
+                        else { ios_c_semret++; ios_pipe_idle = 0; }
                     }
                     else if (ios_srv_wake_sem && nosem)
                     {
@@ -1606,6 +1640,74 @@ void main_loop(void)
                 }
             }
 
+            /* madeira-doge: ONE poll() FOR THE REQUEST PIPES.
+             *
+             * Every client fd used to get a synthetic POLLIN on every
+             * iteration, i.e. one failing read() per thread of every process
+             * per request served. With Sekiro and Steam that is ~150 reads to
+             * reach the one pipe that has data: the server thread sat at 58%
+             * of a core and each request took ~110 us inside the call (1.1
+             * cores of client time at 9 k requests/s). The synthesis exists
+             * for the AF_UNIX pair, which the sandbox will not poll; a
+             * thread's request fd is a plain pipe, which it will. So pipes
+             * are asked in one zero-timeout poll() per 64 and only the ready
+             * ones are dispatched.
+             *
+             * Belt and braces: an iteration that follows an idle tick (the
+             * wake semaphore timed out) and every 16th busy one still scan
+             * everything the old way, so a readiness the poll failed to
+             * report costs at most a millisecond, never a hang.
+             * MADEIRA_SRV_PIPEPOLL=0 restores the old loop. */
+            {
+                int full = 1;
+                if (ios_pipe_poll < 0)
+                {
+                    const char *e = getenv( "MADEIRA_SRV_PIPEPOLL" );
+                    ios_pipe_poll = !(e && *e == '0');
+                    ws_log( "[srv-poll] madeira-doge pipe poll %s", ios_pipe_poll ? "ON" : "off" );
+                }
+                if (ios_pipe_poll && !ios_pipe_idle && (ios_iter & 15) && ios_client_fd_start >= 0)
+                {
+                    if (nb_users > ios_pipe_rev_size)
+                    {
+                        int newsize = (nb_users + 255) & ~255;
+                        short *nr = realloc( ios_pipe_rev, newsize * sizeof(*nr) );
+                        if (nr) { ios_pipe_rev = nr; ios_pipe_rev_size = newsize; }
+                    }
+                    if (nb_users <= ios_pipe_rev_size)
+                    {
+                        struct pollfd pp[64];
+                        int pp_user[64], npp = 0, k, last = nb_users;
+                        full = 0;
+                        for (i = ios_client_fd_start; i <= last; i++)
+                        {
+                            if (i < last)
+                            {
+                                ios_pipe_rev[i] = -1;   /* not a polled pipe: old synthesis */
+                                if (pollfd[i].fd < 0 || !(pollfd[i].events & POLLIN)) continue;
+                                if (ios_fd_is_inet( i, pollfd[i].fd ) || !ios_fd_is_fifo( i, pollfd[i].fd )) continue;
+                                ios_pipe_rev[i] = 0;
+                                pp[npp].fd = pollfd[i].fd; pp[npp].events = POLLIN; pp[npp].revents = 0;
+                                pp_user[npp++] = i;
+                                if (npp < 64) continue;
+                            }
+                            if (!npp) continue;
+                            ios_c_pipe_polled += npp;
+                            if (poll( pp, npp, 0 ) > 0)
+                                for (k = 0; k < npp; k++)
+                                    if (pp[k].revents) { ios_pipe_rev[pp_user[k]] = POLLIN; ios_c_pipe_ready++; }
+                            npp = 0;
+                        }
+                    }
+                }
+                if (full) ios_c_pipe_full++;
+                else ios_pipe_n = nb_users;
+                ios_pipe_idle = full ? 2 : 0;   /* 2 = this iteration scans everything */
+                if (!(ios_iter % 50000))
+                    dprintf( 2, "[srv-poll] madeira-doge pipe poll %s: iter=%d users=%d, %llu pipes asked, %llu ready, %llu full scans\n",
+                             ios_pipe_poll ? "on" : "off", ios_iter, nb_users, ios_c_pipe_polled, ios_c_pipe_ready, ios_c_pipe_full );
+            }
+
             /* Check non-master fds for events.
              * Init fds (signal pipes, files): use ioctl(FIONREAD) — works for pipes/files.
              * Client fds (socketpair, request pipe): always try non-blocking read —
@@ -1624,9 +1726,18 @@ void main_loop(void)
                         if (ios_client_fd_start >= 0 && i >= ios_client_fd_start)
                         {
                             /* Client fd (socketpair/pipe from injection) —
-                             * always try, ioctl broken for AF_UNIX on iOS */
-                            revents |= POLLIN;
-                            ios_c_synin++;
+                             * always try, ioctl broken for AF_UNIX on iOS.
+                             * madeira-doge: unless this is a pipe the poll
+                             * above just reported as having nothing. */
+                            if (ios_pipe_idle != 2 && i < ios_pipe_n && ios_pipe_rev[i] == 0)
+                            {
+                                if (!(pollfd[i].events & POLLOUT)) continue;
+                            }
+                            else
+                            {
+                                revents |= POLLIN;
+                                ios_c_synin++;
+                            }
                         }
                         else
                         {
