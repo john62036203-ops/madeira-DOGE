@@ -1126,8 +1126,15 @@ struct ContentView: View {
                 .padding(.horizontal, 10)
                 .padding(.top, 6)
             }
-            Spacer(minLength: 0)
-            Label("Rotate for full screen and touch controls", systemImage: "rotate.right")
+            // madeira-doge: the free area becomes the portrait controller's; the
+            // controls window (TouchControlsOverlay) draws it there.
+            GeometryReader { g in
+                Color.clear
+                    .onAppear { TouchControlsModel.shared.setPortraitPad(g.frame(in: .global)) }
+                    .onChange(of: g.frame(in: .global)) { _, f in TouchControlsModel.shared.setPortraitPad(f) }
+                    .onDisappear { TouchControlsModel.shared.setPortraitPad(.zero) }
+            }
+            Label("Rotate for full screen", systemImage: "rotate.right")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .padding(.bottom, 10)
@@ -1145,6 +1152,7 @@ struct ContentView: View {
         .sheet(isPresented: $sessionPanelOpen) {
             SessionPanelView(onClose: { sessionPanelOpen = false })
         }
+        .onChange(of: sessionPanelOpen) { _, open in TouchControlsModel.shared.portraitSuspended = open }
     }
 
     private func sessionBarButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
@@ -3117,6 +3125,36 @@ final class TouchControlsModel: ObservableObject {
     /// ml1970: no controls file existed at launch, so the built-in controller
     /// layout may be applied once (ControlPresetsModel.applyDefaultIfNeeded).
     var needsDefaultLayout = false
+    /// madeira-doge: portrait controller. `portraitRect` is the free area under
+    /// the game in a library session (window coordinates; .zero when there is
+    /// none), and `portraitControls` the controller laid out for it. Transient.
+    @Published private(set) var portraitRect: CGRect = .zero
+    @Published private(set) var portraitControls: [TouchControl] = []
+    /// The portrait Session sheet is up: the controls window sits above it, so
+    /// the controller must neither draw nor take touches meanwhile.
+    @Published var portraitSuspended = false
+
+    func setPortraitPad(_ rect: CGRect) {
+        let r = rect.width >= 240 && rect.height >= 200 ? rect.integral : .zero
+        guard r != portraitRect else { return }
+        portraitRect = r
+        let pad = MainActor.assumeIsolated { GamepadInput.touchEnabled }
+        portraitControls = (r.isEmpty || !pad) ? []
+            : ControlPresetLayout.portraitPad(width: Double(r.width), height: Double(r.height))
+        fputs("[controls] portrait pad rect=\(r) controls=\(portraitControls.count)\n", stderr)
+    }
+
+    /// Does this WINDOW point land on a portrait control?
+    func hitsPortrait(_ p: CGPoint) -> Bool {
+        guard visible, !portraitSuspended, !portraitRect.isEmpty else { return false }
+        for c in portraitControls {
+            let r = Self.baseDiameter * CGFloat(c.scale) / 2
+            let cx = portraitRect.minX + CGFloat(c.nx) * portraitRect.width
+            let cy = portraitRect.minY + CGFloat(c.ny) * portraitRect.height
+            if hypot(p.x - cx, p.y - cy) <= r + 4 { return true }
+        }
+        return false
+    }
     private var editBaseline: [TouchControl] = []
 
     private var loading = false
@@ -3207,8 +3245,11 @@ final class ControlsWindow: UIWindow {
         // would be dead wherever they are not over the top bar or a control.
         if ControlPresetsModel.enabled, let root = rootViewController?.view,
            let hit = super.hitTest(point, with: event), hit !== self, !hit.isDescendant(of: root) { return hit }
-        // Portrait draws nothing here, so it must consume nothing.
-        guard bounds.width > bounds.height else { return nil }
+        // Portrait draws only the session controller (madeira-doge); everything
+        // else belongs to the app window underneath.
+        guard bounds.width > bounds.height else {
+            return m.hitsPortrait(point) ? super.hitTest(point, with: event) : nil
+        }
         guard m.hitsInteractive(point, in: bounds) else { return nil }
         return super.hitTest(point, with: event)
     }
@@ -3276,6 +3317,16 @@ struct TouchControlsOverlay: View {
                             .shadow(radius: 24)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
+                } else if m.visible && !m.portraitControls.isEmpty && !m.sessionPanel && !m.portraitSuspended {
+                    // madeira-doge: the controller under the game in portrait.
+                    ZStack {
+                        ForEach(m.portraitControls) { c in
+                            TouchControlButton(control: c, screen: m.portraitRect.size)
+                        }
+                    }
+                    .frame(width: m.portraitRect.width, height: m.portraitRect.height)
+                    .position(x: m.portraitRect.midX, y: m.portraitRect.midY)
+                    .opacity(m.opacity)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
@@ -3286,14 +3337,16 @@ struct TouchControlsOverlay: View {
             .onChange(of: m.controls) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape) }
+            .onChange(of: m.portraitControls) { _, _ in configureGamepad(landscape: landscape) }
             .onDisappear { GamepadInput.shared.configureTouch(controls: []) }
         }
         .ignoresSafeArea()
     }
 
     private func configureGamepad(landscape: Bool) {
-        let ids = landscape && m.visible && !m.editing
-            ? m.controls.filter { $0.action.padName.map(TouchPadAction.supported) ?? false }.map(\.id) : []
+        let source = landscape ? m.controls : m.portraitControls
+        let ids = m.visible && !m.editing
+            ? source.filter { $0.action.padName.map(TouchPadAction.supported) ?? false }.map(\.id) : []
         GamepadInput.shared.configureTouch(controls: Set(ids))
     }
 

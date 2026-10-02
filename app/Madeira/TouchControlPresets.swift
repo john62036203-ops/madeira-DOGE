@@ -157,6 +157,57 @@ enum ControlPresetLayout {
     }
 }
 
+extension ControlPresetLayout {
+    /// madeira-doge: the controller for PORTRAIT, laid out for the free area
+    /// under the game (width x height in points, normalised to that area):
+    ///
+    ///   LT LB        View Menu        RB RT
+    ///   D-pad                       A/B/X/Y
+    ///   LS         L3        R3         RS
+    ///
+    /// Everything shrinks together when the area is smaller than 400 x 360.
+    static func portraitPad(width W: Double, height H: Double) -> [TouchControl] {
+        guard W >= 240, H >= 200 else { return [] }
+        let k = min(1.0, W / 400, H / 360)
+        var out: [TouchControl] = []
+        func add(_ name: String, _ scale: Double, _ x: Double, _ y: Double) {
+            var c = TouchControl()
+            c.action = .pad(name)
+            c.scale = scale * k
+            c.nx = x / W
+            c.ny = y / H
+            out.append(c)
+        }
+        let side = 84 * k                      // centre line of each side cluster
+        let topY = 30 * k
+        add("LT", 0.66, 30 * k, topY)
+        add("LB", 0.66, 80 * k, topY)
+        add("RB", 0.66, W - 80 * k, topY)
+        add("RT", 0.66, W - 30 * k, topY)
+        add("View", 0.58, W / 2 - 26 * k, topY)
+        add("Menu", 0.58, W / 2 + 26 * k, topY)
+
+        let stickY = H - 58 * k
+        let midY = max(topY + 80 * k, min(topY + 108 * k, stickY - 118 * k))
+        let arm = 44 * k
+        add("D↑", 0.62, side, midY - arm)
+        add("D←", 0.62, side - arm, midY)
+        add("D→", 0.62, side + arm, midY)
+        add("D↓", 0.62, side, midY + arm)
+        let o = 42 * k
+        add("Y", 0.68, W - side, midY - o)
+        add("X", 0.68, W - side - o, midY)
+        add("B", 0.68, W - side + o, midY)
+        add("A", 0.68, W - side, midY + o)
+
+        add("LS", 1.35, side, stickY)
+        add("RS", 1.35, W - side, stickY)
+        add("L3", 0.56, W / 2 - 30 * k, stickY + 16 * k)
+        add("R3", 0.56, W / 2 + 30 * k, stickY + 16 * k)
+        return out
+    }
+}
+
 /// The layout list: built-ins (read-only, in code), then the user's own
 /// (persisted). Pure value type; `ControlPresetsModel` owns the file.
 struct ControlPresetStore: Equatable {
