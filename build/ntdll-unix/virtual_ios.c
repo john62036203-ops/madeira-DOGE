@@ -13933,6 +13933,97 @@ static int ios_guest_rwx_is_host_data( const void *base, size_t size )
 #endif
 }
 
+/* madeira-doge: stop GetTickCount & co. from faulting.
+ *
+ * kernel32/kernelbase read KUSER_SHARED_DATA through the architectural
+ * constant 0x7ffe0000 (`mov wN,#off; movk wN,#0x7ffe,lsl#16; ldr ..,[xN,#d]`).
+ * iOS cannot map that address, so every such read is a Mach exception that
+ * the exception thread emulates. Sekiro's main loop spins on GetTickCount:
+ * about half of all exceptions in a gameplay log were that one load, with
+ * the exception thread at 50-90% of a core. Rewrite the pair to build the
+ * real (relocated) address and fold the offset into the loads:
+ *   movz xN,#(R>>32),lsl#32 ; movk xN,#(R>>16),lsl#16 ; ldr ..,[xN,#off+d]
+ * which needs R to be 64 KB aligned. Anything that does not match the exact
+ * shape is left alone and keeps working through the emulation path.
+ * MADEIRA_USD_PATCH=0 disables. Returns the number of sites patched. */
+static int ios_usd_patch_text( unsigned char *img, size_t image_size, unsigned char *out,
+                               unsigned int *rvas, unsigned int (*words)[12], unsigned int *lens, int max_rvas )
+{
+    unsigned long long real = (unsigned long long)(uintptr_t)user_shared_data;
+    unsigned int pe, nsec, optsz, i, hits = 0;
+
+    if ((real & 0xffff) || real < 0x100000000ull || (real >> 48)) return 0;
+    if (image_size < 0x400 || img[0] != 'M' || img[1] != 'Z') return 0;
+    memcpy( &pe, img + 0x3c, 4 );
+    if (pe > image_size - 0x200 || memcmp( img + pe, "PE\0\0", 4 )) return 0;
+    nsec = img[pe + 6] | img[pe + 7] << 8;
+    optsz = img[pe + 20] | img[pe + 21] << 8;
+    for (i = 0; i < nsec && i < 32; i++)
+    {
+        const unsigned char *sh = img + pe + 24 + optsz + 40 * i;
+        unsigned int vsize, va, chars, k;
+        if ((size_t)(sh - img) + 40 > image_size) break;
+        memcpy( &vsize, sh + 8, 4 ); memcpy( &va, sh + 12, 4 ); memcpy( &chars, sh + 36, 4 );
+        if (!(chars & 0x20000000) || va >= image_size) continue;   /* IMAGE_SCN_MEM_EXECUTE */
+        if (vsize > image_size - va) vsize = image_size - va;
+        for (k = 0; k + 64 <= vsize; k += 4)
+        {
+            unsigned int w[12], reg, off, j, nload = 0, ok = 0;
+            memcpy( w, img + va + k, sizeof(w) );
+            /* movz wN,#off ; movk wN,#0x7ffe,lsl#16 */
+            if ((w[0] & 0xffe00000) != 0x52800000) continue;
+            reg = w[0] & 31;
+            if (w[1] != (0x72a00000 | 0x7ffe << 5 | reg)) continue;
+            off = (w[0] >> 5) & 0xffff;
+            for (j = 2; j < 12; j++)
+            {
+                unsigned int x = w[j];
+                if ((x & 0x3fc00000) == 0x39400000 && ((x >> 5) & 31) == reg)
+                {
+                    /* LDR/LDRB/LDRH (unsigned offset) off our base, no SIMD */
+                    unsigned int size = x >> 30, imm = (x >> 10) & 0xfff;
+                    if ((x & 31) == reg || (off & ((1u << size) - 1))) break;
+                    imm += off >> size;
+                    if (imm > 0xfff) break;
+                    w[j] = (x & ~(0xfffu << 10)) | imm << 10;
+                    nload++;
+                    continue;
+                }
+                if (!nload) break;
+                if (x == 0xd65f03c0) { ok = 1; break; }                       /* ret */
+                if ((x & 0xff000010) == 0x54000000)                          /* b.cond, backwards into the loads */
+                {
+                    int d = (int)(x << 8) >> 13;
+                    if (d < 0 && (int)j + d >= 2) continue;
+                    break;
+                }
+                if ((x & 0x7f20001f) == 0x6b00001f &&                        /* cmp reg,reg */
+                    ((x >> 5) & 31) != reg && ((x >> 16) & 31) != reg) continue;
+                if ((x & 0x7f200000) == 0x2a000000 &&                        /* orr xd,xa,xb */
+                    ((x >> 5) & 31) != reg && ((x >> 16) & 31) != reg)
+                {
+                    if ((x & 31) == reg) { ok = 1; break; }                  /* base overwritten: dead */
+                    continue;
+                }
+                break;
+            }
+            if (!ok) continue;
+            w[0] = 0xd2c00000 | (unsigned int)((real >> 32) & 0xffff) << 5 | reg;   /* movz xN,#hi,lsl#32 */
+            w[1] = 0xf2a00000 | (unsigned int)((real >> 16) & 0xffff) << 5 | reg;   /* movk xN,#mid,lsl#16 */
+            memcpy( out + va + k, w, j * 4 );
+            if ((int)hits < max_rvas)
+            {
+                rvas[hits] = va + k;
+                lens[hits] = j * 4;
+                memcpy( words[hits], w, j * 4 );
+            }
+            hits++;
+            k += j * 4 - 4;
+        }
+    }
+    return hits;
+}
+
 static int ios_hexval( char c )
 {
     if (c >= '0' && c <= '9') return c - '0';
@@ -15068,6 +15159,51 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         while (*p && *p != ',') p++;
                         while (*p == ',' || *p == ' ') p++;
                     }
+                }
+            }
+
+            /* madeira-doge: point kernel32/kernelbase tick-count reads at the
+             * real KUSER_SHARED_DATA (see ios_usd_patch_text). The pool copy is
+             * what executes; the mapped image is patched too so a later
+             * image->pool resync cannot bring the faulting form back. */
+            {
+                const char *mn = ios_pe_module_name( image_base, image_size );
+                const char *sw = getenv( "MADEIRA_USD_PATCH" );
+                if (mn && (!sw || *sw != '0') &&
+                    (!strncasecmp( mn, "kernel32", 8 ) || !strncasecmp( mn, "kernelbase", 10 )))
+                {
+                    unsigned int rvas[16], lens[16], words[16][12];
+                    unsigned char *pool = (unsigned char *)jit_rw_base + offset;
+                    int n = ios_usd_patch_text( (unsigned char *)image_base, image_size, pool, rvas, words, lens, 16 ), i, img_ok = 0;
+                    for (i = 0; i < n && i < 16; i++)
+                    {
+                        char *img = (char *)image_base + rvas[i];
+                        char *pg = (char *)((uintptr_t)img & ~(uintptr_t)host_page_mask);
+                        size_t pgsz = ROUND_SIZE( img, lens[i], host_page_mask );
+                        int restore = PROT_READ;
+                        {
+                            mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)pg;
+                            mach_vm_size_t rs = 0;
+                            vm_region_basic_info_data_64_t ri;
+                            mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+                            mach_port_t ro = MACH_PORT_NULL;
+                            if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                                (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS &&
+                                ra <= (mach_vm_address_t)(uintptr_t)pg)
+                                restore = ri.protection & (PROT_READ | PROT_WRITE);
+                        }
+                        if (!mprotect( pg, pgsz, PROT_READ | PROT_WRITE ) ||
+                            vm_protect( mach_task_self(), (vm_address_t)pg, pgsz, FALSE,
+                                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY ) == KERN_SUCCESS)
+                        {
+                            memcpy( img, words[i], lens[i] );
+                            mprotect( pg, pgsz, restore );
+                            img_ok++;
+                        }
+                        sys_icache_invalidate( (char *)jit_rx_base + offset + rvas[i], lens[i] );
+                    }
+                    dprintf( 2, "[usd-patch] %s: %d site(s) now read KUSER_SHARED_DATA at %p directly (image %d ok)\n",
+                             mn, n, user_shared_data, img_ok );
                 }
             }
 
