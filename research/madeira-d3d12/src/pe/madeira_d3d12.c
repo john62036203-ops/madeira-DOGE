@@ -3547,13 +3547,24 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
     return p->rps;
 }
 
+/* madeira-doge: tg-simd = 1 promises Metal that a compute thread group is a
+ * whole number of SIMD groups (32 lanes), so a 32-thread group is one wave --
+ * what a wave-op shader with numthreads == lane count and a group-sync barrier
+ * in its loop (RE Engine PersistentClusterCulling) assumes. */
+static bool mad_tg_simd(const UINT tg[3]) {
+    static LONG on = -1, said; UINT n = (tg[0] ? tg[0] : 1) * (tg[1] ? tg[1] : 1) * (tg[2] ? tg[2] : 1);
+    if (on < 0) { on = mad_cfg_int_pe("tg-simd", 0) ? 1 : 0; }
+    if (!on || (n % 32)) return false;
+    if (InterlockedIncrement(&said) == 1) d3d12_log("[madeira-d3d12] tg-simd: compute pipelines with a multiple of 32 threads per group are built SIMD-aligned\n");
+    return true;
+}
 static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
     if (p->cps || !p->lazy_cs) return p->cps;
     AcquireSRWLockExclusive(&p->rlock);
     if (!p->cps && p->lazy_cs) {
         struct WMTComputePipelineInfo ci; obj_handle_t err = 0;
         memset(&ci, 0, sizeof ci);
-        ci.compute_function = p->vs_fn;
+        ci.compute_function = p->vs_fn; ci.tgsize_is_multiple_of_sgwidth = mad_tg_simd(p->tg);
         p->cps = MTLDevice_newComputePipelineState(p->device_handle, &ci, &err);
         if (err) mad_log_nserror("compute pipeline", err);
         if (!p->cps) {
@@ -11998,7 +12009,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
         return hr;
     }
     memset(&ci, 0, sizeof ci);
-    ci.compute_function = p->vs_fn;
+    ci.compute_function = p->vs_fn; ci.tgsize_is_multiple_of_sgwidth = mad_tg_simd(p->tg);
     p->cps = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
     if (err) mad_log_nserror("compute pipeline", err);
     if (!p->cps) {
