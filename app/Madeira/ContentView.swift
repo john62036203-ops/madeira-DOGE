@@ -1194,19 +1194,11 @@ struct ContentView: View {
                 // game area itself, so it cannot ride on the game view.
                 HStack(spacing: 0) {
                     Spacer(minLength: 0)
-                    // madeira-doge: pinned to the screen's trailing edge, not centred
-                    // in a 4:3 pillarbox bar. A 16:9 title leaves a bar about half
-                    // that wide, and the centred readout sat under the game surface
-                    // (which covers everything): nothing was visible in landscape.
-                    VStack(alignment: .trailing) {
-                        if pendingLaunch == nil || session.showPerformance {
-                            FPSOverlay(compact: true)
-                        }
-                        Spacer()
-                    }
-                    .padding(.top, 14)
-                    .padding(.trailing, 6)
-                    .frame(width: barW, alignment: .trailing)
+                    // madeira-doge: the readout moved to the controls window
+                    // (TouchControlsOverlay). The game surface is a window-level
+                    // view that covers this whole body when the guest display has
+                    // the phone's aspect, so nothing placed here was ever visible.
+                    Color.clear.frame(width: barW)
                 }
             }
         }
@@ -3323,6 +3315,15 @@ struct TouchControlsOverlay: View {
                         .opacity(m.editing ? 1.0 : m.opacity)
                     }
                     topBar
+                    // madeira-doge: the performance readout, above the game surface.
+                    // Display only here: this window passes touches through
+                    // everywhere but its controls, so the pills are tapped in portrait.
+                    if GameSession.shared.showPerformance && !m.editing && !m.sessionPanel {
+                        FPSOverlay()
+                            .allowsHitTesting(false)
+                            .padding(.bottom, 8)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    }
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
                     }
