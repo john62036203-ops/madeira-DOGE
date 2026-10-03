@@ -10777,6 +10777,29 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
               (unsigned)a.ret_len, name);
     snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
     if (o && o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);   /* ml927b */
+    if (strstr(name, "ClusterCulling")) {   /* madeira-doge: the converter's OUTPUT for the wave-op culling kernel, for offline disassembly */
+        static LONG said_ml;
+        if (InterlockedIncrement(&said_ml) <= 3) {
+            static const char t64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            const unsigned char *mp = (const unsigned char *)buf; UINT mi = 0, mlen = (UINT)a.ret_len; char ml[720];
+            d3d12_log("[madeira-d3d12] metallib of '%s' (%u bytes of DXIL): %u bytes follow as base64\n", name, (unsigned)dxil_len, mlen);
+            while (mi < mlen) {
+                UINT mn = 0, mk;
+                for (mk = 0; mk < 175 && mi < mlen; mk++) {
+                    UINT32 v = (UINT32)mp[mi] << 16; UINT got = 1;
+                    if (mi + 1 < mlen) { v |= (UINT32)mp[mi + 1] << 8; got++; }
+                    if (mi + 2 < mlen) { v |= mp[mi + 2]; got++; }
+                    ml[mn++] = t64[(v >> 18) & 63]; ml[mn++] = t64[(v >> 12) & 63];
+                    ml[mn++] = got > 1 ? t64[(v >> 6) & 63] : '=';
+                    ml[mn++] = got > 2 ? t64[v & 63] : '=';
+                    mi += got;
+                }
+                ml[mn] = 0;
+                d3d12_log("[mlib64 %u] %s\n", (unsigned)dxil_len, ml);
+            }
+            d3d12_log("[madeira-d3d12] metallib of '%s': end\n", name);
+        }
+    }
     if (!strcmp(name, "WriteToSliceMainVS") || !strcmp(name, "WriteToSliceMainGS")) {   /* ml926: bytes for offline disassembly */
         static unsigned said; if (said++ < 2) {
             const unsigned char *b = (const unsigned char *)dxil; unsigned i, j; char line[200];
