@@ -24,6 +24,11 @@
  *     do { expected = compare; ok = cmpxchg.weak(...); }
  *     while (!ok && expected == compare);
  *
+ * The intrinsic returns ZERO when the exchange happened: Apple's own compiler
+ * lowers `bool ok = atomic_compare_exchange_weak_explicit(...)` to
+ * `icmp eq i32 %call, 0` (measured by compiling a probe in CI and reading its
+ * AIR). Builds 66-69 had this inverted and retried the successes.
+ *
  * and writes the library back (same container, new bitcode, HASH and MDSZ
  * refreshed). The loop is bounded so a wrong assumption about the intrinsic's
  * return value cannot itself hang the GPU.
@@ -105,7 +110,7 @@ unsigned rewrite(Module &m, int mode) {
                 cur_bb->getTerminator()->eraseFromParent();
                 IRBuilder<> b4(cur_bb);
                 Value *c4 = b4.CreateLoad(ty, expected, "cas.cur");
-                Value *f4 = b4.CreateICmpEQ(call, ConstantInt::get(call->getType(), 0), "cas.failed");
+                Value *f4 = b4.CreateICmpNE(call, ConstantInt::get(call->getType(), 0), "cas.failed");
                 Value *s4 = b4.CreateICmpEQ(c4, cmp0, "cas.same");
                 b4.CreateCondBr(b4.CreateAnd(f4, s4, "cas.again"), next, cont4);
                 CallInst *nc = cast<CallInst>(ci->clone());
@@ -123,7 +128,7 @@ unsigned rewrite(Module &m, int mode) {
         loop->getTerminator()->eraseFromParent();
         IRBuilder<> b(loop);
         Value *cur = b.CreateLoad(ty, expected, "cas.cur");
-        Value *failed = b.CreateICmpEQ(ci, ConstantInt::get(ci->getType(), 0), "cas.failed");
+        Value *failed = b.CreateICmpNE(ci, ConstantInt::get(ci->getType(), 0), "cas.failed");
         Value *same = b.CreateICmpEQ(cur, cmp0, "cas.same");
         Value *n1 = b.CreateAdd(n, ConstantInt::get(i32, 1), "cas.n1");
         Value *more = b.CreateICmpULT(n1, ConstantInt::get(i32, 4096), "cas.more");
@@ -180,11 +185,7 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
     for (Function &f : **mod)
         if (f.isDeclaration() && f.getName().startswith("air.atomic.") && f.getName().contains(".cmpxchg.weak."))
             for (User *u : f.users()) if (isa<CallInst>(u)) nsites++;
-    if (mode < 0) {
-        static const int multi[2] = { 2, 4 }, single[4] = { 2, 4, 2, 4 };
-        static unsigned tm, ts;
-        mode = nsites >= 2 ? multi[tm++ % 2] : single[ts++ % 4];
-    }
+    if (mode < 0) mode = 2;
     std::string kname = "?";
     if (NamedMDNode *k = (*mod)->getNamedMetadata("air.kernel"))
         if (k->getNumOperands() && k->getOperand(0)->getNumOperands())

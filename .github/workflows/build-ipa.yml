@@ -812,26 +812,6 @@ jobs:
           done
           ls -la
 
-      # madeira-doge: what does Apple's own compiler emit for a weak
-      # compare-exchange (return type and how the bool is derived)? The AIR is
-      # printed base64 as notices so it can be disassembled offline.
-      - name: Probe Metal compare-exchange lowering
-        shell: bash
-        run: |
-          cd "$RUNNER_TEMP"
-          printf '%s\n' '#include <metal_stdlib>' 'using namespace metal;' \
-            'kernel void casprobe(device atomic_uint *a [[buffer(0)]], device uint *o [[buffer(1)]], uint t [[thread_position_in_grid]]) {' \
-            '  uint e = 0;' \
-            '  bool ok = atomic_compare_exchange_weak_explicit(a + t, &e, 5u, memory_order_relaxed, memory_order_relaxed);' \
-            '  o[t] = ok ? e + 100u : e;' \
-            '  o[t + 64] = simd_is_first() ? simd_prefix_exclusive_sum(1u) : simd_sum(1u);' \
-            '}' > cas_probe.metal
-          if xcrun -sdk macosx metal -o cas_probe.air -c cas_probe.metal -std=metal3.1 --target=air64-apple-ios18.0; then
-            base64 < cas_probe.air | tr -d '\n' | fold -w 900 | nl -w3 -s' ' | while read -r n l; do echo "::notice::casprobe $n $l"; done
-          else
-            echo "::warning::cas probe did not compile"
-          fi
-
       # The native D3D12 runtime's unix half needs Apple's Metal Shader
       # Converter public headers (Apache-2.0). Upstream resolves them from the
       # installer package on the developer's Mac and does not track them. When
