@@ -3560,6 +3560,11 @@ static bool mad_tg_simd(const UINT tg[3]) {
 }
 static void mad_cps_width_log(struct mad_pso *p) {   /* madeira-doge: the SIMD width a wave-op kernel really runs with */
     struct madeira_ctl_args a; static LONG said;
+    if (strstr(p->vs_name, "ClusterCulling") || strstr(p->vs_name, "RasterFrom") || strstr(p->vs_name, "MiningBricks")) {   /* the kernels madeira_cas.cpp rewrites */
+        static LONG said_c;
+        if (InterlockedIncrement(&said_c) <= 40)
+            d3d12_log("[madeira-d3d12] cas-compile: '%s' dxil=%u pipeline %s\n", p->vs_name, p->cs_len, p->cps ? "BUILT" : "FAILED");
+    }
     if (!p->cps || !strstr(p->vs_name, "Culling") || InterlockedIncrement(&said) > 12) return;
     memset(&a, 0, sizeof a); a.op = 10; a.ptr = (UINT64)p->cps;
     MadeiraCtl(&a);

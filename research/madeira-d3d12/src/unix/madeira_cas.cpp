@@ -92,6 +92,30 @@ unsigned rewrite(Module &m, int mode) {
 
         /* The comparand is whatever the converter stored into `expected`. */
         LoadInst *cmp0 = new LoadInst(ty, expected, "cas.cmp", ci);
+        if (mode == 4 && ci->use_empty()) {
+            /* No back edge: four attempts in a row, each entered only when the
+             * one before failed without the value having changed. */
+            BasicBlock *cur_bb = pre->splitBasicBlock(ci->getIterator(), "cas.try0");
+            BasicBlock *cont4 = cur_bb->splitBasicBlock(after->getIterator(), "cas.done");
+            CallInst *call = ci;
+            for (int k = 0; k < 4; k++) {
+                new StoreInst(cmp0, expected, call);
+                if (k == 3) break;                       /* the last attempt falls through to cas.done */
+                BasicBlock *next = BasicBlock::Create(ctx, "cas.try", cur_bb->getParent(), cont4);
+                cur_bb->getTerminator()->eraseFromParent();
+                IRBuilder<> b4(cur_bb);
+                Value *c4 = b4.CreateLoad(ty, expected, "cas.cur");
+                Value *f4 = b4.CreateICmpEQ(call, ConstantInt::get(call->getType(), 0), "cas.failed");
+                Value *s4 = b4.CreateICmpEQ(c4, cmp0, "cas.same");
+                b4.CreateCondBr(b4.CreateAnd(f4, s4, "cas.again"), next, cont4);
+                CallInst *nc = cast<CallInst>(ci->clone());
+                next->getInstList().push_back(nc);
+                BranchInst::Create(cont4, next);
+                call = nc; cur_bb = next;
+            }
+            done++;
+            continue;
+        }
         BasicBlock *loop = pre->splitBasicBlock(ci->getIterator(), "cas.retry");
         BasicBlock *cont = loop->splitBasicBlock(after->getIterator(), "cas.done");
         PHINode *n = PHINode::Create(i32, 2, "cas.n", &loop->front());
@@ -118,7 +142,8 @@ unsigned rewrite(Module &m, int mode) {
 
 /* mode: 2 = the real fix, 1 = loop without the result, 0 = read and write the
  * module unchanged, -1 = 2 for libraries with several call sites and 0,1,2 in
- * turn for the ones with a single site (a compile-acceptance experiment). */
+ * turn for the ones with a single site (a compile-acceptance experiment);
+ * 4 = the fix as four straight-line attempts instead of a loop. */
 extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *out_len,
                                char *note, size_t note_cap, int mode)
 {
@@ -155,7 +180,11 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
     for (Function &f : **mod)
         if (f.isDeclaration() && f.getName().startswith("air.atomic.") && f.getName().contains(".cmpxchg.weak."))
             for (User *u : f.users()) if (isa<CallInst>(u)) nsites++;
-    if (mode < 0) { static unsigned turn; mode = nsites >= 2 ? 2 : (int)(turn++ % 3); }
+    if (mode < 0) {
+        static const int multi[2] = { 2, 4 }, single[4] = { 0, 1, 2, 4 };
+        static unsigned tm, ts;
+        mode = nsites >= 2 ? multi[tm++ % 2] : single[ts++ % 4];
+    }
     std::string kname = "?";
     if (NamedMDNode *k = (*mod)->getNamedMetadata("air.kernel"))
         if (k->getNumOperands() && k->getOperand(0)->getNumOperands())
@@ -226,7 +255,7 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
     }
     *out = o; *out_len = total;
     if (note && note_cap) snprintf(note, note_cap, "'%s' mode %d: %u weak compare-exchange(s) %s (%llu -> %llu bytes of bitcode)", kname.c_str(), mode, n,
-                                   mode == 2 ? "made strong" : mode == 1 ? "looped without the result (diagnostic)" : "left as they were, module rewritten only (diagnostic)",
+                                   mode == 2 ? "made strong (loop)" : mode == 4 ? "made strong (four attempts, no loop)" : mode == 1 ? "looped without the result (diagnostic)" : "left as they were, module rewritten only (diagnostic)",
                                    (unsigned long long)bc_size, (unsigned long long)nb.size());
     return 1;
 }

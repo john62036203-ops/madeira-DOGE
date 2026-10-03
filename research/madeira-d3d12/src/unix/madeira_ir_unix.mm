@@ -1494,14 +1494,14 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         if (cas_on < 0) {
             char v[16];
             cas_on = !(madeira_cfg_get("cas-strong", v, sizeof v) && v[0] == '0');
-            if (madeira_cfg_get("cas-mode", v, sizeof v) && v[0] >= '0' && v[0] <= '2') cas_mode = v[0] - '0';
+            if (madeira_cfg_get("cas-mode", v, sizeof v) && v[0] >= '0' && v[0] <= '4') cas_mode = v[0] - '0';
         }
         if (cas_on) {
             int crc = madeira_cas_fix((const void *)(uintptr_t)a->out_buf, (size_t)a->ret_len, &nb, &nlen, cnote, sizeof cnote, cas_mode);
             if (crc == 1 && nlen <= a->out_cap) {
                 memcpy((void *)(uintptr_t)a->out_buf, nb, nlen);
                 a->ret_len = nlen;
-                if (cas_said++ < 40) dprintf(2, "[madeira-ir] cas-strong %s\n", cnote);
+                if (cas_said++ < 40) dprintf(2, "[madeira-ir] cas-strong dxil=%llu %s\n", (unsigned long long)a->dxil_len, cnote);
             } else if (crc != 0 || cnote[0]) {
                 if (cas_said++ < 24) dprintf(2, "[madeira-ir] cas-strong '%s' NOT applied (rc %d, %zu bytes, cap %llu): %s\n", entry ? entry : "?", crc, nlen,
                                              (unsigned long long)a->out_cap, cnote);
