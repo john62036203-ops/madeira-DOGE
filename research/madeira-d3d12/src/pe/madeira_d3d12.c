@@ -3558,6 +3558,14 @@ static bool mad_tg_simd(const UINT tg[3]) {
     if (InterlockedIncrement(&said) == 1) d3d12_log("[madeira-d3d12] tg-simd: compute pipelines with a multiple of 32 threads per group are built SIMD-aligned\n");
     return true;
 }
+static void mad_cps_width_log(struct mad_pso *p) {   /* madeira-doge: the SIMD width a wave-op kernel really runs with */
+    struct madeira_ctl_args a; static LONG said;
+    if (!p->cps || !strstr(p->vs_name, "Culling") || InterlockedIncrement(&said) > 12) return;
+    memset(&a, 0, sizeof a); a.op = 10; a.ptr = (UINT64)p->cps;
+    MadeiraCtl(&a);
+    d3d12_log("[madeira-d3d12] simd-width: '%s' tg %ux%ux%u threadExecutionWidth %u maxTotalThreadsPerThreadgroup %u%s\n", p->vs_name, p->tg[0], p->tg[1], p->tg[2],
+              (unsigned)(a.len & 0xffffffffu), (unsigned)(a.len >> 32), a.ret ? "" : " (query unavailable)");
+}
 static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
     if (p->cps || !p->lazy_cs) return p->cps;
     AcquireSRWLockExclusive(&p->rlock);
@@ -3567,6 +3575,7 @@ static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
         ci.compute_function = p->vs_fn; ci.tgsize_is_multiple_of_sgwidth = mad_tg_simd(p->tg);
         p->cps = MTLDevice_newComputePipelineState(p->device_handle, &ci, &err);
         if (err) mad_log_nserror("compute pipeline", err);
+        mad_cps_width_log(p);
         if (!p->cps) {
             LONG n = InterlockedIncrement(&g_pso_lazy_failed);
             p->lazy_cs = 0;
@@ -12015,6 +12024,10 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
             if (mad_cs_dump_on() && ndump++ < 400) { snprintf(fn, sizeof fn, "cs_%p_%u.dxil", (void *)p, (unsigned)desc->CS.BytecodeLength); mad_dump_blob(fn, desc->CS.pShaderBytecode, desc->CS.BytecodeLength); }
         }
         snprintf(p->vs_name, sizeof p->vs_name, "%s", entry[0] ? entry : g_last_entry);   /* ml880 */
+        if (strstr(p->vs_name, "ClusterCulling") && mad_cfg_int_pe("cs-b64", 1)) {   /* madeira-doge: every variant of the wave-op culling kernel, for offline work */
+            mad_fault_cs_load();
+            if (g_fault_cs_nwant < 16) { g_fault_cs_want[g_fault_cs_nwant++] = p->cs_hash; mad_fault_cs_check(desc->CS.pShaderBytecode, p->cs_len, p->cs_hash); }
+        }
         /* ml1008: the reflected top-level layout is the DXIL converter's, and
          * means nothing to the DXBC backend, which reports its own tables. */
         if (p->vs_fn && air.backend != MADEIRA_IR_BACKEND_AIRCONV)
@@ -12047,6 +12060,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
     ci.compute_function = p->vs_fn; ci.tgsize_is_multiple_of_sgwidth = mad_tg_simd(p->tg);
     p->cps = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
     if (err) mad_log_nserror("compute pipeline", err);
+    mad_cps_width_log(p);
     if (!p->cps) {
         d3d12_log("[madeira-d3d12] newComputePipelineState failed\n");
         pso_Release((ID3D12PipelineState *)p);
