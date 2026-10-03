@@ -66,7 +66,7 @@ void wr64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
  * private metadata offset/size, bitcode offset/size. */
 enum { H_FILESIZE = 16, H_FL_OFF = 24, H_FL_SIZE = 32, H_PUB_OFF = 40, H_BC_OFF = 72, H_BC_SIZE = 80, H_SIZE = 88 };
 
-unsigned rewrite(Module &m) {
+unsigned rewrite(Module &m, int mode) {
     std::vector<CallInst *> sites;
     for (Function &f : m) {
         if (!f.isDeclaration()) continue;
@@ -103,7 +103,9 @@ unsigned rewrite(Module &m) {
         Value *same = b.CreateICmpEQ(cur, cmp0, "cas.same");
         Value *n1 = b.CreateAdd(n, ConstantInt::get(i32, 1), "cas.n1");
         Value *more = b.CreateICmpULT(n1, ConstantInt::get(i32, 4096), "cas.more");
-        Value *retry = b.CreateAnd(b.CreateAnd(failed, same), more, "cas.again");
+        /* mode 1 (diagnostic): the same loop shape without reading the intrinsic's result. */
+        Value *retry = mode == 1 ? b.CreateAnd(b.CreateAnd(same, b.CreateICmpULT(n1, ConstantInt::get(i32, 2))), more, "cas.again")
+                                 : b.CreateAnd(b.CreateAnd(failed, same), more, "cas.again");
         b.CreateCondBr(retry, loop, cont);
         n->addIncoming(ConstantInt::get(i32, 0), pre);
         n->addIncoming(n1, loop);
@@ -114,8 +116,11 @@ unsigned rewrite(Module &m) {
 
 }  // namespace
 
+/* mode: 2 = the real fix, 1 = loop without the result, 0 = read and write the
+ * module unchanged, -1 = 2 for libraries with several call sites and 0,1,2 in
+ * turn for the ones with a single site (a compile-acceptance experiment). */
 extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *out_len,
-                               char *note, size_t note_cap)
+                               char *note, size_t note_cap, int mode)
 {
     const uint8_t *d = (const uint8_t *)lib;
     *out = nullptr; *out_len = 0;
@@ -146,7 +151,17 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
         if (f.isDeclaration() && f.getName().startswith("air.atomic.") && f.getName().contains(".cmpxchg.weak.")) has = true;
     if (!has) return 0;
 
-    unsigned n = rewrite(**mod);
+    unsigned nsites = 0;
+    for (Function &f : **mod)
+        if (f.isDeclaration() && f.getName().startswith("air.atomic.") && f.getName().contains(".cmpxchg.weak."))
+            for (User *u : f.users()) if (isa<CallInst>(u)) nsites++;
+    if (mode < 0) { static unsigned turn; mode = nsites >= 2 ? 2 : (int)(turn++ % 3); }
+    std::string kname = "?";
+    if (NamedMDNode *k = (*mod)->getNamedMetadata("air.kernel"))
+        if (k->getNumOperands() && k->getOperand(0)->getNumOperands())
+            if (auto *cm = dyn_cast_or_null<ConstantAsMetadata>(k->getOperand(0)->getOperand(0).get()))
+                if (auto *kf = dyn_cast<Function>(cm->getValue())) kname = kf->getName().str();
+    unsigned n = mode == 0 ? nsites : rewrite(**mod, mode);
     if (!n) { if (note && note_cap) snprintf(note, note_cap, "weak compare-exchange present but no call site matched"); return -1; }
     {
         std::string verr; raw_string_ostream vs(verr);
@@ -210,7 +225,8 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
         memcpy(o + hash_at, &h, 32);
     }
     *out = o; *out_len = total;
-    if (note && note_cap) snprintf(note, note_cap, "%u weak compare-exchange(s) made strong (%llu -> %llu bytes of bitcode)", n,
+    if (note && note_cap) snprintf(note, note_cap, "'%s' mode %d: %u weak compare-exchange(s) %s (%llu -> %llu bytes of bitcode)", kname.c_str(), mode, n,
+                                   mode == 2 ? "made strong" : mode == 1 ? "looped without the result (diagnostic)" : "left as they were, module rewritten only (diagnostic)",
                                    (unsigned long long)bc_size, (unsigned long long)nb.size());
     return 1;
 }
