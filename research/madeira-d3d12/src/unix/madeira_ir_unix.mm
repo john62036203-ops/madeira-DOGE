@@ -275,6 +275,7 @@ extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_
                                    char *note, size_t note_cap);
 
 /* madeira-doge: madeira_cas.cpp -- the converter's weak compare-exchange made strong. */
+extern "C" void madeira_cas_scalar(int on);
 extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *out_len,
                                char *note, size_t note_cap, int mode);
 
@@ -1495,6 +1496,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
             char v[16];
             cas_on = !(madeira_cfg_get("cas-strong", v, sizeof v) && v[0] == '0');
             if (madeira_cfg_get("cas-mode", v, sizeof v) && v[0] >= '0' && v[0] <= '4') cas_mode = v[0] - '0';
+            madeira_cas_scalar(!(madeira_cfg_get("pcc-scalar", v, sizeof v) && v[0] == '0'));   /* one-lane waves, default on */
         }
         if (cas_on) {
             int crc = madeira_cas_fix((const void *)(uintptr_t)a->out_buf, (size_t)a->ret_len, &nb, &nlen, cnote, sizeof cnote, cas_mode);

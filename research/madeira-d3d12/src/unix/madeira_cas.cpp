@@ -143,7 +143,69 @@ unsigned rewrite(Module &m, int mode) {
     return done;
 }
 
+/* madeira-doge: run each thread of a Persistent*ClusterCulling kernel as a wave
+ * of ONE active lane. The shader shares its queue bookkeeping across the wave
+ * (the first lane does one atomic for everybody, the others read its result
+ * with WaveReadLaneFirst / WaveReadLaneAt) and every discarded command buffer
+ * of build 73 had this kernel as its first unfinished encoder, with no other
+ * command buffer named as the cause. A wave in which a single lane is active
+ * is something the shader has to handle anyway; in it a ballot is the lane's
+ * own bit, a prefix count is zero, and "the first lane" is the lane itself --
+ * so nothing depends on how Metal's SIMD groups reconverge inside the loop. */
+bool scalarize(Module &m, Function *kernel, unsigned &ncalls, std::string &why) {
+    std::vector<std::pair<CallInst *, int>> sites;   /* 0 ballot, 1 pass arg 0 through, 2 true */
+    for (Function &f : m) {
+        if (!f.isDeclaration()) continue;
+        StringRef n = f.getName();
+        if (!n.startswith("air.simd_")) continue;
+        int kind;
+        if (n.startswith("air.simd_ballot")) kind = 0;
+        else if (n.startswith("air.simd_broadcast") || n.startswith("air.simd_shuffle")) kind = 1;
+        else if (n.startswith("air.simd_is_first")) kind = 2;
+        else { why = "unhandled " + n.str(); return false; }
+        for (User *u : f.users()) {
+            auto *ci = dyn_cast<CallInst>(u);
+            if (!ci || ci->getCalledFunction() != &f) { why = "non-call use of " + n.str(); return false; }
+            if (kind == 0 && (ci->arg_size() < 1 || !ci->getArgOperand(0)->getType()->isIntegerTy(1) || !ci->getType()->isIntegerTy())) { why = "ballot shape"; return false; }
+            if (kind == 1 && (ci->arg_size() < 1 || ci->getArgOperand(0)->getType() != ci->getType())) { why = "broadcast shape"; return false; }
+            if (kind == 2 && !ci->getType()->isIntegerTy(1)) { why = "is_first shape"; return false; }
+            sites.push_back({ci, kind});
+        }
+    }
+    if (sites.empty()) { why = "no simd calls"; return false; }
+    /* The lane index: the kernel argument tagged air.thread_index_in_simdgroup. */
+    if (NamedMDNode *k = m.getNamedMetadata("air.kernel"))
+        if (k->getNumOperands() && k->getOperand(0)->getNumOperands() > 2)
+            if (auto *args = dyn_cast_or_null<MDNode>(k->getOperand(0)->getOperand(2).get()))
+                for (const MDOperand &ao : args->operands()) {
+                    auto *an = dyn_cast_or_null<MDNode>(ao.get());
+                    if (!an || an->getNumOperands() < 2) continue;
+                    auto *tag = dyn_cast_or_null<MDString>(an->getOperand(1).get());
+                    auto *idx = dyn_cast_or_null<ConstantAsMetadata>(an->getOperand(0).get());
+                    if (!tag || !idx || tag->getString() != "air.thread_index_in_simdgroup") continue;
+                    uint64_t i = cast<ConstantInt>(idx->getValue())->getZExtValue();
+                    if (kernel && i < kernel->arg_size()) {
+                        Argument *a = kernel->getArg((unsigned)i);
+                        a->replaceAllUsesWith(Constant::getNullValue(a->getType()));
+                    }
+                }
+    for (auto &s : sites) {
+        CallInst *ci = s.first; Value *v;
+        if (s.second == 0) v = CastInst::CreateZExtOrBitCast(ci->getArgOperand(0), ci->getType(), "lane.ballot", ci);
+        else if (s.second == 1) v = ci->getArgOperand(0);
+        else v = ConstantInt::getTrue(ci->getType());
+        ci->replaceAllUsesWith(v);
+        ci->eraseFromParent();
+    }
+    ncalls = (unsigned)sites.size();
+    return true;
+}
+
+int g_scalar = 0;
+
 }  // namespace
+
+extern "C" void madeira_cas_scalar(int on) { g_scalar = on; }
 
 /* mode: 2 = the real fix, 1 = loop without the result, 0 = read and write the
  * module unchanged, -1 = 2 for libraries with several call sites and 0,1,2 in
@@ -186,11 +248,13 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
         if (f.isDeclaration() && f.getName().startswith("air.atomic.") && f.getName().contains(".cmpxchg.weak."))
             for (User *u : f.users()) if (isa<CallInst>(u)) nsites++;
     if (mode < 0) mode = 2;
-    std::string kname = "?";
+    std::string kname = "?"; Function *kfn = nullptr;
     if (NamedMDNode *k = (*mod)->getNamedMetadata("air.kernel"))
         if (k->getNumOperands() && k->getOperand(0)->getNumOperands())
             if (auto *cm = dyn_cast_or_null<ConstantAsMetadata>(k->getOperand(0)->getOperand(0).get()))
-                if (auto *kf = dyn_cast<Function>(cm->getValue())) kname = kf->getName().str();
+                if (auto *kf = dyn_cast<Function>(cm->getValue())) { kname = kf->getName().str(); kfn = kf; }
+    unsigned nsimd = 0; std::string swhy; bool scal = false;
+    if (g_scalar && kname.find("ClusterCulling") != std::string::npos) scal = scalarize(**mod, kfn, nsimd, swhy);
     unsigned n = mode == 0 ? nsites : rewrite(**mod, mode);
     if (!n) { if (note && note_cap) snprintf(note, note_cap, "weak compare-exchange present but no call site matched"); return -1; }
     {
@@ -262,8 +326,9 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
         memcpy(o + hash_at, &h, 32);
     }
     *out = o; *out_len = total;
-    if (note && note_cap) snprintf(note, note_cap, "'%s' mode %d: %u weak compare-exchange(s) %s (%llu -> %llu bytes of bitcode)", kname.c_str(), mode, n,
+    if (note && note_cap) snprintf(note, note_cap, "'%s' mode %d: %u weak compare-exchange(s) %s; %s%s (%u wave calls) (%llu -> %llu bytes of bitcode)", kname.c_str(), mode, n,
                                    mode == 2 ? "made strong (loop)" : mode == 4 ? "made strong (four attempts, no loop)" : mode == 1 ? "looped without the result (diagnostic)" : "left as they were, module rewritten only (diagnostic)",
+                                   scal ? "one-lane waves" : g_scalar ? "waves untouched: " : "waves untouched", scal ? "" : swhy.c_str(), nsimd,
                                    (unsigned long long)bc_size, (unsigned long long)nb.size());
     return 1;
 }
