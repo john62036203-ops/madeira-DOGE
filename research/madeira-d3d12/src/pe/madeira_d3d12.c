@@ -6965,6 +6965,16 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         o->WaveOps = TRUE;
         o->WaveLaneCountMin = 32;
         o->WaveLaneCountMax = 32;
+        {   /* madeira-doge: experiment switches. RE Engine's PersistentClusterCulling
+             * (a wave-op work queue) faults the GPU every other frame; wave-ops = 0
+             * asks the engine for its non-wave path, wave-lanes = N reports another
+             * lane count. */
+            static LONG said; int w = mad_cfg_int_pe("wave-ops", 1), n = mad_cfg_int_pe("wave-lanes", 32);
+            if (!w) o->WaveOps = FALSE;
+            if (n >= 4 && n <= 128) { o->WaveLaneCountMin = (UINT)n; o->WaveLaneCountMax = (UINT)n; }
+            if ((!w || n != 32) && InterlockedIncrement(&said) <= 2)
+                d3d12_log("[madeira-d3d12] OPTIONS1: reporting WaveOps=%d, lane count %u (madeira.cfg wave-ops / wave-lanes)\n", (int)o->WaveOps, o->WaveLaneCountMin);
+        }
         o->TotalLaneCount = 4096;
         o->ExpandedComputeResourceStates = TRUE;
         o->Int64ShaderOps = TRUE;
