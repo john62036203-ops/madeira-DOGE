@@ -1194,13 +1194,19 @@ struct ContentView: View {
                 // game area itself, so it cannot ride on the game view.
                 HStack(spacing: 0) {
                     Spacer(minLength: 0)
-                    VStack {
+                    // madeira-doge: pinned to the screen's trailing edge, not centred
+                    // in a 4:3 pillarbox bar. A 16:9 title leaves a bar about half
+                    // that wide, and the centred readout sat under the game surface
+                    // (which covers everything): nothing was visible in landscape.
+                    VStack(alignment: .trailing) {
                         if pendingLaunch == nil || session.showPerformance {
                             FPSOverlay(compact: true)
                         }
                         Spacer()
                     }
-                    .frame(width: barW)
+                    .padding(.top, 14)
+                    .padding(.trailing, 6)
+                    .frame(width: barW, alignment: .trailing)
                 }
             }
         }

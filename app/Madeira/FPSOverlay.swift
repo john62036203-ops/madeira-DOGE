@@ -112,6 +112,10 @@ struct FPSOverlay: View {
                 VStack(spacing: 4) {
                     Text(String(format: "%.1f", fps))
                         .foregroundColor(fpsColor)
+                    // madeira-doge: the footprint, as in portrait (MB used; the
+                    // colour carries the headroom against the device's limit).
+                    Text(verbatim: "\(memMB)")
+                        .foregroundColor(memColor)
                     pacingPill
                     thermalPill
                     capturePill
