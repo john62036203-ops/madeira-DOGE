@@ -313,6 +313,7 @@ struct mad_device {
     struct { UINT32 value[4]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 16-byte period) */
     obj_handle_t k_lib, k_tind_pso, k_ring, k_null_fs; UINT64 k_ring_pos; int k_state; SRWLOCK k_lock;   /* madeira-bcd: helper kernels (mad_kernels.metal) */
     obj_handle_t k_probe_pso; unsigned char *k_ring_cpu;   /* madeira-bcd: indirect-argument probes */
+    obj_handle_t k_u10_pso;   /* madeira-doge: R10G10B10A2_UINT vertex elements (mad_u1010102) */
     obj_handle_t k_gui_pso, gui_tmp; UINT gui_tmp_w, gui_tmp_h, gui_tmp_pf;   /* madeira-doge: gui-overlay (mad_gui_over) */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
     LUID adapter_luid;   /* madeira-bcd: GetAdapterLuid, the DXGI adapter it was created on */
@@ -680,6 +681,7 @@ struct mad_resource {
      * (type, levels, slices). */
     enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips, tex_layers; UINT tex_depth;   /* ml924: 3D depth */
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
+    struct mad_u10 *u10;   /* madeira-doge: unpacked copies of R10G10B10A2_UINT vertex elements */
     unsigned nxview, xview_cap;
 };
 /* madeira-bcd: srv_res / uav_res membership, O(1) through the resource's slot
@@ -754,6 +756,7 @@ struct mad_pso {
      * the pipeline is rebuilt with the real strides and cached here. */
     struct WMTRenderPipelineInfo rp; struct WMTVertexDescriptorInfo vd; int has_vd;
     struct { UINT strides[16]; obj_handle_t rps; } var[8]; unsigned nvar;
+    struct { UINT slot, off; } u10[4]; unsigned nu10;   /* madeira-doge: elements read from an unpacked stream at Metal buffer 22 + k */
     CRITICAL_SECTION var_lock;
     obj_handle_t device_handle;
     int lazy;   /* madeira-bcd: plain render pipeline built at its first draw (mad_pso_realize) */
@@ -1230,7 +1233,7 @@ struct mad_cmd {
         D3D12_RECT scissor;
         D3D12_PRIMITIVE_TOPOLOGY topo;
         struct { struct mad_resource *res; UINT64 off; enum WMTIndexType type; } ib;
-        struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; } vb;
+        struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; UINT size; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
         struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*) */
         struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared */
@@ -1504,7 +1507,7 @@ struct mad_exec {
     D3D12_PRIMITIVE_TOPOLOGY topo;
     struct mad_resource *ib; UINT64 ib_off; enum WMTIndexType ib_type;
     unsigned renc_seq;                          /* ml879: rmetald label index of the open render encoder */
-    struct { struct mad_resource *res; UINT64 off; UINT stride; } vb[16];
+    struct { struct mad_resource *res; UINT64 off; UINT stride; UINT size; } vb[16];
     unsigned draws, skipped;
     UINT64 vis_prev;            /* ml1088: the visibility slot the open encoder was last told to count into, ~0 = disabled */
     obj_handle_t enc_vis_buf;   /* ml1088: the slot chunk attached to the open encoder (a pass attribute) */
@@ -3438,6 +3441,13 @@ static int mad_kernels_ready(struct mad_device *d) {
             if (err) mad_log_nserror("mad_probe_words", err);
             NSObject_release(fn);
         }
+        fn = d->k_lib ? MTLLibrary_newFunction(d->k_lib, "mad_u1010102") : 0;   /* madeira-doge */
+        if (fn) {
+            memset(&ci, 0, sizeof ci); ci.compute_function = fn; err = 0;
+            d->k_u10_pso = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
+            if (err) mad_log_nserror("mad_u1010102", err);
+            NSObject_release(fn);
+        }
         fn = d->k_lib ? MTLLibrary_newFunction(d->k_lib, "mad_gui_over") : 0;   /* madeira-doge */
         if (fn) {
             memset(&ci, 0, sizeof ci); ci.compute_function = fn; err = 0;
@@ -4718,6 +4728,7 @@ static int mad_use_seen(struct mad_exec *e, obj_handle_t enc, obj_handle_t h, UI
     return 0;
 }
 
+static int exec_u10_prepare(struct mad_exec *e, obj_handle_t out[4]);   /* madeira-doge */
 static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_render_setpso c_pso;
     struct wmtcmd_render_draw_indirect c_di;
@@ -4725,7 +4736,8 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_render_draw_indexed_indirect c_dii;
     struct wmtcmd_render_setviewport c_vp;
     struct wmtcmd_render_setscissorrect c_sc;
-    struct wmtcmd_render_setbuffer sb[6 + 16 + 2];
+    struct wmtcmd_render_setbuffer sb[6 + 16 + 2 + 4];
+    obj_handle_t u10buf[4] = {0};   /* madeira-doge */
     struct wmtcmd_render_useresource ur[256];
     struct wmtcmd_render_setdsso c_dss;
     struct wmtcmd_render_setrasterizerstate c_ras;
@@ -4758,6 +4770,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         mad_fault_note(e, e->pso);
     }
     gsemu = e->pso->gs_emu;
+    if (e->pso->nu10 && !exec_u10_prepare(e, u10buf)) { MAD_SKIP(e); return; }   /* madeira-doge: before the render encoder opens */
     if (gsemu && (c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT) && !(gsemu == 2 && e->tind_buf)) {
         static unsigned said; static const void *seen[8];
         if (said < 8) {   /* madeira-bcd: name the pipelines (2700 such skips in a Ghost of Tsushima minute) */
@@ -4945,6 +4958,8 @@ tess_go:
         for (i = 0; i < 16; i++)
             if (e->vb[i].res && e->vb[i].res->buffer)
                 MAD_SETBUF(WMTRenderCommandSetVertexBuffer, e->vb[i].res->buffer, e->vb[i].off, (uint8_t)(6 + i));
+        for (i = 0; i < e->pso->nu10 && i < 4; i++)
+            if (u10buf[i]) MAD_SETBUF(WMTRenderCommandSetVertexBuffer, u10buf[i], 0, (uint8_t)(22 + i));
     }
     /* ml912: the converter's draw contract (metal_irconverter_runtime.h,
      * IRRuntimeDraw*): every vertex stage that reads SV_VertexID /
@@ -5348,12 +5363,13 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     k2.reserved[0] = (uint16_t)mad_aspect_opt(d, c->u.tt.dplane);   /* tools/patch-dxmt-b2t-aspect.py */
     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
 }
+static void mad_u10_dirty(struct mad_resource *r);   /* madeira-doge */
 #define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     switch (c->kind) {   /* ml1116: the destination is written */
-    case MC_FILL_BB: exec_note_write(e, c->u.fill.res); break;
-    case MC_COPY_BB: exec_note_write(e, c->u.bb.dst); break;
+    case MC_FILL_BB: exec_note_write(e, c->u.fill.res); mad_u10_dirty(c->u.fill.res); break;
+    case MC_COPY_BB: exec_note_write(e, c->u.bb.dst); mad_u10_dirty(c->u.bb.dst); break;
     default: e->wr_all = 1; break;   /* texture copies: destination fields differ per kind; be conservative */
     }
     switch (c->kind) {
@@ -5582,6 +5598,93 @@ static int exec_tess_indirect_prep(struct mad_exec *e, const struct mad_cmd *c, 
  * R8G8B8A8_UNORM_SRGB target that nothing composites) over it: one compute pass
  * backbuffer + interface -> scratch texture, then a copy back. */
 static int g_gui_overlay = -1;
+/* madeira-doge: unpacked copies of R10G10B10A2_UINT vertex elements. One entry
+ * per (view offset, stride, element offset) of a buffer; refreshed when the
+ * buffer is the destination of a copy. */
+struct mad_u10 { struct mad_u10 *next; UINT64 off; UINT stride, eoff, count; obj_handle_t buf; LONG dirty; };
+static SRWLOCK g_u10_lock = SRWLOCK_INIT;
+static LONG g_u10_bytes, g_u10_n;
+static void mad_u10_dirty(struct mad_resource *r) {
+    struct mad_u10 *u;
+    if (!r || !r->u10) return;
+    AcquireSRWLockExclusive(&g_u10_lock);
+    for (u = r->u10; u; u = u->next) u->dirty = 1;
+    ReleaseSRWLockExclusive(&g_u10_lock);
+}
+static void mad_u10_free(struct mad_resource *r) {
+    struct mad_u10 *u, *n;
+    AcquireSRWLockExclusive(&g_u10_lock);
+    u = r->u10; r->u10 = NULL;
+    ReleaseSRWLockExclusive(&g_u10_lock);
+    for (; u; u = n) { n = u->next; if (u->buf) NSObject_release(u->buf); InterlockedExchangeAdd(&g_u10_bytes, -(LONG)(u->count * 8)); InterlockedDecrement(&g_u10_n); free(u); }
+}
+/* Fills out[k] with the unpacked stream for every such element of the bound
+ * pipeline; converts (ending the open encoder) when one is missing or stale.
+ * 0 = cannot serve this draw. */
+static int exec_u10_prepare(struct mad_exec *e, obj_handle_t out[4]) {
+    struct mad_device *d = e->q->device; struct mad_pso *p = e->pso; unsigned k;
+    static LONG said, said_fail;
+    mad_kernels_ready(d);
+    for (k = 0; k < p->nu10; k++) {
+        UINT slot = p->u10[k].slot, stride, count; UINT64 avail;
+        struct mad_resource *r = e->vb[slot].res; struct mad_u10 *u; int convert = 0;
+        struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_setbuffer sb[2]; struct wmtcmd_compute_setbytes sby; struct wmtcmd_compute_dispatch dsp;
+        struct { UINT32 eoff, stride, count, pad; } prm;
+        out[k] = 0;
+        if (!r || !r->buffer || !d->k_u10_pso) goto fail;
+        stride = e->vb[slot].stride ? e->vb[slot].stride : p->vb_stride[slot];
+        if (!stride || r->size <= e->vb[slot].off) goto fail;
+        avail = r->size - e->vb[slot].off;
+        if (e->vb[slot].size && e->vb[slot].size < avail) avail = e->vb[slot].size;
+        if (avail < (UINT64)p->u10[k].off + 4) goto fail;
+        count = (UINT)((avail - p->u10[k].off - 4) / stride) + 1;
+        AcquireSRWLockExclusive(&g_u10_lock);
+        for (u = r->u10; u; u = u->next)
+            if (u->off == e->vb[slot].off && u->stride == stride && u->eoff == p->u10[k].off && u->count >= count) break;
+        if (!u) {
+            struct WMTBufferInfo bi;
+            u = calloc(1, sizeof *u);
+            if (u) {
+                memset(&bi, 0, sizeof bi); bi.length = (UINT64)count * 8; bi.options = WMTResourceStorageModePrivate;
+                u->buf = MTLDevice_newBuffer(d->mtl_device, &bi);
+                if (!u->buf) { free(u); u = NULL; }
+            }
+            if (u) {
+                u->off = e->vb[slot].off; u->stride = stride; u->eoff = p->u10[k].off; u->count = count; u->dirty = 1;
+                u->next = r->u10; r->u10 = u;
+                InterlockedExchangeAdd(&g_u10_bytes, (LONG)(count * 8)); InterlockedIncrement(&g_u10_n);
+            }
+        }
+        if (u && u->dirty) { u->dirty = 0; convert = 1; }
+        ReleaseSRWLockExclusive(&g_u10_lock);
+        if (!u) goto fail;
+        out[k] = u->buf;
+        if (!convert) continue;
+        exec_end(e);
+        e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false);
+        if (!e->cenc) goto fail;
+        g_enc_seq++; e->cenc_pso = NULL; e->cenc_seq = g_enc_seq;
+        exec_fence_compute(e, e->cenc, 0);
+        prm.eoff = u->eoff; prm.stride = stride; prm.count = u->count; prm.pad = 0;
+        memset(&sp, 0, sizeof sp); memset(sb, 0, sizeof sb); memset(&sby, 0, sizeof sby); memset(&dsp, 0, sizeof dsp);
+        sp.type = WMTComputeCommandSetPSO; sp.pso = d->k_u10_pso;
+        sp.threadgroup_size.width = 64; sp.threadgroup_size.height = 1; sp.threadgroup_size.depth = 1;
+        sb[0].type = WMTComputeCommandSetBuffer; sb[0].buffer = r->buffer; sb[0].offset = u->off; sb[0].index = 0;
+        sb[1].type = WMTComputeCommandSetBuffer; sb[1].buffer = u->buf; sb[1].offset = 0; sb[1].index = 1;
+        sby.type = WMTComputeCommandSetBytes; sby.bytes.ptr = &prm; sby.length = sizeof prm; sby.index = 2;
+        dsp.type = WMTComputeCommandDispatch; dsp.size.width = (u->count + 63) / 64; dsp.size.height = 1; dsp.size.depth = 1;
+        sp.next.ptr = &sb[0]; sb[0].next.ptr = &sb[1]; sb[1].next.ptr = &sby; sby.next.ptr = &dsp;
+        MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&sp);
+        exec_end(e);
+        if (InterlockedIncrement(&said) <= 8 || !(said & 255))
+            d3d12_log("[madeira-d3d12] u1010102: unpacked %u vertices of r#%u (+%llu stride %u element +%u) for '%s'; %ld streams, %ld KB\n",
+                      u->count, r->serial, (unsigned long long)u->off, stride, u->eoff, p->vs_name, (long)g_u10_n, (long)(g_u10_bytes >> 10));
+    }
+    return 1;
+fail:
+    if (InterlockedIncrement(&said_fail) <= 4) d3d12_log("[madeira-d3d12] u1010102: no unpacked stream for '%s' element %u; draw skipped\n", p->vs_name, k);
+    return 0;
+}
 static void exec_gui_overlay(struct mad_exec *e) {
     struct mad_device *d = e->q->device; struct mad_resource *bb = e->rt[0], *gui = e->gui_rt;
     struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_settexture st[3]; struct wmtcmd_compute_setbytes sby; struct wmtcmd_compute_dispatch dsp;
@@ -5842,7 +5945,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_SCISSOR: e.sc = c->u.scissor; e.has_sc = 1; break;
         case MC_TOPO: e.topo = c->u.topo; break;
         case MC_IB: e.ib = c->u.ib.res; e.ib_off = c->u.ib.off; e.ib_type = c->u.ib.type; break;
-        case MC_VB: if (c->u.vb.slot < 16) { e.vb[c->u.vb.slot].res = c->u.vb.res; e.vb[c->u.vb.slot].off = c->u.vb.off; e.vb[c->u.vb.slot].stride = c->u.vb.stride; } break;
+        case MC_VB: if (c->u.vb.slot < 16) { e.vb[c->u.vb.slot].res = c->u.vb.res; e.vb[c->u.vb.slot].off = c->u.vb.off; e.vb[c->u.vb.slot].stride = c->u.vb.stride; e.vb[c->u.vb.slot].size = c->u.vb.size; } break;
         case MC_RTS:
             /* ml934d: D3D12 begins a new render pass at every OMSetRenderTargets.
              * For passes WITH attachments we reuse the encoder when the bindings
@@ -8327,6 +8430,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->texture && !r->borrowed && !r->hp_used && !r->placed_heap) mad_unresident(r->owner, r->texture);
         if (r->hp_used && r->owner) mad_hp_release(r->owner, r);   /* ml1072: block returns after the GPU is done with it */
         { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->xview); }
+        if (r->u10) mad_u10_free(r);   /* madeira-doge */
         if (r->buffer) NSObject_release(r->buffer);
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
         if (r->placed_heap) { mad_pl_del(r->placed_heap, r); ID3D12Heap_Release((ID3D12Heap *)r->placed_heap); }   /* ml1145 */
@@ -11443,6 +11547,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
      * tightest stride that covers the declared elements is used and every
      * draw checks it against the bound buffer's real stride. */
     memset(&vd, 0, sizeof vd);
+    p->nu10 = 0;   /* madeira-doge */
     if (desc->InputLayout.NumElements && nvsin) {
         UINT running[16] = {0};
         if (said_inputs < 3) {
@@ -11469,6 +11574,34 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
                 if (ai >= 31) break;
                 if (!fmt) { d3d12_log("[madeira-d3d12] input element %s%u has vertex format %u with no Metal equivalent\n",
                                       el->SemanticName, el->SemanticIndex, (unsigned)el->Format); break; }
+                if (el->Format == DXGI_FORMAT_R10G10B10A2_UINT && p->nu10 < 4) {
+                    /* madeira-doge: Metal has no un-normalised 10:10:10:2 vertex
+                     * format (only UInt1010102Normalized, which a uint4 input
+                     * refuses: "Cannot convert attribute ... to int4 or uint4",
+                     * so every RE Engine skinned-mesh pipeline failed and its
+                     * draws were skipped). The element is unpacked into a
+                     * ushort4 stream by a compute kernel at draw time and read
+                     * from its own buffer index. */
+                    UINT k = p->nu10++, bi = 22 + k;
+                    static LONG said_u10;
+                    p->u10[k].slot = slot; p->u10[k].off = off;
+                    vd.attributes[ai].format = 15;   /* MTLVertexFormatUShort4 */
+                    vd.attributes[ai].offset = 0;
+                    vd.attributes[ai].buffer_index = bi;
+                    vd.attribute_mask |= 1u << ai;
+                    vd.layouts[bi].stride = 8;
+                    vd.layouts[bi].step_function = (el->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) ? 2 : 1;
+                    vd.layouts[bi].step_rate = el->InstanceDataStepRate ? el->InstanceDataStepRate : 1;
+                    vd.layout_mask |= 1u << bi;
+                    vd.layout_mask |= 1u << (6 + slot);   /* keeps the slot's stride bookkeeping */
+                    vd.layouts[6 + slot].step_function = vd.layouts[bi].step_function;
+                    vd.layouts[6 + slot].step_rate = vd.layouts[bi].step_rate;
+                    has_vd = 1;
+                    if (InterlockedIncrement(&said_u10) <= 6)
+                        d3d12_log("[madeira-d3d12] u1010102: '%s' element %s%u (slot %u +%u) is read from an unpacked ushort4 stream at buffer %u\n",
+                                  p->vs_name, el->SemanticName, el->SemanticIndex, slot, off, bi);
+                    break;
+                }
                 vd.attributes[ai].format = fmt;
                 vd.attributes[ai].offset = off;
                 vd.attributes[ai].buffer_index = 6 + slot;
@@ -12364,6 +12497,7 @@ static void STDMETHODCALLTYPE list_IASetVertexBuffers(ID3D12GraphicsCommandList 
             c->u.vb.res = mad_resolve_address(l->device, views[i].BufferLocation, &off);
             c->u.vb.off = off;
             c->u.vb.stride = views[i].StrideInBytes;
+            c->u.vb.size = views[i].SizeInBytes;
         }
     }
 }

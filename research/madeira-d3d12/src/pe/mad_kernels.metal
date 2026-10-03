@@ -82,3 +82,23 @@ kernel void mad_gui_over(texture2d_array<float> gui [[texture(0)]],
     }
     dst.write(s, gid);
 }
+
+// madeira-doge: Metal has no un-normalised 10:10:10:2 vertex format, and a
+// uint4 vertex input refuses UInt1010102Normalized. RE Engine stores bone
+// indices that way (DXGI_FORMAT_R10G10B10A2_UINT), so the element is unpacked
+// into a ushort4 stream here and the pipeline reads that instead.
+struct mad_u10_params {
+    uint eoff, stride, count, pad;
+};
+kernel void mad_u1010102(device const uchar *src [[buffer(0)]],
+                         device ushort *dst [[buffer(1)]],
+                         constant mad_u10_params &p [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.count) return;
+    uint o = p.eoff + gid * p.stride;
+    uint v = uint(src[o]) | (uint(src[o + 1]) << 8) | (uint(src[o + 2]) << 16) | (uint(src[o + 3]) << 24);
+    dst[gid * 4 + 0] = ushort(v & 1023u);
+    dst[gid * 4 + 1] = ushort((v >> 10) & 1023u);
+    dst[gid * 4 + 2] = ushort((v >> 20) & 1023u);
+    dst[gid * 4 + 3] = ushort(v >> 30);
+}
