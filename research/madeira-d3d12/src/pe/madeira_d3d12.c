@@ -5780,6 +5780,41 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         g_capture_cs_shots++;
         mad_capture_dispatch_inputs(e, c);
     }
+    /* madeira-doge: RE Engine's Persistent*ClusterCulling is a wave-op work queue
+     * kept in a 2064-byte buffer (512 slots, then count / workers / cursors at
+     * +2048). Every wave loops until count and workers are both zero, so a queue
+     * left non-empty -- by a dispatch the GPU aborted, or by state that was never
+     * reset -- hangs every later dispatch until the watchdog kills it (one second
+     * a frame). The queue is empty between dispatches by construction; start each
+     * one from zero. madeira.cfg pcc-reset = 0 turns this off. */
+    if (strstr(e->cpso->vs_name, "ClusterCulling") && !strncmp(e->cpso->vs_name, "Persistent", 10) && e->crs && e->srv && e->srv->cpu) {
+        static LONG on = -1, said; const struct mad_rootsig *rs = e->crs; UINT pi;
+        if (on < 0) on = mad_cfg_int_pe("pcc-reset", 1) ? 1 : 0;
+        for (pi = 0; on && pi < rs->nparams && pi < MAD_ROOT_PARAM_MAX; pi++) {
+            const struct madeira_ir_root_param *pp = &rs->params[pi]; UINT idx, k2, n = 0, j;
+            if (pp->type != MADEIRA_IR_PARAM_TABLE || e->croot[pi] < e->srv->gpu_address ||
+                e->croot[pi] >= e->srv->gpu_address + (UINT64)e->srv->count * sizeof(struct mad_descriptor)) continue;
+            idx = (UINT)((e->croot[pi] - e->srv->gpu_address) / sizeof(struct mad_descriptor));
+            for (k2 = 0; k2 < pp->num_ranges && pp->first_range + k2 < rs->nranges; k2++) n += rs->ranges[pp->first_range + k2].num_descriptors;
+            if (n > 16) n = 16;
+            if (idx + n > e->srv->count) n = e->srv->count - idx;
+            for (j = 0; j < n; j++) {
+                const struct mad_descriptor *de = &e->srv->cpu[idx + j]; UINT64 off = 0; struct mad_resource *qr;
+                struct wmtcmd_blit_fillbuffer fk;
+                if (!de->gpu_va || (de->metadata & 0xffffffffull) != 2064) continue;
+                qr = mad_resolve_address(e->q->device, de->gpu_va, &off);
+                if (!qr || !qr->buffer || off + 2064 > qr->size) continue;
+                if (!exec_begin_blit(e)) break;
+                memset(&fk, 0, sizeof fk);
+                fk.type = WMTBlitCommandFillBuffer; fk.buffer = qr->buffer; fk.offset = off; fk.length = 2064; fk.value = 0;
+                MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&fk);
+                if (InterlockedIncrement(&said) <= 4)
+                    d3d12_log("[madeira-d3d12] pcc-reset: '%s' work queue r#%u +%llu zeroed before its dispatch (root parameter %u, descriptor %u)\n",
+                              e->cpso->vs_name, qr->serial, (unsigned long long)off, pi, j);
+                pi = MAD_ROOT_PARAM_MAX; break;
+            }
+        }
+    }
     if (g_fault_diag) {   /* madeira-bcd: GPU fault attribution -- one pipeline per compute encoder */
         if (mad_fault_skip_pso(e->cpso)) { MAD_SKIP(e); return; }
         if (e->cenc && e->cenc_pso != e->cpso) exec_end(e);
