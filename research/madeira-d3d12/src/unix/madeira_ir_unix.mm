@@ -274,6 +274,10 @@ static void mad_air_entry_name(const unsigned char *b, size_t len, char *out, si
 extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
                                    char *note, size_t note_cap);
 
+/* madeira-doge: madeira_cas.cpp -- the converter's weak compare-exchange made strong. */
+extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *out_len,
+                               char *note, size_t note_cap);
+
 extern "C" int madeira_sm5_resolve_ia(const void *bc, size_t bclen,
                                       const struct madeira_ir_input_layout *L,
                                       struct SM50_IA_INPUT_ELEMENT *out, uint32_t out_cap,
@@ -1484,6 +1488,23 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     if (!need) { status = MADEIRA_IR_NO_METALLIB; goto done; }
     if (!a->out_buf || a->out_cap < need) { status = MADEIRA_IR_BUFFER_TOO_SMALL; goto done; }
     a->ret_len = g_ir.IRMetalLibGetBytecode(lib, (uint8_t *)(uintptr_t)a->out_buf);
+    if (stage == IRShaderStageCompute && a->ret_len) {   /* madeira-doge: madeira_cas.cpp */
+        static int cas_on = -1; static unsigned cas_said;
+        void *nb = NULL; size_t nlen = 0; char cnote[256];
+        if (cas_on < 0) { char v[16]; cas_on = !(madeira_cfg_get("cas-strong", v, sizeof v) && v[0] == '0'); }
+        if (cas_on) {
+            int crc = madeira_cas_fix((const void *)(uintptr_t)a->out_buf, (size_t)a->ret_len, &nb, &nlen, cnote, sizeof cnote);
+            if (crc == 1 && nlen <= a->out_cap) {
+                memcpy((void *)(uintptr_t)a->out_buf, nb, nlen);
+                a->ret_len = nlen;
+                if (cas_said++ < 24) dprintf(2, "[madeira-ir] cas-strong '%s': %s\n", entry ? entry : "?", cnote);
+            } else if (crc != 0 || cnote[0]) {
+                if (cas_said++ < 24) dprintf(2, "[madeira-ir] cas-strong '%s' NOT applied (rc %d, %zu bytes, cap %llu): %s\n", entry ? entry : "?", crc, nlen,
+                                             (unsigned long long)a->out_cap, cnote);
+            }
+            free(nb);
+        }
+    }
 
     /* The converter RENAMES entry points, so the name to give Metal comes from
      * reflection rather than from what D3D called it.

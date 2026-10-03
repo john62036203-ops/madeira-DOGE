@@ -160,6 +160,8 @@ if [[ "$HAVE_MSC" == 1 ]]; then
     # ml1149: AMD AGS 64-bit atomics -> native SM6.6 atomics, a DXIL rewrite on
     # the LLVM 15 that airconv already links (bitcode reader + writer).
     compile_cxx "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_ags.cpp" madeira_ags
+    # madeira-doge: the converter's weak compare-exchange made strong (AIR rewrite, same LLVM 15).
+    compile_cxx "$REPO_ROOT/research/madeira-d3d12/src/unix/madeira_cas.cpp" madeira_cas "-I$DXMT_SRC/airconv"
 else
     echo "=== madeira-d3d12 canary SKIPPED (converter headers not resolvable) ==="
     echo "=== madeira-d3d12 conversion STUB: D3D12 pipelines will fail, D3D11 unaffected ==="
