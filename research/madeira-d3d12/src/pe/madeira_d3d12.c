@@ -5819,6 +5819,49 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
                 qr = mad_resolve_address(e->q->device, de->gpu_va, &off);
                 if (!qr || !qr->buffer || off + 2064 > qr->size) continue;
                 if (!exec_begin_blit(e)) break;
+                {   /* madeira-doge: what did the previous dispatch leave in the queue? Copied out
+                     * before the reset and printed eight captures later, when the GPU has run it
+                     * (or thrown it away: the 0xEE prefill is then still there). */
+                    static obj_handle_t dbg; static unsigned char *dbg_cpu; static LONG ncap;
+                    enum { SLOT = 2304, NSLOT = 16, MAXCAP = 60 };
+                    LONG kcap = ncap;
+                    if (!dbg) {
+                        struct WMTBufferInfo bi; memset(&bi, 0, sizeof bi);
+                        bi.length = SLOT * NSLOT; bi.options = WMTResourceStorageModeShared;
+                        dbg = MTLDevice_newBuffer(e->q->device->mtl_device, &bi);
+                        dbg_cpu = dbg ? (unsigned char *)bi.memory.ptr : NULL;
+                    }
+                    if (dbg && dbg_cpu && kcap < MAXCAP && (kcap < 6 || g_fault_diag)) {
+                        struct wmtcmd_blit_copy_from_buffer_to_buffer ck; unsigned char *cs = dbg_cpu + (kcap % NSLOT) * SLOT;
+                        ncap = kcap + 1;
+                        if (kcap >= 8) {   /* print capture kcap-8, about to be overwritten in 8 more */
+                            const unsigned char *ps = dbg_cpu + ((kcap - 8) % NSLOT) * SLOT; const UINT32 *w = (const UINT32 *)ps;
+                            if (w[0] == 0xEEEEEEEEu && w[515] == 0xEEEEEEEEu)
+                                d3d12_log("[madeira-d3d12] pcc-state #%ld: not executed (its command buffer was discarded)\n", (long)(kcap - 8));
+                            else {
+                                UINT nz = 0, q, first[4] = {0, 0, 0, 0}, nf = 0;
+                                for (q = 0; q < 512; q++) if (w[q]) { nz++; if (nf < 4) first[nf++] = q; }
+                                d3d12_log("[madeira-d3d12] pcc-state #%ld: count=%d workers=%d cur56=%u cur60=%u | %u of 512 slots occupied (first at %u %u %u %u: %#x %#x) | roots: %u %u %u %u\n",
+                                          (long)(kcap - 8), (int)w[512], (int)w[513], w[514], w[515], nz, first[0], first[1], first[2], first[3],
+                                          nf ? w[first[0]] : 0, nf > 1 ? w[first[1]] : 0, w[516], w[517], w[518], w[519]);
+                            }
+                        }
+                        memset(cs, 0xEE, SLOT);
+                        memset(&ck, 0, sizeof ck);
+                        ck.type = WMTBlitCommandCopyFromBufferToBuffer;
+                        ck.src = qr->buffer; ck.src_offset = off; ck.dst = dbg; ck.dst_offset = (UINT64)(kcap % NSLOT) * SLOT; ck.copy_length = 2064;
+                        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&ck);
+                        if (j + 2 < n) {
+                            const struct mad_descriptor *d2 = &e->srv->cpu[idx + j + 2]; UINT64 o2 = 0; struct mad_resource *r2;
+                            if (d2->gpu_va && (d2->metadata & 0xffffffffull) >= 16 && (r2 = mad_resolve_address(e->q->device, d2->gpu_va, &o2)) && r2->buffer && o2 + 16 <= r2->size) {
+                                memset(&ck, 0, sizeof ck);
+                                ck.type = WMTBlitCommandCopyFromBufferToBuffer;
+                                ck.src = r2->buffer; ck.src_offset = o2; ck.dst = dbg; ck.dst_offset = (UINT64)(kcap % NSLOT) * SLOT + 2064; ck.copy_length = 16;
+                                MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&ck);
+                            }
+                        }
+                    }
+                }
                 memset(&fk, 0, sizeof fk);
                 fk.type = WMTBlitCommandFillBuffer; fk.buffer = qr->buffer; fk.offset = off; fk.length = 2064; fk.value = 0;
                 MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&fk);
