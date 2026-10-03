@@ -3026,7 +3026,16 @@ static void mad_fault_report(obj_handle_t cb) {
     out[0] = 0;
     MadeiraCtl(&a);
     if (a.ret == 1 && out[0]) {
-        if (InterlockedIncrement(&said) <= 40) d3d12_log("[madeira-d3d12] GPU fault encoders: %s\n", out);
+        {   /* madeira-doge: a GPU restart discards every command buffer in flight ("innocent
+             * victim"); the one that CAUSED it says so. Log every cause, however many victims
+             * came first, and keep a tally. */
+            static LONG n_victim, n_cause, n_all; int victim = strstr(out, "InnocentVictim") != NULL; LONG tot;
+            if (victim) InterlockedIncrement(&n_victim);
+            else if (InterlockedIncrement(&n_cause) <= 120) d3d12_log("[madeira-d3d12] GPU fault CAUSE #%ld: %.1500s\n", (long)n_cause, out);
+            tot = InterlockedIncrement(&n_all);
+            if (!(tot % 25)) d3d12_log("[madeira-d3d12] GPU fault tally: %ld errors = %ld causes + %ld innocent victims\n", (long)tot, (long)n_cause, (long)n_victim);
+            if (victim && InterlockedIncrement(&said) <= 12) d3d12_log("[madeira-d3d12] GPU fault encoders: %s\n", out);
+        }
         if (g_fault_skip)
             for (f = out; (f = strstr(f, "[FAULTED] ")); ) {
                 char *end = strstr(f, "; ");
