@@ -181,7 +181,7 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
         if (f.isDeclaration() && f.getName().startswith("air.atomic.") && f.getName().contains(".cmpxchg.weak."))
             for (User *u : f.users()) if (isa<CallInst>(u)) nsites++;
     if (mode < 0) {
-        static const int multi[2] = { 2, 4 }, single[4] = { 0, 1, 2, 4 };
+        static const int multi[2] = { 2, 4 }, single[4] = { 2, 4, 2, 4 };
         static unsigned tm, ts;
         mode = nsites >= 2 ? multi[tm++ % 2] : single[ts++ % 4];
     }
@@ -201,14 +201,21 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
     }
     SmallVector<char, 0> nb;
     {
-        /* The converter wraps its module (0x0B17C0DE: version, offset 20, size,
-         * cpu type) and pads the section to 16 bytes; write the same shape. */
-        SmallVector<char, 0> raw;
-        { raw_svector_ostream os(raw); WriteBitcodeToFile(**mod, os, false, nullptr, true); }
-        uint32_t w[5] = { 0x0B17C0DEu, 0, 20, (uint32_t)raw.size(), 0xffffffffu };
-        if (bc_size >= 20) { uint32_t ow[5]; memcpy(ow, d + bc_off, 20); if (ow[0] == 0x0B17C0DEu) { w[1] = ow[1]; w[4] = ow[4]; } }
-        nb.append((const char *)w, (const char *)w + 20);
-        nb.append(raw.begin(), raw.end());
+        /* For an Apple triple LLVM's writer already emits the 0x0B17C0DE wrapper
+         * and pads to 16 bytes -- the shape the converter's own section has.
+         * (Wrapping it a second time is what made Metal's compiler service
+         * crash on every rewritten library in builds 66-68.) */
+        raw_svector_ostream os(nb);
+        WriteBitcodeToFile(**mod, os, false, nullptr, true);
+    }
+    {
+        uint32_t m0 = 0; if (nb.size() >= 4) memcpy(&m0, nb.data(), 4);
+        if (m0 != 0x0B17C0DEu) {   /* not wrapped (non-Apple triple): wrap and pad it here */
+            SmallVector<char, 0> raw; raw.swap(nb);
+            uint32_t w[5] = { 0x0B17C0DEu, 0, 20, (uint32_t)raw.size(), 0xffffffffu };
+            nb.append((const char *)w, (const char *)w + 20);
+            nb.append(raw.begin(), raw.end());
+        }
         while (nb.size() & 15) nb.push_back(0);
     }
 
