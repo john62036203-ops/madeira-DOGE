@@ -64,6 +64,39 @@ static const char *madeira_user_args(void)
 if s.count(anchor) != 1:
     sys.exit("madeira-dock build: include anchor changed; launch arguments not added")
 s = s.replace(anchor, helper, 1)
+# madeira-doge: give Valve's client time after the game exits. Dock shut the
+# client down 3 s after the game stopped running; the client uploads the Steam
+# Cloud save and tells Steam's servers the game has ended only after that, on
+# its own worker threads, so the save never reached the cloud and another
+# machine was told the game was still running. Keep the client alive and its
+# callbacks served for MADEIRA_DOCK_EXIT_SYNC_S seconds (default 30, 0 = off).
+ended = """                o->event("launch-game-ended", 1);
+"""
+if s.count(ended) == 1:
+    s = s.replace(ended, ended + """                {
+                    wchar_t grace_text[8] = {0};
+                    DWORD grace_len = GetEnvironmentVariableW(L"MADEIRA_DOCK_EXIT_SYNC_S", grace_text, 8);
+                    unsigned long grace_s = grace_len && grace_len < 8 ? wcstoul(grace_text, NULL, 10) : 30;
+                    uint64_t grace_begin = o->now_ms();
+                    unsigned grace_logged = 0;
+                    if (grace_s > 300) grace_s = 300;
+                    o->event("launch-exit-sync-wait", (int32_t)grace_s);
+                    while (!InterlockedCompareExchange(&interrupted, 0, 0) &&
+                           o->now_ms() - grace_begin < (uint64_t)grace_s * 1000) {
+                        for (unsigned grace_batch = 0; grace_batch < 64; ++grace_batch) {
+                            struct sh_callback grace_cb = {0};
+                            if (!api->get_callback(pipe, &grace_cb)) break;
+                            if (grace_logged < 24) { o->event("launch-exit-callback-id", grace_cb.id); ++grace_logged; }
+                            api->free_callback(pipe);
+                        }
+                        o->sleep_ms(50);
+                    }
+                    o->event("launch-exit-sync-done", (int32_t)((o->now_ms() - grace_begin) / 1000));
+                }
+""", 1)
+    print("madeira-dock: exit grace period for Steam Cloud patched into launch.c")
+else:
+    print("madeira-dock: game-ended site changed; exit grace period not added", file=sys.stderr)
 open(p, "w").write(s)
 print("madeira-dock: launch arguments from MADEIRA_DOCK_GAME_ARGS patched into launch.c")
 PY
@@ -76,7 +109,7 @@ PY
 if ! "$CC" -std=c11 -O2 -Wall -Wextra -Werror -Wno-cast-function-type \
     -static -Wl,--strip-all -Wl,--no-insert-timestamp \
     -I"$SRC/src" -o "$TMP/dockhost.exe" "$TMP"/src/*.c -ladvapi32; then
-    echo "madeira-dock: the launch-arguments build failed; building the unmodified sources" >&2
+    echo "::warning::madeira-dock: the patched build failed; building the unmodified sources (no launch arguments, no exit grace period)" >&2
     "$CC" -std=c11 -O2 -Wall -Wextra -Werror -Wno-cast-function-type \
         -static -Wl,--strip-all -Wl,--no-insert-timestamp \
         -o "$TMP/dockhost.exe" "$SRC"/src/*.c -ladvapi32
