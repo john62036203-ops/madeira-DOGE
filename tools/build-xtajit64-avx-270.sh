@@ -48,7 +48,7 @@ git -C "$F" submodule update --init --recursive $SUBS > "$F.avx-submodules.log" 
     || { tail -20 "$F.avx-submodules.log"; exit 1; }
 
 # --------------------------------------------------------------- the patches
-PATCHED="Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h
+PATCHED="FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h
          Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp
          Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp
          Source/Windows/Common/CPUFeatures.cpp"
@@ -62,6 +62,7 @@ python3 "$R/tools/patch-fex-ios-ircap-tls.py" "$F/FEXCore/Source/Interface/IR/Pa
 python3 "$R/tools/patch-fex-ios-teb-tsd.py" "$F/Source/Windows/Common/Priv.h"
 python3 "$R/tools/patch-fex-ios-cpuid-index.py" "$F/FEXCore/Source/Interface/Core/CPUID.cpp"
 python3 "$R/tools/patch-fex-ios-avx.py" "$F/Source/Windows/Common/CPUFeatures.cpp"
+python3 "$R/tools/patch-fex-ios-pool-null.py" "$F/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h"
 
 # ----------------------------------------------------------------- the build
 # Build 270's options for the ARM64EC module (its tools/build-xtajit64.sh).
