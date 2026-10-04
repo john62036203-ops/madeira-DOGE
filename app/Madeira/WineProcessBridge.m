@@ -1148,6 +1148,15 @@ static void *wine_process_thread(void *arg) {
              * rebuild. Lines starting with # are comments. Logged, so a run's log
              * always says what it ran with. */
             {
+                /* madeira-doge: the app process outlives a launch, so a variable an
+                 * earlier launch took from madeira.cfg or from a game's settings
+                 * (WINEDLLOVERRIDES, MADEIRA_DOCK_GAME_ARGS, ...) would leak into
+                 * every later launch. Unset what the previous launch set here
+                 * first; madeira.cfg and the current game set theirs again below. */
+                static NSMutableSet<NSString *> *cfgEnvKeys;
+                if (!cfgEnvKeys) cfgEnvKeys = [NSMutableSet set];
+                for (NSString *key in cfgEnvKeys) unsetenv(key.UTF8String);
+                [cfgEnvKeys removeAllObjects];
                 /* ml1095: "env.NAME = value" lines of madeira.cfg; the legacy
                  * madeira-env.txt (KEY=VALUE lines) only when madeira.cfg is absent. */
                 NSString *text = nil;
@@ -1172,6 +1181,7 @@ static void *wine_process_thread(void *arg) {
                     if (!line.length || [line hasPrefix:@"#"] || eq.location == NSNotFound || eq.location == 0) continue;
                     NSString *k = [line substringToIndex:eq.location], *v = [line substringFromIndex:eq.location + 1];
                     setenv(k.UTF8String, v.UTF8String, 1);
+                    [cfgEnvKeys addObject:k];
                     LOG("madeira.cfg env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
                     fprintf(stderr, "[madeira-env] ml1062 %s=%s\n", k.UTF8String, v.UTF8String);
                 }
@@ -1199,8 +1209,29 @@ static void *wine_process_thread(void *arg) {
                     NSString *v = [[line substringFromIndex:eq.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
                     if (!k.length) continue;
                     setenv(k.UTF8String, v.UTF8String, 1);
+                    [cfgEnvKeys addObject:k];
                     fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);
                 }
+                /* madeira-doge: no Steam Overlay in Madeira Dock sessions. Valve's client
+                 * injects gameoverlayrenderer(64).dll into every game it starts; on iOS its
+                 * hook-trampoline search fails thousands of times (Among Us: ~14,000
+                 * [alloc-fail]) and its Present hook keeps the exception thread busy, so
+                 * games stutter at a third of their frame rate. The overlay cannot be
+                 * used here anyway (no Shift+Tab). Disabled through Wine's load order,
+                 * appended to whatever WINEDLLOVERRIDES madeira.cfg or the game set.
+                 * env.MADEIRA_STEAM_OVERLAY = 1 (madeira.cfg or the game's settings)
+                 * keeps it. */
+                const char *dockSession = getenv("MADEIRA_DOCK_SESSION");
+                const char *overlayOn = getenv("MADEIRA_STEAM_OVERLAY");
+                if (dockSession && !strcmp(dockSession, "1") && !(overlayOn && !strcmp(overlayOn, "1"))) {
+                    const char *cur = getenv("WINEDLLOVERRIDES");
+                    NSString *ov = (cur && *cur)
+                        ? [NSString stringWithFormat:@"%s;gameoverlayrenderer,gameoverlayrenderer64=d", cur]
+                        : @"gameoverlayrenderer,gameoverlayrenderer64=d";
+                    setenv("WINEDLLOVERRIDES", ov.UTF8String, 1);
+                    [cfgEnvKeys addObject:@"WINEDLLOVERRIDES"];
+                    fprintf(stderr, "[steam-overlay] disabled for this Dock session: WINEDLLOVERRIDES=%s "
+                                    "(env.MADEIRA_STEAM_OVERLAY = 1 keeps the overlay)\n", ov.UTF8String);
                 /* Fastsync is the default sync engine: with neither inproc-sync nor
                  * env.MADEIRA_FASTSYNC in madeira.cfg, Wine gets MADEIRA_FASTSYNC=auto,
                  * the value Settings > Sync engine > Fastsync writes. Never overrides a

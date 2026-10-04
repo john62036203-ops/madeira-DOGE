@@ -3277,6 +3277,107 @@ static int ios_jit_alias_has_emulator( void *peb )
     return 0;
 }
 
+/* madeira-doge ml2100: ONE CALLBACK PER FEX INSTANCE.
+ *
+ * Every x64 pseudo-process loads its own libarm64ecfex.dll, with its own
+ * IosAliasEntries table, and registers its own push callback.  The single
+ * global above kept only the LAST registrant, so an image loaded later in an
+ * older process was pushed into the NEWEST process's table instead of its own.
+ * Among Us through Madeira Dock: the game spawns crashpad_handler.exe (whose
+ * FEX registers next), then loads cryptnet.dll; the game's FEX never heard of
+ * cryptnet's pool copy, an EC call into it reached FEX at the pool address,
+ * [iOS-xquery] MISSed with rev == addr, NoExec, and the game was killed.
+ *
+ * Now every registrant is kept (keyed by its PEB, replaced on re-registration,
+ * forgotten at process exit) and each new mapping is pushed to all of them --
+ * the same set the catch-up drain at registration already gives a new FEX.
+ * The plain global stays the newest one, for the sub-floor windows, which are
+ * per-process and keep their old routing.  MADEIRA_JIT_ALIAS_PUSH_ALL=0
+ * restores last-registrant-only pushing. */
+#define IOS_JIT_ALIAS_CB_MAX 32
+static struct { void *peb; void (*cb)(unsigned long long, unsigned long long, unsigned long long); }
+    ios_jit_alias_cbs[IOS_JIT_ALIAS_CB_MAX];
+static pthread_mutex_t ios_jit_alias_cb_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ios_jit_alias_push_all = -1;
+
+static int ios_jit_alias_push_all_on(void)
+{
+    if (ios_jit_alias_push_all < 0)
+    {
+        const char *v = getenv( "MADEIRA_JIT_ALIAS_PUSH_ALL" );
+        ios_jit_alias_push_all = !(v && v[0] == '0');
+        dprintf( 2, "[jit-alias] ml2100 push-all=%d (MADEIRA_JIT_ALIAS_PUSH_ALL=0 pushes to the newest FEX only)\n",
+                 ios_jit_alias_push_all );
+    }
+    return ios_jit_alias_push_all;
+}
+
+static void ios_jit_alias_cb_remember( void *peb, void (*cb)(unsigned long long, unsigned long long, unsigned long long) )
+{
+    int i, free_slot = -1;
+    pthread_mutex_lock( &ios_jit_alias_cb_lock );
+    for (i = 0; i < IOS_JIT_ALIAS_CB_MAX; i++)
+    {
+        if (ios_jit_alias_cbs[i].cb && ios_jit_alias_cbs[i].peb == peb)
+        {
+            ios_jit_alias_cbs[i].cb = cb;
+            pthread_mutex_unlock( &ios_jit_alias_cb_lock );
+            return;
+        }
+        if (!ios_jit_alias_cbs[i].cb && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0)
+    {
+        ios_jit_alias_cbs[free_slot].peb = peb;
+        __sync_synchronize();
+        ios_jit_alias_cbs[free_slot].cb = cb;
+    }
+    pthread_mutex_unlock( &ios_jit_alias_cb_lock );
+    dprintf( 2, "[jit-alias] ml2100 FEX alias callback %s peb=%p cb=%p\n",
+             free_slot >= 0 ? "registered" : "NOT KEPT (table full)", peb, (void *)cb );
+}
+
+/* Called from process_exit_wrapper (server_ios.c) before the dead process's
+ * pool copies -- its libarm64ecfex.dll among them -- are reclaimed. */
+void ios_jit_alias_cb_forget( void *peb )
+{
+    int i;
+    if (!peb) return;
+    pthread_mutex_lock( &ios_jit_alias_cb_lock );
+    for (i = 0; i < IOS_JIT_ALIAS_CB_MAX; i++)
+        if (ios_jit_alias_cbs[i].cb && ios_jit_alias_cbs[i].peb == peb)
+        {
+            ios_jit_alias_cbs[i].cb = NULL;
+            __sync_synchronize();
+            ios_jit_alias_cbs[i].peb = NULL;
+        }
+    pthread_mutex_unlock( &ios_jit_alias_cb_lock );
+}
+
+static void ios_jit_alias_push_new( unsigned long long pe, unsigned long long jit, unsigned long long size )
+{
+    void (*cbs[IOS_JIT_ALIAS_CB_MAX])(unsigned long long, unsigned long long, unsigned long long);
+    int i, n = 0;
+
+    if (!ios_jit_alias_push_all_on())
+    {
+        if (ios_jit_alias_pushback_cb) ios_jit_alias_pushback_cb( pe, jit, size );
+        return;
+    }
+    /* Snapshot under the lock, call outside it: a callback is FEX code that may
+     * itself map memory and come back through ios_jit_add_mapping. */
+    pthread_mutex_lock( &ios_jit_alias_cb_lock );
+    for (i = 0; i < IOS_JIT_ALIAS_CB_MAX; i++)
+        if (ios_jit_alias_cbs[i].cb) cbs[n++] = ios_jit_alias_cbs[i].cb;
+    pthread_mutex_unlock( &ios_jit_alias_cb_lock );
+    if (!n)
+    {
+        if (ios_jit_alias_pushback_cb) ios_jit_alias_pushback_cb( pe, jit, size );
+        return;
+    }
+    for (i = 0; i < n; i++) cbs[i]( pe, jit, size );
+}
+
 void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
     int i;
@@ -6043,6 +6144,10 @@ struct file_view
     void         *base;          /* base address */
     size_t        size;          /* size in bytes */
     unsigned int  protect;       /* protection for all pages at allocation time and SEC_* flags */
+    unsigned int  madeira_creator_tid; /* ml1950: creation attribution, not current ownership */
+    unsigned int  madeira_parked;      /* madeira-doge: nonzero token while the view sits in ios_vpark[] */
+    void         *madeira_rw_base;     /* madeira-doge: span a reused parked view left host-RW and zeroed; */
+    size_t        madeira_rw_size;     /*   valid for the first commit after the reuse only */
 };
 
 /* per-page protection flags */
@@ -9842,6 +9947,40 @@ static BOOL ios_dnsapi_unixlib_enabled(void)
     return !(e && e[0] == '0');
 }
 
+/* MADEIRA (from upstream build 270, docs/MEDIA.md): winegstreamer's unix side
+ * on FFmpeg's libavcodec/libavformat plus VideoToolbox and AudioToolbox
+ * (build/ntdll-unix/winegstreamer_unixlib_ios.c, which includes
+ * wg_parser_av_ios.c).  Without it winegstreamer.dll could not load at all:
+ * CLSID_CWMADecMediaObject -> wmadmod.dll -> CLSID_wg_wma_decoder had no class
+ * object, so FAudio played xWMA voices' COMPRESSED bytes as PCM (static), and
+ * quartz's MP3/WAV splitters and Media Foundation's MP4 source had no parser.
+ *
+ * The wow64 table is written by hand in that file, because
+ * dlls/winegstreamer/unixlib.h carries no 32-bit param structs (the entries
+ * holding a struct wg_media_type or a struct wg_sample * differ).
+ *
+ * 221 tree: build.sh archives the media objects only when both compiled;
+ * otherwise it archives winegstreamer_stub_ios.c, whose two tables are a
+ * single NULL entry, and winegstreamer keeps the generic stub table exactly
+ * as before (ios_wg_unixlib_linked below). */
+extern const void *winegstreamer_unix_call_funcs[];
+extern const void *winegstreamer_unix_call_wow64_funcs[];
+
+/* winegstreamer's unix side is bound for 32-bit (wow64) callers.  A 64-bit
+ * (ARM64EC) caller gets it only with MADEIRA_WG_64BIT=1 (env, or
+ * env.MADEIRA_WG_64BIT = 1 in madeira.cfg); by default it keeps the generic
+ * stub table, as upstream. */
+static BOOL ios_wg_64bit_opted_in(void)
+{
+    const char *e = getenv( "MADEIRA_WG_64BIT" );
+    return e && e[0] == '1';
+}
+
+static BOOL ios_wg_unixlib_linked(void)
+{
+    return winegstreamer_unix_call_funcs[0] != NULL && winegstreamer_unix_call_wow64_funcs[0] != NULL;
+}
+
 /***********************************************************************
  *           ios_module_export_name
  *
@@ -10603,6 +10742,34 @@ static inline UINT64 maskbits( size_t idx )
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot );  /* fwd-decl */
 static void ios_swap_release_range( void *base, size_t size, int copy_back );   /* ml1077 fwd-decls */
 static void ios_swap_init( void );
+/* madeira-doge: is the calling pseudo-process a Steam game (image under
+ * \steamapps\common\)? Cached per PEB. */
+static int ios_swap_proc_is_game(void)
+{
+    static void *last_peb; static int last_res;
+    TEB *teb = NtCurrentTeb();
+    PEB *peb = teb ? teb->Peb : NULL;
+    RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+    static const char needle[] = "\\steamapps\\common\\";
+    const WCHAR *path; size_t len, i, j, n = sizeof(needle) - 1; int res = 0;
+    if (!peb) return 0;
+    if (peb == last_peb) return last_res;
+    if (!pp || !(path = pp->ImagePathName.Buffer)) return 0;   /* not cached: params not set yet */
+    if (!(pp->Flags & PROCESS_PARAMS_FLAG_NORMALIZED)) path = (const WCHAR *)((const char *)pp + (ULONG_PTR)path);
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (i = 0; !res && i + n <= len; i++)
+    {
+        for (j = 0; j < n; j++)
+        {
+            WCHAR c = path[i + j];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (WCHAR)needle[j]) break;
+        }
+        if (j == n) res = 1;
+    }
+    last_res = res; last_peb = peb;
+    return res;
+}
 static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot, struct file_view *view );
 static void ios_swap_back( void *base, size_t size, unsigned int vprot );
 
@@ -11191,6 +11358,20 @@ static inline int ios_in_layerkit( unsigned long long a, size_t size )
 static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                                 void *start, size_t size, int unix_prot )
 {
+    /* madeira-doge: dead-hole memo (bottom-up scans only). A "dead hole" is a
+     * stretch Mach reports as FREE but where the kernel refused every small
+     * mapping we tried (the gap between __PAGEZERO and the app image). After the
+     * pagezero skip a DMC5 scan still paid ~1,200 failed mmaps to cross it, for
+     * every allocation (try_map_free_area was ~30% of sampled CPU). The first
+     * scan that crosses one records it; later scans jump it. MADEIRA_NO_DEAD_HOLE=1
+     * disables this. */
+    static struct { uintptr_t lo, hi; } dead[8];
+    static int ndead, dead_off = -1;
+    void *run_lo = NULL;
+    unsigned run_n = 0;
+
+    if (dead_off < 0) dead_off = getenv( "MADEIRA_NO_DEAD_HOLE" ) != NULL;
+
     while (start && base <= start && (char*)start + size <= (char*)end)
     {
         /* ml253 ROOT-CAUSE FIX: never allocate inside the JIT pool.
@@ -11236,6 +11417,45 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                 continue;
             }
         }
+        /* madeira-doge: never scan inside __PAGEZERO.
+         *
+         * iOS mandates a 4 GB __PAGEZERO (research/HANDOFF-rdr2-arm64ec-hooks.md:
+         * measured four ways), so every address below 0x100000000 is permanently
+         * unmappable. Mach reports it as a FREE hole, so ios_skip_occupied cannot
+         * jump it and a bottom-up scan from 0x10000 crawled one 64 KB granule at a
+         * time: 17 scans in one DMC5 log cost ~67,000 failed mmaps each (~1.14M
+         * total), all under virtual_mutex; the profiler put try_map_free_area's
+         * Mach calls at ~50% of all CPU with threads parked on virtual_mutex.
+         * Start above the zero page (bottom-up) or give up (top-down).
+         * MADEIRA_NO_PAGEZERO_SKIP=1 restores the old behaviour. */
+        {
+            static int pz_off = -1;
+            if (pz_off < 0) pz_off = getenv( "MADEIRA_NO_PAGEZERO_SKIP" ) != NULL;
+            if (!pz_off && (uintptr_t)start < 0x100000000ULL)
+            {
+                static int pz_logged;
+                if (pz_logged++ < 4)
+                    dprintf( 2, "[va-scan] pagezero-skip: %s scan at %p size=%p clamped to 0x100000000\n",
+                             step < 0 ? "top-down" : "bottom-up", start, (void *)size );
+                if (step <= 0) break;
+                start = (void *)(uintptr_t)((0x100000000ULL + (size_t)step - 1) & ~((uintptr_t)step - 1));
+                continue;
+            }
+        }
+        if (!dead_off && step > 0)
+        {
+            int k, jumped = 0;
+
+            for (k = 0; k < ndead; k++)
+            {
+                if ((uintptr_t)start >= dead[k].lo && (uintptr_t)start < dead[k].hi)
+                {
+                    void *nx = (void *)((dead[k].hi + (size_t)step - 1) & ~((uintptr_t)step - 1));
+                    if (nx > start) { start = nx; jumped = 1; run_n = 0; break; }
+                }
+            }
+            if (jumped) continue;
+        }
         if (ios_in_layerkit( (unsigned long long)(uintptr_t)start, size ))   /* ml900 */
         {
             static int skipped;
@@ -11277,16 +11497,40 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
          * the range. */
         {
             void *next = start;
+            int fail_errno = errno;
 
             if (step && ios_skip_occupied( start, size, (size_t)(step < 0 ? -step : step) - 1,
                                            step < 0, &next )
                 && next != start)
             {
+                /* The run of failures in a free hole ends at a real region: if it was
+                 * long, only small requests were failing (so overlap with the region is
+                 * not the reason) and every one of them was ENOMEM, the whole stretch
+                 * is a kernel-refused hole. */
+                if (!dead_off && step > 0 && run_n >= 256 && size <= 0x100000 && ndead < 8 &&
+                    (uintptr_t)start > (uintptr_t)run_lo + size)
+                {
+                    dead[ndead].lo = (uintptr_t)run_lo;
+                    dead[ndead].hi = (uintptr_t)start - size;
+                    dprintf( 2, "[va-scan] dead-hole #%d: [%p,%p) refused %u consecutive requests; later scans skip it\n",
+                             ndead, run_lo, (void *)dead[ndead].hi, run_n );
+                    ndead++;
+                }
+                run_n = 0;
                 ios_va_scan_skips++;
                 start = next;
             }
             else
+            {
+                if (fail_errno == ENOMEM && size <= 0x100000)
+                {
+                    if (!run_n) run_lo = start;
+                    run_n++;
+                }
+                else
+                    run_n = 0;
                 start = (char *)start + step;
+            }
         }
     }
 
@@ -11589,6 +11833,57 @@ static void unregister_view( struct file_view *view )
     if (mmap_is_in_reserved_area( view->base, view->size ))
         free_ranges_remove_view( view );
     wine_rb_remove( &views_tree, &view->entry );
+}
+
+
+/* madeira-doge: re-use the address of a just-released reservation.
+ *
+ * Sekiro reserves, commits and releases 2 MB blocks in a loop (225 GB of them
+ * in a ten-minute session). Every reservation ran the free-area search --
+ * mach_vm_region probes and a vm_map per candidate, all under virtual_mutex --
+ * which was 8-14% of all CPU and serialised the game's worker threads.
+ * A released plain-valloc view of 1..16 MB is remembered (per pseudo-process);
+ * an unplaced request of the same size tries that address first and falls back
+ * to the normal search. Fresh anonymous memory either way, so still zero-filled.
+ * Opt-in: MADEIRA_VALLOC_REUSE=1. virtual_mutex is held by both callers. */
+static struct { void *peb; void *base; size_t size; } ios_vreuse[32];
+static unsigned long ios_vreuse_hits, ios_vreuse_miss;
+static int ios_vreuse_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_VALLOC_REUSE" );
+        on = (e && e[0] == '1');
+        if (on) dprintf( 2, "[valloc-reuse] ON: released 1-16 MB reservations are offered to the next same-size request\n" );
+    }
+    return on;
+}
+static void ios_vreuse_note( struct file_view *view )
+{
+    static unsigned next;
+    TEB *teb;
+    if (!ios_vreuse_on()) return;
+    if (view->size < (1u << 20) || view->size > (16u << 20)) return;
+    if (!is_view_valloc( view ) || (view->protect & (SEC_FILE | SEC_IMAGE | VPROT_SYSTEM))) return;
+    if (!(teb = NtCurrentTeb()) || !teb->Peb) return;
+    ios_vreuse[next].peb = teb->Peb; ios_vreuse[next].base = view->base; ios_vreuse[next].size = view->size;
+    next = (next + 1) % 32;
+}
+static void *ios_vreuse_take( size_t size )
+{
+    TEB *teb = NtCurrentTeb();
+    void *peb = teb ? teb->Peb : NULL, *base;
+    int i;
+    if (!peb) return NULL;
+    for (i = 0; i < 32; i++)
+        if (ios_vreuse[i].base && ios_vreuse[i].size == size && ios_vreuse[i].peb == peb)
+        {
+            base = ios_vreuse[i].base;
+            ios_vreuse[i].base = NULL;
+            return base;
+        }
+    return NULL;
 }
 
 
@@ -11930,6 +12225,7 @@ static void ios_vh_dump( const void *addr )
 static void delete_view( struct file_view *view ) /* [in] View */
 {
     ios_vh_note( 'd', view );   /* madeira-bcd: view history */
+    ios_vreuse_note( view );
     /* ml989: entered BEFORE any field of `view` is read, so "call never
      * entered" is distinguishable from "died reading the view". */
     if (ios_retire_trace_armed) ios_retire_mark( "D0>\n" );
@@ -12005,6 +12301,11 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     view->base    = base;
     view->size    = size;
     view->protect = vprot;
+    view->madeira_creator_tid = madeira_va_diagnostics && NtCurrentTeb()
+        ? (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+    view->madeira_parked = 0;
+    view->madeira_rw_base = NULL;
+    view->madeira_rw_size = 0;
     if (use_kernel_writewatch) vprot &= ~VPROT_WRITEWATCH;
     set_page_vprot( base, size, vprot );
 
@@ -12217,6 +12518,7 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
     if (dead_peb)
     {
         extern void ios_jit_reclaim_process( void *peb );
+        ios_jit_alias_cb_forget( dead_peb );   /* ml2100 */
         ios_jit_reclaim_process( dead_peb );
     }
     ios_jit_purge_window( base, IOS_WOW_WINDOW_SIZE );
@@ -13430,6 +13732,104 @@ static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
 #endif
 }
 
+/* madeira-doge: stop GetTickCount & co. from faulting.
+ *
+ * kernel32/kernelbase read KUSER_SHARED_DATA through the architectural
+ * constant 0x7ffe0000 (`mov wN,#off; movk wN,#0x7ffe,lsl#16; ldr ..,[xN,#d]`).
+ * iOS cannot map that address, so every such read is a Mach exception that
+ * the exception thread emulates. Sekiro's main loop spins on GetTickCount:
+ * about half of all exceptions in a gameplay log were that one load, with
+ * the exception thread at 50-90% of a core. Rewrite the pair to build the
+ * real (relocated) address and fold the offset into the loads:
+ *   movz xN,#(R>>32),lsl#32 ; movk xN,#(R>>16),lsl#16 ; ldr ..,[xN,#off+d]
+ * which needs R to be 64 KB aligned. Anything that does not match the exact
+ * shape is left alone and keeps working through the emulation path.
+ * MADEIRA_USD_PATCH=0 disables. Returns the number of sites patched. */
+static int ios_usd_patch_text( unsigned char *img, size_t image_size, unsigned char *out,
+                               unsigned int *rvas, unsigned int (*words)[12], unsigned int *lens, int max_rvas )
+{
+    unsigned long long real = (unsigned long long)(uintptr_t)user_shared_data;
+    unsigned int pe, nsec, optsz, i, hits = 0;
+
+    if ((real & 0xffff) || real < 0x100000000ull || (real >> 48)) return 0;
+    if (image_size < 0x400 || img[0] != 'M' || img[1] != 'Z') return 0;
+    memcpy( &pe, img + 0x3c, 4 );
+    if (pe > image_size - 0x200 || memcmp( img + pe, "PE\0\0", 4 )) return 0;
+    nsec = img[pe + 6] | img[pe + 7] << 8;
+    optsz = img[pe + 20] | img[pe + 21] << 8;
+    for (i = 0; i < nsec && i < 32; i++)
+    {
+        const unsigned char *sh = img + pe + 24 + optsz + 40 * i;
+        unsigned int vsize, va, chars, k;
+        if ((size_t)(sh - img) + 40 > image_size) break;
+        memcpy( &vsize, sh + 8, 4 ); memcpy( &va, sh + 12, 4 ); memcpy( &chars, sh + 36, 4 );
+        if (!(chars & 0x20000000) || va >= image_size) continue;   /* IMAGE_SCN_MEM_EXECUTE */
+        if (vsize > image_size - va) vsize = image_size - va;
+        for (k = 0; k + 64 <= vsize; k += 4)
+        {
+            unsigned int w[12], reg, off, j, nload = 0, ok = 0;
+            memcpy( w, img + va + k, sizeof(w) );
+            /* movz wN,#off ; movk wN,#0x7ffe,lsl#16 */
+            if ((w[0] & 0xffe00000) != 0x52800000) continue;
+            reg = w[0] & 31;
+            if (w[1] != (0x72a00000 | 0x7ffe << 5 | reg)) continue;
+            off = (w[0] >> 5) & 0xffff;
+            for (j = 2; j < 12; j++)
+            {
+                unsigned int x = w[j];
+                if ((x & 0x3fc00000) == 0x39400000 && ((x >> 5) & 31) == reg)
+                {
+                    /* LDR/LDRB/LDRH (unsigned offset) off our base, no SIMD */
+                    unsigned int size = x >> 30, imm = (x >> 10) & 0xfff;
+                    if ((x & 31) == reg || (off & ((1u << size) - 1))) break;
+                    imm += off >> size;
+                    if (imm > 0xfff) break;
+                    w[j] = (x & ~(0xfffu << 10)) | imm << 10;
+                    nload++;
+                    continue;
+                }
+                if (!nload) break;
+                if (x == 0xd65f03c0) { ok = 1; break; }                       /* ret */
+                if ((x & 0xff000010) == 0x54000000)                          /* b.cond, backwards into the loads */
+                {
+                    int d = (int)(x << 8) >> 13;
+                    if (d < 0 && (int)j + d >= 2) continue;
+                    break;
+                }
+                if ((x & 0x7f20001f) == 0x6b00001f &&                        /* cmp reg,reg */
+                    ((x >> 5) & 31) != reg && ((x >> 16) & 31) != reg) continue;
+                if ((x & 0x7f200000) == 0x2a000000 &&                        /* orr xd,xa,xb */
+                    ((x >> 5) & 31) != reg && ((x >> 16) & 31) != reg)
+                {
+                    if ((x & 31) == reg) { ok = 1; break; }                  /* base overwritten: dead */
+                    continue;
+                }
+                break;
+            }
+            if (!ok) continue;
+            w[0] = 0xd2c00000 | (unsigned int)((real >> 32) & 0xffff) << 5 | reg;   /* movz xN,#hi,lsl#32 */
+            w[1] = 0xf2a00000 | (unsigned int)((real >> 16) & 0xffff) << 5 | reg;   /* movk xN,#mid,lsl#16 */
+            memcpy( out + va + k, w, j * 4 );
+            if ((int)hits < max_rvas)
+            {
+                rvas[hits] = va + k;
+                lens[hits] = j * 4;
+                memcpy( words[hits], w, j * 4 );
+            }
+            hits++;
+            k += j * 4 - 4;
+        }
+    }
+    return hits;
+}
+
+static int ios_hexval( char c )
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
 
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
@@ -14599,6 +14999,167 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
             ios_jit_verify_text_exec( ios_pe_module_name( image_base, image_size ),
                                       (char *)jit_rx_base + offset, image_size );
+
+            /* madeira-doge: dump guest code of one image to the log for offline
+             * disassembly. MADEIRA_DUMP_MODULE names the image as this line's
+             * "[jit-pool] image" reports it (the export name, e.g.
+             * runtime_il2cpp.exe for the RE Requiem demo); MADEIRA_DUMP_RVA is
+             * "rva:len[,rva:len...]" (hex, at most 0x4000 bytes each, 8 ranges). */
+            {
+                const char *want = getenv( "MADEIRA_DUMP_MODULE" );
+                const char *ranges = getenv( "MADEIRA_DUMP_RVA" );
+                const char *mn = ios_pe_module_name( image_base, image_size );
+                if (want && *want && ranges && *ranges && mn && !strcasecmp( mn, want ))
+                {
+                    const char *p = ranges;
+                    int n = 0;
+                    while (*p && n++ < 8)
+                    {
+                        char *e;
+                        unsigned long rva = strtoul( p, &e, 16 ), len = 0x100;
+                        if (e == p) break;
+                        p = e;
+                        if (*p == ':') { len = strtoul( p + 1, &e, 16 ); p = e; }
+                        if (len > 0x4000) len = 0x4000;
+                        if (rva < image_size && len)
+                        {
+                            const unsigned char *b = (const unsigned char *)image_base + rva;
+                            unsigned long i, j;
+                            if (rva + len > image_size) len = image_size - rva;
+                            dprintf( 2, "[rva-dump] %s base=%p rva=0x%lx len=0x%lx\n", mn, image_base, rva, len );
+                            for (i = 0; i < len; i += 32)
+                            {
+                                char line[128];
+                                int o = 0;
+                                for (j = i; j < len && j < i + 32; j++)
+                                    o += snprintf( line + o, sizeof(line) - o, "%02x", b[j] );
+                                dprintf( 2, "[rva-dump] +%lx %s\n", rva + i, line );
+                            }
+                        }
+                        while (*p == ',' || *p == ' ') p++;
+                    }
+                }
+            }
+
+            /* madeira-doge: byte-patch guest code of an image at load.
+             * MADEIRA_PATCH_RVA is "rva:oldhex>newhex[,rva:oldhex>newhex...]"
+             * (at most 8 patches of 64 bytes). A patch applies to any image
+             * whose bytes at rva equal oldhex, so no module name is needed and
+             * a different build of the game is left alone. Both the mapped
+             * image and its pool copy are written so whichever one the
+             * translator reads sees the patch. */
+            {
+                const char *spec = getenv( "MADEIRA_PATCH_RVA" );
+                if (spec && *spec)
+                {
+                    const char *p = spec;
+                    int n = 0;
+                    while (*p && n++ < 8)
+                    {
+                        char *e;
+                        unsigned char ob[64], nb[64];
+                        unsigned long rva = strtoul( p, &e, 16 ), olen = 0, nlen = 0;
+                        int part;
+                        if (e == p || *e != ':') break;
+                        p = e + 1;
+                        for (part = 0; part < 2; part++)
+                        {
+                            unsigned char *dst = part ? nb : ob;
+                            unsigned long *cnt = part ? &nlen : &olen;
+                            for (;;)
+                            {
+                                int hi = ios_hexval( p[0] ), lo = hi < 0 ? -1 : ios_hexval( p[1] );
+                                if (lo < 0 || *cnt >= 64) break;
+                                dst[(*cnt)++] = (unsigned char)(hi << 4 | lo);
+                                p += 2;
+                            }
+                            if (!part) { if (*p != '>') break; p++; }
+                        }
+                        if (olen && olen == nlen && rva + olen <= image_size &&
+                            !memcmp( (char *)image_base + rva, ob, olen ))
+                        {
+                            char *img = (char *)image_base + rva;
+                            /* host pages are 16 KB: aligning to the 4 KB guest page made
+                             * mprotect fail (EINVAL) and left the mapped image unpatched. */
+                            char *pg = (char *)((uintptr_t)img & ~(uintptr_t)host_page_mask);
+                            size_t pgsz = ROUND_SIZE( img, olen, host_page_mask );
+                            int img_ok = 0, img_err = 0, restore = PROT_READ;
+                            {
+                                mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)pg;
+                                mach_vm_size_t rs = 0;
+                                vm_region_basic_info_data_64_t ri;
+                                mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+                                mach_port_t ro = MACH_PORT_NULL;
+                                if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                                    (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS &&
+                                    ra <= (mach_vm_address_t)(uintptr_t)pg)
+                                    restore = ri.protection & (PROT_READ | PROT_WRITE);
+                            }
+                            if (!mprotect( pg, pgsz, PROT_READ | PROT_WRITE ) ||
+                                vm_protect( mach_task_self(), (vm_address_t)pg, pgsz, FALSE,
+                                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY ) == KERN_SUCCESS)
+                            {
+                                memcpy( img, nb, nlen );
+                                mprotect( pg, pgsz, restore );
+                                img_ok = 1;
+                            }
+                            else img_err = errno;
+                            memcpy( (char *)jit_rw_base + offset + rva, nb, nlen );
+                            sys_icache_invalidate( (char *)jit_rx_base + offset + rva, nlen );
+                            dprintf( 2, "[rva-patch] %s rva=0x%lx len=%lu APPLIED image=%s(errno %d, prot %d) pool=ok\n",
+                                     ios_pe_module_name( image_base, image_size ), rva, nlen,
+                                     img_ok ? "ok" : "FAILED", img_err, restore );
+                        }
+                        while (*p && *p != ',') p++;
+                        while (*p == ',' || *p == ' ') p++;
+                    }
+                }
+            }
+
+            /* madeira-doge: point kernel32/kernelbase tick-count reads at the
+             * real KUSER_SHARED_DATA (see ios_usd_patch_text). The pool copy is
+             * what executes; the mapped image is patched too so a later
+             * image->pool resync cannot bring the faulting form back. */
+            {
+                const char *mn = ios_pe_module_name( image_base, image_size );
+                const char *sw = getenv( "MADEIRA_USD_PATCH" );
+                if (mn && (!sw || *sw != '0') &&
+                    (!strncasecmp( mn, "kernel32", 8 ) || !strncasecmp( mn, "kernelbase", 10 )))
+                {
+                    unsigned int rvas[16], lens[16], words[16][12];
+                    unsigned char *pool = (unsigned char *)jit_rw_base + offset;
+                    int n = ios_usd_patch_text( (unsigned char *)image_base, image_size, pool, rvas, words, lens, 16 ), i, img_ok = 0;
+                    for (i = 0; i < n && i < 16; i++)
+                    {
+                        char *img = (char *)image_base + rvas[i];
+                        char *pg = (char *)((uintptr_t)img & ~(uintptr_t)host_page_mask);
+                        size_t pgsz = ROUND_SIZE( img, lens[i], host_page_mask );
+                        int restore = PROT_READ;
+                        {
+                            mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)pg;
+                            mach_vm_size_t rs = 0;
+                            vm_region_basic_info_data_64_t ri;
+                            mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+                            mach_port_t ro = MACH_PORT_NULL;
+                            if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                                (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS &&
+                                ra <= (mach_vm_address_t)(uintptr_t)pg)
+                                restore = ri.protection & (PROT_READ | PROT_WRITE);
+                        }
+                        if (!mprotect( pg, pgsz, PROT_READ | PROT_WRITE ) ||
+                            vm_protect( mach_task_self(), (vm_address_t)pg, pgsz, FALSE,
+                                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY ) == KERN_SUCCESS)
+                        {
+                            memcpy( img, words[i], lens[i] );
+                            mprotect( pg, pgsz, restore );
+                            img_ok++;
+                        }
+                        sys_icache_invalidate( (char *)jit_rx_base + offset + rvas[i], lens[i] );
+                    }
+                    dprintf( 2, "[usd-patch] %s: %d site(s) now read KUSER_SHARED_DATA at %p directly (image %d ok)\n",
+                             mn, n, user_shared_data, img_ok );
+                }
+            }
 
             /* task #34 [share-probe]: DEFAULT-OFF (set MADEIRA_SHARE_PROBE=1).
              * ml79: running it inline here (pre-detach, on explorer's boot
@@ -16115,6 +16676,20 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         size_t unmap_size, view_size = host_size + align_mask + 1;
         int spill_tries = 0;
 
+        if (!limit_low && !limit_high && !top_down && align_mask == granularity_mask &&
+            size >= (1u << 20) && size <= (16u << 20) && ios_vreuse_on())
+        {
+            void *cand = ios_vreuse_take( size );
+            if (cand && !((UINT_PTR)cand & align_mask) && !map_fixed_area( cand, size, unix_prot ))
+            {
+                ptr = cand;
+                if (!(++ios_vreuse_hits % 20000))
+                    dprintf( 2, "[valloc-reuse] %lu reused, %lu searched\n", ios_vreuse_hits, ios_vreuse_miss );
+                goto done;
+            }
+            ios_vreuse_miss++;
+        }
+
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
 
@@ -17113,9 +17688,36 @@ static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot,
     uintptr_t b = (uintptr_t)base;
     if (ios_swap_fd < 0) return 0;
     if (!(vprot & VPROT_WRITE) || (vprot & (VPROT_EXEC | VPROT_WRITECOPY | VPROT_GUARD | VPROT_WRITEWATCH))) return 0;
-    if (!view || !is_view_valloc( view ) || (view->protect & (SEC_FILE | SEC_IMAGE | SEC_RESERVE | VPROT_SYSTEM))) return 0;
-    if (b < 0x7000000000ULL || b >= 0x7c00000000ULL) return 0;   /* the guest band only */
-    if (size < (8u << 20)) return 0;
+    if (!view || !is_view_valloc( view ) || (view->protect & (SEC_FILE | SEC_IMAGE | SEC_RESERVE | VPROT_SYSTEM)))
+    { if (big) ios_swap_no_kind += size; return 0; }
+    if (b < 0x7000000000ULL || b >= 0x7c00000000ULL)   /* the guest band only */
+    {
+        /* madeira-doge: a 63 GB map (no extended-virtual-addressing) has no band at
+         * 0x7000000000, so the tier turned away every commit (17.8 GB in one DMC5
+         * session, 0 MB backed) while the footprint sat at ~5.6 GB, above Metal's
+         * recommended 5461 MB, and the GPU then discarded command buffers.
+         * MADEIRA_SWAP_SMALLMAP=1 also accepts plain valloc commits in
+         * [16 GB, 48 GB): above the low window and the JIT pool, below the emulators'
+         * band at 0xc00000000. Opt-in, untested on a device. */
+        static int smallmap = -1;
+        if (smallmap < 0) smallmap = getenv( "MADEIRA_SWAP_SMALLMAP" ) != NULL && getenv( "MADEIRA_SWAP_SMALLMAP" )[0] == '1';
+        /* Build 34 raised the ceiling to the top of the map and that file-backed
+         * FEX's own 16 MB arenas at 0xc00000000+ (backed/released per compile) in
+         * EVERY process: Valve's client hung before it started the game. So:
+         * the game process only, and [4 GB, 48 GB) -- guest reservations sit at
+         * 0x13.. - 0x14.. and 0xb5.., FEX's band above 48 GB stays anonymous. */
+        /* madeira-doge: RE Requiem dies at the 6144 MB limit with 1.6 GB backed
+         * and 2.9 GB still compressed: its heap blocks (0x3ff000, 19k of them)
+         * are placed above 48 GB, inside the emulators' band, where this test
+         * turned them away. MADEIRA_SWAP_HIGH=1 lifts the ceiling for the game
+         * process, except for exact 16 MB commits up there (FEX's arenas). */
+        static int high = -1;
+        if (high < 0) high = getenv( "MADEIRA_SWAP_HIGH" ) != NULL && getenv( "MADEIRA_SWAP_HIGH" )[0] == '1';
+        if (!(smallmap && b >= 0x100000000ULL && ios_swap_proc_is_game() &&
+              (b + size <= 0xc00000000ULL || (high && size != (16u << 20)))))
+        { if (big) ios_swap_no_band += size; return 0; }
+    }
+    if (size < ios_swap_min) { if (big) ios_swap_no_small += size; return 0; }
     return 1;
 }
 /* blocks/wide: why a range is (not) eligible; the census counts by this. */
@@ -17727,6 +18329,12 @@ static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size
         new_view->base    = base + size;
         new_view->size    = (char *)view->base + view->size - (char *)new_view->base;
         new_view->protect = view->protect;
+        new_view->madeira_creator_tid = view->madeira_creator_tid;
+        new_view->madeira_parked = 0;
+        new_view->madeira_rw_base = NULL;
+        new_view->madeira_rw_size = 0;
+        view->madeira_rw_base = NULL;
+        view->madeira_rw_size = 0;
 
         unregister_view( view );
         view->size = base - (char *)view->base;
@@ -22149,6 +22757,240 @@ void virtual_set_large_address_space(void)
 }
 
 
+#ifdef WINE_IOS
+/* madeira-doge: PARKED RESERVATIONS.
+ *
+ * Sekiro runs "VirtualAlloc(NULL, 0x210000, MEM_RESERVE) / MEM_COMMIT /
+ * VirtualFree(MEM_RELEASE)" about 670 times a second from several worker
+ * threads. Measured late in a session ([valloc] ml1100): reserve 600 us,
+ * release 1600 us, more than half of each spent queueing for virtual_mutex --
+ * over a thread-second per second, with the frame waiting on it.
+ *
+ * A whole-view MEM_RELEASE of a plain read/write reservation of 1 MB up to
+ * (not including) 4 MB is not unmapped. The view is emptied and remembered,
+ * and the next address-less MEM_RESERVE of the same size and protection from
+ * the same pseudo-process gets it back: no free-area search, no vm_map entry
+ * created or destroyed, no view-tree update.
+ *   MADEIRA_VALLOC_PARK=1  empty the view with decommit_pages (memory returned).
+ *   MADEIRA_VALLOC_PARK=2  zero the committed pages in place and keep them
+ *                          resident (no kernel call at all), for at most
+ *                          24 MB parked; beyond that, as mode 1. The zeroing
+ *                          runs AFTER virtual_mutex is dropped (the entry is
+ *                          `busy` meanwhile), and the first commit after a
+ *                          reuse skips mprotect and the zero probe because
+ *                          the span is already host-RW and zero: with both
+ *                          under the lock, commit and release held it for
+ *                          300-570 us a call and every worker queued on it.
+ * A parked view is released for real after 2 s, when the table is full, or
+ * when a fixed-address reservation wants its range. Until then VirtualQuery
+ * reports it as reserved rather than free. virtual_mutex is held by all callers. */
+#define IOS_VPARK_N 32
+static struct
+{
+    void *peb; struct file_view *view; void *base; size_t size, resident;
+    char *zero_base;            /* committed run still to be zeroed (mode 2) */
+    unsigned int protect, token, ms;
+    int busy;                   /* being zeroed outside virtual_mutex: not to be reused or released yet */
+} ios_vpark[IOS_VPARK_N];
+static size_t ios_vpark_resident;
+static unsigned int ios_vpark_next_token;
+static unsigned long ios_vpark_n_park, ios_vpark_n_hit, ios_vpark_n_evict;
+
+static int ios_vpark_mode( void )
+{
+    static int mode = -1;
+    if (mode < 0)
+    {
+        const char *e = getenv( "MADEIRA_VALLOC_PARK" );
+        mode = (e && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0;
+        if (mode) dprintf( 2, "[valloc-park] ON mode=%d: released 1-4 MB read/write reservations are kept for the next same-size request\n", mode );
+    }
+    return mode;
+}
+
+static unsigned int ios_vpark_ms( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned int)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+/* the entry still describes the view it parked (a torn-down process may have deleted it) */
+static struct file_view *ios_vpark_live( int i )
+{
+    struct file_view *v;
+    if (!ios_vpark[i].base) return NULL;
+    v = find_view( ios_vpark[i].base, 0 );
+    if (v && v == ios_vpark[i].view && v->base == ios_vpark[i].base && v->size == ios_vpark[i].size &&
+        v->madeira_parked == ios_vpark[i].token) return v;
+    return NULL;
+}
+
+static void ios_vpark_drop( int i )
+{
+    ios_vpark_resident -= ios_vpark[i].resident;
+    memset( &ios_vpark[i], 0, sizeof(ios_vpark[i]) );
+}
+
+static void ios_vpark_evict( int i )
+{
+    struct file_view *v;
+    if (__atomic_load_n( &ios_vpark[i].busy, __ATOMIC_ACQUIRE )) return;
+    v = ios_vpark_live( i );
+    ios_vpark_drop( i );
+    if (v)
+    {
+        v->madeira_parked = 0;
+        delete_view( v );
+        ios_vpark_n_evict++;
+    }
+}
+
+/* a fixed-address request is about to use [base, base+size) */
+static void ios_vpark_make_room( const void *base, size_t size )
+{
+    int i;
+    for (i = 0; i < IOS_VPARK_N; i++)
+        if (ios_vpark[i].base && (const char *)ios_vpark[i].base < (const char *)base + size &&
+            (const char *)base < (const char *)ios_vpark[i].base + ios_vpark[i].size)
+            ios_vpark_evict( i );
+}
+
+/* 1 = the view was parked instead of deleted. *zero_slot >= 0 means the caller
+ * must call ios_vpark_zero( slot ) once it has left virtual_mutex. */
+static int ios_vpark_put( struct file_view *view, int *zero_slot )
+{
+    extern int ios_swap_overlaps_probe( const void *, size_t );
+    TEB *teb = NtCurrentTeb();
+    unsigned int now;
+    int i, slot = -1, oldest = -1, aged = 0, mode = ios_vpark_mode();
+    size_t resident = 0;
+    char *zero_base = NULL;
+
+    *zero_slot = -1;
+
+    if (!mode || !teb || !teb->Peb) return 0;
+    if (view->size < (1u << 20) || view->size >= (4u << 20)) return 0;
+    if (!is_view_valloc( view ) || (view->protect & ~(unsigned int)(VPROT_READ | VPROT_WRITE))) return 0;
+    if (ios_swap_overlaps_probe( view->base, view->size )) return 0;
+
+    now = ios_vpark_ms();
+    for (i = 0; i < IOS_VPARK_N; i++)
+    {
+        if (!ios_vpark[i].base) { if (slot < 0) slot = i; continue; }
+        if (__atomic_load_n( &ios_vpark[i].busy, __ATOMIC_ACQUIRE )) continue;
+        if ((int)(now - ios_vpark[i].ms) >= 2000 && aged < 2)
+        {
+            ios_vpark_evict( i );
+            aged++;
+            if (slot < 0) slot = i;
+            continue;
+        }
+        if (oldest < 0 || (int)(now - ios_vpark[i].ms) > (int)(now - ios_vpark[oldest].ms)) oldest = i;
+    }
+    if (slot < 0)
+    {
+        if (oldest < 0) return 0;
+        ios_vpark_evict( oldest );
+        slot = oldest;
+    }
+
+    if (mode == 2 && ios_vpark_resident + view->size <= (24u << 20))
+    {
+        /* one contiguous run of plain read/write committed pages, or nothing committed */
+        char *p, *end = (char *)view->base + view->size, *lo = NULL, *hi = NULL;
+        int plain = 1;
+        for (p = view->base; p < end; p += page_size)
+        {
+            BYTE vp = get_page_vprot( p );
+            if (!(vp & VPROT_COMMITTED)) continue;
+            if (vp != (VPROT_COMMITTED | VPROT_READ | VPROT_WRITE) || (hi && hi != p)) { plain = 0; break; }
+            if (!lo) lo = p;
+            hi = p + page_size;
+        }
+        if (plain)
+        {
+            if (lo) { zero_base = lo; resident = hi - lo; }
+            set_page_vprot_bits( view->base, view->size, 0, VPROT_COMMITTED );
+        }
+        else mode = 1;
+    }
+    else mode = 1;
+    if (mode == 1 && decommit_pages( view, view->base, view->size )) return 0;
+
+    if (!++ios_vpark_next_token) ++ios_vpark_next_token;
+    view->madeira_parked = ios_vpark_next_token;
+    ios_vpark[slot].peb = teb->Peb; ios_vpark[slot].view = view; ios_vpark[slot].base = view->base;
+    ios_vpark[slot].size = view->size; ios_vpark[slot].resident = resident;
+    ios_vpark[slot].zero_base = zero_base;
+    if (zero_base)
+    {
+        __atomic_store_n( &ios_vpark[slot].busy, 1, __ATOMIC_RELEASE );
+        *zero_slot = slot;
+    }
+    ios_vpark[slot].protect = view->protect; ios_vpark[slot].token = view->madeira_parked;
+    ios_vpark[slot].ms = now;
+    ios_vpark_resident += resident;
+    ios_vpark_n_park++;
+    return 1;
+}
+
+/* Called WITHOUT virtual_mutex by the thread that parked the entry. A busy entry
+ * is skipped by take, evict and the slot search, so its fields are stable here. */
+static void ios_vpark_zero( int slot )
+{
+    memset( ios_vpark[slot].zero_base, 0, ios_vpark[slot].resident );
+    __atomic_store_n( &ios_vpark[slot].busy, 0, __ATOMIC_RELEASE );
+}
+
+/* First commit after a reuse: the requested span is already host-RW and zero. */
+static int ios_vpark_fast_commit( struct file_view *view, char *base, size_t size, ULONG protect, int any_committed )
+{
+    char *rw = view->madeira_rw_base;
+    size_t rw_size = view->madeira_rw_size;
+
+    view->madeira_rw_base = NULL;
+    view->madeira_rw_size = 0;
+    if (!rw || any_committed || protect != PAGE_READWRITE) return 0;
+    if (base < rw || base + size > rw + rw_size) return 0;
+    set_page_vprot( base, size, VPROT_COMMITTED | VPROT_READ | VPROT_WRITE );
+    return 1;
+}
+
+static struct file_view *ios_vpark_take( size_t size, unsigned int vprot )
+{
+    TEB *teb = NtCurrentTeb();
+    void *peb = teb ? teb->Peb : NULL;
+    int i;
+
+    if (!ios_vpark_mode() || !peb) return NULL;
+    for (i = 0; i < IOS_VPARK_N; i++)
+    {
+        struct file_view *v;
+        char *zb;
+        size_t zs;
+        if (!ios_vpark[i].base || ios_vpark[i].size != size || ios_vpark[i].peb != peb ||
+            ios_vpark[i].protect != vprot) continue;
+        if (__atomic_load_n( &ios_vpark[i].busy, __ATOMIC_ACQUIRE )) continue;
+        v = ios_vpark_live( i );
+        zb = ios_vpark[i].zero_base; zs = ios_vpark[i].resident;
+        ios_vpark_drop( i );
+        if (!v) continue;
+        v->madeira_parked = 0;
+        v->madeira_rw_base = zb;
+        v->madeira_rw_size = zb ? zs : 0;
+        set_page_vprot( v->base, v->size, vprot );
+        if (!(++ios_vpark_n_hit % 20000))
+            dprintf( 2, "[valloc-park] %lu reused, %lu parked, %lu released late, %lu KB kept resident now\n",
+                     ios_vpark_n_hit, ios_vpark_n_park, ios_vpark_n_evict,
+                     (unsigned long)(ios_vpark_resident >> 10) );
+        return v;
+    }
+    return NULL;
+}
+#endif
+
+
 /***********************************************************************
  *             allocate_virtual_memory
  *
@@ -22231,8 +23073,17 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
             if (vprot & VPROT_WRITECOPY) status = STATUS_INVALID_PAGE_PROTECTION;
             else if (is_dos_memory) status = allocate_dos_memory( &view, vprot );
-            else status = map_view( &view, base, size, type, vprot, limit_low, limit_high,
-                                    align ? align - 1 : granularity_mask );
+            else
+            {
+                view = NULL;
+                if (base) ios_vpark_make_room( base, size );
+                else if (type == MEM_RESERVE && !limit_low && !limit_high && !align && !attributes &&
+                         size >= (1u << 20) && size < (4u << 20))
+                    view = ios_vpark_take( size, vprot );
+                if (!view)
+                    status = map_view( &view, base, size, type, vprot, limit_low, limit_high,
+                                       align ? align - 1 : granularity_mask );
+            }
 
             if (status == STATUS_SUCCESS)
             {
@@ -22330,11 +23181,13 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     {
         int was_committed = (get_page_vprot( base ) & VPROT_COMMITTED) != 0;
         int any_committed = 0;   /* ml1077: only FRESH commits may be file-backed (a hole reads as zero) */
+        int fast_commit = 0;
         { const char *pg; for (pg = base; pg < (const char *)base + size; pg += page_size) if (get_page_vprot( pg ) & VPROT_COMMITTED) { any_committed = 1; break; } }
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
         else if (view->protect & SEC_FILE) status = STATUS_ALREADY_COMMITTED;
         else if (view->protect & VPROT_FREE_PLACEHOLDER) status = STATUS_CONFLICTING_ADDRESSES;
-        else if (!(status = set_protection( view, base, size, protect )))
+        else if ((fast_commit = ios_vpark_fast_commit( view, base, size, protect, any_committed )) ||
+                 !(status = set_protection( view, base, size, protect )))
         {
             unsigned int sv = 0;
             ios_swap_init();
@@ -22353,7 +23206,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             SERVER_END_REQ;
         }
         /* ml293 (task #52): PA-arena recommit must read back as zero. */
-        if (!status) ios_verify_commit_zero( base, size, protect, was_committed );
+        if (!status && !fast_commit) ios_verify_commit_zero( base, size, protect, was_committed );
     }
 
     if (!status && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE))
@@ -25783,6 +26636,13 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 
     /* Fix the parameters */
 
+    /* ml1100 [valloc]: the same-process path only — the cross-process APC above is
+     * a server round trip with a different cost model and is not what churns. */
+    const int va_stats = ios_valloc_stats();
+    const unsigned long long va_t0 = va_stats ? ios_va_now_ns() : 0;
+    unsigned long long va_lock_ns = 0;
+    int vpark_zero = -1;
+
     if (size) size = ROUND_SIZE( addr, size, page_mask );
     base = ROUND_ADDR( addr, page_mask );
 
@@ -25886,9 +26746,13 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         status = decommit_pages( view, base, size );
         break;
     case MEM_RELEASE:
+        if (view->madeira_parked) { status = STATUS_MEMORY_NOT_ALLOCATED; break; }   /* already released by the guest */
         if (!size) size = view->size;
         if (base == view->base && size == view->size)
+        {
+            if (ios_vpark_put( view, &vpark_zero )) { status = STATUS_SUCCESS; break; }
             ios_vh_capture_free_site( view, __builtin_return_address(0) );
+        }
         status = free_pages( view, base, size );
         ios_vh_free_site.valid = 0;
         break;
@@ -25912,6 +26776,13 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         *size_ptr = size;
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (vpark_zero >= 0) ios_vpark_zero( vpark_zero );
+    if (va_stats)
+    {
+        unsigned long long now = ios_va_now_ns();
+        ios_va_account( ios_va_class( type, 1 ), now - va_t0, va_lock_ns, size );
+        ios_va_report( now );
+    }
 #ifdef WINE_IOS
     if (sc_rehold && status == STATUS_SUCCESS) ios_sc_rehold( sc_rehold );
 #endif
@@ -26234,6 +27105,105 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                     uintptr_t text_abs_start = pe_start + text_off;
                     uintptr_t text_abs_end   = text_abs_start + text_sz;
 
+                    /* madeira-doge: only translate slots that can hold a pointer.
+                     *
+                     * The loop below used to rewrite EVERY 8-byte value that fell
+                     * inside some module's range. Constant data is not exempt:
+                     * fmt's count_digits table in FEX holds (4<<32)-1000 =
+                     * 0x3fffffc18, and when ntdll lands at 0x3ffef0000+0x110000
+                     * that constant sits "inside ntdll" and got rewritten to a
+                     * pool address. count_digits(2048) then returned 3, and the
+                     * one-time "[ir-topo] ... min-ssa=2048" log wrote at buf[-1]:
+                     * dockhost dies at libarm64ecfex+0x132788 in exactly the runs
+                     * where ntdll sits at 0x3ffef0000 (3/3 crash logs vs 0/3 good
+                     * logs at 0x3ffcf0000).
+                     *
+                     * In an image with a relocation directory a stored address
+                     * either has a DIR64 relocation or was written after load (IAT,
+                     * ARM64EC dispatch slots, ...), i.e. differs from what the pool
+                     * copy held before this sync. Anything else is a constant.
+                     * MADEIRA_IATSYNC_ALLSLOTS=1 restores the old behaviour. */
+                    uint64_t *ptrok_old = NULL;   /* pool contents before the copy */
+                    unsigned char *ptrok_rel = NULL; /* 1 bit per slot: has DIR64 reloc */
+                    size_t ptrok_old_sz = 0, ptrok_rel_sz = 0;
+                    {
+                        static int allslots = -1;
+                        if (allslots < 0)
+                        {
+                            const char *e = getenv( "MADEIRA_IATSYNC_ALLSLOTS" );
+                            allslots = (e && *e == '1');
+                        }
+                        unsigned int r_rva = ios_jit_mappings[idx].reloc_rva;
+                        unsigned int r_sz  = ios_jit_mappings[idx].reloc_size;
+                        size_t img_size    = ios_jit_mappings[idx].size;
+                        size_t nslots      = size / 8;
+                        unsigned int hdr_off = *(const unsigned int *)((const char *)pe_start + 0x3c);
+                        int is_pe64 = hdr_off && hdr_off + 0x100 <= img_size &&
+                                      *(const unsigned short *)((const char *)pe_start + hdr_off + 0x18) == 0x20b;
+                        if (!allslots && is_pe64 && r_rva && r_sz && nslots &&
+                            (size_t)r_rva + r_sz <= img_size)
+                        {
+                            ptrok_old_sz = (nslots * 8 + 0x3fff) & ~(size_t)0x3fff;
+                            ptrok_rel_sz = ((nslots + 7) / 8 + 0x3fff) & ~(size_t)0x3fff;
+                            void *a = mmap( NULL, ptrok_old_sz, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANON, -1, 0 );
+                            void *b = mmap( NULL, ptrok_rel_sz, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANON, -1, 0 );
+                            if (a == MAP_FAILED || b == MAP_FAILED)
+                            {
+                                if (a != MAP_FAILED) munmap( a, ptrok_old_sz );
+                                if (b != MAP_FAILED) munmap( b, ptrok_rel_sz );
+                            }
+                            else
+                            {
+                                ptrok_old = a;
+                                ptrok_rel = b;
+                                memcpy( ptrok_old, jit_rw_dest, nslots * 8 );
+                                /* reloc table read from the PE view (never rewritten
+                                 * by us; .reloc carries no pointers). */
+                                const char *blk = (const char *)pe_start + r_rva;
+                                const char *blk_end = blk + r_sz;
+                                while (blk + 8 <= blk_end)
+                                {
+                                    unsigned int b_rva = *(const unsigned int *)blk;
+                                    unsigned int b_sz  = *(const unsigned int *)(blk + 4);
+                                    if (b_sz < 8 || blk + b_sz > blk_end) break;
+                                    if ((size_t)b_rva + 0x1000 + 8 > off && b_rva < off + size)
+                                    {
+                                        const unsigned short *ent = (const unsigned short *)(blk + 8);
+                                        unsigned int ne = (b_sz - 8) / 2, k;
+                                        for (k = 0; k < ne; k++)
+                                        {
+                                            if ((ent[k] >> 12) != 10) continue;   /* DIR64 */
+                                            size_t frva = (size_t)b_rva + (ent[k] & 0xfff);
+                                            if (frva < off || frva + 8 > off + size) continue;
+                                            size_t rel = frva - off;
+                                            if (rel & 7) continue;   /* loop walks aligned slots */
+                                            rel >>= 3;
+                                            ptrok_rel[rel >> 3] |= (unsigned char)(1u << (rel & 7));
+                                        }
+                                    }
+                                    blk += b_sz;
+                                }
+                                /* The IAT always holds pointers once bound, even if
+                                 * it was bound before the pool copy was taken. */
+                                {
+                                    unsigned int pe_off = *(const unsigned int *)((const char *)pe_start + 0x3c);
+                                    if (pe_off && pe_off + 0xF0 <= img_size)
+                                    {
+                                        unsigned int iat_rva = *(const unsigned int *)((const char *)pe_start + pe_off + 0xE8);
+                                        unsigned int iat_sz  = *(const unsigned int *)((const char *)pe_start + pe_off + 0xEC);
+                                        size_t a0 = iat_rva, a1 = (size_t)iat_rva + iat_sz;
+                                        if (a0 < off) a0 = off;
+                                        if (a1 > off + size) a1 = off + size;
+                                        for (size_t s = (a0 - off + 7) >> 3; iat_rva && s < nslots && off + s * 8 + 8 <= a1; s++)
+                                            ptrok_rel[s >> 3] |= (unsigned char)(1u << (s & 7));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if (text_sz == 0 || text_abs_end <= rgn_start || text_abs_start >= rgn_end)
                     {
                         /* No overlap with .text — safe to copy whole region */
@@ -26374,8 +27344,8 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                          * 6006/18029, 161/2240), which is what distinguishes
                          * this from the earlier EcCodeBitMap probe that reported
                          * a meaningless 100%. */
-                        int x86skip = 0, execskip = 0;
-                        uint64_t x86_first = 0, exec_first = 0;
+                        int x86skip = 0, execskip = 0, constkept = 0;
+                        uint64_t x86_first = 0, exec_first = 0, const_first = 0;
                         /* ml1017: ONE section lookup per region, not per slot.
                          *
                          * The first version called a PE-header parse plus a full
@@ -26416,7 +27386,17 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                             {
                                 void *nv = ios_jit_translate_addr_for_owner(
                                         (void *)(uintptr_t)val, sync_owner);
-                                if (nv != (void *)(uintptr_t)val)
+                                size_t ptrok_i = (size_t)(p - (uint64_t *)jit_rw_dest);
+                                if (nv != (void *)(uintptr_t)val && ptrok_old &&
+                                    ptrok_old[ptrok_i] == val &&
+                                    !(ptrok_rel[ptrok_i >> 3] & (1u << (ptrok_i & 7))))
+                                {
+                                    /* madeira-doge: unchanged since load, no reloc:
+                                     * a constant that only looks like an address. */
+                                    if (!constkept) const_first = val;
+                                    constkept++;
+                                }
+                                else if (nv != (void *)(uintptr_t)val)
                                 {
                                     if (ios_va_is_x86_code( val ))
                                     {
@@ -26464,7 +27444,15 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         if (fixup_count && ml1051_say)
                             dprintf(2, "[iat-sync] region %p+0x%lx: translated %d pointers (owner=%p) [#%lu]\n",
                                     base, (unsigned long)size, fixup_count, sync_owner, ml1051_k);
+                        static int constkept_said;
+                        if (constkept && constkept_said++ < 24)
+                            dprintf(2, "[iat-sync] region %p+0x%lx: KEPT %d address-looking constants "
+                                       "(no reloc, unchanged since load; first 0x%llx)\n",
+                                    base, (unsigned long)size, constkept,
+                                    (unsigned long long)const_first);
                     }
+                    if (ptrok_old) munmap( ptrok_old, ptrok_old_sz );
+                    if (ptrok_rel) munmap( ptrok_rel, ptrok_rel_sz );
                     break;
                 }
             }

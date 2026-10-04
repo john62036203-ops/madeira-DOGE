@@ -903,10 +903,37 @@ unsigned madeira_early_intruder_tag, madeira_early_intruder_prot;
 
 __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
 {
-    const vm_address_t win = 0x140000000ul, winsz = 0x8000000ul;       /* 128MB, see ml1037 */
+    const vm_address_t win = 0x140000000ul;
+    vm_address_t winsz = 0x8000000ul;       /* 128MB, see ml1037 */
     vm_address_t a = win;
     vm_size_t sz;
 
+    /* madeira-doge: a larger window for a main executable that cannot be
+     * relocated and is bigger than 128MB (Final Fantasy Resonance demo's
+     * FFRS-Win64-Shipping.exe: 475MB, no relocations, base 0x140000000). The
+     * size in MB is read from $HOME/Documents/madeira-exe-window-mb (written by
+     * the Steam game settings); it takes effect from the next app start. If the
+     * larger run is not free, the usual 128MB is held instead. */
+    {
+        const char *home = getenv("HOME");
+        char path[1024];
+        if (home && strlen(home) < sizeof(path) - 40) {
+            FILE *f;
+            snprintf(path, sizeof(path), "%s/Documents/madeira-exe-window-mb", home);
+            if ((f = fopen(path, "r"))) {
+                unsigned long mb = 0;
+                if (fscanf(f, "%lu", &mb) == 1 && mb > 128 && mb <= 1024) {
+                    a = win;
+                    if (vm_allocate(mach_task_self(), &a, mb << 20, VM_FLAGS_FIXED) == KERN_SUCCESS && a == win) {
+                        vm_deallocate(mach_task_self(), a, mb << 20);
+                        winsz = mb << 20;
+                    }
+                }
+                fclose(f);
+            }
+        }
+    }
+    a = win;
     if (vm_allocate(mach_task_self(), &a, winsz, VM_FLAGS_FIXED) == KERN_SUCCESS && a == win) {
         vm_protect(mach_task_self(), a, winsz, 0, VM_PROT_NONE);
         madeira_early_window_base = win; madeira_early_window_size = winsz;

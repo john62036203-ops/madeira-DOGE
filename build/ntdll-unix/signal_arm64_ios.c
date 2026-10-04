@@ -118,6 +118,39 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
 
+/* madeira-doge: MADEIRA_FAULT_CHAIN helper. If `vt` looks like a vtable in the
+ * faulting module (within 256MB of the faulting RIP), print its first 16 slots
+ * and 0x100 bytes of code at each, so the class's methods can be disassembled
+ * from the log without having the game's executable. */
+static void ios_fault_vt_dump( uint64_t vt, uint64_t rip )
+{
+    uint64_t slots[16];
+    mach_vm_size_t g = 0;
+    int i, j;
+    if (vt < 0x10000 || (vt > rip ? vt - rip : rip - vt) > 0x10000000ULL) return;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)vt, sizeof(slots),
+                                (mach_vm_address_t)slots, &g ) != KERN_SUCCESS || g != sizeof(slots)) return;
+    dprintf( STDERR_FILENO, "[fault-vt] vtable 0x%llx\n", (unsigned long long)vt );
+    for (i = 0; i < 16; i++)
+    {
+        unsigned char code[0x100];
+        char hex[0x200 + 1];
+        uint64_t f = slots[i];
+        if (f < 0x10000 || (f > rip ? f - rip : rip - f) > 0x10000000ULL) break;
+        g = 0;
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)f, sizeof(code),
+                                    (mach_vm_address_t)code, &g ) != KERN_SUCCESS || g != sizeof(code)) continue;
+        for (j = 0; j < 0x100; j++)
+        {
+            hex[j * 2]     = "0123456789abcdef"[code[j] >> 4];
+            hex[j * 2 + 1] = "0123456789abcdef"[code[j] & 15];
+        }
+        hex[0x200] = 0;
+        dprintf( STDERR_FILENO, "[fault-vt]   slot %d = 0x%llx: %s\n", i, (unsigned long long)f, hex );
+    }
+}
+
+
 /* ml649: runtime diagnostic switch, defined in virtual_ios.c. Default OFF.
  * Gate the WORK, not the print — several probes do expensive reads first. */
 extern volatile int madeira_diag_enabled;
@@ -5850,6 +5883,161 @@ skip_reclaim_band: ;
                                     (unsigned long long)obj[4],
                                     (unsigned long long)obj[5],
                                     (unsigned long long)obj[6]);
+                        }
+
+                        /* madeira-doge: MADEIRA_FAULT_CHAIN="reg:off1,off2,..."
+                         * follows a pointer chain from a live x86 register at the
+                         * fault: v=[reg+off1], dump 0x80 bytes at v, v=[v+off2], ...
+                         * (offsets hex). For RE Requiem's NULL-bucket hash table:
+                         * "r12:108,8" = the table its caller passed. First 6 faults. */
+                        {
+                            static int chain_n;
+                            const char *ch = getenv( "MADEIRA_FAULT_CHAIN" );
+                            if (ch && *ch && chain_n < 6)
+                            {
+                                static const char *const rn[16] = { "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                                                    "r8","r9","r10","r11","r12","r13","r14","r15" };
+                                uint64_t rv[16] = { live_rax, live_rcx, live_rdx, live_rbx, live_rsp, live_rbp,
+                                                    live_rsi, live_rdi, live_r8, live_r9, live_r10, live_r11,
+                                                    live_r12, live_r13, live_r14, live_r15 };
+                                const char *colon = strchr( ch, ':' );
+                                int ri = -1, k;
+                                for (k = 0; colon && k < 16; k++)
+                                    if ((size_t)(colon - ch) == strlen( rn[k] ) && !strncmp( ch, rn[k], colon - ch )) ri = k;
+                                if (ri >= 0)
+                                {
+                                    uint64_t cur = rv[ri];
+                                    const char *s = colon + 1;
+                                    int depth = 0;
+                                    chain_n++;
+                                    if (chain_n == 1)
+                                    {
+                                        uint64_t o0[20]; mach_vm_size_t g0 = 0; int q;
+                                        if (cur >= 0x10000 && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)cur,
+                                                sizeof(o0), (mach_vm_address_t)o0, &g0 ) == KERN_SUCCESS && g0 == sizeof(o0))
+                                        {
+                                            for (q = 0; q < 20; q += 4)
+                                                dprintf( STDERR_FILENO, "[fault-chain]   %s+%02x: %016llx %016llx %016llx %016llx\n", rn[ri], q * 8,
+                                                         (unsigned long long)o0[q], (unsigned long long)o0[q+1],
+                                                         (unsigned long long)o0[q+2], (unsigned long long)o0[q+3] );
+                                            ios_fault_vt_dump( o0[0], state_rip );
+                                        }
+                                    }
+                                    dprintf( STDERR_FILENO, "[fault-chain] #%d %s=0x%llx rip=0x%llx\n",
+                                             chain_n, rn[ri], (unsigned long long)cur, (unsigned long long)state_rip );
+                                    while (*s && depth < 8)
+                                    {
+                                        char *e2;
+                                        unsigned long long off = strtoull( s, &e2, 16 );
+                                        uint64_t v = 0, d[16];
+                                        mach_vm_size_t g = 0;
+                                        if (e2 == s) break;
+                                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cur + off), 8,
+                                                                    (mach_vm_address_t)&v, &g ) != KERN_SUCCESS || g != 8)
+                                        {
+                                            dprintf( STDERR_FILENO, "[fault-chain]   [0x%llx+0x%llx] unreadable\n",
+                                                     (unsigned long long)cur, off );
+                                            break;
+                                        }
+                                        dprintf( STDERR_FILENO, "[fault-chain]   [0x%llx+0x%llx] = 0x%llx\n",
+                                                 (unsigned long long)cur, off, (unsigned long long)v );
+                                        g = 0;
+                                        if (v >= 0x10000 && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)v,
+                                                sizeof(d), (mach_vm_address_t)d, &g ) == KERN_SUCCESS && g == sizeof(d))
+                                            for (k = 0; k < 16; k += 4)
+                                                dprintf( STDERR_FILENO, "[fault-chain]     +%02x: %016llx %016llx %016llx %016llx\n",
+                                                         k * 8, (unsigned long long)d[k], (unsigned long long)d[k+1],
+                                                         (unsigned long long)d[k+2], (unsigned long long)d[k+3] );
+                                        if (chain_n == 1 && g == sizeof(d)) ios_fault_vt_dump( d[0], state_rip );
+                                        cur = v;
+                                        depth++;
+                                        s = e2;
+                                        if (*s == ',') s++;
+                                    }
+                                }
+                            }
+                        }
+
+                        /* madeira-doge: name the C++ exception behind a terminate().
+                         * A game that dies by __fastfail after an uncaught MSVC C++
+                         * exception (Sekiro: e06d7363 -> unhandled -> int 0x29, status
+                         * c0000409) still has the EXCEPTION_RECORD on its stack. Scan up
+                         * from RSP for it and print the thrown type names and, for
+                         * std::exception-derived objects, what(). First 4 faults. */
+                        {
+                            static int cxx_n, cxx_tries;
+                            if (cxx_n < 4 && cxx_tries++ < 12 && live_rsp >= 0x10000 && live_rsp < 0xfffffff000000000ULL)
+                            {
+                                enum { SCAN = 0x10000 };
+                                static uint64_t sbuf[SCAN / 8];
+                                mach_vm_size_t sg = 0;
+                                size_t want = SCAN, k2;
+                                /* stop at the end of the readable range */
+                                while (want >= 0x1000 &&
+                                       (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)live_rsp, want,
+                                                                (mach_vm_address_t)sbuf, &sg ) != KERN_SUCCESS || sg != want))
+                                    want >>= 1;
+                                if (want >= 0x1000)
+                                {
+                                    int found = 0;
+                                    for (k2 = 0; k2 + 8 < want / 8 && found < 2; k2++)
+                                    {
+                                        uint32_t code = (uint32_t)sbuf[k2], flags = (uint32_t)(sbuf[k2] >> 32);
+                                        uint64_t info0, info1, info2, info3;
+                                        if (code != 0xe06d7363 || (flags & ~1u)) continue;
+                                        if ((uint32_t)sbuf[k2 + 3] != 4) continue;           /* NumberParameters */
+                                        info0 = sbuf[k2 + 4]; info1 = sbuf[k2 + 5];
+                                        info2 = sbuf[k2 + 6]; info3 = sbuf[k2 + 7];
+                                        if ((uint32_t)info0 != 0x19930520 && (uint32_t)info0 != 0x19930521 &&
+                                            (uint32_t)info0 != 0x19930522) continue;
+                                        found++;
+                                        cxx_n++;
+                                        dprintf( STDERR_FILENO, "[cxx-exc] C++ exception record @0x%llx: obj=0x%llx throwinfo=0x%llx imagebase=0x%llx\n",
+                                                 (unsigned long long)(live_rsp + k2 * 8), (unsigned long long)info1,
+                                                 (unsigned long long)info2, (unsigned long long)info3 );
+                                        {
+                                            uint32_t ti[4], cta[6];
+                                            mach_vm_size_t g3 = 0;
+                                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)info2, sizeof(ti),
+                                                                        (mach_vm_address_t)ti, &g3 ) == KERN_SUCCESS && g3 == sizeof(ti) &&
+                                                ti[3] && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(info3 + ti[3]),
+                                                                        sizeof(cta), (mach_vm_address_t)cta, &g3 ) == KERN_SUCCESS)
+                                            {
+                                                uint32_t nt = cta[0] > 5 ? 5 : cta[0], t;
+                                                for (t = 0; t < nt; t++)
+                                                {
+                                                    uint32_t ct[2];
+                                                    char name[96];
+                                                    memset( name, 0, sizeof(name) );
+                                                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(info3 + cta[1 + t]),
+                                                                                sizeof(ct), (mach_vm_address_t)ct, &g3 ) != KERN_SUCCESS) break;
+                                                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(info3 + ct[1] + 16),
+                                                                                sizeof(name) - 1, (mach_vm_address_t)name, &g3 ) != KERN_SUCCESS) break;
+                                                    name[sizeof(name) - 1] = 0;
+                                                    dprintf( STDERR_FILENO, "[cxx-exc]   type[%u] %s\n", t, name );
+                                                }
+                                            }
+                                        }
+                                        {
+                                            uint64_t whatp = 0;
+                                            char what[160];
+                                            mach_vm_size_t g4 = 0;
+                                            memset( what, 0, sizeof(what) );
+                                            if (info1 && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(info1 + 8), 8,
+                                                                                 (mach_vm_address_t)&whatp, &g4 ) == KERN_SUCCESS &&
+                                                whatp >= 0x10000 &&
+                                                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)whatp, sizeof(what) - 1,
+                                                                        (mach_vm_address_t)what, &g4 ) == KERN_SUCCESS)
+                                            {
+                                                size_t q;
+                                                what[sizeof(what) - 1] = 0;
+                                                for (q = 0; what[q]; q++) if ((unsigned char)what[q] < 0x20 || (unsigned char)what[q] > 0x7e) { what[q] = 0; break; }
+                                                if (what[0]) dprintf( STDERR_FILENO, "[cxx-exc]   what(): \"%s\"\n", what );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         /* Thumper-debug: also dump the static singleton slot
