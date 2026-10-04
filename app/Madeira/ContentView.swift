@@ -2928,11 +2928,17 @@ struct ContentView: View {
             var poolSizeMB = DockPerformancePolicy.sessionPoolMB(standard: 896, dock: dockLaunch.dock, compact: dockLaunch.compact)
             if poolSizeMB != 896 { logStore.log("[dock-pool] compact JIT pool \(poolSizeMB)MB for this Dock launch") }
             // madeira.cfg pool: the JIT pool size in MB (256 to 1152) for every launch; wins over the size above.
-            if let txt = MadeiraConfig.get("pool"),
+            // madeira-doge: the game's own file (Advanced: this game's config) wins over madeira.cfg,
+            // so two games can keep different pools. The pool is taken per launch, after
+            // BCDLaunch has exported MADEIRA_CFG_GAME.
+            let gamePool = MadeiraConfig.gameValue("pool")
+            if let txt = gamePool ?? MadeiraConfig.get("pool"),
                let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
                mb >= 256, mb <= 1152 {
                 poolSizeMB = mb
-                logStore.log("JIT pool overridden to \(mb)MB via madeira.cfg pool")
+                logStore.log("JIT pool overridden to \(mb)MB via \(gamePool != nil ? "this game's config" : "madeira.cfg") pool")
+            } else if let txt = gamePool {
+                logStore.log("[pool] this game's config has pool = \(txt), outside 256...1152; ignored")
             }
             // ml694: W^X A/B switch. Documents/madeira-wx.txt containing "0"
             // disables page demotion for the SAME binary, so the on/off

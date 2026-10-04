@@ -42,6 +42,7 @@ struct vt_dec
     int codec;
     CMVideoFormatDescriptionRef fmt;
     VTDecompressionSessionRef session;
+    uint32_t out_width, out_height;     /* 0: the coded size */
     /* the decode() call currently in progress */
     mav_vframe_emit emit;
     void *ctx;
@@ -162,12 +163,24 @@ static OSStatus vt_create_session( struct vt_dec *d )
     CFNumberRef num;
     OSStatus status;
 
-    attrs = CFDictionaryCreateMutable( kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks,
+    attrs = CFDictionaryCreateMutable( kCFAllocatorDefault, 3, &kCFTypeDictionaryKeyCallBacks,
                                        &kCFTypeDictionaryValueCallBacks );
     if (!attrs) return -1;
     num = CFNumberCreate( kCFAllocatorDefault, kCFNumberSInt32Type, &pixfmt );
     CFDictionarySetValue( attrs, kCVPixelBufferPixelFormatTypeKey, num );
     CFRelease( num );
+    if (d->out_width && d->out_height)
+    {
+        /* madeira-doge: a size other than the coded one makes VideoToolbox
+         * scale its output; the core shrinks the picture itself if not. */
+        SInt32 w = (SInt32)d->out_width, h = (SInt32)d->out_height;
+        num = CFNumberCreate( kCFAllocatorDefault, kCFNumberSInt32Type, &w );
+        CFDictionarySetValue( attrs, kCVPixelBufferWidthKey, num );
+        CFRelease( num );
+        num = CFNumberCreate( kCFAllocatorDefault, kCFNumberSInt32Type, &h );
+        CFDictionarySetValue( attrs, kCVPixelBufferHeightKey, num );
+        CFRelease( num );
+    }
     status = VTDecompressionSessionCreate( kCFAllocatorDefault, d->fmt, NULL, attrs, &cb, &d->session );
     CFRelease( attrs );
     return status;
@@ -202,7 +215,6 @@ static void *vt_open( int codec, const uint8_t *extradata, uint32_t extradata_si
     int nal_len = 4;
     OSStatus status;
 
-    (void)width; (void)height;
     if (!vt_supports( codec ))
     {
         snprintf( why, why_size, "codec %d is not a VideoToolbox codec here", codec );
@@ -240,6 +252,15 @@ static void *vt_open( int codec, const uint8_t *extradata, uint32_t extradata_si
                   codec == MAV_BACKEND_H264 ? "H264" : "HEVC", (int)status, count );
         vt_close( d );
         return NULL;
+    }
+    {
+        CMVideoDimensions coded = CMVideoFormatDescriptionGetDimensions( d->fmt );
+        if (width && height && coded.width > 0 && coded.height > 0
+            && ((uint32_t)coded.width >= width * 2 || (uint32_t)coded.height >= height * 2))
+        {
+            d->out_width = width;
+            d->out_height = height;
+        }
     }
     if ((status = vt_create_session( d )))
     {

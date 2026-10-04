@@ -2252,6 +2252,15 @@ static enum mav_pixel_format wg_video_native_format(void)
     return MAV_PIX_NV12;
 }
 
+/* madeira-doge: MADEIRA_WG_VIDEO_MAX_HEIGHT = lines (default 1080, 0 = no
+ * limit).  Taller video is handed to the title divided by a whole number. */
+static uint32_t wg_video_max_height(void)
+{
+    const char *v = getenv( "MADEIRA_WG_VIDEO_MAX_HEIGHT" );
+    long n = v && *v ? strtol( v, NULL, 10 ) : 1080;
+    return n <= 0 ? 0 : n < 240 ? 240 : n > 8192 ? 8192 : (uint32_t)n;
+}
+
 static pthread_once_t wgp_config_once = PTHREAD_ONCE_INIT;
 
 static void wgp_configure(void)
@@ -2261,9 +2270,11 @@ static void wgp_configure(void)
 
 #ifdef __APPLE__
     mav_configure( video, &mav_apple_video_backend, &mav_apple_audio_backend, native );
-    mav_log( "mp4/mov %s (MADEIRA_WG_VIDEO=0 disables): video on %s, aac on %s, native video format %s",
+    mav_set_video_max_height( wg_video_max_height() );
+    mav_log( "mp4/mov %s (MADEIRA_WG_VIDEO=0 disables): video on %s, aac on %s, native video format %s, "
+             "pictures above %u lines are divided (MADEIRA_WG_VIDEO_MAX_HEIGHT, 0 = never)",
              video ? "enabled" : "disabled", mav_apple_video_backend.name, mav_apple_audio_backend.name,
-             mav_pix_name( native ) );
+             mav_pix_name( native ), wg_video_max_height() );
 #else
     mav_configure( FALSE, NULL, NULL, native );
 #endif

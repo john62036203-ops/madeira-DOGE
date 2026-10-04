@@ -164,10 +164,12 @@ struct stub_vdec { int have_ref; };
 struct stub_pic { uint8_t *y, *uv; int idx; };
 
 static int stub_vsupports( int codec ) { return codec == MAV_BACKEND_H264; }
+static uint32_t stub_alt_w, stub_alt_h;   /* the divided size the core may ask for (madeira-doge) */
 
 static void *stub_vopen( int codec, const uint8_t *ed, uint32_t n, uint32_t w, uint32_t h, char *why, size_t ws )
 {
-    if (codec != MAV_BACKEND_H264 || n != sizeof(stub_avcc) || memcmp( ed, stub_avcc, n ) || w != W || h != H)
+    if (codec != MAV_BACKEND_H264 || n != sizeof(stub_avcc) || memcmp( ed, stub_avcc, n )
+        || !((w == W && h == H) || (stub_alt_w && w == stub_alt_w && h == stub_alt_h)))
     {
         snprintf( why, ws, "stub: unexpected codec data (%u bytes) or size %ux%u", n, w, h );
         return NULL;
@@ -766,6 +768,69 @@ static int picture_index( const uint8_t *buf, int flip, enum mav_pixel_format fm
     return buf[(flip ? H - 1 : 0) * l.stride[0]] - 16;
 }
 
+/* madeira-doge: MADEIRA_WG_VIDEO_MAX_HEIGHT.  The stub backend ignores the
+ * size it is asked for, like a decoder that cannot scale, so the core's own
+ * n x n averaging is what is checked here, sample by sample. */
+static int test_mp4_shrunk( const uint8_t *mp4, size_t size, int frames )
+{
+    struct mav_parser *p; struct source s; struct mav_stream_info vi; struct mav_layout l;
+    const int n = 3, ow = (W / n) & ~1, oh = (H / n) & ~1, cw = (ow + 1) / 2, ch = (oh + 1) / 2;
+    int got = 0, x, y, i, j;
+
+    mav_set_video_max_height( 100 );
+    stub_alt_w = ow; stub_alt_h = oh;
+    p = mav_create( 0 );
+    src_start( &s, p, mp4, size );
+    CHECK( mav_connect( p, size ) == MAV_OK, "connect (divided)" );
+    CHECK( mav_stream_info( p, 0, &vi ) == MAV_OK && vi.vnative.width == ow && vi.vnative.height == oh,
+           "native size %dx%d, expected %dx%d", vi.vnative.width, vi.vnative.height, ow, oh );
+    CHECK( mav_enable_video( p, 0, &vi.vnative ) == MAV_OK, "enable at the divided size" );
+    CHECK( mav_seek( p, 0, 1, 0, 0, 0 ) == MAV_OK, "seek 0" );
+    mav_video_layout( MAV_PIX_NV12, ow, oh, &l );
+    for (;;)
+    {
+        struct mav_buffer b; uint8_t *pic;
+        int r = mav_get_buffer( p, 0, &b );
+        if (r != MAV_OK) { CHECK( r == MAV_NO_BUFFER, "get_buffer %d", r ); break; }
+        CHECK( b.size == l.size, "picture is %u bytes, layout says %zu", b.size, l.size );
+        pic = malloc( b.size );
+        CHECK( mav_copy_buffer( p, 0, pic, 0, b.size ) == MAV_OK, "copy picture" );
+        if (got == 0 || got == 41)
+        {
+            for (y = 0; y < oh; y++) for (x = 0; x < ow; x++)
+            {
+                int sum = 0;
+                for (j = 0; j < n; j++) for (i = 0; i < n; i++) sum += ref_y( got, x * n + i, y * n + j );
+                CHECK( pic[y * l.stride[0] + x] == (sum + n * n / 2) / (n * n), "Y(%d,%d) of picture %d: %d, expected %d",
+                       x, y, got, pic[y * l.stride[0] + x], (sum + n * n / 2) / (n * n) );
+            }
+            for (y = 0; y < ch; y++) for (x = 0; x < cw; x++)
+            {
+                int su = 0, sv = 0;
+                const uint8_t *uv = pic + l.offset[1] + y * l.stride[1] + 2 * x;
+                for (j = 0; j < n; j++) for (i = 0; i < n; i++)
+                {
+                    su += ref_u( 2 * (x * n + i), 2 * (y * n + j) );
+                    sv += ref_v( 2 * (x * n + i), 2 * (y * n + j) );
+                }
+                CHECK( uv[0] == (su + n * n / 2) / (n * n) && uv[1] == (sv + n * n / 2) / (n * n),
+                       "UV(%d,%d) of picture %d: %d,%d expected %d,%d", x, y, got, uv[0], uv[1],
+                       (su + n * n / 2) / (n * n), (sv + n * n / 2) / (n * n) );
+            }
+        }
+        free( pic );
+        got++;
+        mav_release_buffer( p, 0 );
+    }
+    CHECK( got == frames, "%d divided pictures, expected %d", got, frames );
+    CHECK( stub_vmapped == 0 && stub_vlive == 0, "every picture unmapped (%d) and released (%d)", stub_vmapped, stub_vlive );
+    src_stop( &s ); mav_destroy( p );
+    mav_set_video_max_height( 0 );
+    stub_alt_w = stub_alt_h = 0;
+    printf( "ok: %d pictures divided by %d (%dx%d -> %dx%d), every sample of two of them checked\n", got, n, W, H, ow, oh );
+    return 0;
+}
+
 static int test_mp4_basic( const uint8_t *mp4, size_t size, int frames, double seconds )
 {
     struct mav_parser *p = mav_create( 0 ); struct source s; struct mav_stream_info vi, ai; struct mav_video_output vo;
@@ -1066,6 +1131,7 @@ int main( int argc, char **argv )
     if (test_mp4_basic( mp4, mp4_size, frames, seconds )) return 1;
     if (test_mp4_formats( mp4, mp4_size )) return 1;
     if (test_mp4_late_audio( mp4, mp4_size, seconds )) return 1;
+    if (test_mp4_shrunk( mp4, mp4_size, frames )) return 1;
     if (test_mp4_refusals()) return 1;
     if (argc > 1)
     {
@@ -1121,6 +1187,8 @@ with tempfile.TemporaryDirectory() as t:
     assert any("connect refused (mov,mp4,m4a,3gp,3g2,mj2, compressed_out=0): container disabled by MADEIRA_WG_VIDEO=0" in l for l in lines), lines
     assert any("connect refused (mov,mp4,m4a,3gp,3g2,mj2, compressed_out=1): compressed output requested" in l for l in lines), lines
     assert any("video codec h264 (codec id 27" in l and "stub: unexpected codec data" in l for l in lines), lines
+    assert any("backend=stub-video 106x80 fps=30/1 out=nv12" in l and "coded=320x240 div=3" in l for l in lines), lines
+    assert "[wg-video] madeira-doge stream closed: 90 picture(s) handed out, 90 shrunk here, 106x80 (coded 320x240) nv12" in out.stderr, out.stderr[-2000:]
     assert any("video codec h264 (codec id 27" in l and "no video decoder backend" in l for l in lines), lines
     assert any("video codec mpeg4 (codec id 12" in l and "no decoder for it in this port" in l for l in lines), lines
     assert any("audio codec pcm_s16be (codec id" in l and "not exposed" in l for l in lines), lines

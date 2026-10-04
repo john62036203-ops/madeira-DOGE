@@ -276,6 +276,15 @@ static int mav_video_allowed = 1;
 static const struct mav_video_backend *mav_vbackend;
 static const struct mav_audio_backend *mav_abackend;
 static enum mav_pixel_format mav_native_pix = MAV_PIX_NV12;
+/* madeira-doge: pictures taller than this are handed out divided by a whole
+ * number (3840x2160 -> 1920x1080); 0 = never.  A title that plays several 4K
+ * clips at once keeps a second of each in memory, 12 MB a picture. */
+static uint32_t mav_video_max_height;
+
+static void __attribute__((unused)) mav_set_video_max_height( uint32_t lines )
+{
+    mav_video_max_height = lines;
+}
 
 static void mav_configure( int video_allowed, const struct mav_video_backend *video,
                            const struct mav_audio_backend *audio, enum mav_pixel_format native )
@@ -378,6 +387,10 @@ struct mav_stream
     int64_t last_vpts;
     int64_t frame_duration;     /* 100 ns, from the frame rate */
     int bt709;
+    uint32_t coded_width, coded_height, vdiv;   /* vdiv > 1: handed out divided by it */
+    uint8_t *scaled;            /* a picture the backend did not scale itself */
+    size_t scaled_cap;
+    unsigned int pictures_out, pictures_shrunk;
 
     /* ---- packets ---- */
     AVPacket *pkt;              /* the packet being decoded */
@@ -577,6 +590,22 @@ static struct mav_parser *mav_create( int output_compressed )
     return p;
 }
 
+/* madeira-doge: whether pictures actually leave the parser is the first
+ * question when a title shows no video.  Outside mav_log's small budget of
+ * distinct lines, and bounded on its own. */
+static const char *mav_pix_name( enum mav_pixel_format fmt );
+
+static void mav_note_pictures( struct mav_stream *s, int closing )
+{
+    static unsigned int lines;
+
+    if (!closing && s->pictures_out != 1) return;
+    if (__sync_fetch_and_add( &lines, 1 ) >= 96) return;
+    dprintf( 2, "[wg-video] madeira-doge stream %s: %u picture(s) handed out, %u shrunk here, %ux%u (coded %ux%u) %s\n",
+             closing ? "closed" : "started", s->pictures_out, s->pictures_shrunk, s->info.vnative.width,
+             s->info.vnative.height, s->coded_width, s->coded_height, mav_pix_name( s->vout.fmt ) );
+}
+
 static void mav_queue_clear( struct mav_stream *s )
 {
     while (s->queue_count)
@@ -613,6 +642,8 @@ static void mav_stream_free( struct mav_stream *s )
     av_packet_free( &s->pkt );
     av_frame_free( &s->frame );
     av_frame_free( &s->bframe );
+    if (s->type == MAV_STREAM_VIDEO) mav_note_pictures( s, 1 );
+    free( s->scaled );
     free( s->buf );
     free( s );
 }
@@ -954,6 +985,7 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
 {
     const AVCodecParameters *par = st->codecpar;
     AVRational fps = st->avg_frame_rate;
+    uint32_t out_w, out_h;
     int codec;
 
     (void)p;
@@ -976,7 +1008,16 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
         snprintf( why, why_size, "unusable picture size %dx%d", par->width, par->height );
         return MAV_E_UNSUPPORTED;
     }
-    if (!(s->vdec = mav_vbackend->open( codec, par->extradata, par->extradata_size, par->width, par->height,
+    s->coded_width = par->width;
+    s->coded_height = par->height;
+    s->vdiv = 1;
+    /* 8 lines of slack: 1920x1088 is a 1080-line picture. */
+    while (mav_video_max_height && s->coded_height / s->vdiv > mav_video_max_height + 8
+           && s->coded_width / (s->vdiv + 1) >= 16 && s->coded_height / (s->vdiv + 1) >= 16)
+        s->vdiv++;
+    out_w = s->vdiv > 1 ? (s->coded_width / s->vdiv) & ~1u : s->coded_width;
+    out_h = s->vdiv > 1 ? (s->coded_height / s->vdiv) & ~1u : s->coded_height;
+    if (!(s->vdec = mav_vbackend->open( codec, par->extradata, par->extradata_size, out_w, out_h,
                                         why, why_size )))
         return MAV_E_UNSUPPORTED;
     snprintf( s->info.backend, sizeof(s->info.backend), "%s", mav_vbackend->name );
@@ -988,8 +1029,8 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
         fps = (AVRational){ 30, 1 };
     }
     s->info.vnative.fmt = mav_native_pix;
-    s->info.vnative.width = par->width;
-    s->info.vnative.height = par->height;
+    s->info.vnative.width = out_w;
+    s->info.vnative.height = out_h;
     s->info.vnative.fps_n = fps.num;
     s->info.vnative.fps_d = fps.den;
     s->frame_duration = av_rescale( 10000000, fps.den, fps.num );
@@ -1147,11 +1188,11 @@ static int mav_connect_locked( struct mav_parser *p )
         s->seek_target = p->is_mov ? 0 : -1;
         if (s->type == MAV_STREAM_VIDEO)
             mav_log( "connect container=%s stream=%u video codec=%s backend=%s %dx%d fps=%u/%u out=%s "
-                     "duration=%llums bitrate=%u profile=%u level=%u",
+                     "duration=%llums bitrate=%u profile=%u level=%u coded=%ux%u div=%u",
                      s->info.container, i, s->info.codec, s->info.backend, s->info.vnative.width,
                      s->info.vnative.height, s->info.vnative.fps_n, s->info.vnative.fps_d,
                      mav_pix_name( s->vout.fmt ), (unsigned long long)(s->info.duration / 10000),
-                     s->info.bitrate, s->info.profile, s->info.level );
+                     s->info.bitrate, s->info.profile, s->info.level, s->coded_width, s->coded_height, s->vdiv );
         else
             mav_log( "connect container=%s codec=%s layer=%u rate=%u channels=%u mask=%#x out=%s "
                      "duration=%llums bitrate=%u compressed_out=%d stream=%u backend=%s",
@@ -1766,13 +1807,84 @@ static void mav_yuv_coefs( int bt709, int full, struct mav_yuv_coefs *c )
     c->yoff = full ? 0 : 16;
 }
 
+/* madeira-doge: the backend was asked for pictures divided by s->vdiv and
+ * handed back a full-size one: average n x n blocks into s->scaled.  Returns
+ * 0 when the picture is not (at least) twice the output, i.e. already small. */
+static int mav_shrink_picture( struct mav_stream *s, const struct mav_vplanes *src, uint32_t w, uint32_t h,
+                               struct mav_vplanes *out )
+{
+    uint32_t n, cw = (w + 1) / 2, ch = (h + 1) / 2, sw, sh, scw, sch, x, y, i, j;
+    size_t need = (size_t)w * h + (size_t)cw * 2 * ch;
+    uint8_t *yp, *cp;
+
+    if (!w || !h || src->width < w * 2 || src->height < h * 2) return 0;
+    n = src->width / w < src->height / h ? src->width / w : src->height / h;
+    if (n > 16) n = 16;
+    sw = src->width; sh = src->height;
+    scw = (sw + 1) / 2; sch = (sh + 1) / 2;
+    if (s->scaled_cap < need)
+    {
+        uint8_t *grown = realloc( s->scaled, need );
+        if (!grown) return 0;
+        s->scaled = grown;
+        s->scaled_cap = need;
+    }
+    yp = s->scaled;
+    cp = s->scaled + (size_t)w * h;
+    for (y = 0; y < h; y++)
+    {
+        uint8_t *o = yp + (size_t)y * w;
+        for (x = 0; x < w; x++)
+        {
+            unsigned int sum = 0;
+            for (j = 0; j < n; j++)
+            {
+                const uint8_t *r = src->y + (size_t)(y * n + j) * src->y_stride + x * n;
+                for (i = 0; i < n; i++) sum += r[i];
+            }
+            o[x] = (uint8_t)((sum + n * n / 2) / (n * n));
+        }
+    }
+    for (y = 0; y < ch; y++)
+    {
+        uint8_t *o = cp + (size_t)y * cw * 2;
+        for (x = 0; x < cw; x++)
+        {
+            unsigned int su = 0, sv = 0, cnt = 0;
+            for (j = 0; j < n && y * n + j < sch; j++)
+            {
+                const uint8_t *r = src->uv + (size_t)(y * n + j) * src->uv_stride;
+                for (i = 0; i < n && x * n + i < scw; i++, cnt++)
+                {
+                    su += r[2 * (x * n + i)];
+                    sv += r[2 * (x * n + i) + 1];
+                }
+            }
+            o[2 * x] = cnt ? (uint8_t)((su + cnt / 2) / cnt) : 128;
+            o[2 * x + 1] = cnt ? (uint8_t)((sv + cnt / 2) / cnt) : 128;
+        }
+    }
+    out->y = yp;
+    out->uv = cp;
+    out->y_stride = w;
+    out->uv_stride = cw * 2;
+    out->width = w;
+    out->height = h;
+    out->full_range = src->full_range;
+    s->pictures_shrunk++;
+    return 1;
+}
+
 /* Writes one decoded 4:2:0 bi-planar picture into `dst` in s->vout's format
  * and layout.  A picture smaller than the output is padded with black; a
  * larger one is cropped (the codec's cropping is the decoder's business). */
-static void mav_convert_picture( struct mav_stream *s, const struct mav_vplanes *src, uint8_t *dst,
+static void mav_convert_picture( struct mav_stream *s, const struct mav_vplanes *in, uint8_t *dst,
                                  const struct mav_layout *l )
 {
     uint32_t w = s->vout.width, h = s->vout.height < 0 ? -s->vout.height : s->vout.height;
+    struct mav_vplanes shrunk;
+    const struct mav_vplanes *src = s->vdiv > 1 && mav_shrink_picture( s, in, w, h, &shrunk ) ? &shrunk : in;
+
     uint32_t cw = src->width < w ? src->width : w, ch = src->height < h ? src->height : h;
     uint32_t ccw = (cw + 1) / 2, cch = (ch + 1) / 2, x, y;
     int flip = s->vout.height < 0;
@@ -1924,6 +2036,8 @@ static int mav_video_emit( struct mav_parser *p, struct mav_stream *s, struct ma
     s->cur.delta = 0;
     s->discontinuity = 0;
     s->has_buffer = 1;
+    s->pictures_out++;
+    mav_note_pictures( s, 0 );
     return 1;
 }
 
