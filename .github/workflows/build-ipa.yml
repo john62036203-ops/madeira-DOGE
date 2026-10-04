@@ -347,6 +347,15 @@ jobs:
       - name: Patch wine with the guest file trace
         run: python3 tools/patch-wine-file-trace.py wine/dlls/ntdll/unix/file.c
 
+      # Upstream v0.1.3: on-device pairing for the built-in JIT helper
+      # (build/rppairing-ios, Rust). The app target links libmadeira_rppairing.a.
+      - name: Build libmadeira_rppairing.a (in-app JIT pairing)
+        shell: bash
+        run: |
+          rustup target add aarch64-apple-ios
+          bash build/rppairing-ios/build.sh
+          ls -la app/Madeira/libmadeira_rppairing.a
+
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and
         # LLVM). "Verify all linked archives exist" still fails the job before
@@ -867,10 +876,12 @@ jobs:
                           print(a['url'], a['name']); sys.exit(0)
           ")
           if [ -z "$ASSET" ]; then
-            # madeira-bcd: a stub build draws nothing in any D3D12 game (build 180
-            # after the release was deleted); fail instead of shipping one.
-            echo "::error::no msc-private release with a .dmg/.pkg asset -- a D3D12 stub build draws nothing; re-create the DRAFT release"
-            exit 1
+            # madeira-doge: a fork has no msc-private release (Apple's installer
+            # cannot be redistributed). Continue: the next step falls back to the
+            # Apache-2.0 headers vendored in-tree, and the tracked iOS library is
+            # the same package's.
+            echo "::warning::no msc-private release with a .dmg/.pkg asset -- using the vendored converter headers and the tracked iOS library"
+            exit 0
           fi
           URL=${ASSET%% *}; NAME=${ASSET#* }
           mkdir -p /tmp/msc && cd /tmp/msc
@@ -911,6 +922,13 @@ jobs:
         shell: bash
         run: |
           INC="$GITHUB_WORKSPACE/build/madeira-d3d12/msc-include"
+          # madeira-doge: without an msc-private release, the headers vendored
+          # in-tree (checked against their SHA256SUMS).
+          VEND="$GITHUB_WORKSPACE/madeira-d3d12/third_party/metal-shader-converter"
+          if [ ! -f "$INC/metal_irconverter/metal_irconverter.h" ] && \
+             (cd "$VEND" && shasum -a 256 -c --quiet SHA256SUMS); then
+            INC="$VEND/include"
+          fi
           if [ -f "$INC/metal_irconverter/metal_irconverter.h" ]; then
             echo "MADEIRA_MSC_INCLUDE=$INC" >> "$GITHUB_ENV"
             echo "::notice::converter headers present -- building the real D3D12 conversion service"
