@@ -1219,11 +1219,11 @@ jobs:
       - name: Report the 64-bit media DLLs
         continue-on-error: true
         run: |
-          for d in winegstreamer msmpeg2vdec wmvdecod colorcnv; do
+          for d in winegstreamer msmpeg2vdec wmvdecod colorcnv comctl32_v6; do
             if [ -f "app/Madeira/arm64ec-windows/$d.dll" ]; then
               echo "::notice::arm64ec $d.dll present ($(wc -c < app/Madeira/arm64ec-windows/$d.dll | tr -d ' ') bytes)"
             else
-              echo "::warning::arm64ec $d.dll missing: 64-bit games cannot decode their movies"
+              echo "::warning::arm64ec $d.dll missing (media DLLs: 64-bit games cannot decode their movies; comctl32_v6: no Common Controls 6 for x64 programs)"
             fi
           done
 

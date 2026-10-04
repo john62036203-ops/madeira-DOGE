@@ -5,6 +5,10 @@
 # Rockstar Games SDK / Launcher installers load Msftedit.dll and gdiplus.dll). Configured the way
 # upstream's build/wine-pe/build-ntdll.sh configures wine/build-arm64ec;
 # stripped and padded by 64 KB past SizeOfImage like the shipped builtins.
+# comctl32_v6: Common Controls 6 (TaskDialogIndirect, ordinal 345). Without it
+# the amd64 Common-Controls assembly is never seeded (WineProcessBridge.m),
+# x64 programs get the v5 comctl32, and RE Engine's error dialog died as
+# "Unimplemented function COMCTL32.dll.345" instead of showing its message.
 # Media Foundation for 64-bit games: winegstreamer and the byte stream handler /
 # decoder front ends that forward to it (docs/MEDIA.md). RE Requiem's demo
 # aborts with "Failed to create SourceReader with registered byte stream
@@ -29,6 +33,7 @@ WANT="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcr110 msvcrt20 msvcrt40 msvcir
       msvcp60 msvcp70 msvcp71 msvcp80 msvcp90 msvcp100 msvcp110 msvcp120
       vcomp vcomp90 vcomp100 vcomp110 vcomp120 vcomp140
       d3d10 d3d10_1 avifil32 msvfw32 dinput
+      comctl32_v6
       wbemprox wbemdisp wmiutils
       riched20 riched32 msftedit gdiplus mlang usp10 cabinet sspicli msxml3 msxml6
       msasn1 wldp hnetcfg msctf xmllite netprofm d2d1

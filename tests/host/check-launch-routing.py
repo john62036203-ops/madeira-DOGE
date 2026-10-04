@@ -48,8 +48,13 @@ i386_branch = exe[exe.index("} else if (is_i386_target) {"):]
 assert i386_branch.index('"C:\\\\windows\\\\syswow64\\\\%s"') < i386_branch.index("} else {"), exe
 assert 'snprintf(exe_path, sizeof(exe_path), "C:\\\\windows\\\\system32\\\\%s", madeira_exe);' in exe
 sxs = function(src, "static void madeira_seed_winsxs_x86(")
-assert "x86_%s_%s_%s_none_deadbeef" in sxs and 'processorArchitecture=\\"x86\\"' in sxs
-assert "arm64" not in sxs and "amd64" not in sxs, "only x86 assemblies are written"
+# madeira-doge: x86 from the i386 farm and, as build 79 had it, amd64 from the arm64ec farm;
+# never arm64 (aarch64 and arm64ec processes would share it and load from different farms).
+assert 'madeira_seed_winsxs_arch(fm, prefix, bundle, "x86", "i386-windows");' in sxs
+assert 'madeira_seed_winsxs_arch(fm, prefix, bundle, "amd64", "arm64ec-windows");' in sxs
+assert sxs.count("madeira_seed_winsxs_arch(") == 2 and '"arm64"' not in sxs, "x86 and amd64 only"
+arch = function(src, "static void madeira_seed_winsxs_arch(NSFileManager *fm, NSString *prefix, NSString *bundle,\n                                     const char *arch, const char *farm)\n{")
+assert "%s_%s_%s_%s_none_deadbeef" in arch and 'processorArchitecture=\\"%s\\"' in arch
 print("PASS: non-i386 targets keep the upstream core choice and exe path; the i386 farm, wbem and winsxs come with the farm")
 
 # ---- Part B: the machine probe

@@ -648,8 +648,27 @@ static void madeira_link_syswow64_wbem(NSFileManager *fm, NSString *prefix, NSSt
  * a 32-bit process and for "arm64_"/"amd64_" ones in 64-bit processes, so
  * 64-bit processes in the same prefix see no difference. An assembly whose
  * first file is missing from the i386 farm is skipped: a manifest without its
- * DLL would redirect that DLL's loads into an empty directory. */
+ * DLL would redirect that DLL's loads into an empty directory.
+ *
+ * madeira-doge: build 79 also wrote the "amd64" architecture from the
+ * arm64ec farm, and that is back. An x64 program whose manifest asks for
+ * processorArchitecture="amd64" Common-Controls 6 gets comctl32_v6 instead of
+ * the v5 comctl32 (RE Engine's error dialog died as "Unimplemented function
+ * COMCTL32.dll.345", TaskDialogIndirect, instead of showing its message):
+ * actctx.c lookup_manifest_file turns an explicit "amd64_" request into
+ * "a??64_" in an arm64ec process. "arm64" is NOT written: both an aarch64
+ * and an arm64ec process look for "arm64_" when the manifest says "*", and
+ * the two load from different farms, so one of them would be redirected to a
+ * DLL of the wrong machine. */
+static void madeira_seed_winsxs_arch(NSFileManager *fm, NSString *prefix, NSString *bundle,
+                                     const char *arch, const char *farm);
 static void madeira_seed_winsxs_x86(NSFileManager *fm, NSString *prefix, NSString *bundle)
+{
+    madeira_seed_winsxs_arch(fm, prefix, bundle, "x86", "i386-windows");
+    madeira_seed_winsxs_arch(fm, prefix, bundle, "amd64", "arm64ec-windows");
+}
+static void madeira_seed_winsxs_arch(NSFileManager *fm, NSString *prefix, NSString *bundle,
+                                     const char *arch, const char *farm)
 {
     struct sxs_file { const char *in_assembly; const char *in_farm; };
     struct sxs_assembly { const char *name, *lname, *key, *version; struct sxs_file files[4]; };
@@ -717,7 +736,7 @@ static void madeira_seed_winsxs_x86(NSFileManager *fm, NSString *prefix, NSStrin
     };
     NSString *winsxs = [prefix stringByAppendingPathComponent:@"drive_c/windows/winsxs"];
     NSString *manifests = [winsxs stringByAppendingPathComponent:@"manifests"];
-    NSString *source = [bundle stringByAppendingPathComponent:@"i386-windows"];
+    NSString *source = [bundle stringByAppendingPathComponent:[NSString stringWithUTF8String:farm]];
     const size_t count = sizeof(asms) / sizeof(asms[0]);
     int seeded = 0, skipped = 0;
 
@@ -730,13 +749,13 @@ static void madeira_seed_winsxs_x86(NSFileManager *fm, NSString *prefix, NSStrin
                            [NSString stringWithUTF8String:def->files[0].in_farm]];
         if (![fm fileExistsAtPath:first])
         {
-            dprintf(STDERR_FILENO, "[WineProc] winsxs: x86 %s skipped, i386-windows has no %s\n",
-                    def->name, def->files[0].in_farm);
+            dprintf(STDERR_FILENO, "[WineProc] winsxs: %s %s skipped, %s has no %s\n",
+                    arch, def->name, farm, def->files[0].in_farm);
             skipped++;
             continue;
         }
-        NSString *dirName = [NSString stringWithFormat:@"x86_%s_%s_%s_none_deadbeef",
-                             def->lname, def->key, def->version];
+        NSString *dirName = [NSString stringWithFormat:@"%s_%s_%s_%s_none_deadbeef",
+                             arch, def->lname, def->key, def->version];
         NSString *asmDir = [winsxs stringByAppendingPathComponent:dirName];
         NSString *manifest = [manifests stringByAppendingPathComponent:
                               [dirName stringByAppendingString:@".manifest"]];
@@ -749,8 +768,8 @@ static void madeira_seed_winsxs_x86(NSFileManager *fm, NSString *prefix, NSStrin
             @"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
             @"<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"];
         [text appendFormat:@"  <assemblyIdentity type=\"win32\" name=\"%s\" version=\"%s\" "
-                           @"processorArchitecture=\"x86\" publicKeyToken=\"%s\"/>\n",
-                           def->name, def->version, def->key];
+                           @"processorArchitecture=\"%s\" publicKeyToken=\"%s\"/>\n",
+                           def->name, def->version, arch, def->key];
         BOOL ok = YES;
         for (size_t f = 0; f < sizeof(def->files) / sizeof(def->files[0]) && def->files[f].in_assembly; f++)
         {
@@ -769,14 +788,14 @@ static void madeira_seed_winsxs_x86(NSFileManager *fm, NSString *prefix, NSStrin
         [text appendString:@"</assembly>\n"];
         if (!ok || ![[text dataUsingEncoding:NSUTF8StringEncoding] writeToFile:manifest atomically:YES])
         {
-            dprintf(STDERR_FILENO, "[WineProc] winsxs: x86 %s FAILED\n", def->name);
+            dprintf(STDERR_FILENO, "[WineProc] winsxs: %s %s FAILED\n", arch, def->name);
             skipped++;
             continue;
         }
         seeded++;
     }
-    dprintf(STDERR_FILENO, "[WineProc] winsxs: %d/%zu x86 assemblies seeded, %d skipped\n",
-            seeded, count, skipped);
+    dprintf(STDERR_FILENO, "[WineProc] winsxs: %d/%zu %s assemblies seeded, %d skipped\n",
+            seeded, count, arch, skipped);
 }
 
 /* FEX's WOW64 module cannot call sysctl, and without an answer it assumes the
