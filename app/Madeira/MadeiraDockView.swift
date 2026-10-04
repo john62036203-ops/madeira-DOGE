@@ -129,6 +129,7 @@ struct MadeiraDockView: View {
     @ObservedObject private var signIn = SteamSignInModel.shared
     @Environment(\.dismiss) private var dismiss
     @State private var showSignIn = false
+    @AppStorage(MadeiraDock.noDesktopKey) private var noDesktop = false
     let start: (DockGame, Bool) -> Void
 
     var body: some View {
@@ -137,6 +138,11 @@ struct MadeiraDockView: View {
                 Section {
                     Text("Madeira Dock starts an installed Steam game through Valve's own Steam client, without the Steam desktop window. Valve's client signs in with your account and decides whether the game may run.")
                         .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section {
+                    Toggle("Start games without the virtual desktop (experimental)", isOn: $noDesktop)
+                } footer: {
+                    Text("The game starts on the full-screen game view and no Windows desktop is shown while Steam starts. Turn it off if a game does not appear.")
                 }
                 Section("Steam account") {
                     if let name = signIn.accountName {

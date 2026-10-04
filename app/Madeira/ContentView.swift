@@ -3592,9 +3592,26 @@ struct ContentView: View {
             if let size = profile?.resolution.split(separator: "x").compactMap({ Int($0) }), size.count == 2 {
                 width = size[0]; height = size[1]
             }
-            setenv("MADEIRA_EXE", "explorer.exe", 1)
-            setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
-            setenv("MADEIRA_DESKTOP", "1", 1)
+            // madeira-doge: "Start games without the virtual desktop" (Madeira Dock page, or
+            // dock-no-desktop = 1 in madeira.cfg). The host and the game Valve's client starts
+            // run like a directly launched program, so the game's window gets the full-screen
+            // layer instead of a sublayer of the desktop compositor, and no Windows desktop
+            // is shown while the client starts. One-time installs still run first.
+            if MadeiraDock.noDesktop {
+                if let installers = DockInstallers.script {
+                    setenv("MADEIRA_EXE", "C:\\windows\\system32\\cmd.exe", 1)
+                    setenv("MADEIRA_ARGS", "/c call \(installers) & \(MadeiraDock.executable)", 1)
+                } else {
+                    setenv("MADEIRA_EXE", MadeiraDock.executable, 1)
+                    unsetenv("MADEIRA_ARGS")
+                }
+                unsetenv("MADEIRA_DESKTOP")
+                logStore.log("[madeira-dock] no virtual desktop for this launch")
+            } else {
+                setenv("MADEIRA_EXE", "explorer.exe", 1)
+                setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
+                setenv("MADEIRA_DESKTOP", "1", 1)
+            }
             setenv("MADEIRA_SCREEN_W", String(width), 1)
             setenv("MADEIRA_SCREEN_H", String(height), 1)
             // The compositor and touch mapping read the published size

@@ -60,6 +60,13 @@ enum MadeiraDock {
     }
     static let executable = "C:\\windows\\system32\\dockhost.exe"
 
+    /// madeira-doge: start games without explorer's virtual desktop (off by default,
+    /// as upstream). The Madeira Dock page's switch, or dock-no-desktop = 1 in madeira.cfg.
+    static let noDesktopKey = "madeira.dock.noDesktop"
+    static var noDesktop: Bool {
+        UserDefaults.standard.bool(forKey: noDesktopKey) || MadeiraConfig.get("dock-no-desktop") == "1"
+    }
+
     static var prefix: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("wine")
     }
