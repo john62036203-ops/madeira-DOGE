@@ -4228,18 +4228,21 @@ struct TouchControlsOverlay: View {
     /// neighbours sit further apart than that, so nothing merges until it is
     /// moved almost touching. Before 26 the same views stack as plain material.
     @ViewBuilder private func controls(_ screen: CGSize, session: Bool) -> some View {
+        // A library session's Control opacity; full while editing.
+        let alpha = session && !m.editing ? library.opacity : 1
         let buttons = ForEach(m.controls) { c in
             TouchControlButton(control: c, screen: screen)
-                // A library session's Control opacity; full while editing.
-                .opacity(session && !m.editing ? library.opacity : 1)
         }
         if #available(iOS 26.0, *) {
+            // madeira-doge: the container composites every glass face as one layer,
+            // so an opacity on a single button never showed; fade the container.
             GlassEffectContainer(spacing: 12) {
                 ZStack { buttons }
                     .frame(width: screen.width, height: screen.height, alignment: .topLeading)
             }
+            .opacity(alpha)
         } else {
-            buttons
+            buttons.opacity(alpha)
         }
     }
 
