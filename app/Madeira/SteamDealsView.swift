@@ -188,6 +188,7 @@ struct SteamDealsView: View {
     var search: String
     @ObservedObject private var model = SteamDealsModel.shared
     @State private var opened: SteamDeal?
+    @State private var storeSearch = false
 
     private var shown: [SteamDeal] {
         let q = search.trimmingCharacters(in: .whitespaces)
@@ -197,7 +198,15 @@ struct SteamDealsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("Steam specials").font(.title2.bold())
+                HStack {
+                    Text("Steam specials").font(.title2.bold())
+                    Spacer()
+                    // madeira-doge: search the whole store; free games can be added to the account.
+                    Button { storeSearch = true } label: {
+                        Label(SteamRequirements.chinese ? "搜尋商店" : "Search store", systemImage: "magnifyingglass")
+                    }
+                    .buttonStyle(.bordered)
+                }
                 if let message = model.message {
                     Text(message).foregroundStyle(.secondary)
                 }
@@ -224,6 +233,7 @@ struct SteamDealsView: View {
         .refreshable { model.reload() }
         .onAppear { model.loadFirstIfNeeded() }
         .sheet(item: $opened) { SteamDealDetailView(deal: $0) }
+        .sheet(isPresented: $storeSearch) { SteamStoreView() }
     }
 }
 
