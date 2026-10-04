@@ -1462,6 +1462,14 @@ jobs:
           done
           echo "::notice::native ABI $ABI, shader cache identity ${SCID:-none}"
 
+      # madeira-doge: upstream's prebuilt StikJIT.xcframework carries a Swift 6.4
+      # module interface; this runner's Swift is older and cannot parse it.
+      - name: StikJIT interface in the older syntax
+        shell: bash
+        run: |
+          swift --version 2>&1 | head -1
+          python3 tools/patch-stikjit-interface.py app/Frameworks/StikJIT.xcframework
+
       - name: Archive (unsigned)
         shell: bash
         run: |
