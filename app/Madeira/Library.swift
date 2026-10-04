@@ -3390,6 +3390,20 @@ struct LibraryHUD: View {
                     SteamCloudQuitRow(appID: appID)
                 }
                 Divider()
+                // madeira-doge: the developer interface's CAP, reachable in a library session.
+                Button {
+                    model.menu = false
+                    // After the menu has gone, so the frame shows what the player saw.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        madeira_capture_request(1)
+                        LogStore.shared.log("[capture] madeira-doge: frame capture requested from the session menu")
+                    }
+                } label: {
+                    Label("Capture the next frame", systemImage: "camera.viewfinder")
+                }
+                Text("For a wrong or missing picture: saves what every drawing step of the next frame produced as picture sheets in Files \u{203A} Madeira \u{203A} capture.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Divider()
                 // Red label and symbol; the menu's .primary style would otherwise win.
                 Button(role: .destructive) { model.requestQuit() } label: {
                     Label("Quit game", systemImage: "stop.circle").foregroundStyle(.red)
