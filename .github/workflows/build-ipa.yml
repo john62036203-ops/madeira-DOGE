@@ -1475,6 +1475,13 @@ jobs:
           # A failing xcodebuild buries the diagnostic under a multi-kilobyte
           # swift-frontend invocation, so surface just the errors.
           if [ "$rc" -ne 0 ]; then
+            # madeira-doge: the same lines as annotations (a fork cannot read the job log through the API).
+            E=$(grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | sed "s#^$GITHUB_WORKSPACE/##" | sort -u | cut -c1-260 | head -24 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            [ -n "$E" ] && echo "::error::xcodebuild compiler errors :: $E"
+            K=$(grep -E "Undefined symbol|^ld: |symbol\(s\) not found|duplicate symbol|error: " "$GITHUB_WORKSPACE/archive.log" | grep -vE "^[^ ].*: (error|fatal error):" | sort -u | cut -c1-240 | head -24 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            [ -n "$K" ] && echo "::error::xcodebuild other errors :: $K"
+            F=$(sed -n '/The following build commands failed/,/failures)/p' "$GITHUB_WORKSPACE/archive.log" | cut -c1-200 | head -12 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            [ -n "$F" ] && echo "::error::xcodebuild failing commands :: $F"
             echo "===== compiler errors ====="
             grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | head -30
             # Linker diagnostics carry no "error:" prefix, so the undefined
