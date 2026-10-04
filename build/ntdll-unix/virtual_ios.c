@@ -17675,6 +17675,19 @@ static int ios_swap_is_fexjit( uintptr_t b, size_t size )
     if (ps && rw && b < rw + ps && e > rw) return 1;
     return 0;
 }
+/* madeira-doge: MADEIRA_SWAP_SMALLMAP=1, as build 79 had it.  A 63 GB map (no
+ * extended-virtual-addressing) has no band at 0x7000000000, so "blocks"
+ * turns every commit away there.  With the switch, blocks also accepts plain
+ * commits of the GAME process from 4 GB up: below the emulators' band at
+ * 0xc00000000 always, above it only with MADEIRA_SWAP_HIGH=1 and never an
+ * exact 16 MB commit (FEX's arenas).  Commits only -- reservations are not
+ * backed, which is what separates this from "wide". */
+static int ios_swap_smallmap_on(void)
+{
+    static int smallmap = -1;
+    if (smallmap < 0) smallmap = getenv( "MADEIRA_SWAP_SMALLMAP" ) != NULL && getenv( "MADEIRA_SWAP_SMALLMAP" )[0] == '1';
+    return smallmap;
+}
 static int ios_swap_why( const void *base, size_t size, unsigned int vprot, struct file_view *view )
 {
     uintptr_t b = (uintptr_t)base;
@@ -17696,7 +17709,13 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
         if (!high || size == (16u << 20) || !ios_swap_proc_is_game() ||
             (ps && rx && b < rx + ps && e > rx) || (ps && rw && b < rw + ps && e > rw)) return IOS_SW_FEXJIT;
     }
-    if (!ios_swap_wide && (b < 0x7000000000ULL || b >= 0x7c00000000ULL)) return IOS_SW_BAND;
+    if (!ios_swap_wide && (b < 0x7000000000ULL || b >= 0x7c00000000ULL))
+    {
+        static int high = -1;
+        if (high < 0) high = getenv( "MADEIRA_SWAP_HIGH" ) != NULL && getenv( "MADEIRA_SWAP_HIGH" )[0] == '1';
+        if (!(ios_swap_smallmap_on() && b >= 0x100000000ULL && ios_swap_proc_is_game() &&
+              (b + size <= 0xc00000000ULL || (high && size != (16u << 20))))) return IOS_SW_BAND;
+    }
     if (size < ios_swap_min) return IOS_SW_SMALL;
     return IOS_SW_BACKED;
 }
@@ -17925,7 +17944,8 @@ static void ios_swap_commit( void *base, size_t size, unsigned int vprot, struct
     int why;
     if (ios_swap_fd < 0) return;
     if (!ios_swap_v2) { if (ios_swap_eligible( base, size, vprot, view )) ios_swap_back( base, size, vprot ); return; }
-    if (ios_swap_wide && ios_swap_n && ios_swap_overlaps( base, size )) { ios_swap_note( IOS_SW_PRESENT, size ); return; }
+    if ((ios_swap_wide || ios_swap_smallmap_on()) && ios_swap_n && ios_swap_overlaps( base, size ))
+    { ios_swap_note( IOS_SW_PRESENT, size ); return; }
     why = ios_swap_why( base, size, vprot, view );
     if (why == IOS_SW_BACKED) why = ios_swap_map( base, size, get_unix_prot( vprot | VPROT_COMMITTED ) );   /* ml1082 */
     ios_swap_note( why, size );
