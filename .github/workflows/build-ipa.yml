@@ -15,7 +15,8 @@ concurrency:
 jobs:
   build:
     # madeira-bcd: runs only in the owner's repository; a fork's run is skipped.
-    if: github.repository == 'bahacan16/madeira-bcd'
+    # madeira-doge: and in this fork.
+    if: github.repository == 'bahacan16/madeira-bcd' || github.repository_owner == 'john62036203-ops'
     runs-on: macos-15
     # contents: write only so the token can see DRAFT releases, which is where
     # the Metal Shader Converter installer is kept (drafts are not public).
