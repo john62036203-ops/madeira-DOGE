@@ -17937,6 +17937,7 @@ static void ios_swap_reserve( void *base, size_t size, unsigned int vprot, struc
 {
     if (ios_swap_fd < 0 || !ios_swap_wide) return;
     if ((vprot & VPROT_COMMITTED) || size > ios_swap_resv_max) return;
+    if (ios_swap_n && ios_swap_overlaps( base, size )) return;   /* madeira-doge: a parked view reused, still mapped */
     if (ios_swap_why( base, size, vprot, view ) != IOS_SW_BACKED) return;
     if (ios_swap_map( base, size, get_unix_prot( vprot ) ) != IOS_SW_BACKED) return;
     ios_swap_resv_n++;
@@ -22821,7 +22822,7 @@ static int ios_vpark_put( struct file_view *view, int *zero_slot )
     extern int ios_swap_overlaps_probe( const void *, size_t );
     TEB *teb = NtCurrentTeb();
     unsigned int now;
-    int i, slot = -1, oldest = -1, aged = 0, mode = ios_vpark_mode();
+    int i, slot = -1, oldest = -1, aged = 0, mode = ios_vpark_mode(), backed;
     size_t resident = 0;
     char *zero_base = NULL;
 
@@ -22830,7 +22831,26 @@ static int ios_vpark_put( struct file_view *view, int *zero_slot )
     if (!mode || !teb || !teb->Peb) return 0;
     if (view->size < (1u << 20) || view->size >= (4u << 20)) return 0;
     if (!is_view_valloc( view ) || (view->protect & ~(unsigned int)(VPROT_READ | VPROT_WRITE))) return 0;
-    if (ios_swap_overlaps_probe( view->base, view->size )) return 0;
+    /* madeira-doge: a reservation the swap tier mapped from its file (coverage
+     * "wide") was never parked, so a game that reserves and releases ~2 MB
+     * blocks hundreds of times a second paid a file mapping and a hole punch
+     * for each one (Sekiro: 155000 reservations backed in one session, and the
+     * frame waited on them). In mode 2 such a view is parked like any other:
+     * its pages are zeroed in place and stay mapped from the file, and the
+     * reuse keeps the mapping (ios_swap_reserve skips a range already backed).
+     * Mode 1 would replace the mapping, so it does not park a backed view.
+     * MADEIRA_VALLOC_PARK_SWAP=0 restores "never park a backed view". */
+    backed = ios_swap_overlaps_probe( view->base, view->size );
+    if (backed)
+    {
+        static int park_swap = -1;
+        if (park_swap < 0)
+        {
+            const char *e = getenv( "MADEIRA_VALLOC_PARK_SWAP" );
+            park_swap = !(e && e[0] == '0');
+        }
+        if (mode != 2 || !park_swap) return 0;
+    }
 
     now = ios_vpark_ms();
     for (i = 0; i < IOS_VPARK_N; i++)
@@ -22853,7 +22873,7 @@ static int ios_vpark_put( struct file_view *view, int *zero_slot )
         slot = oldest;
     }
 
-    if (mode == 2 && ios_vpark_resident + view->size <= (24u << 20))
+    if (mode == 2 && (backed || ios_vpark_resident + view->size <= (24u << 20)))
     {
         /* one contiguous run of plain read/write committed pages, or nothing committed */
         char *p, *end = (char *)view->base + view->size, *lo = NULL, *hi = NULL;
@@ -22874,6 +22894,7 @@ static int ios_vpark_put( struct file_view *view, int *zero_slot )
         else mode = 1;
     }
     else mode = 1;
+    if (mode == 1 && backed) return 0;
     if (mode == 1 && decommit_pages( view, view->base, view->size )) return 0;
 
     if (!++ios_vpark_next_token) ++ios_vpark_next_token;
