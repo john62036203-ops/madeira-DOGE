@@ -9947,40 +9947,6 @@ static BOOL ios_dnsapi_unixlib_enabled(void)
     return !(e && e[0] == '0');
 }
 
-/* MADEIRA (from upstream build 270, docs/MEDIA.md): winegstreamer's unix side
- * on FFmpeg's libavcodec/libavformat plus VideoToolbox and AudioToolbox
- * (build/ntdll-unix/winegstreamer_unixlib_ios.c, which includes
- * wg_parser_av_ios.c).  Without it winegstreamer.dll could not load at all:
- * CLSID_CWMADecMediaObject -> wmadmod.dll -> CLSID_wg_wma_decoder had no class
- * object, so FAudio played xWMA voices' COMPRESSED bytes as PCM (static), and
- * quartz's MP3/WAV splitters and Media Foundation's MP4 source had no parser.
- *
- * The wow64 table is written by hand in that file, because
- * dlls/winegstreamer/unixlib.h carries no 32-bit param structs (the entries
- * holding a struct wg_media_type or a struct wg_sample * differ).
- *
- * 221 tree: build.sh archives the media objects only when both compiled;
- * otherwise it archives winegstreamer_stub_ios.c, whose two tables are a
- * single NULL entry, and winegstreamer keeps the generic stub table exactly
- * as before (ios_wg_unixlib_linked below). */
-extern const void *winegstreamer_unix_call_funcs[];
-extern const void *winegstreamer_unix_call_wow64_funcs[];
-
-/* winegstreamer's unix side is bound for 32-bit (wow64) callers.  A 64-bit
- * (ARM64EC) caller gets it only with MADEIRA_WG_64BIT=1 (env, or
- * env.MADEIRA_WG_64BIT = 1 in madeira.cfg); by default it keeps the generic
- * stub table, as upstream. */
-static BOOL ios_wg_64bit_opted_in(void)
-{
-    const char *e = getenv( "MADEIRA_WG_64BIT" );
-    return e && e[0] == '1';
-}
-
-static BOOL ios_wg_unixlib_linked(void)
-{
-    return winegstreamer_unix_call_funcs[0] != NULL && winegstreamer_unix_call_wow64_funcs[0] != NULL;
-}
-
 /***********************************************************************
  *           ios_module_export_name
  *
@@ -12301,8 +12267,7 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     view->base    = base;
     view->size    = size;
     view->protect = vprot;
-    view->madeira_creator_tid = madeira_va_diagnostics && NtCurrentTeb()
-        ? (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+    view->madeira_creator_tid = 0;
     view->madeira_parked = 0;
     view->madeira_rw_base = NULL;
     view->madeira_rw_size = 0;
@@ -17688,36 +17653,9 @@ static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot,
     uintptr_t b = (uintptr_t)base;
     if (ios_swap_fd < 0) return 0;
     if (!(vprot & VPROT_WRITE) || (vprot & (VPROT_EXEC | VPROT_WRITECOPY | VPROT_GUARD | VPROT_WRITEWATCH))) return 0;
-    if (!view || !is_view_valloc( view ) || (view->protect & (SEC_FILE | SEC_IMAGE | SEC_RESERVE | VPROT_SYSTEM)))
-    { if (big) ios_swap_no_kind += size; return 0; }
-    if (b < 0x7000000000ULL || b >= 0x7c00000000ULL)   /* the guest band only */
-    {
-        /* madeira-doge: a 63 GB map (no extended-virtual-addressing) has no band at
-         * 0x7000000000, so the tier turned away every commit (17.8 GB in one DMC5
-         * session, 0 MB backed) while the footprint sat at ~5.6 GB, above Metal's
-         * recommended 5461 MB, and the GPU then discarded command buffers.
-         * MADEIRA_SWAP_SMALLMAP=1 also accepts plain valloc commits in
-         * [16 GB, 48 GB): above the low window and the JIT pool, below the emulators'
-         * band at 0xc00000000. Opt-in, untested on a device. */
-        static int smallmap = -1;
-        if (smallmap < 0) smallmap = getenv( "MADEIRA_SWAP_SMALLMAP" ) != NULL && getenv( "MADEIRA_SWAP_SMALLMAP" )[0] == '1';
-        /* Build 34 raised the ceiling to the top of the map and that file-backed
-         * FEX's own 16 MB arenas at 0xc00000000+ (backed/released per compile) in
-         * EVERY process: Valve's client hung before it started the game. So:
-         * the game process only, and [4 GB, 48 GB) -- guest reservations sit at
-         * 0x13.. - 0x14.. and 0xb5.., FEX's band above 48 GB stays anonymous. */
-        /* madeira-doge: RE Requiem dies at the 6144 MB limit with 1.6 GB backed
-         * and 2.9 GB still compressed: its heap blocks (0x3ff000, 19k of them)
-         * are placed above 48 GB, inside the emulators' band, where this test
-         * turned them away. MADEIRA_SWAP_HIGH=1 lifts the ceiling for the game
-         * process, except for exact 16 MB commits up there (FEX's arenas). */
-        static int high = -1;
-        if (high < 0) high = getenv( "MADEIRA_SWAP_HIGH" ) != NULL && getenv( "MADEIRA_SWAP_HIGH" )[0] == '1';
-        if (!(smallmap && b >= 0x100000000ULL && ios_swap_proc_is_game() &&
-              (b + size <= 0xc00000000ULL || (high && size != (16u << 20)))))
-        { if (big) ios_swap_no_band += size; return 0; }
-    }
-    if (size < ios_swap_min) { if (big) ios_swap_no_small += size; return 0; }
+    if (!view || !is_view_valloc( view ) || (view->protect & (SEC_FILE | SEC_IMAGE | SEC_RESERVE | VPROT_SYSTEM))) return 0;
+    if (b < 0x7000000000ULL || b >= 0x7c00000000ULL) return 0;   /* the guest band only */
+    if (size < (8u << 20)) return 0;
     return 1;
 }
 /* blocks/wide: why a range is (not) eligible; the census counts by this. */
