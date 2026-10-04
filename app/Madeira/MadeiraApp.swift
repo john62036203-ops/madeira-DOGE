@@ -18,9 +18,13 @@ struct MadeiraApp: App {
                 .onAppear {
                     GamepadInput.shared.start()
                     HardwareInput.shared.start()
+                    JITNetworkShortcut.shared.restoreLeftover()   // also starts its network path monitor
                 }
-                // madeira-bcd: madeira://play?exe=... (Home Screen shortcuts)
-                .onOpenURL { ShortcutRouter.shared.handle($0) }
+                // madeira-bcd: madeira://play?exe=... (Home Screen shortcuts);
+                // madeira://jit-network/...: the Madeira JIT shortcut returning (JITNetwork.swift).
+                .onOpenURL { url in
+                    if !JITNetworkShortcut.shared.handle(url) { ShortcutRouter.shared.handle(url) }
+                }
         }
     }
 }
