@@ -3485,10 +3485,15 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
                         cur, ios_jit_alias_pushback_peb, cross_n);
             }
         }
-        ios_jit_alias_pushback_cb((unsigned long long)(uintptr_t)pe_base,
-                                  (unsigned long long)(uintptr_t)jit_base,
-                                  (unsigned long long)size);
     }
+    /* madeira-doge ml2100: to EVERY registered emulator, not only the newest
+     * (ios_jit_alias_push_new; it falls back to the single callback above when
+     * none is kept). Among Us, build 90: cryptnet.dll mapped by the game went to
+     * Steam's emulator only, and the game then ran the image's pool copy as x86
+     * ("AV EXEC" at a pool address) and ended with 0xc0000005 before its window. */
+    ios_jit_alias_push_new((unsigned long long)(uintptr_t)pe_base,
+                           (unsigned long long)(uintptr_t)jit_base,
+                           (unsigned long long)size);
 }
 
 /* ml951: hand a sub-floor image window to FEX so QueryGuestExecutableRange can
@@ -3826,6 +3831,7 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     prev_peb = ios_jit_alias_pushback_peb;
     ios_jit_alias_pushback_cb = params->callback;
     ios_jit_alias_pushback_peb = self;
+    ios_jit_alias_cb_remember( self, params->callback );   /* madeira-doge ml2100 */
     if (self && !ios_jit_alias_has_emulator( self ) && ios_jit_alias_registered_n < IOS_ALIAS_REG_MAX)
     {
         ios_jit_alias_registered[ios_jit_alias_registered_n] = self;
@@ -10809,6 +10815,7 @@ void ios_jit_reclaim_process( void *peb )
 
     /* madeira-bcd: its Social Club reservations go when the next helper asks */
     ios_sc_grants_owner_died( peb );
+    ios_jit_alias_cb_forget( peb );   /* madeira-doge ml2100: before its emulator's pool copy is reclaimed */
     if (!peb || !rx_base) return;
 
     /* madeira-bcd: the alias-push callback lives in the emulator of the LAST
