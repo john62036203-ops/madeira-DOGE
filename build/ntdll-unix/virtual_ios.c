@@ -17682,7 +17682,20 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
     if (!view || !is_view_valloc( view ) ||
         (view->protect & (SEC_FILE | SEC_IMAGE | SEC_RESERVE | VPROT_SYSTEM | VPROT_PLACEHOLDER |
                           VPROT_FREE_PLACEHOLDER | VPROT_ARM64EC | VPROT_WRITEWATCH))) return IOS_SW_VIEW;
-    if (ios_swap_is_fexjit( b, size )) return IOS_SW_FEXJIT;
+    if (ios_swap_is_fexjit( b, size ))
+    {
+        /* madeira-doge: RE Engine heap blocks (0x3ff000 each, tens of GB of commit
+         * requests in a session) land inside the emulator's arena range and were all
+         * counted fex/jit, so the title died at the footprint limit with 2 GB backed.
+         * MADEIRA_SWAP_HIGH=1 backs them in the game process: never the JIT pool,
+         * never an exact 16 MB commit (FEX's own arenas). */
+        static int high = -1;
+        uintptr_t e = b + size, rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
+        size_t ps = ios_jit_pool_size_global;
+        if (high < 0) high = getenv( "MADEIRA_SWAP_HIGH" ) != NULL && getenv( "MADEIRA_SWAP_HIGH" )[0] == '1';
+        if (!high || size == (16u << 20) || !ios_swap_proc_is_game() ||
+            (ps && rx && b < rx + ps && e > rx) || (ps && rw && b < rw + ps && e > rw)) return IOS_SW_FEXJIT;
+    }
     if (!ios_swap_wide && (b < 0x7000000000ULL || b >= 0x7c00000000ULL)) return IOS_SW_BAND;
     if (size < ios_swap_min) return IOS_SW_SMALL;
     return IOS_SW_BACKED;
