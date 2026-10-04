@@ -1901,6 +1901,7 @@ struct LibraryView: View {
     @State private var search = ""
     /// The Settings tab's own search text, kept apart from the library's.
     @State private var settingsSearch = ""
+    @State private var dealsSearch = ""
     @State private var focused: UUID?
     @ObservedObject private var controller = LibraryController.shared
     @ObservedObject private var input = InputSettings.shared
@@ -1940,11 +1941,15 @@ struct LibraryView: View {
             settings
                 .tabItem { Image(systemName: "gearshape.fill").accessibilityLabel("Settings") }
                 .tag(1)
+            // madeira-doge: Steam's current specials.
+            SteamDealsView(search: dealsSearch)
+                .tabItem { Image(systemName: "tag.fill").accessibilityLabel("Steam specials") }
+                .tag(2)
         }
         // The system search field (Liquid Glass on iOS 26) in the title's place, left
         // of the library's buttons, on both tabs; each tab keeps its own text.
-        .background(LibraryNavSearch(text: tab == 0 ? $search : $settingsSearch,
-                                     placeholder: tab == 0 ? "Search your library" : "Search settings")
+        .background(LibraryNavSearch(text: tab == 0 ? $search : (tab == 1 ? $settingsSearch : $dealsSearch),
+                                     placeholder: tab == 0 ? "Search your library" : (tab == 1 ? "Search settings" : "Search specials"))
             .frame(width: 0, height: 0))
         // Each tab is hosted by the tab bar controller, so a toolbar set inside a tab
         // would not reach the navigation bar: the library's lives here.
@@ -1955,7 +1960,7 @@ struct LibraryView: View {
         .navigationTitle("")
         .toolbar {
             LibraryLargeTitle()
-            if tab == 0 { libraryToolbar } else { settingsToolbar }
+            if tab == 0 { libraryToolbar } else if tab == 1 { settingsToolbar }
         }
         // On the tab view, not inside one tab's page: an alert attached to the Library
         // page cannot present while Settings is showing, so an error raised there (its
@@ -1976,7 +1981,7 @@ struct LibraryView: View {
             LogStore.shared.log("[library-sections] native-steam=\(SteamOwnedLibrary.enabled ? 1 : 0) sections=\(SteamGamesSection.shown ? 1 : 0) collapse=\(SteamGamesSection.collapsible ? 1 : 0)")
         }
         .onReceive(controller.commands) { command in
-            if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: 1 - tab) }
+            if selected == nil, !browser, !onboarding.presented, command == "tab" { switchTab(to: (tab + 1) % 3) }
         }
     }
     @ToolbarContentBuilder private var libraryToolbar: some ToolbarContent {
