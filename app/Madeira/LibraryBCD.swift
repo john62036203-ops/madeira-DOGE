@@ -146,6 +146,13 @@ struct BCDGameSections: View {
 
     private var profile: GameProfile { GameProfile(windowsPath: windowsPath) }
 
+    private var thisGameFooter: String {
+        let pool = "JIT pool for this game only; \"Same as Settings\" uses the size chosen in Settings › Memory & sync."
+        guard steamDock else { return pool }
+        return pool + " Steam launch arguments are what Steam calls Launch Options (for example -d3d12)."
+            + " The Steam Overlay is off in Madeira Dock sessions unless allowed here."
+    }
+
     /// madeira-doge: the JIT pool of this game alone (ContentView reads the game's `pool` first).
     static let poolChoices: [(String, String)] = [("", "Same as Settings"), ("512", "512 MB"), ("640", "640 MB"),
                                                    ("768", "768 MB"), ("896", "896 MB"), ("1024", "1024 MB"),
@@ -251,9 +258,7 @@ struct BCDGameSections: View {
         } header: {
             Text("madeira-doge: this game")
         } footer: {
-            Text("JIT pool for this game only; \"Same as Settings\" uses the size chosen in Settings › Memory & sync. "
-                 + (steamDock ? "Steam launch arguments are what Steam calls Launch Options (for example -d3d12). "
-                                + "The Steam Overlay is off in Madeira Dock sessions unless allowed here." : ""))
+            Text(thisGameFooter)
         }
         Section {
             choicePicker("Controller API", $padMode, GameProfile.padModeChoices)
