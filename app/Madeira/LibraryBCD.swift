@@ -106,7 +106,13 @@ struct BCDGameSections: View {
     let windowsPath: String
     /// Bumped by LibraryDetail when it changes this game's config file itself.
     var refresh: Int = 0
+    /// madeira-doge: a Steam game that starts through Madeira Dock (its launch
+    /// arguments and the overlay choice go to Valve's client).
+    var steamDock = false
 
+    @State private var pool = ""
+    @State private var dockArgs = ""
+    @State private var overlay = false
     @State private var avx = false
     @State private var wineVCRT = false
     @State private var nvidia = false
@@ -119,10 +125,14 @@ struct BCDGameSections: View {
     @State private var loaded = true
     @State private var copiedLink = false
 
-    init(windowsPath: String, refresh: Int = 0) {
+    init(windowsPath: String, refresh: Int = 0, steamDock: Bool = false) {
         self.windowsPath = windowsPath
         self.refresh = refresh
+        self.steamDock = steamDock
         let p = GameProfile(windowsPath: windowsPath)
+        _pool = State(initialValue: p.get("pool") ?? "")
+        _dockArgs = State(initialValue: p.get("env.MADEIRA_DOCK_GAME_ARGS") ?? "")
+        _overlay = State(initialValue: p.get("env.MADEIRA_STEAM_OVERLAY") == "1")
         _avx = State(initialValue: LibraryPrefs.avx(windowsPath))
         _wineVCRT = State(initialValue: LibraryPrefs.wineVCRT(windowsPath))
         _nvidia = State(initialValue: LibraryPrefs.nvidia(windowsPath))
@@ -136,12 +146,20 @@ struct BCDGameSections: View {
 
     private var profile: GameProfile { GameProfile(windowsPath: windowsPath) }
 
+    /// madeira-doge: the JIT pool of this game alone (ContentView reads the game's `pool` first).
+    static let poolChoices: [(String, String)] = [("", "Same as Settings"), ("512", "512 MB"), ("640", "640 MB"),
+                                                   ("768", "768 MB"), ("896", "896 MB"), ("1024", "1024 MB"),
+                                                   ("1152", "1152 MB")]
+
     private func load() {
         loaded = false
         avx = LibraryPrefs.avx(windowsPath)
         wineVCRT = LibraryPrefs.wineVCRT(windowsPath)
         nvidia = LibraryPrefs.nvidia(windowsPath)
         let p = profile
+        pool = p.get("pool") ?? ""
+        dockArgs = p.get("env.MADEIRA_DOCK_GAME_ARGS") ?? ""
+        overlay = p.get("env.MADEIRA_STEAM_OVERLAY") == "1"
         metalFX = p.get("metalfx-upscale") ?? ""
         frameGen = p.get("env.MADEIRA_FRAMEGEN") ?? ""
         tess = p.get("dxil-tess-max-factor") ?? ""
@@ -215,6 +233,27 @@ struct BCDGameSections: View {
                  + "1.5× brings to 720. Frame generation (experimental) shows a MetalFX-interpolated frame between "
                  + "every two game frames; FPS limits do not apply while it is on. The advanced file takes any "
                  + "madeira.cfg key or env.NAME line for this game only.")
+        }
+        Section {
+            choicePicker("JIT pool (this game)", $pool, BCDGameSections.poolChoices)
+                .onChange(of: pool) { _, v in store("pool", v) }
+            if steamDock {
+                TextField("Steam launch arguments", text: $dockArgs, axis: .vertical)
+                    .autocorrectionDisabled().textInputAutocapitalization(.never)
+                    .onChange(of: dockArgs) { _, v in
+                        // One line; the Dock host hands it to Valve's client as the launch options.
+                        store("env.MADEIRA_DOCK_GAME_ARGS",
+                              v.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces))
+                    }
+                Toggle("Allow the Steam Overlay (slower)", isOn: $overlay)
+                    .onChange(of: overlay) { _, on in store("env.MADEIRA_STEAM_OVERLAY", on ? "1" : "") }
+            }
+        } header: {
+            Text("madeira-doge: this game")
+        } footer: {
+            Text("JIT pool for this game only; \"Same as Settings\" uses the size chosen in Settings › Memory & sync. "
+                 + (steamDock ? "Steam launch arguments are what Steam calls Launch Options (for example -d3d12). "
+                                + "The Steam Overlay is off in Madeira Dock sessions unless allowed here." : ""))
         }
         Section {
             choicePicker("Controller API", $padMode, GameProfile.padModeChoices)

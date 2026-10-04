@@ -2494,7 +2494,8 @@ struct LibraryDetail: View {
                     Text("Reduced-precision x87 can make older games faster at some cost in accuracy; it is off by default. With Fastsync, fast synchronization (on by default) handles events without a server round trip, and fast semaphore waits (off by default) does the same for semaphores. Settings apply to the next launch; a precision change may still require restarting Madeira.")
                 }
                 // madeira-bcd: this fork's per-game options (LibraryBCD.swift).
-                if entry.desktop != true { BCDGameSections(windowsPath: entry.windowsPath, refresh: bcdRefresh) }
+                if entry.desktop != true { BCDGameSections(windowsPath: entry.windowsPath, refresh: bcdRefresh,
+                                                            steamDock: entry.steamAppID != nil && !entry.startsSteamGameDirectly) }
                 Section("On screen") {
                     Toggle("Performance overlay", isOn: $entry.performance)
                     Toggle("Live logs", isOn: $entry.liveLogs)
