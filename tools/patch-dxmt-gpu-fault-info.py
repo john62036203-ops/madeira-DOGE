@@ -50,7 +50,11 @@ ADDITION = """  case 8: {   /* madeira-bcd: GPU fault attribution (tools/patch-d
       NSError *err = [(id<MTLCommandBuffer>)(uintptr_t)t->cb error];
       NSArray *infos = err ? err.userInfo[MTLCommandBufferEncoderInfoErrorKey] : nil;
       if (err) {   /* the MTLCommandBufferError code: 3 timeout, 4 page fault, ... */
-        int w0 = snprintf(out, cap, "code %ld (%s): ", (long)err.code, err.domain.UTF8String ? err.domain.UTF8String : "?");
+        NSError *un = err.userInfo[NSUnderlyingErrorKey];
+        const char *ld = err.localizedDescription.UTF8String;
+        int w0 = snprintf(out, cap, "code %ld (%s) '%.160s' under=%ld/%.40s '%.120s': ", (long)err.code, err.domain.UTF8String ? err.domain.UTF8String : "?",
+                          ld ? ld : "", un ? (long)un.code : 0L, un && un.domain.UTF8String ? un.domain.UTF8String : "-",
+                          un && un.localizedDescription.UTF8String ? un.localizedDescription.UTF8String : "");
         if (w0 > 0 && (size_t)w0 < cap) n = (size_t)w0;
       }
       for (int pass = 0; pass < 2; pass++) {
@@ -84,6 +88,13 @@ ADDITION = """  case 8: {   /* madeira-bcd: GPU fault attribution (tools/patch-d
         snprintf(out + n, cap - n, "%s(%u completed, %u pending, %u encoders)", n ? "; " : "",
                  completed, pending, (unsigned)infos.count);
     }
+    a->ret = 1;
+    break;
+  }
+  case 10: {   /* madeira-doge: SIMD width of a compute pipeline (len = threadExecutionWidth | maxTotalThreadsPerThreadgroup << 32) */
+    id<MTLComputePipelineState> cps = (id<MTLComputePipelineState>)(uintptr_t)a->ptr;
+    if (wmtr_enabled() || !cps) break;
+    a->len = (uint64_t)cps.threadExecutionWidth | ((uint64_t)cps.maxTotalThreadsPerThreadgroup << 32);
     a->ret = 1;
     break;
   }

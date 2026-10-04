@@ -315,6 +315,11 @@ static void mad_air_entry_name(const unsigned char *b, size_t len, char *out, si
 extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
                                    char *note, size_t note_cap);
 
+/* madeira-doge: madeira_cas.cpp -- the converter's weak compare-exchange made strong. */
+extern "C" void madeira_cas_scalar(int on);
+extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *out_len,
+                               char *note, size_t note_cap, int mode);
+
 extern "C" int madeira_sm5_resolve_ia(const void *bc, size_t bclen,
                                       const struct madeira_ir_input_layout *L,
                                       struct SM50_IA_INPUT_ELEMENT *out, uint32_t out_cap,
@@ -1726,6 +1731,28 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     if (!lib_bytes) { status = MADEIRA_IR_NO_MEMORY; goto done; }
     need = g_ir.IRMetalLibGetBytecode(lib, lib_bytes);
     if (!need) { status = MADEIRA_IR_NO_METALLIB; goto done; }
+    if (stage == IRShaderStageCompute) {   /* madeira-doge: madeira_cas.cpp */
+        static int cas_on = -1, cas_mode = -1; static unsigned cas_said;
+        void *nb = NULL; size_t nlen = 0; char cnote[256];
+        if (cas_on < 0) {
+            char v[16];
+            cas_on = !(madeira_cfg_get("cas-strong", v, sizeof v) && v[0] == '0');
+            if (madeira_cfg_get("cas-mode", v, sizeof v) && v[0] >= '0' && v[0] <= '4') cas_mode = v[0] - '0';
+            madeira_cas_scalar(!(madeira_cfg_get("pcc-scalar", v, sizeof v) && v[0] == '0'));   /* one-lane waves, default on */
+        }
+        if (cas_on) {
+            int crc = madeira_cas_fix(lib_bytes, (size_t)need, &nb, &nlen, cnote, sizeof cnote, cas_mode);
+            if (crc == 1 && nb && nlen) {
+                free(lib_bytes);
+                lib_bytes = (uint8_t *)nb; nb = NULL;
+                need = nlen; a->ret_len = need;
+                if (cas_said++ < 40) dprintf(2, "[madeira-ir] cas-strong dxil=%llu %s\n", (unsigned long long)a->dxil_len, cnote);
+            } else if (crc != 0 || cnote[0]) {
+                if (cas_said++ < 24) dprintf(2, "[madeira-ir] cas-strong '%s' NOT applied (rc %d, %zu bytes): %s\n", entry ? entry : "?", crc, nlen, cnote);
+            }
+            free(nb);
+        }
+    }
 
     /* The converter RENAMES entry points, so the name to give Metal comes from
      * reflection rather than from what D3D called it.
