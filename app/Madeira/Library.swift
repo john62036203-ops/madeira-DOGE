@@ -3631,11 +3631,29 @@ enum EndedSessionSurface {
 /// madeira-doge: the Dock's "no virtual desktop" switch, also in Settings.
 struct NoDesktopSettings: View {
     @AppStorage(MadeiraDock.noDesktopKey) private var noDesktop = false
+    @State private var bigExe = NoDesktopSettings.bigExeWindow
+    /// madeira-doge: Documents/madeira-exe-window-mb, read by JITAllocator.c at the
+    /// next app start: a 512MB window at 0x140000000 instead of 128MB, for a main
+    /// executable that cannot be relocated and is larger (many Unreal Engine games).
+    static var bigExeWindowFile: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("madeira-exe-window-mb")
+    }
+    static var bigExeWindow: Bool {
+        get { bigExeWindowFile.map { FileManager.default.fileExists(atPath: $0.path) } ?? false }
+        set {
+            guard let url = bigExeWindowFile else { return }
+            if newValue { try? Data("512\n".utf8).write(to: url, options: .atomic) }
+            else { try? FileManager.default.removeItem(at: url) }
+        }
+    }
     var body: some View {
         Section {
             Toggle("Start games without the virtual desktop", isOn: $noDesktop)
+            Toggle("Room for a large game executable", isOn: $bigExe)
+                .onChange(of: bigExe) { _, on in NoDesktopSettings.bigExeWindow = on }
         } header: { Text("Steam games") } footer: {
-            Text("Starts the game directly instead of on a Windows desktop. A game with one-time installers still to run starts on the desktop.")
+            Text("No virtual desktop: starts the game directly instead of on a Windows desktop. A game with one-time installers still to run starts on the desktop.\n\nLarge executable: keeps 512 MB at the fixed address some big games (Unreal Engine) must load at, for a game that ends right at its start. It applies to all games and takes effect after Madeira is fully closed and reopened.")
         }
     }
 }
