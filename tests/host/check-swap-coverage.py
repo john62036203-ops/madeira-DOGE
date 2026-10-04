@@ -65,6 +65,9 @@ core = virt[begin:end]
 
 prelude = r'''
 #define _GNU_SOURCE
+/* madeira-doge: MADEIRA_SWAP_HIGH / MADEIRA_SWAP_SMALLMAP apply to the game process only. */
+static int test_is_game;
+static int ios_swap_proc_is_game(void) { return test_is_game; }
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -433,6 +436,48 @@ static void test_off( void )
     ios_swap_fd = fd;
 }
 
+/* madeira-doge: blocks + MADEIRA_SWAP_SMALLMAP=1 (build 79's rule): plain commits of
+ * the game process from 4 GB up; above 48 GB only with MADEIRA_SWAP_HIGH=1, and
+ * never an exact 16 MB commit there. */
+static void test_smallmap( int high )
+{
+    struct file_view v = { 0, 0, 0 };
+    void *mid = (void *)0x200000000ULL, *below = (void *)0x80000000ULL, *top = (void *)0x1000000000ULL;
+    unsigned rw = VPROT_READ | VPROT_WRITE;
+
+    env( "blocks", NULL, NULL );
+    test_is_game = 0;
+    CHECK( ios_swap_why( mid, 1u << 20, rw, &v ) == IOS_SW_BAND, "smallmap: not the game process, not backed" );
+    test_is_game = 1;
+    CHECK( ios_swap_why( mid, 1u << 20, rw, &v ) == IOS_SW_BACKED, "smallmap: game commit at 8 GB backed" );
+    CHECK( ios_swap_why( mid, (1u << 20) - 0x1000, rw, &v ) == IOS_SW_SMALL, "smallmap: below the minimum small" );
+    CHECK( ios_swap_why( mid, 1u << 20, rw | VPROT_EXEC, &v ) == IOS_SW_PROT, "smallmap: exec never" );
+    CHECK( ios_swap_why( below, 1u << 20, rw, &v ) == IOS_SW_BAND, "smallmap: below 4 GB never" );
+    CHECK( ios_swap_why( (void *)0xbfff00000ULL, 0x200000, rw, &v ) == (high ? IOS_SW_BACKED : IOS_SW_BAND),
+           "smallmap: a commit crossing 48 GB needs MADEIRA_SWAP_HIGH" );
+    CHECK( ios_swap_why( top, 1u << 20, rw, &v ) == (high ? IOS_SW_BACKED : IOS_SW_BAND), "smallmap: above 48 GB only with MADEIRA_SWAP_HIGH" );
+    CHECK( ios_swap_why( top, 16u << 20, rw, &v ) == IOS_SW_BAND, "smallmap: an exact 16 MB commit above 48 GB never" );
+    CHECK( ios_swap_why( (void *)0x7050000000ULL, 1u << 20, rw, &v ) == IOS_SW_BACKED, "smallmap: the guest band as before" );
+    /* a second commit over a backed range is not mapped twice */
+    {
+        size_t len = 4u << 20;
+        void *m = mmap( (void *)0x300000000ULL, len, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0 );
+        if (m != MAP_FAILED && (uintptr_t)m >= 0x100000000ULL && (uintptr_t)m + len <= 0xc00000000ULL)
+        {
+            reset_tier();
+            ios_swap_commit( m, len, rw | VPROT_COMMITTED, &v );
+            CHECK( ios_swap_n == 1, "smallmap: commit backed" );
+            ios_swap_commit( m, len, rw | VPROT_COMMITTED, &v );
+            CHECK( ios_swap_n == 1 && ios_swap_why_bytes[IOS_SW_PRESENT] == len, "smallmap: a commit over a backed range is not backed twice" );
+            ios_swap_release_range( m, len, 0 );
+        }
+        else printf( "note: host mapping at %p is outside [4 GB, 48 GB); double-commit case skipped\n", m );
+        if (m != MAP_FAILED) munmap( m, len );
+    }
+    test_is_game = 0;
+}
+
 int main( int argc, char **argv )
 {
     char path[] = "/tmp/madeira-swap-XXXXXX";
@@ -445,6 +490,12 @@ int main( int argc, char **argv )
     ios_swap_init();
     unlink( path );
     if (ios_swap_fd < 0) { printf( "FAIL: tier did not start\n" ); return 1; }
+    if (argc > 1 && !strcmp( argv[1], "smallmap" ))
+    {
+        test_smallmap( argc > 2 );
+        printf( "%d failures (smallmap%s)\n", bad, argc > 2 ? " + high" : "" );
+        return bad != 0;
+    }
     test_off();
     test_config();
     test_why();
@@ -464,9 +515,15 @@ with tempfile.TemporaryDirectory() as tmp:
     exe = Path(tmp) / 'swap'
     c.write_text(prelude + core + harness)
     subprocess.run(['cc', '-O1', '-Wall', '-Wno-unused-function', '-Werror', '-o', str(exe), str(c)], check=True)
-    r = subprocess.run([str(exe)], capture_output=True, text=True, env=dict(os.environ))
+    base_env = {k: v for k, v in os.environ.items() if not k.startswith('MADEIRA_SWAP_')}
+    r = subprocess.run([str(exe)], capture_output=True, text=True, env=base_env)
     print(r.stdout.strip())
     check(r.returncode == 0, 'swap-tier core run failed:\n' + r.stdout + r.stderr)
+    for extra, args in (({'MADEIRA_SWAP_SMALLMAP': '1'}, ['smallmap']),
+                        ({'MADEIRA_SWAP_SMALLMAP': '1', 'MADEIRA_SWAP_HIGH': '1'}, ['smallmap', 'high'])):
+        rs = subprocess.run([str(exe)] + args, capture_output=True, text=True, env=dict(base_env, **extra))
+        print(rs.stdout.strip())
+        check(rs.returncode == 0, 'smallmap run failed:\n' + rs.stdout + rs.stderr)
     err = r.stderr
     check('[swap] coverage=blocks min=1024KB reserve-max=256MB' in err, 'coverage line printed at tier start')
     census = [l for l in err.splitlines() if l.startswith('[swap] census file-backed now=')]
