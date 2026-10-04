@@ -1594,6 +1594,8 @@ jobs:
       # the packs index -- metadata only, the IPA itself is not published --
       # so the app can tell which build a newer pack needs.
       - name: Record the app build in the update-pack index
+        # madeira-doge: the owner's repository only; a fork publishes no packs.
+        if: github.repository == 'bahacan16/madeira-bcd'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1611,6 +1613,15 @@ jobs:
         run: |
           echo "::error::OTA signing/upload did not succeed: this build's IPA was not kept anywhere (no GitHub artifact by design)"
           exit 1
+
+      # madeira-doge: this fork has no OTA bucket; the unsigned IPA is the build's
+      # only output, kept as an artifact as on the from-221 branch.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: madeira-0.1.${{ github.run_number }}-unsigned-ipa
+          path: build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa
+          if-no-files-found: ignore
 
       # Full logs as an artifact -- the annotations above are truncated, and
       # digging them out of the raw job log is painful.
