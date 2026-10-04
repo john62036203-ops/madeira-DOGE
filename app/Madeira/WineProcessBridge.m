@@ -1232,6 +1232,7 @@ static void *wine_process_thread(void *arg) {
                     [cfgEnvKeys addObject:@"WINEDLLOVERRIDES"];
                     fprintf(stderr, "[steam-overlay] disabled for this Dock session: WINEDLLOVERRIDES=%s "
                                     "(env.MADEIRA_STEAM_OVERLAY = 1 keeps the overlay)\n", ov.UTF8String);
+                }
                 /* Fastsync is the default sync engine: with neither inproc-sync nor
                  * env.MADEIRA_FASTSYNC in madeira.cfg, Wine gets MADEIRA_FASTSYNC=auto,
                  * the value Settings > Sync engine > Fastsync writes. Never overrides a
