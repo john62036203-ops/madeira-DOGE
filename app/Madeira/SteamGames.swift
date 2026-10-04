@@ -1209,7 +1209,7 @@ struct SteamEntrySection: View {
                 Toggle("Smaller JIT pool (512 MB) for this launch", isOn: $dock.compactPool)
                 // The game's One-time installs choice (Madeira Dock, DockInstallers).
                 if DockInstallers.choiceEnabled, dock.installPrograms[appID] != nil {
-                    Picker("One-time installs", selection: Binding(get: { dock.installRunNext[appID] ?? true },
+                    Picker("One-time installs", selection: Binding(get: { dock.installRunNext[appID] ?? DockInstallLedger.defaultRun },
                                                                    set: { dock.setRunsInstallers(appID, $0) })) {
                         Text("Run at next start").tag(true)
                         Text("Skip").tag(false)

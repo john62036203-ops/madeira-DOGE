@@ -183,7 +183,7 @@ struct MadeiraDockView: View {
                 if !dock.installPrograms.isEmpty {
                     Section {
                         ForEach(dock.games.filter { dock.installPrograms[$0.id] != nil }) { game in
-                            Picker(game.name, selection: Binding(get: { dock.installRunNext[game.id] ?? true },
+                            Picker(game.name, selection: Binding(get: { dock.installRunNext[game.id] ?? DockInstallLedger.defaultRun },
                                                                  set: { dock.setRunsInstallers(game.id, $0) })) {
                                 Text("Run at next start").tag(true)
                                 Text("Skip").tag(false)

@@ -429,9 +429,14 @@ struct DockInstallLedger: Codable, Equatable, Sendable {
     static let fileName = "madeira-dock-installs.json"
     var session: [SteamInstallRun] = []
     var sessionApp: Int = 0
-    /// App ID -> false: the game's next Dock start skips its one-time installs (Skip).
-    /// Absent or true: the next start runs the pending ones ("Run at next start").
+    /// App ID -> true: the game's next Dock start runs its pending one-time installs
+    /// ("Run at next start"). False: it skips them (Skip).
+    /// madeira-doge: ABSENT now means Skip. The redistributable installers mostly fail
+    /// under translation (on a device: one of six succeeded, and a vcredist run ended
+    /// the whole app), so a game's first start no longer runs them unasked.
+    /// `env.MADEIRA_DOCK_INSTALL_DEFAULT_RUN = 1` in madeira.cfg restores "absent runs".
     var runNext: [String: Bool] = [:]
+    static var defaultRun: Bool { MadeiraConfig.get("env.MADEIRA_DOCK_INSTALL_DEFAULT_RUN") == "1" }
 
     static func load(prefix: URL) -> DockInstallLedger {
         let file = prefix.appendingPathComponent(fileName)
@@ -443,7 +448,7 @@ struct DockInstallLedger: Codable, Equatable, Sendable {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         try encoder.encode(self).write(to: prefix.appendingPathComponent(Self.fileName), options: .atomic)
     }
-    func runsNext(_ appID: Int) -> Bool { runNext[String(appID)] != false }
+    func runsNext(_ appID: Int) -> Bool { runNext[String(appID)] ?? Self.defaultRun }
 }
 
 // MARK: - A Dock start's one-time installs
@@ -583,7 +588,7 @@ enum DockInstallers {
 
     static func setRunsNext(_ appID: Int, _ run: Bool, prefix: URL) {
         var ledger = DockInstallLedger.load(prefix: prefix)
-        ledger.runNext[String(appID)] = run ? nil : false
+        ledger.runNext[String(appID)] = run
         do { try ledger.save(prefix: prefix) }
         catch { LogStore.shared.log("[dock-installers] app=\(appID) choice not saved: \(error.localizedDescription)", level: .error); return }
         LogStore.shared.log("[dock-installers] app=\(appID) choice=\(run ? "run" : "skip")")
