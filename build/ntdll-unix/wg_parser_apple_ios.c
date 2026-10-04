@@ -183,6 +183,13 @@ static OSStatus vt_create_session( struct vt_dec *d )
     }
     status = VTDecompressionSessionCreate( kCFAllocatorDefault, d->fmt, NULL, attrs, &cb, &d->session );
     CFRelease( attrs );
+    if (status && d->out_width)
+    {
+        /* No session at that size: decode at the coded size, the core shrinks. */
+        d->out_width = d->out_height = 0;
+        d->session = NULL;
+        return vt_create_session( d );
+    }
     return status;
 }
 
