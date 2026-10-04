@@ -596,6 +596,31 @@ enum DockInstallers {
 
     // MARK: A start
 
+    /// madeira-doge: Wine's own msvcp140/vcruntime140 (14.50.35719) are always in the
+    /// prefix, but nothing records the Visual C++ 2015-2022 runtime the way Microsoft's
+    /// installer does (HKLM\Software\Microsoft\VisualStudio\14.0\VC\Runtimes\<arch>).
+    /// Unreal Engine 5's bootstrap (Final Fantasy Resonance demo) then stops with "The
+    /// following component(s) are required to run this program: Microsoft Visual C++
+    /// 2015-2022 Redistributable (arm64)" -- on an ARM64 host it asks for the arm64
+    /// package. Record x64, x86 and ARM64 (both registry views) at the version Wine ships;
+    /// values already at least as high are left alone.
+    static let vcRuntimeValues: [(String, UInt32)] = [("Installed", 1), ("Major", 14), ("Minor", 50), ("Bld", 35719), ("Rbld", 0)]
+    static func recordVCRuntime(prefix: URL) {
+        var runs: [SteamInstallRun] = []
+        for arch in ["X64", "x86", "ARM64"] {
+            for (name, value) in vcRuntimeValues where value > 0 {
+                runs.append(SteamInstallRun(name: name, hive: .machine,
+                                            key: "Software\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\" + arch, value: value))
+            }
+        }
+        do {
+            let written = try SteamInstallScripts.mark(runs, prefix: prefix)
+            if written > 0 { LogStore.shared.log("[dock-vcruntime] recorded the VC++ 2015-2022 runtime 14.50.35719 (x64, x86, ARM64): \(written) value(s)") }
+        } catch {
+            LogStore.shared.log("[dock-vcruntime] not recorded: \(error.localizedDescription)", level: .error)
+        }
+    }
+
     /// Called right before a Dock start, while no session runs (the registry is on disk).
     /// Records the previous batch's results, plans the game's programs and writes the batch.
     static func prepare(_ game: DockGame, drive: URL, prefix: URL,
@@ -607,6 +632,7 @@ enum DockInstallers {
         try? FileManager.default.removeItem(at: batchFile)
         absorbResults(reason: "next-start", drive: drive, prefix: prefix)
         try? FileManager.default.removeItem(at: drive.appendingPathComponent(resultName))
+        recordVCRuntime(prefix: prefix)
         guard enabled else {
             LogStore.shared.log("[dock-installers] app=\(app) off (MADEIRA_DOCK_INSTALLERS=0)"); return
         }
