@@ -364,6 +364,20 @@ jobs:
         continue-on-error: true
         run: bash build/ntdll-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/ntdll.log"; exit ${PIPESTATUS[0]}
 
+      # madeira-doge: the compiler's own words as annotations (a fork cannot
+      # read the job log through the API).
+      - name: Report ntdll-unix compile errors
+        if: always()
+        shell: bash
+        run: |
+          set +e +o pipefail
+          for f in build/ntdll-unix/obj/*.err; do
+            grep -q "error:" "$f" || continue
+            MSG=$(grep "error:" "$f" | sed 's#^.*/build/ntdll-unix/##' | cut -c1-230 | sed -n '1,28p' | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::$(basename "$f") :: $MSG"
+          done
+          exit 0
+
       # The link failure showed up only at xcodebuild time; catch it here.
       # nm without -U also matches the UNDEFINED references virtual_ios.o
       # makes to these same names, which is why the first version of this

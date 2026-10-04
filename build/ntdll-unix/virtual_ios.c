@@ -26638,9 +26638,6 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 
     /* ml1100 [valloc]: the same-process path only — the cross-process APC above is
      * a server round trip with a different cost model and is not what churns. */
-    const int va_stats = ios_valloc_stats();
-    const unsigned long long va_t0 = va_stats ? ios_va_now_ns() : 0;
-    unsigned long long va_lock_ns = 0;
     int vpark_zero = -1;
 
     if (size) size = ROUND_SIZE( addr, size, page_mask );
@@ -26777,12 +26774,6 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     if (vpark_zero >= 0) ios_vpark_zero( vpark_zero );
-    if (va_stats)
-    {
-        unsigned long long now = ios_va_now_ns();
-        ios_va_account( ios_va_class( type, 1 ), now - va_t0, va_lock_ns, size );
-        ios_va_report( now );
-    }
 #ifdef WINE_IOS
     if (sc_rehold && status == STATUS_SUCCESS) ios_sc_rehold( sc_rehold );
 #endif
