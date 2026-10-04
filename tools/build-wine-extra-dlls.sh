@@ -5,6 +5,14 @@
 # Rockstar Games SDK / Launcher installers load Msftedit.dll and gdiplus.dll). Configured the way
 # upstream's build/wine-pe/build-ntdll.sh configures wine/build-arm64ec;
 # stripped and padded by 64 KB past SizeOfImage like the shipped builtins.
+# Media Foundation for 64-bit games: winegstreamer and the byte stream handler /
+# decoder front ends that forward to it (docs/MEDIA.md). RE Requiem's demo
+# aborts with "Failed to create SourceReader with registered byte stream
+# handler (c00d36c4)" when mfmp4srcsnk.dll and winegstreamer.dll are missing.
+# The unix side is bound for 64-bit processes only with MADEIRA_WG_64BIT=1.
+# mfmp4srcsnk/mfsrcsnk/winedmo are left out on purpose: winedmo has no unix
+# side here, and with them missing the source resolver falls back to
+# winegstreamer's byte stream handler, which is the path that has one.
 # A DLL upstream already ships is never replaced. Run from the repository
 # root; needs llvm-mingw on PATH (or MINGW) and the native wine tools.
 #   usage: build-wine-extra-dlls.sh [native tools dir]
@@ -30,7 +38,9 @@ WANT="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcr110 msvcrt20 msvcrt40 msvcir
       d3dcompiler_33 d3dcompiler_34 d3dcompiler_35 d3dcompiler_36 d3dcompiler_37 d3dcompiler_38
       d3dcompiler_39 d3dcompiler_40 d3dcompiler_41 d3dcompiler_42 d3dcompiler_46
       d3dx10_33 d3dx10_34 d3dx10_35 d3dx10_36 d3dx10_37 d3dx10_38 d3dx10_39 d3dx10_40 d3dx10_41 d3dx10_42 d3dx10_43
-      d3dx11_42 d3dx11_43"
+      d3dx11_42 d3dx11_43
+      winegstreamer msmpeg2vdec wmadmod wmvdecod
+      msauddecmft mp3dmod colorcnv resampledmo msvproc mferror"
 for n in $(seq 24 42); do WANT="$WANT d3dx9_$n"; done
 
 shipped() { ls "$SHIP" | tr 'A-Z' 'a-z' | grep -qx "$1.dll"; }
@@ -56,10 +66,15 @@ if [ "${MADEIRA_XINPUT_RUMBLE_BUILD:-1}" != 0 ]; then
 fi
 [ -n "$todo$XI" ] || { echo "nothing to build"; exit 0; }
 
+# A tree configured before winegstreamer was wanted has no Makefile rule for it.
+if [ -f "$B/Makefile" ] && ! grep -q "dlls/winegstreamer/arm64ec-windows/winegstreamer.dll" "$B/Makefile"; then
+    echo "reconfiguring $B with --enable-winegstreamer"
+    rm -f "$B/Makefile" "$B/config.status"
+fi
 if [ ! -f "$B/Makefile" ]; then
     mkdir -p "$B"
     ( cd "$B" && "$R/wine/configure" --enable-archs=arm64ec --without-x --disable-tests \
-          --without-freetype --without-gnutls ${TOOLS:+--with-wine-tools="$TOOLS"} ) > "$B.cfg.log" 2>&1 \
+          --without-freetype --without-gnutls --enable-winegstreamer ${TOOLS:+--with-wine-tools="$TOOLS"} ) > "$B.cfg.log" 2>&1 \
         || { tail -20 "$B.cfg.log"; echo "::error::wine arm64ec configure failed"; exit 1; }
 fi
 # widl looks for imported typelibs (stdole2.tlb) under aarch64-windows, its
