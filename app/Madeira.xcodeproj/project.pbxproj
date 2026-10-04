@@ -901,6 +901,11 @@
 				A1000035 /* StikJITHelper.swift in Sources */,
 				5A864326ABA078F978B4C2F1 /* MemoryHostTest.m in Sources */,
 				5271C4AE571BDF56B9E51EAA /* MemoryPool.m in Sources */,
+				B1000001 /* JITSetup.swift in Sources */,
+				B1000050 /* JITNetwork.swift in Sources */,
+				B1000002 /* JITBuiltInHost.swift in Sources */,
+				B1000003 /* JITBuiltInMessages.swift in Sources */,
+				B1000040 /* JITPairing.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -909,11 +914,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				A30972F13DC1D583109676F1 /* MemoryHost.m in Sources */,
-				B1000001 /* JITSetup.swift in Sources */,
-				B1000050 /* JITNetwork.swift in Sources */,
-				B1000002 /* JITBuiltInHost.swift in Sources */,
-				B1000003 /* JITBuiltInMessages.swift in Sources */,
-				B1000040 /* JITPairing.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
