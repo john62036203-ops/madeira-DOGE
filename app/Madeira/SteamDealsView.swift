@@ -187,7 +187,7 @@ struct SteamDealsView: View {
     /// The tab's search text: filters the loaded cards by name.
     var search: String
     @ObservedObject private var model = SteamDealsModel.shared
-    @Environment(\.openURL) private var openURL
+    @State private var opened: SteamDeal?
 
     private var shown: [SteamDeal] {
         let q = search.trimmingCharacters(in: .whitespaces)
@@ -203,7 +203,7 @@ struct SteamDealsView: View {
                 }
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 20, alignment: .top)], spacing: 24) {
                     ForEach(shown) { deal in
-                        Button { openURL(deal.storeURL) } label: { SteamDealCard(deal: deal) }
+                        Button { opened = deal } label: { SteamDealCard(deal: deal) }
                             .buttonStyle(.plain)
                             .onAppear { if deal.id == model.deals.last?.id { model.loadMore() } }
                     }
@@ -223,6 +223,7 @@ struct SteamDealsView: View {
         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         .refreshable { model.reload() }
         .onAppear { model.loadFirstIfNeeded() }
+        .sheet(item: $opened) { SteamDealDetailView(deal: $0) }
     }
 }
 
@@ -265,5 +266,225 @@ struct SteamDealCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
+    }
+}
+
+/// madeira-doge: can this phone run the game? An ESTIMATE from what Steam's
+/// store lists (api/appdetails, no sign-in): the game's minimum and recommended
+/// memory against the phone's, whether there is a Windows build at all, and the
+/// install size against the free space. It knows nothing about how a particular
+/// game behaves under translation (anti-cheat, launchers, a renderer the D3D
+/// layers do not cover), so it says what the numbers allow, not what was tested.
+struct SteamRequirements {
+    var windows = true
+    var minimumText: String?
+    var recommendedText: String?
+    var minimumRAM: Double?        // GB
+    var recommendedRAM: Double?    // GB
+    var storage: Double?           // GB
+
+    enum Verdict: Int { case perfect, normal, barely, no, unknown }
+
+    static var chinese: Bool { (Locale.preferredLanguages.first ?? "en").lowercased().hasPrefix("zh") }
+    static var deviceRAM: Double { (Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824).rounded() }
+    static var freeDisk: Double? {
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        guard let v = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+              let bytes = v.volumeAvailableCapacityForImportantUsage else { return nil }
+        return Double(bytes) / 1_073_741_824
+    }
+
+    /// The phone's memory is the yardstick: a game whose MINIMUM is a quarter of it
+    /// has room to spare, half of it runs, all of it only just, more than it does not.
+    var verdict: Verdict {
+        if !windows { return .no }
+        guard let need = minimumRAM ?? recommendedRAM else { return .unknown }
+        let have = Self.deviceRAM
+        if need > have { return .no }
+        if need > have * 0.5 { return .barely }
+        if need > have * 0.25 { return .normal }
+        // Light on its minimum, heavy on its recommendation: not "perfect".
+        if let rec = recommendedRAM, rec > have * 0.5 { return .normal }
+        return .perfect
+    }
+
+    static func label(_ v: Verdict) -> String {
+        switch v {
+        case .perfect: return chinese ? "完美" : "Perfect"
+        case .normal: return chinese ? "普通" : "Playable"
+        case .barely: return chinese ? "勉強" : "Barely"
+        case .no: return chinese ? "完全不行" : "Won't run"
+        case .unknown: return chinese ? "無法判斷" : "Unknown"
+        }
+    }
+    static func color(_ v: Verdict) -> Color {
+        switch v {
+        case .perfect: return .green
+        case .normal: return .blue
+        case .barely: return .orange
+        case .no: return .red
+        case .unknown: return .gray
+        }
+    }
+
+    var reasons: [String] {
+        let zh = Self.chinese
+        var out: [String] = []
+        if !windows { out.append(zh ? "這款遊戲沒有 Windows 版本。" : "This game has no Windows build."); return out }
+        let have = Int(Self.deviceRAM)
+        if let m = minimumRAM {
+            out.append(zh ? "最低需求記憶體 \(Self.gb(m))，這支手機有 \(have) GB。" : "Minimum memory \(Self.gb(m)); this phone has \(have) GB.")
+        }
+        if let r = recommendedRAM {
+            out.append(zh ? "建議記憶體 \(Self.gb(r))。" : "Recommended memory \(Self.gb(r)).")
+        }
+        if minimumRAM == nil && recommendedRAM == nil {
+            out.append(zh ? "Steam 沒有列出這款遊戲的記憶體需求。" : "Steam lists no memory requirement for this game.")
+        }
+        if let need = storage {
+            if let free = Self.freeDisk, free < need {
+                out.append(zh ? "需要 \(Self.gb(need)) 空間，手機只剩 \(Self.gb(free))，要先清出空間。" : "Needs \(Self.gb(need)) of storage; the phone has \(Self.gb(free)) free.")
+            } else {
+                out.append(zh ? "需要 \(Self.gb(need)) 儲存空間。" : "Needs \(Self.gb(need)) of storage.")
+            }
+        }
+        return out
+    }
+
+    static func gb(_ v: Double) -> String {
+        v < 1 ? "\(Int((v * 1024).rounded())) MB" : (v == v.rounded() ? "\(Int(v)) GB" : String(format: "%.1f GB", v))
+    }
+
+    /// "8 GB RAM", "Memory: 512 MB", "Storage: 60 GB available space" out of Steam's requirement HTML.
+    static func size(in html: String?, labels: [String]) -> Double? {
+        guard let html else { return nil }
+        for label in labels {
+            guard let text = SteamDealsModel.first(label + #":?\s*</strong>\s*([0-9]+(?:[.,][0-9]+)?\s*(?:GB|MB|TB))"#, in: html) else { continue }
+            let number = text.replacingOccurrences(of: ",", with: ".").trimmingCharacters(in: CharacterSet(charactersIn: "0123456789.").inverted)
+            guard let value = Double(number) else { continue }
+            let upper = text.uppercased()
+            if upper.contains("MB") { return value / 1024 }
+            if upper.contains("TB") { return value * 1024 }
+            return value
+        }
+        return nil
+    }
+
+    static func fetch(appID: Int) async -> SteamRequirements? {
+        var c = URLComponents(string: "https://store.steampowered.com/api/appdetails")!
+        // English: the labels the sizes are read from are then always the same.
+        c.queryItems = [URLQueryItem(name: "appids", value: String(appID)),
+                        URLQueryItem(name: "l", value: "english")]
+        guard let url = c.url,
+              let (data, _) = try? await URLSession.shared.data(for: SteamDealsModel.request(url)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entry = json[String(appID)] as? [String: Any],
+              (entry["success"] as? Bool) == true,
+              let info = entry["data"] as? [String: Any] else { return nil }
+        var r = SteamRequirements()
+        if let platforms = info["platforms"] as? [String: Any], let win = platforms["windows"] as? Bool { r.windows = win }
+        // An app with no requirements has an empty array here instead of an object.
+        let pc = info["pc_requirements"] as? [String: Any]
+        let minimum = pc?["minimum"] as? String
+        let recommended = pc?["recommended"] as? String
+        r.minimumRAM = size(in: minimum, labels: ["Memory", "RAM"])
+        r.recommendedRAM = size(in: recommended, labels: ["Memory", "RAM"])
+        r.storage = size(in: recommended, labels: ["Storage", "Hard Drive", "Hard Disk Space"])
+            ?? size(in: minimum, labels: ["Storage", "Hard Drive", "Hard Disk Space"])
+        r.minimumText = minimum.map(lines)
+        r.recommendedText = recommended.map(lines)
+        return r
+    }
+
+    /// Requirement HTML as plain lines, one per list item.
+    static func lines(_ html: String) -> String {
+        let broken = html.replacingOccurrences(of: "<br\\s*/?>|</li>|</p>", with: "\n", options: .regularExpression)
+        return SteamDealsModel.plain(broken)
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
+}
+
+struct SteamDealDetailView: View {
+    let deal: SteamDeal
+    @Environment(\.openURL) private var openURL
+    @Environment(\.dismiss) private var dismiss
+    @State private var requirements: SteamRequirements?
+    @State private var loaded = false
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    AsyncImage(url: deal.headerArt) { phase in
+                        if let image = phase.image { image.resizable().scaledToFit() }
+                        else { Color.black.opacity(0.25).aspectRatio(460.0 / 215.0, contentMode: .fit) }
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    Text(deal.name).font(.title2.bold())
+                    HStack(spacing: 10) {
+                        Text("-\(deal.discount)%")
+                            .font(.headline).foregroundStyle(.black)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(Color(red: 0.64, green: 0.81, blue: 0.20), in: RoundedRectangle(cornerRadius: 6))
+                        if let original = deal.originalPrice {
+                            Text(original).strikethrough().foregroundStyle(.secondary)
+                        }
+                        Text(deal.finalPrice).font(.headline)
+                    }
+                    compatibility
+                    Button { openURL(deal.storeURL) } label: {
+                        Label(SteamRequirements.chinese ? "在 Steam 商店開啟" : "Open in the Steam store", systemImage: "safari")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+                    if let text = requirements?.minimumText { requirementBlock(text) }
+                    if let text = requirements?.recommendedText { requirementBlock(text) }
+                }
+                .padding(20)
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .task {
+            requirements = await SteamRequirements.fetch(appID: deal.id)
+            loaded = true
+            LogStore.shared.log("[steam-deals] requirements app=\(deal.id) found=\(requirements == nil ? 0 : 1) min=\(requirements?.minimumRAM ?? -1) rec=\(requirements?.recommendedRAM ?? -1) verdict=\(requirements?.verdict.rawValue ?? -1)")
+        }
+    }
+
+    @ViewBuilder private var compatibility: some View {
+        let zh = SteamRequirements.chinese
+        VStack(alignment: .leading, spacing: 8) {
+            Text(zh ? "這支手機跑得動嗎？" : "Will it run on this phone?").font(.headline)
+            if !loaded {
+                ProgressView()
+            } else if let r = requirements {
+                let v = r.verdict
+                Text(SteamRequirements.label(v))
+                    .font(.title3.weight(.bold)).foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(SteamRequirements.color(v), in: Capsule())
+                ForEach(r.reasons, id: \.self) { Text($0).font(.subheadline) }
+                Text(zh ? "這是依 Steam 列出的系統需求估算的，沒有實際測試過。防作弊、啟動器或特殊的繪圖功能都可能讓遊戲跑不起來。"
+                        : "An estimate from the requirements Steam lists, not a test. Anti-cheat, a launcher or an unsupported renderer can still stop a game.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            } else {
+                Text(zh ? "讀不到 Steam 的系統需求，無法判斷。" : "Steam's requirements could not be read.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func requirementBlock(_ text: String) -> some View {
+        Text(text).font(.footnote).foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
