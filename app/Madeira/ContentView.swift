@@ -3596,15 +3596,14 @@ struct ContentView: View {
             // dock-no-desktop = 1 in madeira.cfg). The host and the game Valve's client starts
             // run like a directly launched program, so the game's window gets the full-screen
             // layer instead of a sublayer of the desktop compositor, and no Windows desktop
-            // is shown while the client starts. One-time installs still run first.
-            if MadeiraDock.noDesktop {
-                if let installers = DockInstallers.script {
-                    setenv("MADEIRA_EXE", "C:\\windows\\system32\\cmd.exe", 1)
-                    setenv("MADEIRA_ARGS", "/c call \(installers) & \(MadeiraDock.executable)", 1)
-                } else {
-                    setenv("MADEIRA_EXE", MadeiraDock.executable, 1)
-                    unsetenv("MADEIRA_ARGS")
-                }
+            // is shown while the client starts.
+            // A start with one-time installs keeps the desktop: they run through cmd.exe,
+            // which exists only as an aarch64 program and cannot start a session whose
+            // system32 is the ARM64EC farm (device log, build 79: "could not load
+            // kernel32.dll, status c000007b" three seconds into the launch).
+            if MadeiraDock.noDesktop && DockInstallers.script == nil {
+                setenv("MADEIRA_EXE", MadeiraDock.executable, 1)
+                unsetenv("MADEIRA_ARGS")
                 unsetenv("MADEIRA_DESKTOP")
                 logStore.log("[madeira-dock] no virtual desktop for this launch")
             } else {
