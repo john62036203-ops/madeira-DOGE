@@ -867,12 +867,24 @@ static void ios_load_roots_locked(void)
     ios_roots_loaded = TRUE;
 }
 
+static NTSTATUS ios_enum_root_certs_wow( struct enum_root_certs_params *params );
+
 static NTSTATUS enum_root_certs( void *args )
 {
     struct enum_root_certs_params *params = args;
     struct list *ptr;
     struct root_cert *cert;
     NTSTATUS status = STATUS_SUCCESS;
+    const char *shared = getenv( "MADEIRA_ROOT_ENUM_SHARED" );
+
+    /* madeira-doge: 64-bit pseudo-processes share this unix side as well.  The
+     * first one to import (Valve's client) consumed the whole list, the game
+     * started after it saw no host roots, and rootstore.c then deleted the
+     * roots from the registry: every HTTPS chain of the game ended untrusted
+     * (Among Us: "Cert verify failed", EOS_NoConnection).  Every caller now
+     * enumerates with its own position; MADEIRA_ROOT_ENUM_SHARED=0 restores
+     * the consuming walk below. */
+    if (!shared || strcmp( shared, "0" )) return ios_enum_root_certs_wow( params );
 
     pthread_mutex_lock( &ios_root_lock );
     ios_load_roots_locked();
