@@ -1565,6 +1565,22 @@ jobs:
         run: |
           mkdir -p build-out/Payload
           cp -R build-out/Madeira.xcarchive/Products/Applications/Madeira.app build-out/Payload/
+          # madeira-doge: an ad-hoc signature that carries the entitlements a
+          # sideloading tool can copy. Device log, build 87: the profile granted
+          # increased-memory-limit (profile-increased-memory=1) but the unsigned
+          # app asked for nothing, so the installed app had none and iOS capped
+          # it near 3.3 GB. Only what a free profile grants is asked for here; a
+          # key the profile lacks can stop the app launching.
+          APP=build-out/Payload/Madeira.app
+          ENT="$RUNNER_TEMP/sideload.entitlements"
+          /usr/libexec/PlistBuddy -c "Add :com.apple.developer.kernel.increased-memory-limit bool true" \
+                                  -c "Add :get-task-allow bool true" "$ENT" > /dev/null
+          for x in "$APP"/PlugIns/*.appex; do
+            [ -d "$x" ] && codesign -f -s - --deep "$x"
+          done
+          codesign -f -s - --deep "$APP" 2>&1 | tail -2
+          codesign -f -s - --entitlements "$ENT" --generate-entitlement-der "$APP"
+          codesign -d --entitlements - "$APP" 2>/dev/null | grep -c "increased-memory-limit" | sed 's/^/entitlement lines in the app signature: /'
           cd build-out && ditto -c -k --keepParent Payload Madeira-0.1.${{ github.run_number }}-unsigned.ipa
 
       # Over-the-air install: sign with the owner's certificate (kept in the
