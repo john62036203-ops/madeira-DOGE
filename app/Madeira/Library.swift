@@ -2045,6 +2045,9 @@ struct LibraryView: View {
             if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
                 SteamSettingsSection(open: { settingsSheet = $0 })
             }
+            if settingsShow("desktop", "virtual desktop", "Steam", "Dock", "start games") {
+                NoDesktopSettings()
+            }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
                     Toggle("Liquid metal", isOn: $liquidMetal.on)
@@ -3617,5 +3620,17 @@ enum EndedSessionSurface {
         hiddenByUs = false
         _ = winios_compositor_set_hidden(0)
         LogStore.shared.log("[library-surface] desktop shown for the new session")
+    }
+}
+
+/// madeira-doge: the Dock's "no virtual desktop" switch, also in Settings.
+struct NoDesktopSettings: View {
+    @AppStorage(MadeiraDock.noDesktopKey) private var noDesktop = false
+    var body: some View {
+        Section {
+            Toggle("Start games without the virtual desktop", isOn: $noDesktop)
+        } header: { Text("Steam games") } footer: {
+            Text("Starts the game directly instead of on a Windows desktop. A game with one-time installers still to run starts on the desktop.")
+        }
     }
 }
