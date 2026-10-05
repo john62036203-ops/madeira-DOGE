@@ -53,6 +53,18 @@ s = sub(s, """                                B[0], B[1], B[2], B[3], B[4], B[5]
                   LogMan::Msg::EFmt("[bad-inst] blocks decoded before it ({} of {}): {:X} {:X} {:X} {:X} {:X} {:X} {:X} {:X}", i, MadCount,
                                     R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7]);
                 }
+                /* ... and the code of the last six (they were decoded moments ago, so they are mapped) */
+                for (uint32_t i = MadCount > 6 ? MadCount - 6 : 0; i < MadCount; i++) {
+                  const uint64_t A = MadBlockRing[(MadEnd - MadCount + i) & 63].load(std::memory_order_relaxed);
+                  uint8_t C[24] = {};
+                  const uint64_t CLeft = 0x4000 - (A & 0x3fff);
+                  if (A < 0x10000) continue;
+                  std::memcpy(C, reinterpret_cast<const void*>(A), CLeft < 24 ? CLeft : 24);
+                  LogMan::Msg::EFmt("[bad-inst] code at {:X}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} "
+                                    "{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}", A,
+                                    C[0], C[1], C[2], C[3], C[4], C[5], C[6], C[7], C[8], C[9], C[10], C[11],
+                                    C[12], C[13], C[14], C[15], C[16], C[17], C[18], C[19], C[20], C[21], C[22], C[23]);
+                }
               }
 """, "the [bad-inst] line")
 
