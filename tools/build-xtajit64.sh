@@ -131,6 +131,7 @@ fi
 #    full (it ran nested inside a unix syscall and corrupted its frame).
 #  - patch-fex-ios-pool-null.py: a pooled buffer the band refused is never NULL.
 #  - patch-fex-ios-invalid-bytes.py: the bytes of an instruction the decoder refused.
+#  - patch-fex-ios-inline-smc-split.py: a write into the following bytes ends the block.
 #  - patch-fex-ios-avx.py: AVX/AVX2 only when MADEIRA_FEX_AVX=1 at launch, so
 #    the same module serves both; xtajit64-avx.dll is kept as a copy for the
 #    bridge's existing switch.
@@ -144,6 +145,7 @@ python3 "$R/tools/patch-fex-ios-avx.py" "$R/FEX/$CPUF"
 python3 "$R/tools/patch-fex-ios-alias-full-quiet.py" "$R/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp"
 python3 "$R/tools/patch-fex-ios-pool-null.py" "$R/FEX/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h"
 python3 "$R/tools/patch-fex-ios-invalid-bytes.py" "$R/FEX/FEXCore/Source/Interface/Core/Frontend.cpp"
+python3 "$R/tools/patch-fex-ios-inline-smc-split.py" "$R/FEX/FEXCore/Source/Interface/Core/Frontend.cpp"
 python3 "$R/tools/patch-fex-ios-smc-read.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-trace-tail.py" "$R/FEX/FEXCore/Source/Interface/Core"
 build
