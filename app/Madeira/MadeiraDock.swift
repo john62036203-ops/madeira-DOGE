@@ -64,7 +64,11 @@ enum MadeiraDock {
     /// as upstream). The Madeira Dock page's switch, or dock-no-desktop = 1 in madeira.cfg.
     static let noDesktopKey = "madeira.dock.noDesktop"
     static var noDesktop: Bool {
-        UserDefaults.standard.bool(forKey: noDesktopKey) || MadeiraConfig.get("dock-no-desktop") == "1"
+        // madeira-doge: the game's own file decides first (dock-no-desktop = 1 or 0), so one
+        // game can run without the desktop while another keeps it; then the Settings
+        // switch or madeira.cfg. Read at a Dock start, after the game's file is known.
+        if let own = MadeiraConfig.gameValue("dock-no-desktop") { return own == "1" }
+        return UserDefaults.standard.bool(forKey: noDesktopKey) || MadeiraConfig.get("dock-no-desktop") == "1"
     }
 
     static var prefix: URL {
