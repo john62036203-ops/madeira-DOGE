@@ -1880,6 +1880,7 @@ struct LibraryCells<Item: Identifiable, Cell: View>: View {
 }
 
 struct LibraryView: View {
+    private static var fixedBaseWarned = false
     @ObservedObject private var model = LibraryModel.shared
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.colorScheme) private var colorScheme
@@ -1978,6 +1979,19 @@ struct LibraryView: View {
             onboarding.presentIfNeeded()
         }
         .onAppear {
+            // madeira-doge: iOS sometimes puts a malloc region at 0x140000000 before any
+            // of our code runs (two of five starts on an iPhone 16 Pro Max). The window a
+            // game's fixed-base executable needs cannot be held then, and such a game
+            // ends at its start (P3R Demo: "failed to create main module", c0000018).
+            // Nothing in this process can undo it; say so once instead of letting the
+            // launch fail without a word.
+            if !LibraryView.fixedBaseWarned, madeira_early_window_base != 0x140000000 {
+                LibraryView.fixedBaseWarned = true
+                LogStore.shared.log("[exe-window] madeira-doge: 0x140000000 was taken before Madeira's first code ran; fixed-base games will not start in this app session", level: .error)
+                if model.error == nil {
+                    model.error = "This start of Madeira cannot give games their fixed address (iOS took it first). Games with a large fixed-base program, such as P3R, will close right after launch. Close Madeira completely and open it again."
+                }
+            }
             LogStore.shared.log("[library-sections] native-steam=\(SteamOwnedLibrary.enabled ? 1 : 0) sections=\(SteamGamesSection.shown ? 1 : 0) collapse=\(SteamGamesSection.collapsible ? 1 : 0)")
         }
         .onReceive(controller.commands) { command in
