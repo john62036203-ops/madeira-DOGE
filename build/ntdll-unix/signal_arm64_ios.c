@@ -2391,7 +2391,33 @@ static void *ios_mach_exception_thread( void *arg )
                                  insn, rn, (unsigned long)fault_addr );
                     }
 
-                    if (rn != 18 && !x18_derived)
+                    /* madeira-doge: THE DEBUG BUFFER THROUGH A ZERO x18.
+                     * ntdll's PE-side debug output takes its buffer as TEB + 0x3000
+                     * (thread.c get_info(): the 0x800-byte struct debug_info after the
+                     * 32-bit TEB) and hands that pointer on, so with x18 == 0 the
+                     * store lands at 0x3404 through an ordinary register, long after
+                     * the instruction that read x18. Neither rule above sees it; the
+                     * fault went to the guest, the exception dispatcher printed
+                     * through the same buffer, and the process died of its own
+                     * diagnostics (RE Requiem's SteamNetworkingSockets thread and
+                     * Onimusha's main thread, device logs 2026-10-05). The base
+                     * register holds a bare offset into that struct: make it the
+                     * pointer it was meant to be, put the TEB back in x18, and retry
+                     * the instruction. Nothing else lives at 0x3000-0x37ff. */
+                    if (rn != 18 && !x18_derived && rn < 29 && fault_addr >= 0x3000 && fault_addr < 0x3800
+                        && state.__x[rn] >= 0x3000 && state.__x[rn] < 0x3800)
+                    {
+                        static int ios_x18_dbg_reports;
+                        if (ios_x18_dbg_reports++ < 8)
+                            dprintf( STDERR_FILENO, "[x18-dbgbuf] madeira-doge #%d pc=%p insn=%08x x%d=0x%llx -> TEB+0x%llx (debug buffer), x18 restored\n",
+                                     ios_x18_dbg_reports, (void *)(uintptr_t)fault_pc, insn, rn,
+                                     (unsigned long long)state.__x[rn], (unsigned long long)state.__x[rn] );
+                        state.__x[rn] += thread_teb;
+                        state.__x[18] = thread_teb;
+                        ios_exc_x18_fixes++;
+                        handled = 1;
+                    }
+                    else if (rn != 18 && !x18_derived)
                     {
                         static int ios_x18_decline_reports;
                         if (ios_x18_decline_reports < 4)
@@ -9706,6 +9732,28 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         (void *)(uintptr_t)cpu_area, ok1,
                         (void *)(uintptr_t)ca30, ok2);
                 }
+            }
+        }
+
+        /* madeira-doge: the debug buffer through a zero x18 (see the Mach
+         * handler's [x18-dbgbuf]): the base register is a bare offset into
+         * struct debug_info at TEB + 0x3000. */
+        if (REGn_sig(18, context) == 0 && ios_teb_for_signals != 0
+            && (uintptr_t)pc >= 0x100000000ULL)
+        {
+            uintptr_t d_addr = (uintptr_t)siginfo->si_addr;
+            int d_rn = (*(uint32_t *)pc >> 5) & 31;
+            if (d_rn != 18 && d_rn < 29 && d_addr >= 0x3000 && d_addr < 0x3800
+                && REGn_sig(d_rn, context) >= 0x3000 && REGn_sig(d_rn, context) < 0x3800)
+            {
+                static int said;
+                if (said++ < 8)
+                    dprintf( 2, "[x18-dbgbuf] madeira-doge signal #%d pc=%p x%d=0x%llx -> TEB+0x%llx, x18 restored\n",
+                             said, pc, d_rn, (unsigned long long)REGn_sig(d_rn, context),
+                             (unsigned long long)REGn_sig(d_rn, context) );
+                REGn_sig(d_rn, context) += ios_teb_for_signals;
+                REGn_sig(18, context) = ios_teb_for_signals;
+                return;
             }
         }
 
