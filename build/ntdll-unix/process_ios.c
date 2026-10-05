@@ -63,6 +63,7 @@
 #ifdef WINE_IOS
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdint.h>
 #endif
 
 #include "ntstatus.h"
@@ -2566,6 +2567,252 @@ static void ios_unwind_dump( uint64_t rip, const uint64_t *gregs, const char *ta
 #endif /* WINE_IOS */
 
 
+#ifdef WINE_IOS
+/* Fatal x64 instructions can differ from the file after self-modification.
+ * Read only registered code, never dereference guest pointers or alter SEH. */
+static uint64_t ios_guest_instruction_read( const char *view, uint64_t address, size_t length,
+                                           unsigned char bytes[48] )
+{
+    uint64_t valid = 0;
+    char line[48 * 3 + 1];
+    size_t i;
+
+    if (!length || length > 48 || address > UINT64_MAX - length) return 0;
+    for (i = 0; i < length; i++)
+    {
+        mach_vm_size_t got = 0;
+        unsigned char byte = 0;
+        if (mach_vm_read_overwrite( mach_task_self(), address + i, 1,
+                                    (mach_vm_address_t)&byte, &got ) == KERN_SUCCESS && got == 1)
+        {
+            bytes[i] = byte;
+            valid |= (uint64_t)1 << i;
+            snprintf( line + i * 3, 4, "%02x ", byte );
+        }
+        else memcpy( line + i * 3, "?? ", 3 );
+    }
+    line[length * 3] = 0;
+    dprintf( 2, "[guest-insn] %s address=%#llx valid=%#llx bytes=%s\n", view,
+             (unsigned long long)address, (unsigned long long)valid, line );
+    return valid;
+}
+
+static void ios_guest_code_pair( const char *tag, uint64_t rip, void *owner )
+{
+    extern int ios_jit_guest_code_window( uint64_t, uint64_t *, uint64_t *, size_t * );
+    extern void *ios_jit_translate_addr_for_owner( void *, void * );
+    uint64_t image = 0, start = 0, copy, a, b, full;
+    size_t length = 0;
+    unsigned char pe[48] = {0}, pool[48] = {0};
+    char view[32];
+
+    if (!ios_jit_guest_code_window( rip, &image, &start, &length ) ||
+        !length || length > 48 || start > rip || rip - start >= length) return;
+    dprintf( 2, "[guest-path] %s rip=%#llx image=%#llx rva=%#llx window=%#llx length=%zu\n",
+             tag, (unsigned long long)rip, (unsigned long long)image,
+             (unsigned long long)(rip - image), (unsigned long long)start, length );
+    snprintf( view, sizeof(view), "%s-PE", tag );
+    a = ios_guest_instruction_read( view, start, length, pe );
+    copy = (uint64_t)(uintptr_t)ios_jit_translate_addr_for_owner( (void *)(uintptr_t)start, owner );
+    if (!copy || copy == start) return;
+    snprintf( view, sizeof(view), "%s-COPY", tag );
+    b = ios_guest_instruction_read( view, copy, length, pool );
+    full = ((uint64_t)1 << length) - 1;
+    dprintf( 2, "[guest-path] %s snapshot=%s\n", tag,
+             a != full || b != full ? "INCOMPLETE" : memcmp( pe, pool, length ) ? "DIFFER" : "MATCH" );
+}
+
+/* CALL-shape evidence only, not an unwind or proof that a stack word is live.
+ * Check the complete FF /2 encoding, including SIB/disp32; never read cb[8]. */
+static int ios_guest_call_decode( const unsigned char cb[8], unsigned *length, int32_t *relative )
+{
+    unsigned k;
+    if (cb[3] == 0xe8)
+    {
+        *length = 5;
+        memcpy( relative, cb + 4, 4 );
+        return 1;
+    }
+    for (k = 2; k <= 7; k++)
+    {
+        unsigned pos = 8 - k, modrm = cb[pos + 1], mod = modrm >> 6, rm = modrm & 7;
+        unsigned n = 2;
+        if (cb[pos] != 0xff || ((modrm >> 3) & 7) != 2) continue;
+        if (mod != 3)
+        {
+            if (rm == 4)
+            {
+                if (k < 3) continue;
+                n++;
+                if (!mod && (cb[pos + 2] & 7) == 5) n += 4;
+            }
+            else if (!mod && rm == 5) n += 4;
+            if (mod == 1) n++;
+            else if (mod == 2) n += 4;
+        }
+        if (n != k) continue;
+        *length = k;
+        *relative = 0;
+        return 2;
+    }
+    return 0;
+}
+
+static const char *ios_guest_return_kind( uint64_t v, unsigned *length, int32_t *relative )
+{
+    extern int ios_jit_guest_code_window( uint64_t, uint64_t *, uint64_t *, size_t * );
+    uint64_t image = 0, start = 0;
+    size_t size = 0;
+    unsigned char cb[8];
+    mach_vm_size_t got = 0;
+    int kind;
+
+    if (v < 8 || !ios_jit_guest_code_window( v - 1, &image, &start, &size ) ||
+        start > v - 8 || v - start > size) return "  ?";
+    if (mach_vm_read_overwrite( mach_task_self(), v - 8, sizeof(cb),
+                                (mach_vm_address_t)cb, &got ) != KERN_SUCCESS || got != sizeof(cb)) return "  ?";
+    kind = ios_guest_call_decode( cb, length, relative );
+    return kind == 1 ? "CALL" : kind == 2 ? "call*" : "  ?";
+}
+
+static void ios_guest_call_dump( uint64_t v, unsigned length, int32_t relative, int direct,
+                                 unsigned stack_offset, uint64_t fault_rip, void *owner )
+{
+    uint64_t target;
+    if (length < 2 || length > 7 || v < length) return;
+    dprintf( 2, "[guest-call] candidate sp+%03x ret=%#llx site=%#llx kind=%s length=%u\n",
+             stack_offset, (unsigned long long)v, (unsigned long long)(v - length),
+             direct ? "E8" : "FF/2", length );
+    ios_guest_code_pair( "call-site", v - length, owner );
+    if (!direct) return; /* no guessed register or memory operand */
+    if (relative >= 0)
+    {
+        if (v > UINT64_MAX - (uint32_t)relative) return;
+        target = v + (uint32_t)relative;
+    }
+    else
+    {
+        uint64_t delta = (uint64_t)-(int64_t)relative;
+        if (v < delta) return;
+        target = v - delta;
+    }
+    dprintf( 2, "[guest-call] direct-target=%#llx equals-fault=%u (candidate, not an unwind)\n",
+             (unsigned long long)target, target == fault_rip );
+    ios_guest_code_pair( "call-target", target, owner );
+}
+
+/* Read the pinned FEX JITCodeHeader/Tail layout through Mach, with no PE call.
+ * The guest bytes below are current snapshots, not saved compile-time bytes. */
+static void ios_guest_block_dump( uint64_t block, uint64_t fault_rip, void *owner )
+{
+    uint32_t offset = 0;
+    struct { uint64_t size, rip, guest_size; uint32_t count, entries, spin;
+             uint8_t single, pad[3]; } tail;
+    mach_vm_size_t got = 0;
+    _Static_assert( sizeof(tail) == 40, "FEX JITCodeTail layout" );
+
+    if (!block || mach_vm_read_overwrite( mach_task_self(), block, sizeof(offset),
+            (mach_vm_address_t)&offset, &got ) != KERN_SUCCESS || got != sizeof(offset) ||
+        offset < 4 || offset > (64u << 20) || block > UINT64_MAX - offset - sizeof(tail))
+    {
+        dprintf( 2, "[guest-block] header unavailable/invalid block=%#llx\n", (unsigned long long)block );
+        return;
+    }
+    got = 0;
+    if (mach_vm_read_overwrite( mach_task_self(), block + offset, sizeof(tail),
+            (mach_vm_address_t)&tail, &got ) != KERN_SUCCESS || got != sizeof(tail) ||
+        tail.size < offset + sizeof(tail) || tail.size > (64u << 20) ||
+        !tail.guest_size || tail.guest_size > (64u << 20) || !tail.rip ||
+        tail.rip > UINT64_MAX - tail.guest_size || tail.count > 65536 || tail.single > 1)
+    {
+        dprintf( 2, "[guest-block] tail unavailable/invalid block=%#llx\n", (unsigned long long)block );
+        return;
+    }
+    dprintf( 2, "[guest-block] block=%#llx host-size=%llu guest-entry=%#llx guest-size=%llu "
+             "rip-entries=%u single=%u contains-fault=%u (current bytes, not compile history)\n",
+             (unsigned long long)block, (unsigned long long)tail.size,
+             (unsigned long long)tail.rip, (unsigned long long)tail.guest_size,
+             tail.count, tail.single, fault_rip >= tail.rip && fault_rip - tail.rip < tail.guest_size );
+    ios_guest_code_pair( "block-entry", tail.rip, owner );
+}
+
+static void ios_guest_branch_history_dump( const void *frame, uint64_t fault_rip, void *owner )
+{
+    extern unsigned ios_fex_branch_history_offset( void );
+    struct { uint64_t magic, serial; struct { uint64_t source, target, block, hint; } edges[8]; } history;
+    uint64_t address = (uint64_t)(uintptr_t)frame;
+    unsigned offset = ios_fex_branch_history_offset(), i, count;
+    mach_vm_size_t got = 0;
+    static const char *const hints[4] = { "branch", "call", "return", "check-tf" };
+    _Static_assert( sizeof(history) == 272, "FEX branch history DATA v1" );
+
+    if (!offset || !address || address > UINT64_MAX - offset - sizeof(history) ||
+        mach_vm_read_overwrite( mach_task_self(), address + offset, sizeof(history),
+            (mach_vm_address_t)&history, &got ) != KERN_SUCCESS || got != sizeof(history) ||
+        history.magic != UINT64_C(0x314744454742444d))
+    {
+        dprintf( 2, "[guest-edge] history unavailable (DATA layout or frame read)\n" );
+        return;
+    }
+    count = history.serial < 8 ? (unsigned)history.serial : 8;
+    dprintf( 2, "[guest-edge] serial=%llu count=%u newest-first (executed FEX exits; source=last mapped opcode, current bytes)\n",
+             (unsigned long long)history.serial, count );
+    for (i = 0; i < count; i++)
+    {
+        unsigned slot = (unsigned)((history.serial - 1 - i) & 7);
+        if (history.edges[slot].hint > 3) break;
+        dprintf( 2, "[guest-edge] #%u source=%#llx target=%#llx block=%#llx kind=%s equals-fault=%u\n",
+                 i, (unsigned long long)history.edges[slot].source,
+                 (unsigned long long)history.edges[slot].target,
+                 (unsigned long long)history.edges[slot].block, hints[history.edges[slot].hint],
+                 history.edges[slot].target == fault_rip );
+        ios_guest_code_pair( "branch-source", history.edges[slot].source, owner );
+    }
+}
+
+static int ios_dump_guest_instruction( HANDLE handle, LONG exit_code, uint64_t rip, void *owner )
+{
+    extern int ios_jit_guest_code_window( uint64_t, uint64_t *, uint64_t *, size_t * );
+    extern void *ios_jit_translate_addr_for_owner( void *, void * );
+    static unsigned reports;
+    uint64_t image = 0, start = 0, copy, pe_valid, copy_valid, complete;
+    unsigned char pe_bytes[48] = {0}, copy_bytes[48] = {0};
+    size_t length = 0;
+    unsigned report;
+
+    if ((handle && handle != NtCurrentProcess()) ||
+        (exit_code != (LONG)STATUS_PRIVILEGED_INSTRUCTION &&
+         exit_code != (LONG)STATUS_ILLEGAL_INSTRUCTION)) return 0;
+    report = __atomic_fetch_add( &reports, 1, __ATOMIC_RELAXED );
+    if (report >= 16) return 0;
+    if (!ios_jit_guest_code_window( rip, &image, &start, &length ) ||
+        !length || length > 48 || start > rip || rip - start >= length)
+    {
+        dprintf( 2, "[guest-insn] #%u code=%08x rip=%#llx: no registered x64 text window\n",
+                 report + 1, (unsigned)exit_code, (unsigned long long)rip );
+        return 0;
+    }
+    dprintf( 2, "[guest-insn] #%u code=%08x rip=%#llx image=%#llx rva=%#llx "
+             "window=%#llx length=%zu opcode-offset=%llu owner=%p\n", report + 1,
+             (unsigned)exit_code, (unsigned long long)rip, (unsigned long long)image,
+             (unsigned long long)(rip - image), (unsigned long long)start, length,
+             (unsigned long long)(rip - start), owner );
+    pe_valid = ios_guest_instruction_read( "PE", start, length, pe_bytes );
+    copy = (uint64_t)(uintptr_t)ios_jit_translate_addr_for_owner( (void *)(uintptr_t)start, owner );
+    if (!copy || copy == start)
+    {
+        dprintf( 2, "[guest-insn] COPY: no separate mapping\n" );
+        return 1;
+    }
+    copy_valid = ios_guest_instruction_read( "COPY", copy, length, copy_bytes );
+    complete = ((uint64_t)1 << length) - 1;
+    dprintf( 2, "[guest-insn] PE/COPY snapshot=%s\n",
+             pe_valid != complete || copy_valid != complete ? "INCOMPLETE" :
+             memcmp( pe_bytes, copy_bytes, length ) ? "DIFFER" : "MATCH" );
+    return 1;
+}
+#endif
+
 /******************************************************************************
  *              NtTerminateProcess  (NTDLL.@)
  */
@@ -2611,10 +2858,25 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                     uint64_t sbase = (uint64_t)cpuarea->EmulatorStackBase;
                     uint64_t slimit = (uint64_t)cpuarea->EmulatorStackLimit;
                     uint64_t rsp = 0;
+                    unsigned callsites = 0;
+                    int guest_diag;
                     int gi, hits = 0;
                     dprintf(2, "[term-stack] rip=%llx stack=[%llx..%llx]\n",
                             (unsigned long long)rip, (unsigned long long)slimit,
                             (unsigned long long)sbase);
+                    guest_diag = ios_dump_guest_instruction( handle, exit_code, rip, cur_teb->Peb );
+                    if (guest_diag)
+                    {
+                        extern int ios_jit_guest_code_window( uint64_t, uint64_t *, uint64_t *, size_t * );
+                        uint64_t image = 0, start = 0, fault_image = 0, fault_start = 0;
+                        size_t length = 0, fault_length = 0;
+                        /* Show earlier bytes only inside the same registered image. */
+                        if (rip >= 32 && ios_jit_guest_code_window( rip, &fault_image, &fault_start, &fault_length ) &&
+                            ios_jit_guest_code_window( rip - 32, &image, &start, &length ) && image == fault_image)
+                            ios_guest_code_pair( "before-rip", rip - 32, cur_teb->Peb );
+                        ios_guest_block_dump( fx[0], rip, cur_teb->Peb );
+                        ios_guest_branch_history_dump( fex_state, rip, cur_teb->Peb );
+                    }
                     dprintf(2, "[term-stack] g0-7: %llx %llx %llx %llx %llx %llx %llx %llx\n",
                             gregs[0], gregs[1], gregs[2], gregs[3],
                             gregs[4], gregs[5], gregs[6], gregs[7]);
@@ -2676,24 +2938,14 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                                  * still owed — but it turns address soup into a chain worth
                                  * reading. Unvalidated entries are still shown, marked, so a
                                  * missed CALL form cannot hide the real caller. */
-                                const char *kind = "  ?";
+                                unsigned call_length = 0;
+                                int32_t call_relative = 0;
+                                const char *kind = ios_guest_return_kind( v, &call_length, &call_relative );
+                                if (guest_diag && kind[0] != ' ' && callsites < 8)
                                 {
-                                    unsigned char cb[8];
-                                    mach_vm_size_t cg = 0;
-                                    if (v >= 8 &&
-                                        mach_vm_read_overwrite( mach_task_self(),
-                                            (mach_vm_address_t)(v - 8), sizeof(cb),
-                                            (mach_vm_address_t)cb, &cg ) == KERN_SUCCESS && cg == 8)
-                                    {
-                                        if (cb[3] == 0xE8) kind = "CALL";          /* v-5 */
-                                        else {
-                                            int k;
-                                            for (k = 1; k <= 6; k++) {
-                                                unsigned char op = cb[8 - k], modrm = cb[8 - k + 1];
-                                                if (op == 0xFF && ((modrm >> 3) & 7) == 2) { kind = "call*"; break; }
-                                            }
-                                        }
-                                    }
+                                    callsites++;
+                                    ios_guest_call_dump( v, call_length, call_relative, kind[0] == 'C',
+                                                         wi * 8, rip, cur_teb->Peb );
                                 }
                                 if (kind[0] == ' ' && hits >= 8) continue;   /* keep the log honest but bounded */
                                 /* name via export directory of the map view */
