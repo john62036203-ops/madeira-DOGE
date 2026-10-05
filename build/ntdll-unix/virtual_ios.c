@@ -213,6 +213,23 @@ static size_t jit_pool_offset = 0;
  * the unsplit one. */
 static size_t ios_jit_hole_off, ios_jit_hole_end;
 
+/* madeira-bcd BIG-IMAGE SLOT (env MADEIRA_POOL_BIG_SLOT_MB = N, split pool only;
+ * off by default). Ten processes each copy their own system DLLs into the pool
+ * (GTA V Enhanced build 373, 2026-10-04 08:41: 326 images, 469 MB -- shell32
+ * x7, steamclient64 x2, kernelbase x10), the head fills the run below the hole
+ * and the FEX code buffers (tail) take the top of the run above it, so Social
+ * Club's 240 MB libcef.dll fits in neither part although 330 MB are free:
+ * EXHAUSTED for every SocialClubHelper.exe, "SC_INIT_ERR_WEBSITE_FAILED_LOAD".
+ * With the slot, the N MB right above the hole go to one image of
+ * IOS_POOL_BIG_MIN or more; for everything else (smaller images, the bump, the
+ * tail) the hole ends at ios_jit_hole_end_eff, above the slot. When the slot's
+ * process dies, the slot is free again after the reuse grace. */
+static size_t ios_jit_hole_end_eff;        /* ios_jit_hole_end + the slot */
+static size_t ios_pool_big_off, ios_pool_big_size;
+static int ios_pool_big_taken;
+static time_t ios_pool_big_freed_at;
+#define IOS_POOL_BIG_MIN (64u * 1024 * 1024)
+
 /* The offset a head allocation of `size` gets with the bump cursor at `cur`:
  * `cur`, or the end of the hole when [cur, cur + size) would reach into it. */
 static size_t ios_pool_hole_head_place( size_t cur, size_t size, size_t hole_off, size_t hole_end )
@@ -2564,12 +2581,44 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
      * died at d2d1. pool_limit 0 (the tail's freelist-only take) keeps the old
      * rule. */
     int bump_short = 0;
-    if (pool_limit)
+    /* madeira-bcd: the big-image slot (ios_pool_big_off), once it is free and
+     * past the reuse grace of its previous owner -- waited out here, as for a
+     * freed range below: a restarted SocialClubHelper.exe asks again within it. */
+    if (pool_limit && ios_pool_big_size && !ios_pool_big_taken && alloc_size >= IOS_POOL_BIG_MIN &&
+        alloc_size <= ios_pool_big_size)
     {
-        size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off, ios_jit_hole_end );
+        int waited = 0;
+        while (now - ios_pool_big_freed_at < IOS_POOL_REUSE_GRACE_SEC && waited < 40)
+        {
+            pthread_mutex_unlock( &ios_pool_lock );
+            { struct timespec ts = { 0, 100 * 1000 * 1000 }; nanosleep( &ts, NULL ); }
+            waited++;
+            pthread_mutex_lock( &ios_pool_lock );
+            now = time( NULL );
+        }
+        if (waited)
+            dprintf(2, "[pool-big] madeira-bcd waited %d00 ms for the slot's reuse grace\n", waited);
+    }
+    if (pool_limit && ios_pool_big_size && !ios_pool_big_taken && alloc_size >= IOS_POOL_BIG_MIN &&
+        alloc_size <= ios_pool_big_size && now - ios_pool_big_freed_at >= IOS_POOL_REUSE_GRACE_SEC &&
+        IOS_POOL_IN_REACH(ios_pool_big_off))
+    {
+        off = ios_pool_big_off;
+        ios_pool_big_taken = 1;
+        ios_pool_last_alloc_reused = 0;
+        dprintf(2, "[pool-big] madeira-bcd 0x%lx bytes placed in the big-image slot at off 0x%lx (bump=0x%lx)\n",
+                (unsigned long)alloc_size, (unsigned long)off, (unsigned long)jit_pool_offset);
+    }
+    else if (pool_limit && ios_pool_big_size && alloc_size >= IOS_POOL_BIG_MIN)
+        dprintf(2, "[pool-big] madeira-bcd 0x%lx bytes: slot %s -- normal placement\n", (unsigned long)alloc_size,
+                ios_pool_big_taken ? "taken" : alloc_size > ios_pool_big_size ? "too small"
+                : now - ios_pool_big_freed_at < IOS_POOL_REUSE_GRACE_SEC ? "in its reuse grace" : "out of reach");
+    if (pool_limit && off == (size_t)-1)
+    {
+        size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off, ios_jit_hole_end_eff );
         bump_short = cand + alloc_size > pool_limit;
     }
-    if (alloc_size >= 32u * 1024 * 1024 || bump_short)
+    if (off == (size_t)-1 && (alloc_size >= 32u * 1024 * 1024 || bump_short))
     {
         int waited = 0;
         for (;;)
@@ -2663,10 +2712,11 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
 
     /* each `continue` below has dropped or replaced entry i: pick again */
     {
-        size_t bump_cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off, ios_jit_hole_end );
+        size_t bump_cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off, ios_jit_hole_end_eff );
         bump_ok = bump_cand + alloc_size <= pool_limit && IOS_POOL_IN_REACH(bump_cand);
     }
-    while ((i = ios_pool_best_fit( ios_pool_freelist, ios_pool_free_count, alloc_size, now,
+    while (off == (size_t)-1 &&
+           (i = ios_pool_best_fit( ios_pool_freelist, ios_pool_free_count, alloc_size, now,
                                    anchor_off, max_dist )) >= 0)
     {
         if (ios_pool_keep_big( ios_pool_freelist[i].size, alloc_size, bump_ok ))
@@ -2783,7 +2833,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
         /* madeira-bcd split pool: never into the hole (ios_jit_hole_off). Without
          * a split `cand` is the cursor itself and this is the old bump. */
         size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size,
-                                                ios_jit_hole_off, ios_jit_hole_end );
+                                                ios_jit_hole_off, ios_jit_hole_end_eff );
         if (cand + alloc_size <= pool_limit
             && IOS_POOL_IN_REACH(cand))
         {
@@ -2806,7 +2856,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                     dprintf(2, "[jit-pool] split pool: head 0x%lx+0x%lx would reach the hole [0x%lx,0x%lx) "
                             "-- placed above it at 0x%lx; the 0x%lx below it stays on the freelist\n",
                             (unsigned long)jit_pool_offset, (unsigned long)alloc_size,
-                            (unsigned long)ios_jit_hole_off, (unsigned long)ios_jit_hole_end,
+                            (unsigned long)ios_jit_hole_off, (unsigned long)ios_jit_hole_end_eff,
                             (unsigned long)cand, (unsigned long)below);
             }
             off = cand;
@@ -5560,20 +5610,55 @@ static int ios_insn_x18_role(uint32_t insn)
         if (rm == 18) return X18_ROLE_RM;
     }
 
-    /* ADD/SUB (immediate) — [31:24]=x00 10001 or x10 10001 */
-    if ((top8 & 0x5F) == 0x11)
+    /* ADD/SUB (immediate) — [31:24]=sf op S 10001. madeira-bcd: the mask was
+     * 0x5F, which kept op (bit 30) and so matched ADD only: every SUB off x18
+     * went unpatched and read the raw (zeroed) x18. 0x1F takes ADD, ADDS, SUB
+     * and SUBS, as the comment always said. */
+    if ((top8 & 0x1F) == 0x11)
     {
         if (rn == 18) return X18_ROLE_RN;
     }
 
-    /* ADD/SUB (register) — [31:24]=x00 01011 or x10 01011 */
-    if ((top8 & 0x5F) == 0x0B)
+    /* ADD/SUB (register) — [31:24]=sf op S 01011 (same mask fix as above) */
+    if ((top8 & 0x1F) == 0x0B)
     {
         if (rn == 18) return X18_ROLE_RN;
         if (rm == 18) return X18_ROLE_RM;
     }
 
     return X18_ROLE_NONE;
+}
+
+/* madeira-bcd: the destination of an ADD/SUB (immediate or register) that reads
+ * x18 once, when that destination can carry the TEB instead of x18: not x18,
+ * not 31 (SP or XZR), and not the instruction's other source. -1 otherwise.
+ *
+ * Such an instruction used to take the "via x18" trampoline (load x18 from
+ * TPIDRRO_EL0, run the instruction unchanged). If iOS preempts the thread
+ * between the load and the instruction it zeroes x18, and unlike a load or a
+ * store the ADD does not fault: it computes a small address that faults later,
+ * somewhere the handler cannot repair ([x18-decline]). Wine's debug channel
+ * buffer is get_info() = NtCurrentTeb() + 0x2000 + sizeof(TEB32), so with the
+ * TEB read as 0 its output lands at 0x3404: RockstarService.exe died that way
+ * in ntdll's printf padding loop (GTA V Enhanced build 375, 2026-10-04 09:52,
+ * `pc ntdll+0x63458 ... writing to 0x3404`, x18=0), the self-restarted
+ * Rockstar Games Launcher on 2026-10-03 23:21, and God of War's 0x3404 SEGVs.
+ * With the destination as scratch x18 is never touched. */
+static int ios_x18_arith_dest(uint32_t insn, int role)
+{
+    uint32_t top8 = insn >> 24;
+    int rd = insn & 0x1f, rn = (insn >> 5) & 0x1f, rm = (insn >> 16) & 0x1f;
+
+    if (rd == 18 || rd == 31) return -1;
+    if ((top8 & 0x1F) == 0x11)                       /* ADD/SUB (immediate) */
+        return (role == X18_ROLE_RN && rn == 18) ? rd : -1;
+    if ((top8 & 0x1F) == 0x0B)                       /* ADD/SUB (register) */
+    {
+        if (rn == 18 && rm == 18) return -1;
+        if (role == X18_ROLE_RN && rn == 18 && rm != rd) return rd;
+        if (role == X18_ROLE_RM && rm == 18 && rn != rd) return rd;
+    }
+    return -1;
 }
 
 /* Replace x18 in an instruction with a different register */
@@ -5868,6 +5953,10 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
              ((insn & 0xFFC00000) == 0xB9400000)) &&     /* ldr wT, [x18,#imm] */
             rt != 31 && rt != 18;
 
+        /* madeira-bcd: ADD/SUB off x18 with a usable destination (see
+         * ios_x18_arith_dest): same form as the LDR below. */
+        int arith_rd = (!is_mov_from_x18 && !is_int_ldr_imm) ? ios_x18_arith_dest(insn, role) : -1;
+
         if (is_mov_from_x18)
         {
             int rd = insn & 0x1f;
@@ -5905,6 +5994,28 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
             *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (rt << 5) | rt;
             tramp_off += 4;
             *(uint32_t *)(tramp_rw + tramp_off) = ios_insn_replace_x18(insn, role, rt);
+            tramp_off += 4;
+            ldr_scratch++;
+        }
+        else if (arith_rd >= 0)
+        {
+            /*   mrs xRd, TPIDRRO_EL0
+             *   and xRd, xRd, #~7
+             *   ldr xRd, [xRd, #slot_off]
+             *   add/sub xRd, xRd, <the other operand>   (x18 -> xRd)
+             * Counted with the destination-register forms. */
+            if (tramp_off + 20 > tramp_size)
+            {
+                ERR("x18 patcher: out of trampoline space at %d patches\n", count);
+                break;
+            }
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xD53BD060 | arith_rd;
+            tramp_off += 4;
+            *(uint32_t *)(tramp_rw + tramp_off) = 0x927DF000 | (arith_rd << 5) | arith_rd;
+            tramp_off += 4;
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (arith_rd << 5) | arith_rd;
+            tramp_off += 4;
+            *(uint32_t *)(tramp_rw + tramp_off) = ios_insn_replace_x18(insn, role, arith_rd);
             tramp_off += 4;
             ldr_scratch++;
         }
@@ -10946,6 +11057,20 @@ void ios_jit_reclaim_process( void *peb )
                          (unsigned long)off, (unsigned long)size, fcur, fmax );
         }
 
+        /* madeira-bcd: a range in the big-image slot frees the slot (after the
+         * grace) instead of going on the freelist, where small images would
+         * carve it up. */
+        if (ios_pool_big_size && off < ios_pool_big_off + ios_pool_big_size && off + size > ios_pool_big_off)
+        {
+            ios_pool_big_taken = 0;
+            ios_pool_big_freed_at = time( NULL );
+            total += size;
+            ranges++;
+            dprintf(2, "[pool-big] madeira-bcd slot freed by peb=%p (off 0x%lx size 0x%lx), reusable after %ds\n",
+                    peb, (unsigned long)off, (unsigned long)size, IOS_POOL_REUSE_GRACE_SEC);
+            ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
+            continue;
+        }
         /* madeira-bcd: merged with its clean neighbours (ios_pool_free_put); a
          * POISONED range goes on as its executable runs, which merge too. The
          * MADV_FREE sweep that used to follow is gone (ml87), and nothing is
@@ -11108,6 +11233,121 @@ static int get_unix_prot( BYTE vprot )
 /***********************************************************************
  *           dump_view
  */
+#ifdef WINE_IOS
+/* Called with virtual_mutex held, only after a constrained FEX allocation
+ * fails. Count live views, rather than ALLOC/COMMIT events (which count the
+ * same span repeatedly). Read only Wine's native protection bookkeeping;
+ * never read guest/FEX payloads or reclaim a live or dead thread's memory. */
+static void ios_fex_arena_census( void *start, void *end, size_t request, size_t align_mask )
+{
+    struct fex_va_bucket { size_t size, bytes, committed; unsigned flags, views; } buckets[32] = {{0}};
+    struct file_view *view;
+    ULONG_PTR lo = ios_fex_arena_base_unix, hi = ios_fex_arena_end_unix, cursor;
+    size_t covered = 0, committed = 0, overlap = 0, biggest = 0, aligned_biggest = 0;
+    size_t other_bytes = 0, other_committed = 0;
+    unsigned nviews = 0, holes = 0, used = 0, other_views = 0, i, j;
+    static unsigned printed;
+
+    if (printed || !lo || hi <= lo || (ULONG_PTR)start < lo || (ULONG_PTR)end > hi ||
+        (ULONG_PTR)start >= (ULONG_PTR)end || !page_size) return;
+    printed = 1;
+    cursor = lo;
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        ULONG_PTR b = (ULONG_PTR)view->base, e, first, fresh, p;
+        size_t vc = 0;
+
+        if (b >= hi) break;
+        e = view->size > ~(ULONG_PTR)0 - b ? ~(ULONG_PTR)0 : b + view->size;
+        if (e <= lo || e <= b) continue;
+        if (b < lo) b = lo;
+        if (e > hi) e = hi;
+        nviews++;
+        if (b > cursor)
+        {
+            size_t gap = b - cursor;
+            ULONG_PTR aligned;
+            holes++;
+            if (gap > biggest) biggest = gap;
+            if (cursor <= ~(ULONG_PTR)0 - align_mask)
+            {
+                aligned = (cursor + align_mask) & ~(ULONG_PTR)align_mask;
+                if (aligned < b && b - aligned > aligned_biggest) aligned_biggest = b - aligned;
+            }
+        }
+        first = b;
+        fresh = b > cursor ? b : cursor;
+        if (b < cursor) overlap += (e < cursor ? e : cursor) - b;
+        if (e > fresh) covered += e - fresh;
+        if (e > cursor) cursor = e;
+        for (p = first; p < e; )
+        {
+            size_t bytes = e - p < page_size ? e - p : page_size;
+            if (get_page_vprot( (void *)p ) & VPROT_COMMITTED)
+            {
+                vc += bytes;
+                if (p >= fresh) committed += bytes;
+                else if (p + bytes > fresh) committed += p + bytes - fresh;
+            }
+            p += bytes;
+        }
+        for (i = 0; i < used; i++)
+            if (buckets[i].size == view->size && buckets[i].flags == view->protect) break;
+        if (i == used && used < ARRAY_SIZE(buckets))
+        {
+            buckets[i].size = view->size;
+            buckets[i].flags = view->protect;
+            used++;
+        }
+        if (i < used)
+        {
+            buckets[i].views++;
+            buckets[i].bytes += e - b;
+            buckets[i].committed += vc;
+        }
+        else
+        {
+            other_views++;
+            other_bytes += e - b;
+            other_committed += vc;
+        }
+    }
+    if (cursor < hi)
+    {
+        size_t gap = hi - cursor;
+        ULONG_PTR aligned;
+        holes++;
+        if (gap > biggest) biggest = gap;
+        if (cursor <= ~(ULONG_PTR)0 - align_mask)
+        {
+            aligned = (cursor + align_mask) & ~(ULONG_PTR)align_mask;
+            if (aligned < hi && hi - aligned > aligned_biggest) aligned_biggest = hi - aligned;
+        }
+    }
+    dprintf( 2, "[fex-va] live arena=%p..%p failed_range=%p..%p request=0x%llx align_mask=0x%llx "
+                "views=%u covered=0x%llx free=0x%llx committed=0x%llx overlap=0x%llx "
+                "holes=%u maxgap=0x%llx max_aligned_gap=0x%llx (virtual bytes, not residency)\n",
+             (void *)lo, (void *)hi, start, end, (unsigned long long)request, (unsigned long long)align_mask,
+             nviews, (unsigned long long)covered, (unsigned long long)(hi - lo - covered),
+             (unsigned long long)committed, (unsigned long long)overlap, holes,
+             (unsigned long long)biggest, (unsigned long long)aligned_biggest );
+    /* Largest consumers first, at most 32 buckets plus one overflow line. */
+    for (i = 0; i < used; i++)
+    {
+        unsigned largest = i;
+        struct fex_va_bucket tmp;
+        for (j = i + 1; j < used; j++) if (buckets[j].bytes > buckets[largest].bytes) largest = j;
+        tmp = buckets[i]; buckets[i] = buckets[largest]; buckets[largest] = tmp;
+        dprintf( 2, "[fex-va] size=0x%llx view_flags=0x%x views=%u reserved=0x%llx committed=0x%llx\n",
+                 (unsigned long long)buckets[i].size, buckets[i].flags, buckets[i].views,
+                 (unsigned long long)buckets[i].bytes, (unsigned long long)buckets[i].committed );
+    }
+    if (other_views)
+        dprintf( 2, "[fex-va] other_sizes views=%u reserved=0x%llx committed=0x%llx\n",
+                 other_views, (unsigned long long)other_bytes, (unsigned long long)other_committed );
+}
+#endif
+
 static void dump_view( struct file_view *view )
 {
     UINT i, count;
@@ -13002,6 +13242,14 @@ static int ios_sc_layout(void)
  * tried. */
 static int ios_sc2_classify( uint64_t size, uint64_t hint, unsigned held, int e_mine, int l_mine, int cage_mine )
 {
+    /* Oilpan asks for 32 GB with a 16 GB-aligned random hint (393 jumbo#5:
+     * 0x2be400000000). PartitionAlloc needs 32 GB alignment, so keep that
+     * rule for E/L. Only this helper's third block can use the Oilpan slot:
+     * both PA blocks belong to it and their holds have already been consumed.
+     * The reported base remains 32 GB-aligned, satisfying either request. */
+    if (size == 0x800000000ULL && hint && !(hint & (0x400000000ULL - 1)) &&
+        e_mine && l_mine && !(held & ((1u << IOS_SC2_E) | (1u << IOS_SC2_L))) &&
+        (held & (1u << IOS_SC2_OILPAN))) return IOS_SC2_OILPAN;
     if (size == 0x800000000ULL && hint && !(hint & (0x800000000ULL - 1)))
     {
         if (held & (1u << IOS_SC2_E)) return IOS_SC2_E;
@@ -14071,6 +14319,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         {
                             ios_jit_hole_off = (size_t)h0;
                             ios_jit_hole_end = (size_t)h1;
+                            ios_jit_hole_end_eff = (size_t)h1;
                             dprintf( 2, "[jit-pool] split pool: RX [%p,%p) + [%p,%p) as one span of 0x%lx; "
                                      "hole [0x%llx,0x%llx) (%llu MB: the main thread's stack) is never "
                                      "handed out -- images 0x%llx below it, FEX code from the top\n",
@@ -14081,6 +14330,34 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         else
                             dprintf( 2, "[jit-pool] split pool: WINE_IOS_JIT_HOLE=%s ignored (pool size 0x%lx)\n",
                                      hole, (unsigned long)jit_pool_size );
+                    }
+                }
+                /* madeira-bcd: the big-image slot right above the hole (see
+                 * ios_pool_big_off). Needs the split; a slot that does not fit
+                 * in the run above the hole is ignored. */
+                {
+                    /* N MB above the hole of a split pool for one image of 64 MB or more (Social Club's libcef.dll); off by default. */
+                    const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );
+                    if (big && *big && strtoul( big, NULL, 10 ))
+                    {
+                        size_t want = (size_t)strtoul( big, NULL, 10 ) << 20;
+                        if (ios_jit_hole_end > ios_jit_hole_off && want >= IOS_POOL_BIG_MIN &&
+                            ios_jit_hole_end + want <= jit_pool_size)
+                        {
+                            ios_pool_big_off = ios_jit_hole_end;
+                            ios_pool_big_size = want;
+                            ios_jit_hole_end_eff = ios_jit_hole_end + want;
+                            dprintf( 2, "[pool-big] madeira-bcd slot [0x%lx,0x%lx) (%lu MB) above the hole for one "
+                                     "image of %u MB or more; %lu MB above it left for the rest\n",
+                                     (unsigned long)ios_pool_big_off, (unsigned long)ios_jit_hole_end_eff,
+                                     (unsigned long)(want >> 20), IOS_POOL_BIG_MIN >> 20,
+                                     (unsigned long)((jit_pool_size - ios_jit_hole_end_eff) >> 20) );
+                        }
+                        else
+                            dprintf( 2, "[pool-big] madeira-bcd MADEIRA_POOL_BIG_SLOT_MB=%s ignored: %s\n", big,
+                                     ios_jit_hole_end <= ios_jit_hole_off ? "needs pool-split = 1 (no hole)"
+                                     : want < IOS_POOL_BIG_MIN ? "smaller than 64 MB"
+                                     : "larger than the run above the hole" );
                     }
                 }
 
@@ -16861,6 +17138,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                                                        : "  <-- STATUS_NO_MEMORY (callers see a NULL alloc)") );
                 }
             }
+#ifdef WINE_IOS
+            if (!ptr) ios_fex_arena_census( start, end, size, align_mask );
+#endif
             if (ptr)
             {
                 TRACE( "got mem with map_free_area %p-%p\n", ptr, (char *)ptr + size );
@@ -25854,7 +26134,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             size_t head_now = jit_pool_offset, tail_now = ios_jit_tail_reserved;
             /* madeira-bcd split pool: a hole still between head and tail is not room */
             size_t hole_now = ios_pool_hole_between( ios_jit_pool_size_global, head_now, tail_now,
-                                                     ios_jit_hole_off, ios_jit_hole_end );
+                                                     ios_jit_hole_off, ios_jit_hole_end_eff );
             size_t room = ios_jit_pool_size_global > head_now + tail_now + hole_now + HEAD_RESERVE
                         ? ios_jit_pool_size_global - head_now - tail_now - hole_now - HEAD_RESERVE : 0;
             size_t cap = TAIL_SMALL;
@@ -25932,12 +26212,12 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             {
                 cur = ios_jit_tail_reserved;
                 start = ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,
-                                                  ios_jit_hole_off, ios_jit_hole_end );
+                                                  ios_jit_hole_off, ios_jit_hole_end_eff );
             } while (!__sync_bool_compare_and_swap( &ios_jit_tail_reserved, cur, start + alloc_size ));
             reserve_offset = start;
             tail_added = start + alloc_size - cur;
-            if (start != cur && ios_jit_pool_size_global - cur > ios_jit_hole_end)
-                tail_skipped = ios_jit_pool_size_global - cur - ios_jit_hole_end;
+            if (start != cur && ios_jit_pool_size_global - cur > ios_jit_hole_end_eff)
+                tail_skipped = ios_jit_pool_size_global - cur - ios_jit_hole_end_eff;
         }
         else
         {
@@ -26076,7 +26356,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * skipped above the hole is a never-used carve a smaller ask can take. */
             if (tail_skipped >= 0x100000 && ios_tail_carve_n < IOS_TAIL_CARVE_MAX)
             {
-                ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end;
+                ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end_eff;
                 ios_tail_carves[ios_tail_carve_n].size = tail_skipped & ~(size_t)0x3fff;
                 ios_tail_carves[ios_tail_carve_n].free = 1;
                 ios_tail_carve_n++;
@@ -26086,7 +26366,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                 dprintf(2, "[jit-pool] split pool: tail carve 0x%lx would overlap the hole [0x%lx,0x%lx) -- "
                         "placed below it at off 0x%lx; 0x%lx above the hole kept as a free carve\n",
                         (unsigned long)alloc_size, (unsigned long)ios_jit_hole_off,
-                        (unsigned long)ios_jit_hole_end, (unsigned long)pool_tail_off,
+                        (unsigned long)ios_jit_hole_end_eff, (unsigned long)pool_tail_off,
                         (unsigned long)tail_skipped);
             dprintf(2, "[jit-pool] tail EC_CODE rx=%p size=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx\n",
                     jit_rx, (unsigned long)alloc_size,

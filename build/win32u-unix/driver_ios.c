@@ -401,6 +401,7 @@ extern int winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirt
                                     int surf_w, int surf_h, int stride, const void *bits ) __attribute__((weak));
 extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible,
                                  int cx, int cy, int cw, int ch ) __attribute__((weak));
+extern void winios_window_visibility( HWND hwnd, int visible ) __attribute__((weak));
 extern void winios_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
                                const void *bgra ) __attribute__((weak));
 extern void winios_cursor_show( int show ) __attribute__((weak));
@@ -711,6 +712,31 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     return TRUE;
 }
 
+/* The desktop compositor keeps child HWNDs in independent layers. A parent
+ * show/hide does not send WindowPosChanged to every child, so refresh their
+ * effective visibility without moving or recreating their existing layers. */
+static void winios_drv_refresh_child_visibility( HWND hwnd )
+{
+    HWND *children;
+    ULONG capacity = 128, count, i;
+    NTSTATUS status;
+
+    if (!winios_window_visibility) return;
+    for (;;)
+    {
+        if (!(children = malloc( capacity * sizeof(*children) ))) return;
+        status = NtUserBuildHwndList( 0, hwnd, TRUE, TRUE, 0, capacity, children, &count );
+        if (!status) break;
+        free( children );
+        if (status != STATUS_BUFFER_TOO_SMALL || count <= capacity) return;
+        capacity = count;
+    }
+    /* NtUserBuildHwndList includes a final HWND_BOTTOM sentinel. */
+    for (i = 0; i + 1 < count; i++)
+        winios_window_visibility( children[i], is_window_visible( children[i] ) );
+    free( children );
+}
+
 /* pWindowPosChanged wrapper: dereference window_rects HERE (Winios.m
  * cannot include wine headers) and forward plain ints for the layer
  * frame; chain to the Winios.m hook afterwards. */
@@ -725,9 +751,14 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
     {
         const RECT *v = &new_rects->visible;
         const RECT *c = &new_rects->client;
-        int visible = !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
+        /* The visible rect describes geometry even for a hidden window.
+         * Wine has already updated WS_VISIBLE before this callback; include
+         * its parent chain so a hidden browser's child Metal layer stays hidden. */
+        int visible = is_window_visible( hwnd ) && !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
         winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
                              c->left, c->top, c->right - c->left, c->bottom - c->top );
+        if (winios_desktop_mode() && (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)))
+            winios_drv_refresh_child_visibility( hwnd );
         if (visible && surface && winios_game_windows()) winios_note_dialog_thread( hwnd, v );
     }
     /* ml505: z-order and geometry churn. If the three same-rect siblings are
@@ -747,8 +778,11 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         {
             const RECT *v = &new_rects->visible;
             dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "
-                     "surface=%p rev=ml505\n", n, hwnd, insert_after, (unsigned)swp_flags,
-                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface );
+                     "surface=%p rev=ml505 style=%08x visible=%u parent=%p\n",
+                     n, hwnd, insert_after, (unsigned)swp_flags,
+                     (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface,
+                     (unsigned)get_window_long( hwnd, GWL_STYLE ), (unsigned)is_window_visible( hwnd ),
+                     NtUserGetAncestor( hwnd, GA_PARENT ) );
             /* ml853: name the window. A dialog nobody can see (nothing is
              * presenting) is otherwise just a rectangle; the class and the
              * text of every window, children included, make it readable
