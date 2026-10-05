@@ -8,8 +8,10 @@ on:
 
 # A push and a manual dispatch seconds apart used to start two parallel
 # multi-hour macOS jobs on the same commit.
+# madeira-doge: one group per branch. With a single group, starting a build on
+# one branch cancelled the build still running on another.
 concurrency:
-  group: build-ipa
+  group: build-ipa-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
