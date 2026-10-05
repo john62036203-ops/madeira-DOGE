@@ -25958,8 +25958,13 @@ void ios_reserve_fex_arena(void)
      * reservation has been observed to work, so smaller is worth trying before
      * giving up -- the failure mode that matters is reserving NOTHING.
      * The VM's ceiling is 63GiB, so nothing above that can ever succeed. */
-    static const struct { ULONG_PTR lo, hi; SIZE_T size; const char *what; } plan[] = {
+    /* madeira-doge: arena-mb above 8192 ASKS for a larger arena (slot 1, size 0 = unused).
+     * P3R runs ~100 threads and FEX keeps 64 MB of address space per thread in the
+     * arena; 8 GB ran out when the game left its menu ("FEXAlloc could not allocate",
+     * thread stopped, black screen). 8192 or less stays the ml995 cap. */
+    static struct { ULONG_PTR lo, hi; SIZE_T size; const char *what; } plan[] = {
         { 0x7c00000000ull, 0x7fffffffffull, 0x400000000ull, "hardware high band 16GB"  },
+        { 0x0800000000ull, 0x0fffffffffull, 0,              "constrained (arena-mb)"   },
         { 0x0800000000ull, 0x0fffffffffull, 0x200000000ull, "constrained 8GB"          },
         { 0x0400000000ull, 0x07ffffffffull, 0x200000000ull, "8GB @16-32G"              },
         { 0x0200000000ull, 0x03ffffffffull, 0x200000000ull, "8GB @8-16G"               },
@@ -26106,7 +26111,13 @@ void ios_reserve_fex_arena(void)
      * nothing -- and that should land on evidence, not on this hypothesis. */
     {
         long long mb = madeira_cfg_int( "arena-mb", 0 );   /* ml1095: madeira.cfg arena-mb = N */
-        if (mb > 0)
+        if (mb > 8192)
+        {
+            if (mb > 16384) mb = 16384;
+            plan[1].size = (SIZE_T)mb << 20;
+            dprintf( 2, "[fex-arena] madeira-doge: arena-mb asks for %lld MB, tried before the 8 GB step\n", mb );
+        }
+        else if (mb > 0)
         {
             arena_size_cap = (unsigned long long)mb * 1024ull * 1024ull;
             dprintf( 2, "[fex-arena] ml995 size cap from arena-mb: %llu MB\n", arena_size_cap >> 20 );
@@ -26115,6 +26126,7 @@ void ios_reserve_fex_arena(void)
 
     for (i = 0; i < ARRAY_SIZE(plan); i++)
     {
+        if (!plan[i].size) continue;
         if (arena_size_cap && (unsigned long long)plan[i].size > arena_size_cap)
         {
             dprintf( 2, "[fex-arena] ml995 SKIP %s (%llu MB) -- over the %llu MB cap\n",
