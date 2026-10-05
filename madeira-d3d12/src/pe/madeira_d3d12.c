@@ -2763,6 +2763,23 @@ static int mad_pso_lazy_on(void) {   /* madeira-bcd: madeira.cfg pso-lazy (defau
                   d3d12_log("[madeira-d3d12] pipelines are built %s (madeira.cfg pso-lazy)\n", on ? "at their first draw/dispatch" : "at creation"); }
     return on;
 }
+/* madeira-doge: madeira.cfg default-swap-mb = N (0 = off, the default). A GPU-only
+ * (DEFAULT heap) committed buffer of N MB or more gets storage WE allocate, like
+ * ml1154 does for CPU-visible ones: a Metal shared, no-copy buffer over a fresh
+ * guest commit that the file tier backs, so it is not charged to phys_footprint.
+ * RE Engine keeps ~0.9 GB of such buffers (139 of them) once a scene loads, on top
+ * of a footprint already at the limit. The application never maps a DEFAULT
+ * buffer, so r->cpu stays NULL and every path treats it as before; only the Metal
+ * storage mode and who owns the pages differ. Needs the swap tier (swap-mb) with
+ * wide coverage, otherwise the commit is ordinary memory and nothing is gained. */
+static volatile LONG64 g_default_swap_bytes; static volatile LONG g_default_swap_n;
+static UINT64 mad_default_swap_min(void) {
+    static LONG64 min = -1;
+    if (min < 0) { int mb = mad_cfg_int_pe("default-swap-mb", 0);
+                   min = mb > 0 ? (LONG64)mb << 20 : 0;
+                   d3d12_log("[madeira-d3d12] default-swap-mb = %d (%s)\n", mb, mb > 0 ? "GPU-only buffers from that size live on file-backed storage" : "off: GPU-only buffers are Metal-owned"); }
+    return (UINT64)min;
+}
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
     static int on = -1;
     if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
@@ -10256,6 +10273,33 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                         d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffer %llu MB (heap type %u) on our storage %p: %s; %ld so far, %lld MB\n",
                                   (unsigned long long)(want >> 20), (unsigned)heap_type, mem, r->buffer ? "Metal accepted it" : "Metal REFUSED it, Metal-owned instead",
                                   g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+                }
+            }
+        }
+        if (!r->buffer && heap_type == D3D12_HEAP_TYPE_DEFAULT && !r->placed_heap && mad_default_swap_min()
+            && info.length >= mad_default_swap_min()) {   /* madeira-doge: default-swap-mb */
+            SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
+            void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (mem) {
+                UINT64 want = info.length;
+                info.length = len; info.memory.ptr = mem; info.options = WMTResourceStorageModeShared;
+                r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+                if (r->buffer) {
+                    r->own_mem = mem;
+                    /* released through the ml1154 path, which subtracts from its counter */
+                    InterlockedExchangeAdd64(&g_upload_swap_bytes, (LONG64)len); InterlockedIncrement(&g_upload_swap_n);
+                    InterlockedExchangeAdd64(&g_default_swap_bytes, (LONG64)len); InterlockedIncrement(&g_default_swap_n);
+                    info.memory.ptr = NULL;   /* never CPU-visible to the application */
+                } else {
+                    VirtualFree(mem, 0, MEM_RELEASE);
+                    info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; info.options = WMTResourceStorageModePrivate;
+                }
+                {
+                    static unsigned said;
+                    if (said++ < 8 || !(said % 64))
+                        d3d12_log("[madeira-d3d12] default-swap: GPU-only buffer %llu MB on our storage %p: %s; %ld created so far, %lld MB\n",
+                                  (unsigned long long)(want >> 20), mem, r->buffer ? "Metal accepted it" : "Metal REFUSED it, Metal-owned instead",
+                                  g_default_swap_n, (long long)(g_default_swap_bytes >> 20));
                 }
             }
         }
