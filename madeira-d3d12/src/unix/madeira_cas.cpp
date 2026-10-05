@@ -161,6 +161,7 @@ unsigned rewrite(Module &m, int mode) {
  *     item ((task - 1) >> 13) & 0x7ffe0 with its end at + 32, and the item
  *     loop's step of 32. Each becomes its one-lane form. If the shapes are not
  *     all there, nothing is changed and the kernel keeps its waves;
+ *   - the hand-over guards (lanes 0 and 1 keep their task, see below);
  *   - the group-sync barrier at the end of the loop: one-lane waves leave the
  *     loop at different times, and a thread group barrier must not be reached
  *     by only some of its threads. The memory fence before it stays. */
@@ -193,6 +194,7 @@ bool scalarize(Module &m, Function *kernel, unsigned &ncalls, std::string &why) 
     /* The lane count, by shape. Everything is matched before anything is changed. */
     std::vector<Instruction *> ceil_sites, step_adds, end_adds, barriers;
     std::vector<CallInst *> min_sites;
+    std::vector<ICmpInst *> keep_guards, push_guards;
     BinaryOperator *chunk_and = nullptr; unsigned nchunk = 0;
     for (BasicBlock &bb : *kernel)
         for (Instruction &i : bb) {
@@ -201,6 +203,16 @@ bool scalarize(Module &m, Function *kernel, unsigned &ncalls, std::string &why) 
                 if (!cf) continue;
                 if (cf->getName().startswith("air.min.u.i32") && ci->arg_size() == 2 && is_c(ci->getArgOperand(0), 32) && is_c(ci->getArgOperand(1), 32)) min_sites.push_back(ci);
                 else if (cf->getName().startswith("air.wg.barrier")) barriers.push_back(ci);
+                continue;
+            }
+            if (auto *ic = dyn_cast<ICmpInst>(&i)) {
+                /* "lanes 0 and 1 keep their task, the others hand theirs to the queue":
+                 * WavePrefixCountBits(true) < 2 around the first hand-over, > 1 around
+                 * the second. */
+                auto *pc = dyn_cast<CallInst>(ic->getOperand(0));
+                if (!pc || !pc->getCalledFunction() || !pc->getCalledFunction()->getName().startswith("air.popcount")) continue;
+                if (ic->getPredicate() == ICmpInst::ICMP_ULT && is_c(ic->getOperand(1), 2)) keep_guards.push_back(ic);
+                else if (ic->getPredicate() == ICmpInst::ICMP_UGT && is_c(ic->getOperand(1), 1)) push_guards.push_back(ic);
                 continue;
             }
             auto *bo = dyn_cast<BinaryOperator>(&i);
@@ -216,9 +228,12 @@ bool scalarize(Module &m, Function *kernel, unsigned &ncalls, std::string &why) 
                 if (ph) for (Value *iv : ph->incoming_values()) if (iv == bo) { step_adds.push_back(bo); break; }
             }
         }
-    if (ceil_sites.size() != 1 || min_sites.empty() || nchunk != 1 || step_adds.size() != 1) {
+    /* A kernel may walk a chunk's items in more than one loop (the shadow
+     * variants have two), so any number of steps is accepted; the rest is exact. */
+    if (ceil_sites.size() != 1 || min_sites.empty() || nchunk != 1 || step_adds.empty() || keep_guards.size() + push_guards.size() == 0) {
         why = "lane count shapes: " + std::to_string(ceil_sites.size()) + " ceil, " + std::to_string(min_sites.size()) + " min, " +
-              std::to_string(nchunk) + " chunk, " + std::to_string(step_adds.size()) + " step";
+              std::to_string(nchunk) + " chunk, " + std::to_string(step_adds.size()) + " step, " +
+              std::to_string(keep_guards.size()) + "+" + std::to_string(push_guards.size()) + " hand-over";
         return false;
     }
     for (User *u : chunk_and->users()) {
@@ -239,7 +254,14 @@ bool scalarize(Module &m, Function *kernel, unsigned &ncalls, std::string &why) 
         cast<BinaryOperator>(chunk_and->getOperand(0))->setOperand(1, ConstantInt::get(i32, 18));
         chunk_and->setOperand(1, ConstantInt::get(i32, 16383));                               /* first item = chunk */
         end_adds[0]->setOperand(1, ConstantInt::get(i32, 1));                                  /* end = chunk + 1 */
-        step_adds[0]->setOperand(1, ConstantInt::get(i32, 1));                                 /* next item */
+        for (Instruction *sa : step_adds) sa->setOperand(1, ConstantInt::get(i32, 1));         /* next item */
+        /* Every thread hands work to the queue. With 32-lane waves lanes 2..31 do,
+         * which is what lets idle waves take it; a one-lane wave is always "lane
+         * 0", so without this each job ran start to finish on ONE GPU thread
+         * while the other sixteen thousand polled an empty queue (build 108: 28
+         * million polls a dispatch, and the watchdog again on a busy view). */
+        for (ICmpInst *g : keep_guards) g->replaceAllUsesWith(ConstantInt::getFalse(g->getType()));
+        for (ICmpInst *g : push_guards) g->replaceAllUsesWith(ConstantInt::getTrue(g->getType()));
         for (Instruction *bi : barriers) bi->eraseFromParent();
     }
     /* The lane index: the kernel argument tagged air.thread_index_in_simdgroup. */

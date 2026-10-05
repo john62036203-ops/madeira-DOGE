@@ -1219,7 +1219,7 @@ static void mad_cas_cfg_once(void)
 }
 static unsigned mad_cas_key(void)
 {
-    enum { CAS_REV = 2 };
+    enum { CAS_REV = 3 };
     pthread_once(&g_cas_once, mad_cas_cfg_once);
     return (unsigned)CAS_REV << 8 | (unsigned)(g_cas_mode + 1) << 2 | (unsigned)g_cas_scalar << 1 | (unsigned)(g_cas_on > 0);
 }

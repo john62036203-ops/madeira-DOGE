@@ -12666,7 +12666,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     if (o && o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);   /* ml927b */
     if (strstr(name, "ClusterCulling")) {   /* madeira-doge: the converter's OUTPUT for the wave-op culling kernel, for offline disassembly */
         static LONG said_ml;
-        if (InterlockedIncrement(&said_ml) <= 3) {
+        if (InterlockedIncrement(&said_ml) <= 12) {
             static const char t64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             const unsigned char *mp = (const unsigned char *)buf; UINT mi = 0, mlen = (UINT)a.ret_len; char ml[720];
             d3d12_log("[madeira-d3d12] metallib of '%s' (%u bytes of DXIL): %u bytes follow as base64\n", name, (unsigned)dxil_len, mlen);
