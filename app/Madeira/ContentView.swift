@@ -2781,7 +2781,7 @@ struct ContentView: View {
         /* ml2100: XInput (default) or the HID controller; before the wineserver starts. */
         GamepadInput.shared.beginPadSession()
         /* ml1990: player 1 exists before the game enumerates XInput. */
-        GamepadInput.shared.reserveSessionSlot(touchControls: TouchControlsModel.shared.offersControllerInput)
+        GamepadInput.shared.reserveSessionSlot(touchControls: TouchControlsModel.shared.couldOfferControllerInput)
         if MadeiraConfig.present {
             let cfg = MadeiraConfig.all().sorted { $0.key < $1.key }
             logStore.log("madeira.cfg: " + (cfg.isEmpty ? "(empty)" : cfg.map { "\($0.key)=\($0.value)" }.joined(separator: " ")))
@@ -4073,6 +4073,14 @@ final class TouchControlsModel: ObservableObject {
     var offersControllerInput: Bool {
         visible && (controls.contains { $0.action.padName.map(TouchPadAction.supported) ?? false }
                     || ControlPresetsModel.shared.defaultPending)
+    }
+
+    /// madeira-doge: the same without `visible`, for the early slot. Touch controls switched
+    /// on from the in-game menu fed a player 1 the game had never seen, because the slot
+    /// was reserved only when they were already showing at the start.
+    var couldOfferControllerInput: Bool {
+        controls.contains { $0.action.padName.map(TouchPadAction.supported) ?? false }
+            || ControlPresetsModel.shared.defaultPending
     }
 
     func index(of id: UUID?) -> Int? {
