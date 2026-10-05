@@ -324,7 +324,12 @@ struct LibraryEntry: Codable, Identifiable {
         if let anisotropyLimit, [1, 2, 4, 8].contains(anisotropyLimit) { setenv("DXMT_D9_ANISO_LIMIT", String(anisotropyLimit), 1) }
         // Fastsync's per-game switches, only when Settings chose Fastsync; with Madsync
         // (the default) or Wine's standard sync nothing is exported here.
-        if SyncEngine.current == .fastsync {
+        // madeira-doge: a game's own file may pick madsync (inproc-sync = 1) while Settings
+        // stays on Fastsync; the native side already reads that key from the game's file.
+        if MadeiraConfig.gameValue("inproc-sync") == "1" {
+            unsetenv("MADEIRA_FASTSYNC")
+            LogStore.shared.log("[sync] madeira-doge: this game's config selects madsync (inproc-sync = 1)")
+        } else if SyncEngine.current == .fastsync {
             let mode = MadeiraConfig.get("env.MADEIRA_FASTSYNC") ?? "auto"
             setenv("MADEIRA_FASTSYNC", fastSync == false ? "0" : mode, 1)
             setenv("MADEIRA_FASTSYNC_SEM", semaphoreFastPath == true ? "1" : "0", 1)
