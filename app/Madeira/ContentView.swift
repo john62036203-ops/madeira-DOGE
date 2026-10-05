@@ -3611,7 +3611,7 @@ struct ContentView: View {
                 setenv("MADEIRA_EXE", MadeiraDock.executable, 1)
                 unsetenv("MADEIRA_ARGS")
                 unsetenv("MADEIRA_DESKTOP")
-                logStore.log("[madeira-dock] no virtual desktop for this launch")
+                logStore.log("[madeira-dock] no virtual desktop for this launch (\(MadeiraConfig.gameValue("dock-no-desktop") != nil ? "this game's config" : "Settings"))")
             } else {
                 setenv("MADEIRA_EXE", "explorer.exe", 1)
                 setenv("MADEIRA_ARGS", MadeiraDock.launchArguments(width: width, height: height, installers: DockInstallers.script), 1)
@@ -4216,12 +4216,15 @@ struct TouchControlsOverlay: View {
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             .contentShape(Rectangle())
             .gesture(scalePinch, including: m.editing ? .all : .subviews)
-            .onAppear { applyDefaultLayout(geo); configureGamepad(landscape: landscape) }
-            .onChange(of: geo.size) { _, _ in applyDefaultLayout(geo); configureGamepad(landscape: landscape) }
-            .onChange(of: m.controls) { _, _ in configureGamepad(landscape: landscape) }
-            .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape) }
-            .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape) }
-            .onChange(of: library.blocksGameplayTouch) { _, _ in configureGamepad(landscape: landscape) }
+            .onAppear { applyDefaultLayout(geo); configureGamepad(landscape: landscape); logState("appear", geo.size, landscape) }
+            .onChange(of: geo.size) { _, _ in applyDefaultLayout(geo); configureGamepad(landscape: landscape); logState("size", geo.size, landscape) }
+            .onChange(of: m.controls) { _, _ in configureGamepad(landscape: landscape); logState("controls", geo.size, landscape) }
+            .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape); logState("visible", geo.size, landscape) }
+            .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape); logState("editing", geo.size, landscape) }
+            .onChange(of: library.blocksGameplayTouch) { _, _ in configureGamepad(landscape: landscape); logState("blocked", geo.size, landscape) }
+            .onChange(of: m.opacity) { _, _ in logState("opacity", geo.size, landscape) }
+            .onChange(of: library.opacity) { _, _ in logState("session-opacity", geo.size, landscape) }
+            .onChange(of: library.current != nil) { _, _ in logState("session", geo.size, landscape) }
             .onDisappear { GamepadInput.shared.configureTouch(controls: []) }
         }
         .ignoresSafeArea()
@@ -4250,6 +4253,22 @@ struct TouchControlsOverlay: View {
         } else {
             buttons.opacity(alpha)
         }
+    }
+
+    /// madeira-doge: one line whenever something that shows, hides or fades the on-screen
+    /// controls changes, so a log can say why the buttons went away. Opacities are
+    /// rounded to one decimal and identical lines are dropped (a slider drag is a few lines).
+    private static var lastState = ""
+    private func logState(_ why: String, _ size: CGSize, _ landscape: Bool) {
+        let session = library.current != nil
+        let drawn = landscape && (m.visible || m.editing) && !library.blocksGameplayTouch
+        let line = "drawn=\(drawn ? 1 : 0) landscape=\(landscape ? 1 : 0) visible=\(m.visible ? 1 : 0) editing=\(m.editing ? 1 : 0) "
+            + "blocked=\(library.blocksGameplayTouch ? 1 : 0) session=\(session ? 1 : 0) "
+            + "opacity=\(String(format: "%.1f", m.opacity)) session-opacity=\(String(format: "%.1f", library.opacity)) "
+            + "controls=\(m.controls.count) size=\(Int(size.width))x\(Int(size.height))"
+        guard line != Self.lastState else { return }
+        Self.lastState = line
+        LogStore.shared.log("[touch-controls] madeira-doge \(why): \(line)")
     }
 
     private func configureGamepad(landscape: Bool) {
