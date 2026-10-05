@@ -1204,6 +1204,26 @@ done:
     return status;
 }
 
+/* madeira-doge: madeira_cas.cpp's switches, read once. The value returned goes
+ * into the conversion cache key. */
+static int g_cas_on = -1, g_cas_mode = -1, g_cas_scalar = 1;
+static pthread_once_t g_cas_once = PTHREAD_ONCE_INIT;
+static void mad_cas_cfg_once(void)
+{
+    char v[16];
+    g_cas_mode = -1;
+    if (madeira_cfg_get("cas-mode", v, sizeof v) && v[0] >= '0' && v[0] <= '4') g_cas_mode = v[0] - '0';
+    g_cas_scalar = !(madeira_cfg_get("pcc-scalar", v, sizeof v) && v[0] == '0');   /* one-lane waves, default on */
+    madeira_cas_scalar(g_cas_scalar);
+    g_cas_on = !(madeira_cfg_get("cas-strong", v, sizeof v) && v[0] == '0');
+}
+static unsigned mad_cas_key(void)
+{
+    enum { CAS_REV = 2 };
+    pthread_once(&g_cas_once, mad_cas_cfg_once);
+    return (unsigned)CAS_REV << 8 | (unsigned)(g_cas_mode + 1) << 2 | (unsigned)g_cas_scalar << 1 | (unsigned)(g_cas_on > 0);
+}
+
 /* ---------------------------------------------------------------------------
  * ml1990: DXIL conversion reuse (see madeira_dxil_cache.h for the key).
  *
@@ -1447,7 +1467,12 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         size_t hit_len = 0;
         env.converter_ident = g_ir.ident;
         env.build_stamp = __DATE__ " " __TIME__;
-        env.ags_rewrite = (uint32_t)mad_ags_enabled();
+        /* madeira-doge: the compute rewrite's switches change what is stored, so
+         * they are part of the key too (builds up to 106 left them out, and a
+         * changed cas-strong / cas-mode / pcc-scalar kept getting the library an
+         * earlier setting had stored). The leading number is the rewrite's own
+         * revision: raise it whenever madeira_cas.cpp changes what it emits. */
+        env.ags_rewrite = (uint32_t)mad_ags_enabled() | (uint32_t)mad_cas_key() << 1;
         env.compat_flags = (uint32_t)IRCompatibilityFlagForceTextureArray;
         mad_dxc_key(a, &env, &dxc_key, &dxc_check);
         if (dxc_slot) hit = mad_dxc_slot_take(dxc_key, dxc_check, &hit_len);
@@ -1732,16 +1757,11 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     need = g_ir.IRMetalLibGetBytecode(lib, lib_bytes);
     if (!need) { status = MADEIRA_IR_NO_METALLIB; goto done; }
     if (stage == IRShaderStageCompute) {   /* madeira-doge: madeira_cas.cpp */
-        static int cas_on = -1, cas_mode = -1; static unsigned cas_said;
+        static unsigned cas_said;
         void *nb = NULL; size_t nlen = 0; char cnote[256];
-        if (cas_on < 0) {
-            char v[16];
-            cas_on = !(madeira_cfg_get("cas-strong", v, sizeof v) && v[0] == '0');
-            if (madeira_cfg_get("cas-mode", v, sizeof v) && v[0] >= '0' && v[0] <= '4') cas_mode = v[0] - '0';
-            madeira_cas_scalar(!(madeira_cfg_get("pcc-scalar", v, sizeof v) && v[0] == '0'));   /* one-lane waves, default on */
-        }
-        if (cas_on) {
-            int crc = madeira_cas_fix(lib_bytes, (size_t)need, &nb, &nlen, cnote, sizeof cnote, cas_mode);
+        (void)mad_cas_key();
+        if (g_cas_on) {
+            int crc = madeira_cas_fix(lib_bytes, (size_t)need, &nb, &nlen, cnote, sizeof cnote, g_cas_mode);
             if (crc == 1 && nb && nlen) {
                 free(lib_bytes);
                 lib_bytes = (uint8_t *)nb; nb = NULL;

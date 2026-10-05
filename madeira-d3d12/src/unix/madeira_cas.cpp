@@ -144,14 +144,30 @@ unsigned rewrite(Module &m, int mode) {
 }
 
 /* madeira-doge: run each thread of a Persistent*ClusterCulling kernel as a wave
- * of ONE active lane. The shader shares its queue bookkeeping across the wave
- * (the first lane does one atomic for everybody, the others read its result
- * with WaveReadLaneFirst / WaveReadLaneAt) and every discarded command buffer
- * of build 73 had this kernel as its first unfinished encoder, with no other
- * command buffer named as the cause. A wave in which a single lane is active
- * is something the shader has to handle anyway; in it a ballot is the lane's
- * own bit, a prefix count is zero, and "the first lane" is the lane itself --
- * so nothing depends on how Metal's SIMD groups reconverge inside the loop. */
+ * of ONE lane. The shader shares its queue bookkeeping across the wave (the
+ * first lane does one atomic for everybody, the others read its result with
+ * WaveReadLaneFirst / WaveReadLaneAt), which is only right when Metal's SIMD
+ * group reconverges inside the loop the way a D3D wave does; when it does not,
+ * the queue's count leaks and every wave spins until the GPU watchdog fires.
+ * With one lane a ballot is the lane's own bit, a prefix count is zero and "the
+ * first lane" is the lane itself.
+ *
+ * Three things have to change together (builds up to 106 did only the first,
+ * which left the kernel culling one item in 32 of one chunk in 32, and could
+ * leave threads waiting at the barrier for threads that had returned):
+ *   - the wave intrinsics and the lane index;
+ *   - the lane COUNT. The converter folds WaveGetLaneCount() to 32, so it is
+ *     found by shape: chunks = (n + 31) >> 5, min(32, 32), the chunk's first
+ *     item ((task - 1) >> 13) & 0x7ffe0 with its end at + 32, and the item
+ *     loop's step of 32. Each becomes its one-lane form. If the shapes are not
+ *     all there, nothing is changed and the kernel keeps its waves;
+ *   - the group-sync barrier at the end of the loop: one-lane waves leave the
+ *     loop at different times, and a thread group barrier must not be reached
+ *     by only some of its threads. The memory fence before it stays. */
+static bool is_c(const Value *v, uint64_t c) {
+    auto *ci = dyn_cast<ConstantInt>(v);
+    return ci && ci->getBitWidth() <= 64 && ci->getZExtValue() == c;
+}
 bool scalarize(Module &m, Function *kernel, unsigned &ncalls, std::string &why) {
     std::vector<std::pair<CallInst *, int>> sites;   /* 0 ballot, 1 pass arg 0 through, 2 true */
     for (Function &f : m) {
@@ -173,6 +189,59 @@ bool scalarize(Module &m, Function *kernel, unsigned &ncalls, std::string &why) 
         }
     }
     if (sites.empty()) { why = "no simd calls"; return false; }
+    if (!kernel) { why = "no kernel function"; return false; }
+    /* The lane count, by shape. Everything is matched before anything is changed. */
+    std::vector<Instruction *> ceil_sites, step_adds, end_adds, barriers;
+    std::vector<CallInst *> min_sites;
+    BinaryOperator *chunk_and = nullptr; unsigned nchunk = 0;
+    for (BasicBlock &bb : *kernel)
+        for (Instruction &i : bb) {
+            if (auto *ci = dyn_cast<CallInst>(&i)) {
+                Function *cf = ci->getCalledFunction();
+                if (!cf) continue;
+                if (cf->getName().startswith("air.min.u.i32") && ci->arg_size() == 2 && is_c(ci->getArgOperand(0), 32) && is_c(ci->getArgOperand(1), 32)) min_sites.push_back(ci);
+                else if (cf->getName().startswith("air.wg.barrier")) barriers.push_back(ci);
+                continue;
+            }
+            auto *bo = dyn_cast<BinaryOperator>(&i);
+            if (!bo || !bo->getType()->isIntegerTy(32)) continue;
+            if (bo->getOpcode() == Instruction::LShr && is_c(bo->getOperand(1), 5)) {
+                auto *ad = dyn_cast<BinaryOperator>(bo->getOperand(0));
+                if (ad && ad->getOpcode() == Instruction::Add && is_c(ad->getOperand(1), 31)) ceil_sites.push_back(bo);
+            } else if (bo->getOpcode() == Instruction::And && is_c(bo->getOperand(1), 524256)) {
+                auto *sh = dyn_cast<BinaryOperator>(bo->getOperand(0));
+                if (sh && sh->getOpcode() == Instruction::LShr && is_c(sh->getOperand(1), 13) && sh->hasOneUse()) { chunk_and = bo; nchunk++; }
+            } else if (bo->getOpcode() == Instruction::Add && is_c(bo->getOperand(1), 32)) {
+                auto *ph = dyn_cast<PHINode>(bo->getOperand(0));
+                if (ph) for (Value *iv : ph->incoming_values()) if (iv == bo) { step_adds.push_back(bo); break; }
+            }
+        }
+    if (ceil_sites.size() != 1 || min_sites.empty() || nchunk != 1 || step_adds.size() != 1) {
+        why = "lane count shapes: " + std::to_string(ceil_sites.size()) + " ceil, " + std::to_string(min_sites.size()) + " min, " +
+              std::to_string(nchunk) + " chunk, " + std::to_string(step_adds.size()) + " step";
+        return false;
+    }
+    for (User *u : chunk_and->users()) {
+        auto *ub = dyn_cast<BinaryOperator>(u);
+        if (ub && ub->getOpcode() == Instruction::Add && ub->getOperand(0) == chunk_and && is_c(ub->getOperand(1), 32)) end_adds.push_back(ub);
+        else if (ub && ub->getOpcode() == Instruction::Shl && ub->getOperand(0) == chunk_and) continue;
+        else { why = "chunk base has a use that is neither its shift nor its end"; return false; }
+    }
+    if (end_adds.size() != 1) { why = "chunk end: " + std::to_string(end_adds.size()) + " found"; return false; }
+    {
+        IntegerType *i32 = Type::getInt32Ty(m.getContext());
+        BinaryOperator *ce = cast<BinaryOperator>(ceil_sites[0]);
+        Instruction *ca = cast<Instruction>(ce->getOperand(0));
+        ce->replaceAllUsesWith(ca->getOperand(0));                                             /* chunks = n */
+        ce->eraseFromParent();
+        if (ca->use_empty()) ca->eraseFromParent();
+        for (CallInst *mc : min_sites) { mc->replaceAllUsesWith(ConstantInt::get(i32, 1)); mc->eraseFromParent(); }   /* min(32, lanes) = 1 */
+        cast<BinaryOperator>(chunk_and->getOperand(0))->setOperand(1, ConstantInt::get(i32, 18));
+        chunk_and->setOperand(1, ConstantInt::get(i32, 16383));                               /* first item = chunk */
+        end_adds[0]->setOperand(1, ConstantInt::get(i32, 1));                                  /* end = chunk + 1 */
+        step_adds[0]->setOperand(1, ConstantInt::get(i32, 1));                                 /* next item */
+        for (Instruction *bi : barriers) bi->eraseFromParent();
+    }
     /* The lane index: the kernel argument tagged air.thread_index_in_simdgroup. */
     if (NamedMDNode *k = m.getNamedMetadata("air.kernel"))
         if (k->getNumOperands() && k->getOperand(0)->getNumOperands() > 2)
