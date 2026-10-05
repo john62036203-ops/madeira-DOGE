@@ -2877,6 +2877,36 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                         ios_guest_block_dump( fx[0], rip, cur_teb->Peb );
                         ios_guest_branch_history_dump( fex_state, rip, cur_teb->Peb );
                     }
+                    /* madeira-doge: an unhandled access violation in a protected start-up stub
+                     * (MHR, RE) is not an illegal instruction, so none of the above ran. With
+                     * env.MADEIRA_FEX_BRANCH_HISTORY = 1 show the executed exits and the guest
+                     * bytes around the reported rip (512 before, 64 after), read safely. */
+                    if (!guest_diag && exit_code < 0 && (!handle || handle == NtCurrentProcess()))
+                    {
+                        const char *want = getenv( "MADEIRA_FEX_BRANCH_HISTORY" );
+                        static unsigned mad_reports;
+                        if (want && want[0] == '1' && __atomic_fetch_add( &mad_reports, 1, __ATOMIC_RELAXED ) < 4)
+                        {
+                            uint64_t from = rip >= 512 ? rip - 512 : 0, at;
+                            ios_guest_block_dump( fx[0], rip, cur_teb->Peb );
+                            ios_guest_branch_history_dump( fex_state, rip, cur_teb->Peb );
+                            for (at = from; at < rip + 64; at += 32)
+                            {
+                                unsigned char row[32];
+                                mach_vm_size_t got = 0;
+                                char text[32 * 3 + 1];
+                                unsigned k;
+                                if (mach_vm_read_overwrite( mach_task_self(), at, sizeof(row),
+                                        (mach_vm_address_t)row, &got ) != KERN_SUCCESS || got != sizeof(row))
+                                {
+                                    dprintf( 2, "[guest-bytes-wide] %#llx: unreadable\n", (unsigned long long)at );
+                                    continue;
+                                }
+                                for (k = 0; k < 32; k++) snprintf( text + k * 3, 4, "%02x ", row[k] );
+                                dprintf( 2, "[guest-bytes-wide] %#llx: %s\n", (unsigned long long)at, text );
+                            }
+                        }
+                    }
                     dprintf(2, "[term-stack] g0-7: %llx %llx %llx %llx %llx %llx %llx %llx\n",
                             gregs[0], gregs[1], gregs[2], gregs[3],
                             gregs[4], gregs[5], gregs[6], gregs[7]);
