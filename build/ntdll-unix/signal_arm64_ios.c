@@ -4752,11 +4752,19 @@ skip_reclaim_band: ;
                                 mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
                                                 (vm_region_info_t)&rbi, &rc, &ro ) == KERN_SUCCESS)
                             { hp = rbi.protection; rbase = (unsigned long long)ra; rsize = (unsigned long long)rs; }
+                            unsigned mad_fault_insn = 0;
+                            {   /* read through the kernel: the pc of a fault is not always readable */
+                                mach_vm_size_t got = 0;
+                                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)fault_pc_check, 4,
+                                                            (mach_vm_address_t)&mad_fault_insn, &got ) != KERN_SUCCESS || got != 4)
+                                    mad_fault_insn = 0;
+                            }
                             dprintf(STDERR_FILENO,
-                                "[fault_rip] cnt=%d rip=0x%llx pc=0x%llx addr=0x%llx "
+                                "[fault_rip] cnt=%d rip=0x%llx pc=0x%llx insn=0x%08x addr=0x%llx "
                                 "kr=%llu(%s) entryprot=%d nowprot=%d region=0x%llx+0x%llx%s%s%s rev=ml555\n",
                                 cnt, (unsigned long long)state_rip_q,
                                 (unsigned long long)fault_pc_check,
+                                mad_fault_insn,   /* madeira-doge: the host instruction that faulted */
                                 (unsigned long long)fault_addr,
                                 fault_kr,
                                 fault_kr == 1 ? "INVALID_ADDRESS" :

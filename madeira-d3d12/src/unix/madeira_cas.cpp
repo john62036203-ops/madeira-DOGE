@@ -43,6 +43,7 @@
 #include <vector>
 #include <string>
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/BasicBlock.h"
@@ -292,6 +293,104 @@ bool scalarize(Module &m, Function *kernel, unsigned &ncalls, std::string &why) 
     return true;
 }
 
+/* madeira-doge: pcc-scalar = 2 -- keep the 32-lane waves, take the queue's
+ * BOOKKEEPING out of them.
+ *
+ * The kernel does its accounting inside branches only some lanes take:
+ *
+ *     if (pushed) { n = WaveActiveCountBits(true); if (WaveIsFirstLane()) count += n; }
+ *     n = WaveActiveCountBits(true); p = WavePrefixCountBits(true);
+ *     if (p == 0) base = InterlockedAdd(cursor, n);  slot = WaveReadLaneFirst(base) + p;
+ *
+ * which is right only if "the active lanes" inside the branch are the lanes
+ * that took it. Build 109 with untouched waves (SIMD-aligned groups, strong
+ * compare-exchange) left tasks in the ring with the count at zero and hung on
+ * the first large dispatch, as it would if those calls saw every lane. Each
+ * lane now does its own: count += 1, slot = InterlockedAdd(cursor, 1). The sum
+ * is the same and nothing depends on which lanes Metal calls active.
+ *
+ * What stays a wave operation is what the wave has to agree on, all of it at
+ * points every lane reaches: the job the wave works on (first lane fetches,
+ * the others read it), the task picked each round (ballot + read-lane-at) and
+ * the lane's index, which is taken from the thread's index in its SIMD group
+ * instead of a prefix count. Needs tg-simd = 1 (a thread group is one wave). */
+bool bookkeep(Module &m, Function *kernel, unsigned &ncalls, std::string &why) {
+    if (!kernel) { why = "no kernel function"; return false; }
+    Argument *lane = nullptr;
+    if (NamedMDNode *k = m.getNamedMetadata("air.kernel"))
+        if (k->getNumOperands() && k->getOperand(0)->getNumOperands() > 2)
+            if (auto *args = dyn_cast_or_null<MDNode>(k->getOperand(0)->getOperand(2).get()))
+                for (const MDOperand &ao : args->operands()) {
+                    auto *an = dyn_cast_or_null<MDNode>(ao.get());
+                    if (!an || an->getNumOperands() < 2) continue;
+                    auto *tag = dyn_cast_or_null<MDString>(an->getOperand(1).get());
+                    auto *idx = dyn_cast_or_null<ConstantAsMetadata>(an->getOperand(0).get());
+                    if (!tag || !idx || tag->getString() != "air.thread_index_in_simdgroup") continue;
+                    uint64_t i = cast<ConstantInt>(idx->getValue())->getZExtValue();
+                    if (i < kernel->arg_size()) lane = kernel->getArg((unsigned)i);
+                }
+    if (!lane || !lane->getType()->isIntegerTy(32)) { why = "no lane index argument"; return false; }
+    auto callee = [](Value *v, const char *prefix) -> CallInst * {
+        auto *ci = dyn_cast<CallInst>(v);
+        return ci && ci->getCalledFunction() && ci->getCalledFunction()->getName().startswith(prefix) ? ci : nullptr;
+    };
+    auto ballot_true = [&](Value *v) { CallInst *b = callee(v, "air.simd_ballot"); return b && b->arg_size() == 1 && is_c(b->getArgOperand(0), 1); };
+    std::vector<CallInst *> counts, ranks_a, ranks_b, firsts, adds_a, casts;
+    for (BasicBlock &bb : *kernel) {
+        CallInst *live_count = nullptr;   /* an active-lane count in this block that something uses */
+        for (Instruction &i : bb) {
+            CallInst *pc = callee(&i, "air.popcount");
+            if (CallInst *f = callee(&i, "air.simd_is_first")) { firsts.push_back(f); continue; }
+            if (CallInst *b = callee(&i, "air.simd_broadcast_first")) { casts.push_back(b); continue; }
+            if (!pc || pc->arg_size() != 1) continue;
+            Value *x = pc->getArgOperand(0);
+            if (ballot_true(x)) {
+                if (pc->use_empty()) continue;
+                for (User *u : pc->users()) {
+                    Value *val = pc; User *uu = u;
+                    if (auto *neg = dyn_cast<BinaryOperator>(u)) {
+                        if (neg->getOpcode() != Instruction::Sub || !is_c(neg->getOperand(0), 0) || !neg->hasOneUse()) { why = "an active-lane count is used in arithmetic"; return false; }
+                        val = neg; uu = *neg->user_begin();
+                    }
+                    CallInst *add = callee(uu, "air.atomic.global.add");
+                    if (!add || add->arg_size() < 2 || add->getArgOperand(1) != val) { std::string us; raw_string_ostream os(us); uu->print(os); why = "an active-lane count feeds something other than an atomic add:" + os.str().substr(0, 140); return false; }
+                    adds_a.push_back(add);
+                }
+                counts.push_back(pc); live_count = pc;
+            } else if (auto *an = dyn_cast<BinaryOperator>(x)) {
+                if (an->getOpcode() != Instruction::And || !(ballot_true(an->getOperand(0)) || ballot_true(an->getOperand(1)))) continue;
+                (live_count ? ranks_a : ranks_b).push_back(pc);
+            }
+        }
+    }
+    if (counts.empty() || ranks_a.empty() || ranks_b.empty()) {
+        why = "bookkeeping shapes: " + std::to_string(counts.size()) + " counts, " + std::to_string(ranks_a.size()) + "+" + std::to_string(ranks_b.size()) + " ranks";
+        return false;
+    }
+    /* A read-first-lane of what one of those adds returned becomes the lane's own value. */
+    std::vector<CallInst *> casts_a;
+    for (CallInst *b : casts) {
+        std::vector<Value *> work{b->getArgOperand(0)}; SmallPtrSet<Value *, 16> seen; bool own = false;
+        while (!work.empty() && !own && seen.size() < 32) {
+            Value *v = work.back(); work.pop_back();
+            if (!seen.insert(v).second) continue;
+            if (auto *ci = dyn_cast<CallInst>(v)) { for (CallInst *a : adds_a) if (a == ci) own = true; }
+            else if (auto *ph = dyn_cast<PHINode>(v)) { for (Value *iv : ph->incoming_values()) work.push_back(iv); }
+            else if (auto *se = dyn_cast<SelectInst>(v)) { work.push_back(se->getTrueValue()); work.push_back(se->getFalseValue()); }
+        }
+        if (own) casts_a.push_back(b);
+    }
+    for (CallInst *c : counts) c->replaceAllUsesWith(ConstantInt::get(c->getType(), 1));
+    for (CallInst *r : ranks_a) r->replaceAllUsesWith(ConstantInt::get(r->getType(), 0));
+    for (CallInst *r : ranks_b) r->replaceAllUsesWith(lane);
+    for (CallInst *f : firsts) f->replaceAllUsesWith(ConstantInt::getTrue(f->getType()));
+    for (CallInst *b : casts_a) b->replaceAllUsesWith(b->getArgOperand(0));
+    ncalls = (unsigned)(counts.size() + ranks_a.size() + ranks_b.size() + firsts.size() + casts_a.size());
+    why = std::to_string(counts.size()) + " counts, " + std::to_string(ranks_a.size()) + " slot ranks, " + std::to_string(ranks_b.size()) +
+          " lane indices, " + std::to_string(firsts.size()) + " first-lane tests, " + std::to_string(casts_a.size()) + " of " + std::to_string(casts.size()) + " read-firsts";
+    return true;
+}
+
 int g_scalar = 0;
 
 }  // namespace
@@ -345,7 +444,9 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
             if (auto *cm = dyn_cast_or_null<ConstantAsMetadata>(k->getOperand(0)->getOperand(0).get()))
                 if (auto *kf = dyn_cast<Function>(cm->getValue())) { kname = kf->getName().str(); kfn = kf; }
     unsigned nsimd = 0; std::string swhy; bool scal = false;
-    if (g_scalar && kname.find("ClusterCulling") != std::string::npos) scal = scalarize(**mod, kfn, nsimd, swhy);
+    bool book = false;
+    if (g_scalar == 2 && kname.find("ClusterCulling") != std::string::npos) book = bookkeep(**mod, kfn, nsimd, swhy);
+    else if (g_scalar && kname.find("ClusterCulling") != std::string::npos) scal = scalarize(**mod, kfn, nsimd, swhy);
     unsigned n = mode == 0 ? nsites : rewrite(**mod, mode);
     if (!n) { if (note && note_cap) snprintf(note, note_cap, "weak compare-exchange present but no call site matched"); return -1; }
     {
@@ -419,7 +520,7 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
     *out = o; *out_len = total;
     if (note && note_cap) snprintf(note, note_cap, "'%s' mode %d: %u weak compare-exchange(s) %s; %s%s (%u wave calls) (%llu -> %llu bytes of bitcode)", kname.c_str(), mode, n,
                                    mode == 2 ? "made strong (loop)" : mode == 4 ? "made strong (four attempts, no loop)" : mode == 1 ? "looped without the result (diagnostic)" : "left as they were, module rewritten only (diagnostic)",
-                                   scal ? "one-lane waves" : g_scalar ? "waves untouched: " : "waves untouched", scal ? "" : swhy.c_str(), nsimd,
+                                   scal ? "one-lane waves" : book ? "per-lane bookkeeping: " : g_scalar ? "waves untouched: " : "waves untouched", scal ? "" : swhy.c_str(), nsimd,
                                    (unsigned long long)bc_size, (unsigned long long)nb.size());
     return 1;
 }

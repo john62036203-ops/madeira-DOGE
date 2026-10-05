@@ -1213,15 +1213,16 @@ static void mad_cas_cfg_once(void)
     char v[16];
     g_cas_mode = -1;
     if (madeira_cfg_get("cas-mode", v, sizeof v) && v[0] >= '0' && v[0] <= '4') g_cas_mode = v[0] - '0';
-    g_cas_scalar = !(madeira_cfg_get("pcc-scalar", v, sizeof v) && v[0] == '0');   /* one-lane waves, default on */
+    /* 0 waves untouched, 1 one-lane waves (default), 2 waves kept with per-lane queue bookkeeping */
+    g_cas_scalar = madeira_cfg_get("pcc-scalar", v, sizeof v) ? (v[0] == '0' ? 0 : v[0] == '2' ? 2 : 1) : 1;
     madeira_cas_scalar(g_cas_scalar);
     g_cas_on = !(madeira_cfg_get("cas-strong", v, sizeof v) && v[0] == '0');
 }
 static unsigned mad_cas_key(void)
 {
-    enum { CAS_REV = 3 };
+    enum { CAS_REV = 4 };
     pthread_once(&g_cas_once, mad_cas_cfg_once);
-    return (unsigned)CAS_REV << 8 | (unsigned)(g_cas_mode + 1) << 2 | (unsigned)g_cas_scalar << 1 | (unsigned)(g_cas_on > 0);
+    return (unsigned)CAS_REV << 8 | (unsigned)(g_cas_mode + 1) << 4 | (unsigned)g_cas_scalar << 1 | (unsigned)(g_cas_on > 0);
 }
 
 /* ---------------------------------------------------------------------------

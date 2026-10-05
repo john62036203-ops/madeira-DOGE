@@ -144,6 +144,7 @@ python3 "$R/tools/patch-fex-ios-avx.py" "$R/FEX/$CPUF"
 python3 "$R/tools/patch-fex-ios-alias-full-quiet.py" "$R/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp"
 python3 "$R/tools/patch-fex-ios-pool-null.py" "$R/FEX/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h"
 python3 "$R/tools/patch-fex-ios-invalid-bytes.py" "$R/FEX/FEXCore/Source/Interface/Core/Frontend.cpp"
+python3 "$R/tools/patch-fex-ios-smc-read.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 build
 git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
