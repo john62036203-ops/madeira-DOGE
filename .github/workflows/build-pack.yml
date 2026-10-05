@@ -22,11 +22,12 @@ on:
         type: boolean
         default: true
   push:
-    branches: [claude/madeira-bcd-repo-ymg5cb]
+    # madeira-doge: the branch this fork builds from (the upstream working
+    # branch named here before does not exist in the fork).
+    branches: [from-221]
     paths:
       - research/madeira-d3d12/src/pe/**
       - tools/build-madeira-d3d12-dll.sh
-      - .github/workflows/build-pack.yml
 
 concurrency:
   group: build-pack-${{ github.ref }}
