@@ -118,6 +118,7 @@ struct BCDGameSections: View {
     @State private var nvidia = false
     @State private var metalFX = ""
     @State private var frameGen = ""
+    @State private var syncEngine = ""
     @State private var tess = ""
     @State private var submit = ""
     @State private var gpuSync = ""
@@ -138,6 +139,7 @@ struct BCDGameSections: View {
         _nvidia = State(initialValue: LibraryPrefs.nvidia(windowsPath))
         _metalFX = State(initialValue: p.get("metalfx-upscale") ?? "")
         _frameGen = State(initialValue: p.get("env.MADEIRA_FRAMEGEN") ?? "")
+        _syncEngine = State(initialValue: p.get("inproc-sync") ?? "")
         _tess = State(initialValue: p.get("dxil-tess-max-factor") ?? "")
         _submit = State(initialValue: p.get("async-submit") ?? "")
         _gpuSync = State(initialValue: p.get("fence-chain") ?? "")
@@ -169,6 +171,7 @@ struct BCDGameSections: View {
         overlay = p.get("env.MADEIRA_STEAM_OVERLAY") == "1"
         metalFX = p.get("metalfx-upscale") ?? ""
         frameGen = p.get("env.MADEIRA_FRAMEGEN") ?? ""
+        syncEngine = p.get("inproc-sync") ?? ""
         tess = p.get("dxil-tess-max-factor") ?? ""
         submit = p.get("async-submit") ?? ""
         gpuSync = p.get("fence-chain") ?? ""
@@ -221,6 +224,10 @@ struct BCDGameSections: View {
                 .onChange(of: metalFX) { _, v in store("metalfx-upscale", v) }
             choicePicker("Frame generation", $frameGen, GameProfile.frameGenChoices)
                 .onChange(of: frameGen) { _, v in store("env.MADEIRA_FRAMEGEN", v) }
+            // madeira-doge: this game's sync engine (inproc-sync in its own file; the
+            // native side reads it there, Library.swift drops the fastsync export).
+            choicePicker("Sync engine (this game)", $syncEngine, [("", "App setting (default)"), ("1", "Madsync")])
+                .onChange(of: syncEngine) { _, v in store("inproc-sync", v) }
             choicePicker("Tessellation detail (D3D12)", $tess, GameProfile.tessChoices)
                 .onChange(of: tess) { _, v in store("dxil-tess-max-factor", v) }
             choicePicker("D3D12 command encoding", $submit, GameProfile.submitChoices)
@@ -238,7 +245,10 @@ struct BCDGameSections: View {
             Text("MetalFX upscaling renders at the resolution above and scales the picture up 1.5× or 2× with "
                  + "Apple's scaler; the \"MetalFX 1.5×\" resolution is this screen's shape at 480 lines, which "
                  + "1.5× brings to 720. Frame generation (experimental) shows a MetalFX-interpolated frame between "
-                 + "every two game frames; FPS limits do not apply while it is on. The advanced file takes any "
+                 + "every two game frames; FPS limits do not apply while it is on. Sync engine: Madsync keeps thread "
+                 + "waits inside the game instead of asking the Wine server (faster for games that wait a lot, "
+                 + "such as Sekiro; a game's own online service may not connect); it applies from the next full "
+                 + "restart of the app. The advanced file takes any "
                  + "madeira.cfg key or env.NAME line for this game only.")
         }
         Section {
