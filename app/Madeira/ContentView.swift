@@ -4174,6 +4174,33 @@ enum TouchControlsHost {
         window?.frame = scene.coordinateSpace.bounds
         fputs("[controls] ml644 overlay attached frame=\(window?.frame ?? .zero) " +
               "controls=\(TouchControlsModel.shared.controls.count)\n", stderr)
+        // madeira-doge: the orientation notification arrives before the interface has
+        // finished turning, so the bounds read above can still be the old ones; a quick
+        // portrait-landscape-portrait flip then left the overlay with a stale frame and
+        // every control off screen. Fit it again once the rotation has settled.
+        for delay in [0.35, 1.2] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { refit(scene) }
+        }
+    }
+
+    private static func refit(_ scene: UIWindowScene) {
+        guard let w = window else { return }
+        let want = scene.coordinateSpace.bounds
+        let stale = w.frame != want || w.isHidden || (w.rootViewController?.view.frame.size ?? want.size) != want.size
+        guard stale else { return }
+        LogStore.shared.log("[touch-controls] madeira-doge refit: window \(Int(w.frame.width))x\(Int(w.frame.height)) hidden=\(w.isHidden ? 1 : 0) "
+                            + "view \(Int(w.rootViewController?.view.frame.width ?? 0))x\(Int(w.rootViewController?.view.frame.height ?? 0)) "
+                            + "-> \(Int(want.width))x\(Int(want.height))")
+        w.frame = want
+        w.isHidden = false
+        w.rootViewController?.view.frame = CGRect(origin: .zero, size: want.size)
+        w.rootViewController?.view.setNeedsLayout()
+    }
+
+    /// For the state log: the overlay window's own frame next to what SwiftUI was given.
+    static var frameText: String {
+        guard let w = window else { return "none" }
+        return "\(Int(w.frame.width))x\(Int(w.frame.height))\(w.isHidden ? " hidden" : "")"
     }
 }
 
@@ -4265,7 +4292,7 @@ struct TouchControlsOverlay: View {
         let line = "drawn=\(drawn ? 1 : 0) landscape=\(landscape ? 1 : 0) visible=\(m.visible ? 1 : 0) editing=\(m.editing ? 1 : 0) "
             + "blocked=\(library.blocksGameplayTouch ? 1 : 0) session=\(session ? 1 : 0) "
             + "opacity=\(String(format: "%.1f", m.opacity)) session-opacity=\(String(format: "%.1f", library.opacity)) "
-            + "controls=\(m.controls.count) size=\(Int(size.width))x\(Int(size.height))"
+            + "controls=\(m.controls.count) size=\(Int(size.width))x\(Int(size.height)) window=\(TouchControlsHost.frameText)"
         guard line != Self.lastState else { return }
         Self.lastState = line
         LogStore.shared.log("[touch-controls] madeira-doge \(why): \(line)")
