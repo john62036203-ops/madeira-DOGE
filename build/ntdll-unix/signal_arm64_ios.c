@@ -4774,6 +4774,43 @@ skip_reclaim_band: ;
                                 (entry_prot >= 0 && hp >= 0 && entry_prot != hp)
                                     ? "  <== PROT CHANGED MID-HANDLER (race)" : "",
                                 first_seen ? " [first]" : "");
+                            /* madeira-doge: an LSE atomic (x86 xchg / lock op) that faulted. What the
+                             * guest was doing and with which values is the only way to tell a wrong
+                             * emulation from a guest that got there with wrong data: the registers
+                             * of the instruction, guest rsp/rbp (x23/x29 under ARM64EC), the bytes
+                             * at the target and the guest code at the block's rip. First 24 only. */
+                            if ((mad_fault_insn & 0x3B200C00u) == 0x38200000u)
+                            {
+                                static int atomic_said;
+                                if (atomic_said < 24)
+                                {
+                                    unsigned char mb[8] = {0}, gb[32] = {0};
+                                    mach_vm_size_t g1 = 0, g2 = 0;
+                                    int rs = (mad_fault_insn >> 16) & 0x1f, rt = mad_fault_insn & 0x1f, rn = (mad_fault_insn >> 5) & 0x1f;
+                                    atomic_said++;
+                                    mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)fault_addr, sizeof(mb),
+                                                            (mach_vm_address_t)mb, &g1 );
+                                    if (state_rip_q)
+                                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)state_rip_q, sizeof(gb),
+                                                                (mach_vm_address_t)gb, &g2 );
+                                    dprintf(STDERR_FILENO,
+                                        "[fault-atomic] insn=0x%08x size=%d op=%s rs=x%d=0x%llx rt=x%d rn=x%d=0x%llx rsp(x23)=0x%llx rbp(x29)=0x%llx "
+                                        "mem=%02x %02x %02x %02x %02x %02x %02x %02x (%d read) "
+                                        "guest@rip=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x "
+                                        "%02x %02x %02x %02x %02x %02x %02x %02x (%d read)\n",
+                                        mad_fault_insn, 1 << (mad_fault_insn >> 30),
+                                        (mad_fault_insn & 0x8000) ? "swp" : "ld-op",
+                                        rs, rs == 31 ? 0ull : (unsigned long long)state.__x[rs], rt,
+                                        rn, rn == 31 ? (unsigned long long)__darwin_arm_thread_state64_get_sp(state)
+                                                     : (unsigned long long)state.__x[rn],
+                                        (unsigned long long)state.__x[23],
+                                        (unsigned long long)__darwin_arm_thread_state64_get_fp(state),
+                                        mb[0], mb[1], mb[2], mb[3], mb[4], mb[5], mb[6], mb[7], (int)g1,
+                                        gb[0], gb[1], gb[2], gb[3], gb[4], gb[5], gb[6], gb[7], gb[8], gb[9], gb[10], gb[11],
+                                        gb[12], gb[13], gb[14], gb[15], gb[16], gb[17], gb[18], gb[19], gb[20], gb[21], gb[22], gb[23],
+                                        (int)g2);
+                                }
+                            }
                         }
                     }
                     /* TEMP [rip-leak] task#34 ml64-class: guest RIP inside a

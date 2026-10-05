@@ -36,5 +36,20 @@ new = """      if (Exception->NumberParameters >= 2 && Exception->ExceptionInfor
 """ + old
 if old not in s:
     sys.exit("patch-fex-ios-smc-read: anchor not found in " + path)
-open(path, "w").write(s.replace(old, new, 1))
+s = s.replace(old, new, 1)
+
+# ... and what the unaligned-atomic helper left behind when it took such a fault.
+old2 = """          static unsigned SmcAtomicCount;
+"""
+new2 = """          if (Exception->NumberParameters >= 2 && Exception->ExceptionInformation[0] == 0) {
+            static std::atomic<uint32_t> IosSmcReadDone {0};
+            if (IosSmcReadDone.fetch_add(1, std::memory_order_relaxed) < 64) {
+              LogMan::Msg::EFmt("[smc-read] emulated as an unaligned atomic: pc {:X} -> {:X} x29 {:X} x23 {:X} x6 {:X}", SmcPc,
+                                NativeContext->Pc, NativeContext->Fp, NativeContext->X23, NativeContext->X6);
+            }
+          }
+""" + old2
+if old2 not in s:
+    sys.exit("patch-fex-ios-smc-read: second anchor not found in " + path)
+open(path, "w").write(s.replace(old2, new2, 1))
 print("patched")
