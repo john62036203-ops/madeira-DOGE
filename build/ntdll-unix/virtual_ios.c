@@ -1019,7 +1019,15 @@ static void *ios_pool_warmer_thread( void *arg )
              * addresses identify the owner offline (pool = RX base, FEX bands,
              * PA pools, guest heap). Every 5th cycle plus cycle 2, because the
              * walk is tens of thousands of kernel calls. */
-            if (cycle == 2 || (cycle % 5) == 0)
+            /* madeira-doge: THE WALK FROZE THE GAME. With P3R's address space (100,000+
+             * regions) one walk took 20-28 s, every fifth cycle, and the game presented
+             * nothing while it ran: the walk holds the map lock the game's own
+             * allocations and protection changes need. A walk that took longer than
+             * 300 ms is not repeated (env.MADEIRA_PHYS_MAP = 1 keeps it). */
+            static int phys_walk_off;
+            struct timespec phys_t0;
+            clock_gettime( CLOCK_MONOTONIC, &phys_t0 );
+            if (!phys_walk_off && (cycle == 2 || (cycle % 5) == 0))
             {
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];
@@ -1237,6 +1245,19 @@ static void *ios_pool_warmer_thread( void *arg )
                         /* ml1073: the array is libmalloc's OWN zone table, not a copy. ml1071
                          * vm_deallocate'd it and the next malloc in the process faulted on the
                          * freed metadata page (crash during desktop boot, ph-rdr39). Never free it. */
+                    }
+                }
+                {
+                    struct timespec phys_t1;
+                    long phys_ms;
+                    const char *keep = getenv( "MADEIRA_PHYS_MAP" );
+                    clock_gettime( CLOCK_MONOTONIC, &phys_t1 );
+                    phys_ms = (phys_t1.tv_sec - phys_t0.tv_sec) * 1000 + (phys_t1.tv_nsec - phys_t0.tv_nsec) / 1000000;
+                    if (phys_ms > 300 && !(keep && keep[0] == '1'))
+                    {
+                        phys_walk_off = 1;
+                        dprintf( 2, "[phys-map] madeira-doge: the walk took %ld ms at cycle=%u -- not repeated this "
+                                    "session (env.MADEIRA_PHYS_MAP = 1 keeps it)\n", phys_ms, cycle );
                     }
                 }
             }
