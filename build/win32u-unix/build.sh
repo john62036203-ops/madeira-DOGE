@@ -25,7 +25,7 @@ FAILED_FILES=""
 
 FREETYPE_DIR="$REPO_ROOT/build/freetype-ios"
 
-compile_one() {
+compile_one_seq() {
     local src=$1
     local name=$2
     shift 2
@@ -63,6 +63,11 @@ compile_one() {
         FAILED_FILES="$FAILED_FILES $name"
     fi
 }
+
+# Compiles run side by side (build/par.sh): compile_one queues one, and the
+# par_wait after the loop collects the results.
+. "$REPO_ROOT/build/par.sh"
+compile_one() { par_spawn compile_one_seq "$@"; }
 
 echo "=== Building win32u unix (iOS) ==="
 
@@ -126,6 +131,7 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
 
     compile_one "$src" "$name"
 done
+par_wait
 
 echo ""
 echo "Results: $SUCCEEDED succeeded, $FAILED failed"

@@ -45,7 +45,7 @@ CC_FLAGS=(
     -Wno-implicit-function-declaration
 )
 
-compile_one() {
+compile_one_seq() {
     local src=$1
     local name=$2
     echo -n "  $name... "
@@ -57,6 +57,11 @@ compile_one() {
         return 1
     fi
 }
+
+# Compiles run side by side (build/par.sh): compile_one queues one, and the
+# par_wait after the case block stops the script if any of them failed.
+. "$REPO_ROOT/build/par.sh"
+compile_one() { par_spawn compile_one_seq "$@"; }
 
 # Patched files: name:source_file:replaces_in_archive
 PATCHED_FILES=(
@@ -142,6 +147,11 @@ case "${1:-all}" in
         exit 1
         ;;
 esac
+par_wait
+if [ "$PAR_FAILED_JOBS" -ne 0 ]; then
+    echo "$PAR_FAILED_JOBS wineserver file(s) failed to compile"
+    exit 1
+fi
 
 echo ""
 echo "=== Updating libwineserver.a ==="

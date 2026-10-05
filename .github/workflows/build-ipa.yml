@@ -407,15 +407,21 @@ jobs:
             -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\"
             -D__WINESRC__ -DWINE_IOS=1 -Dmain=wineserver_main
             -Wno-implicit-function-declaration)
-          OK=0; BAD=0; BADLIST=""
-          for src in "$GITHUB_WORKSPACE"/wine/server/*.c; do
-            n=$(basename "$src" .c)
-            if xcrun -sdk iphoneos clang "${FLAGS[@]}" -c "$src" -o "$OBJ/base/$n.o" 2>"$OBJ/base/$n.err"; then
-              OK=$((OK+1))
+          # Side by side (build/par.sh); par_wait adds up the three counters.
+          . "$GITHUB_WORKSPACE/build/par.sh"
+          SUCCEEDED=0; FAILED=0; FAILED_FILES=""
+          base_cc() {
+            if xcrun -sdk iphoneos clang "${FLAGS[@]}" -c "$1" -o "$OBJ/base/$2.o" 2>"$OBJ/base/$2.err"; then
+              SUCCEEDED=$((SUCCEEDED+1))
             else
-              BAD=$((BAD+1)); BADLIST="$BADLIST $n"
+              FAILED=$((FAILED+1)); FAILED_FILES="$FAILED_FILES $2"
             fi
+          }
+          for src in "$GITHUB_WORKSPACE"/wine/server/*.c; do
+            par_spawn base_cc "$src" "$(basename "$src" .c)"
           done
+          par_wait
+          OK=$SUCCEEDED; BAD=$FAILED; BADLIST="$FAILED_FILES"
           echo "base compile: $OK ok, $BAD failed:$BADLIST"
           echo "::notice::base wineserver compile :: $OK ok, $BAD failed:$BADLIST"
           ar rcs "$OBJ/libwineserver.a" "$OBJ"/base/*.o

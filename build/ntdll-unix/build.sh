@@ -16,7 +16,7 @@ FAILED=0
 FAILED_FILES=""
 EXTRA_OBJS=()
 
-compile_one() {
+compile_one_seq() {
     local src=$1
     local name=$2
     echo -n "  $name... "
@@ -58,7 +58,7 @@ compile_one() {
 # route dlopen/dlsym at the static symtab (gnutls_symtab_ios.c).
 CRYPTO_DIR="$REPO_ROOT/build/crypto-unix"
 GNUTLS_PREFIX="$REPO_ROOT/toolchains/gnutls-ios"
-compile_unixlib() {
+compile_unixlib_seq() {
     local src=$1 name=$2 prefix=$3
     shift 3
     echo -n "  $name... "
@@ -84,6 +84,13 @@ compile_unixlib() {
         FAILED_FILES="$FAILED_FILES $name"
     fi
 }
+
+# Compiles run side by side (build/par.sh). The *_seq functions above are the
+# compiles themselves; these two queue one, and its result -- the .o and the
+# SUCCEEDED/FAILED counters -- exists only after the next par_wait.
+. "$REPO_ROOT/build/par.sh"
+compile_one() { par_spawn compile_one_seq "$@"; }
+compile_unixlib() { par_spawn compile_unixlib_seq "$@"; }
 
 echo "=== Building ntdll unix (iOS) ==="
 
@@ -165,6 +172,7 @@ if [ -f "$FFMPEG_PREFIX/include/libavcodec/avcodec.h" ]; then
         FAILED=$((FAILED + 1))
         FAILED_FILES="$FAILED_FILES wg_parser_apple_ios"
     fi
+    par_wait   # winegstreamer_unixlib.o is tested on the next line
     if [ -f "$OBJ_DIR/winegstreamer_unixlib.o" ] && [ -f "$OBJ_DIR/wg_parser_apple_ios.o" ]; then
         MEDIA_OBJS=("$OBJ_DIR/winegstreamer_unixlib.o" "$OBJ_DIR/wg_parser_apple_ios.o")
     else
@@ -213,10 +221,12 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
             # (fex_avx_redirect_ios.c: the AVX FEX module for a Steam game
             # only). If either half fails to build, file.c builds as before.
             FAILED_BEFORE=$FAILED
+            # In the foreground (compile_one_seq): each step below reads the
+            # result of the one before it.
             EXTRA_CFLAGS="-DNtCreateFile=wine_impl_NtCreateFile -DNtOpenFile=wine_impl_NtOpenFile" \
-                compile_one "$src" "file"
+                compile_one_seq "$src" "file"
             if [ "$FAILED" = "$FAILED_BEFORE" ]; then
-                compile_one "$BUILD_DIR/fex_avx_redirect_ios.c" "fex_avx_redirect"
+                compile_one_seq "$BUILD_DIR/fex_avx_redirect_ios.c" "fex_avx_redirect"
             fi
             if [ "$FAILED" = "$FAILED_BEFORE" ]; then
                 EXTRA_OBJS+=("$OBJ_DIR/fex_avx_redirect.o")
@@ -224,7 +234,7 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
             else
                 FAILED=$FAILED_BEFORE
                 echo "  [fex-avx] wrapper did not build; file.c without it (Dock AVX then applies to the whole session)"
-                compile_one "$src" "file"
+                compile_one_seq "$src" "file"
             fi
             ;;
         *)
@@ -232,6 +242,7 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
             ;;
     esac
 done
+par_wait
 
 echo ""
 echo "Results: $SUCCEEDED succeeded, $FAILED failed"

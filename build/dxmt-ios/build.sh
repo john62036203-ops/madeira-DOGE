@@ -57,7 +57,7 @@ SUCCEEDED=0
 FAILED=0
 FAILED_FILES=""
 
-compile_objc() {
+compile_objc_seq() {
     local src=$1 name=$2
     # MADEIRA_ONLY=<name>: recompile one object only. madeira_ir_unix carries a __DATE__
     # stamp in the shader-cache key, so a full rebuild costs a full shader recompile on device.
@@ -71,7 +71,7 @@ compile_objc() {
     fi
 }
 
-compile_cxx() {
+compile_cxx_seq() {
     local src=$1 name=$2 extra="${3:-}"
     # MADEIRA_ONLY=<name>: recompile one object only. madeira_ir_unix carries a __DATE__
     # stamp in the shader-cache key, so a full rebuild costs a full shader recompile on device.
@@ -86,7 +86,7 @@ compile_cxx() {
 }
 
 # MADEIRA: the native D3D9 frontend and its substrate (section 8.10 step 1).
-compile_madeira_cxx() {
+compile_madeira_cxx_seq() {
     local src=$1 name=$2 extra="${3:-}"
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang++ $COMMON_FLAGS $MADEIRA_CXX_FLAGS $MADEIRA_WARNINGS \
@@ -98,7 +98,7 @@ compile_madeira_cxx() {
     fi
 }
 
-compile_madeira_c() {
+compile_madeira_c_seq() {
     local src=$1 name=$2 extra="${3:-}"
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang $COMMON_FLAGS -std=c11 $MADEIRA_WARNINGS \
@@ -114,7 +114,7 @@ compile_madeira_c() {
 # Compiled into this library so the app can run the shader-converter gate
 # in-process. Guarded: the converter package is a locally supplied dependency
 # and the DXMT build must not start failing when it is absent.
-compile_objcxx_arc() {
+compile_objcxx_arc_seq() {
     local src=$1 name=$2 extra="${3:-}"
     # MADEIRA_ONLY=<name>: recompile one object only. madeira_ir_unix carries a __DATE__
     # stamp in the shader-cache key, so a full rebuild costs a full shader recompile on device.
@@ -127,6 +127,16 @@ compile_objcxx_arc() {
         echo "FAILED"; FAILED=$((FAILED+1)); FAILED_FILES="$FAILED_FILES $name"
     fi
 }
+# Compiles run side by side (build/par.sh). The *_seq functions above are the
+# compiles themselves; these queue one, and the par_wait before "Results"
+# collects them. Nothing in between reads a queued compile's object.
+. "$REPO_ROOT/build/par.sh"
+compile_objc() { par_spawn compile_objc_seq "$@"; }
+compile_cxx() { par_spawn compile_cxx_seq "$@"; }
+compile_madeira_cxx() { par_spawn compile_madeira_cxx_seq "$@"; }
+compile_madeira_c() { par_spawn compile_madeira_c_seq "$@"; }
+compile_objcxx_arc() { par_spawn compile_objcxx_arc_seq "$@"; }
+
 # madeira-bcd: deps.sh is `set -eu` and `exit 1`s when the package is absent;
 # sourced directly, that exit ends THIS script. Probe it in a subshell first.
 # MADEIRA_MSC_INCLUDE points at the converter's public headers alone (CI has
@@ -278,6 +288,7 @@ echo "=== MADEIRA: dxmt_madeira_native -- d3d9 unix boundary ==="
 compile_madeira_c "$DXMT_SRC/d3d9/unix/d3d9_unix.c" d3d9_unix
 compile_madeira_c "$DXMT_SRC/d3d9/unix/d3d9_unix_table.c" d3d9_unix_table
 compile_madeira_cxx "$DXMT_SRC/d3d9/unix/d3d9_native_glue.cpp" d3d9_native_glue
+par_wait
 
 echo ""
 echo "Results: $SUCCEEDED succeeded, $FAILED failed"
