@@ -130,6 +130,7 @@ fi
 #  - patch-fex-ios-alias-full-quiet.py: no LogMan call when the alias table is
 #    full (it ran nested inside a unix syscall and corrupted its frame).
 #  - patch-fex-ios-pool-null.py: a pooled buffer the band refused is never NULL.
+#  - patch-fex-ios-invalid-bytes.py: the bytes of an instruction the decoder refused.
 #  - patch-fex-ios-avx.py: AVX/AVX2 only when MADEIRA_FEX_AVX=1 at launch, so
 #    the same module serves both; xtajit64-avx.dll is kept as a copy for the
 #    bridge's existing switch.
@@ -142,8 +143,9 @@ python3 "$R/tools/patch-fex-ios-cpuid-index.py" "$R/FEX/FEXCore/Source/Interface
 python3 "$R/tools/patch-fex-ios-avx.py" "$R/FEX/$CPUF"
 python3 "$R/tools/patch-fex-ios-alias-full-quiet.py" "$R/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp"
 python3 "$R/tools/patch-fex-ios-pool-null.py" "$R/FEX/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h"
+python3 "$R/tools/patch-fex-ios-invalid-bytes.py" "$R/FEX/FEXCore/Source/Interface/Core/Frontend.cpp"
 build
-git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp
+git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
 cp "$B/Bin/libarm64ecfex.dll" "$AVX"
 echo "::notice::xtajit64.dll (and xtajit64-avx.dll) built from FEX $(git -C FEX rev-parse --short HEAD) with the map-notification and IntervalsLock self-deadlock fixes, IRCapRIP out of the game's TLS, the TSD-slot TEB for the WinAPI shims, the CPUID index wrap, and the MADEIRA_FEX_AVX opt-in, and shipped"
