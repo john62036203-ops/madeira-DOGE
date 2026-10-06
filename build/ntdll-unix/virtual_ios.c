@@ -963,6 +963,53 @@ static void *ios_pool_warmer_thread( void *arg )
                             (unsigned long long)vmi.compressed >> 20,
                             (unsigned long long)vmi.external >> 20,
                             (unsigned long long)vmi.reusable >> 20, cycle);
+                    {   /* madeira-doge: leave before the system does.
+                         *
+                         * The file tier keeps gigabytes of a game's memory off phys_footprint,
+                         * so jetsam's per-process limit is not what a game on this tier runs
+                         * into: the WHOLE device runs out. Onimusha (build 131-133) spent its
+                         * last 30-60 seconds under critical memory pressure at under 1 fps with
+                         * 350 MB of its own limit still unused, and then the phone restarted to
+                         * the Apple logo, every time. Critical pressure that lasts is the one
+                         * signal there is; after mem-guard-sec seconds of it (madeira.cfg,
+                         * default 12, 0 = never) the process ends itself, which is a game that
+                         * closes instead of a device that reboots. */
+                        static int guard_s = -1; static time_t crit_since; static unsigned sys_said;
+                        extern int ios_mem_pressure_level( void );
+                        int lvl = ios_mem_pressure_level();
+                        if (guard_s < 0)
+                        {
+                            char v[16];
+                            guard_s = madeira_cfg_get( "mem-guard-sec", v, sizeof v ) && v[0] ? atoi( v ) : 12;
+                            if (guard_s < 0) guard_s = 0;
+                            dprintf( 2, "[mem-guard] madeira-doge: the process ends itself after %d s of critical memory pressure (madeira.cfg mem-guard-sec; 0 = never)\n", guard_s );
+                        }
+                        if (lvl >= 1 && (sys_said++ % 8) == 0)
+                        {
+                            vm_statistics64_data_t hv; mach_msg_type_number_t hc = HOST_VM_INFO64_COUNT;
+                            if (host_statistics64( mach_host_self(), HOST_VM_INFO64, (host_info64_t)&hv, &hc ) == KERN_SUCCESS)
+                                dprintf( 2, "[mem-guard] pressure %s: device free %llu MB, inactive %llu MB, file-backed %llu MB, compressor %llu MB, wired %llu MB; ours %llu MB\n",
+                                         lvl >= 2 ? "CRITICAL" : "warning",
+                                         (unsigned long long)hv.free_count * vm_kernel_page_size >> 20,
+                                         (unsigned long long)hv.inactive_count * vm_kernel_page_size >> 20,
+                                         (unsigned long long)hv.external_page_count * vm_kernel_page_size >> 20,
+                                         (unsigned long long)hv.compressor_page_count * vm_kernel_page_size >> 20,
+                                         (unsigned long long)hv.wire_count * vm_kernel_page_size >> 20, fp_mb );
+                        }
+                        if (lvl >= 2)
+                        {
+                            time_t now = time( NULL );
+                            if (!crit_since) crit_since = now;
+                            else if (guard_s && now - crit_since >= guard_s)
+                            {
+                                dprintf( 2, "[mem-guard] madeira-doge: %ld s of critical memory pressure at %llu MB -- ending the process now, before the device runs out\n",
+                                         (long)(now - crit_since), fp_mb );
+                                usleep( 400000 );   /* let the log line reach its file */
+                                _exit( 0 );
+                            }
+                        }
+                        else crit_since = 0;
+                    }
                     /* madeira-doge: whose memory is the footprint? The kernel keeps it by
                      * tag: graphics (Metal / IOSurface storage charged to us), purgeable,
                      * media, network, and what is left is ordinary anonymous memory (guest
@@ -18029,6 +18076,20 @@ static void ios_swap_init( void )
     if (ios_swap_cap < (64ull << 20)) return;
     ios_swap_fd = open( f, O_RDWR | O_CLOEXEC );
     if (ios_swap_fd < 0) { dprintf( 2, "[swap] ml1077 cannot open %s (errno %d): tier OFF\n", f, errno ); return; }
+    /* madeira-doge: the file has no name from here on. A process that dies with
+     * gigabytes of dirty pages mapped from a NAMED file leaves the kernel to write
+     * them all back: Onimusha, killed at its memory limit with about 5 GB in the
+     * tier, restarted the phone every time -- "busy timeout (60s) ...
+     * AppleAPFSMediaBSDClient, AppleAPFSVolumeBSDClient", watchdogd's panic
+     * (panic-full 2026-10-06 17:19). Pages of a file with no links are discarded
+     * with it instead. Nothing opens the file by name after this, and the app
+     * removes the path before it creates the next one. MADEIRA_SWAP_KEEP=1 keeps
+     * the name (to look at the file's size from outside). */
+    {
+        const char *keep = getenv( "MADEIRA_SWAP_KEEP" );
+        if (!(keep && keep[0] == '1'))
+            dprintf( 2, "[swap] madeira-doge: backing file unlinked after open (%s): its pages go with the process\n", unlink( f ) ? "FAILED" : "ok" );
+    }
     ios_swap_config();
     ios_swap_logical = ios_swap_cap;
     if (ios_swap_broad && ios_swap_logical < (128ull << 30))
@@ -18140,6 +18201,7 @@ int madeira_pool_add( unsigned int entry, unsigned long long size )
                          (unsigned long long)(ios_pool_margin >> 20) );
     return 0;
 }
+int ios_mem_pressure_level( void ) { return __atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ); }
 void madeira_pool_set_pressure( int level )
 {
     __atomic_store_n( &ios_pool_pressure, level, __ATOMIC_RELAXED );
