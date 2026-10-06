@@ -12216,7 +12216,72 @@ static void mad_sc_memo_set(struct mad_sc_memo *m, const UINT64 key[2], unsigned
     if (m->blob && m->blob != blob) free(m->blob);
     m->key[0] = key[0]; m->key[1] = key[1]; m->blob = blob; m->size = size; m->fresh = fresh;
 }
+/* madeira-doge: the cache's entries, kept in memory once read.
+ *
+ * A game asks for the same shader stage many times: Onimusha made 22,144
+ * conversion requests in six minutes for 2,422 distinct libraries, every one a
+ * cache hit -- and every hit opened, sized, read and closed its file through
+ * Wine, 150 seconds of it in all, on the threads that build pipelines while a
+ * new area streams in. An entry read once is now handed out from memory.
+ * madeira.cfg shader-ram-mb bounds what is kept (default 48, 0 = off); entries
+ * over 128 KB are not kept. Nothing is evicted: past the bound the file is read
+ * as before. */
+struct mad_sc_ram { UINT64 k0, k1; unsigned char *blob; UINT32 size; };
+enum { MAD_SC_RAM_SLOTS = 16384 };
+static struct mad_sc_ram *g_sc_ram; static SRWLOCK g_sc_ram_lock = SRWLOCK_INIT;
+static LONG64 g_sc_ram_bytes, g_sc_ram_limit = -1; static LONG g_sc_ram_n, g_sc_ram_hits;
+static struct mad_sc_ram *mad_sc_ram_slot(UINT64 k0, UINT64 k1) {
+    SIZE_T i, n;
+    for (i = (SIZE_T)(k1 & (MAD_SC_RAM_SLOTS - 1)), n = 0; n < MAD_SC_RAM_SLOTS; i = (i + 1) & (MAD_SC_RAM_SLOTS - 1), n++)
+        if (!g_sc_ram[i].blob || (g_sc_ram[i].k0 == k0 && g_sc_ram[i].k1 == k1)) return &g_sc_ram[i];
+    return NULL;
+}
+static int mad_sc_ram_get(const UINT64 key[2], unsigned char **blob_out, SIZE_T *size_out) {
+    struct mad_sc_ram *e; unsigned char *copy = NULL; SIZE_T size = 0;
+    if (g_sc_ram_limit < 0) {
+        AcquireSRWLockExclusive(&g_sc_ram_lock);
+        if (g_sc_ram_limit < 0) {
+            int mb = (int)mad_cfg_int_pe("shader-ram-mb", 48);
+            if (mb < 0) mb = 0; if (mb > 256) mb = 256;
+            if (mb && !(g_sc_ram = calloc(MAD_SC_RAM_SLOTS, sizeof *g_sc_ram))) mb = 0;
+            g_sc_ram_limit = (LONG64)mb << 20;
+            d3d12_log("[madeira-d3d12] shader cache entries kept in memory: up to %d MB (madeira.cfg shader-ram-mb)\n", mb);
+        }
+        ReleaseSRWLockExclusive(&g_sc_ram_lock);
+    }
+    if (!g_sc_ram_limit) return 0;
+    AcquireSRWLockShared(&g_sc_ram_lock);
+    e = mad_sc_ram_slot(key[0], key[1]);
+    if (e && e->blob && (copy = malloc(e->size))) { memcpy(copy, e->blob, e->size); size = e->size; }
+    ReleaseSRWLockShared(&g_sc_ram_lock);
+    if (!copy) return 0;
+    *blob_out = copy; *size_out = size;
+    {
+        LONG n = InterlockedIncrement(&g_sc_ram_hits);
+        if (n == 1 || !(n % 4000))
+            d3d12_log("[madeira-d3d12] shader cache in memory: %ld reads served, %ld entries, %lld KB\n", (long)n, (long)g_sc_ram_n, (long long)(g_sc_ram_bytes >> 10));
+    }
+    return 1;
+}
+static void mad_sc_ram_put(const UINT64 key[2], const unsigned char *blob, SIZE_T size) {
+    struct mad_sc_ram *e; unsigned char *copy;
+    if (g_sc_ram_limit <= 0 || size > (128u << 10) || g_sc_ram_bytes + (LONG64)size > g_sc_ram_limit || g_sc_ram_n >= MAD_SC_RAM_SLOTS * 3 / 4) return;
+    if (!(copy = malloc(size))) return;
+    memcpy(copy, blob, size);
+    AcquireSRWLockExclusive(&g_sc_ram_lock);
+    e = mad_sc_ram_slot(key[0], key[1]);
+    if (e && !e->blob) { e->k0 = key[0]; e->k1 = key[1]; e->blob = copy; e->size = (UINT32)size; g_sc_ram_bytes += (LONG64)size; g_sc_ram_n++; copy = NULL; }
+    ReleaseSRWLockExclusive(&g_sc_ram_lock);
+    free(copy);
+}
+static int mad_sc_read_file_disk(const UINT64 key[2], unsigned char **blob_out, SIZE_T *size_out);
 static int mad_sc_read_file(const UINT64 key[2], unsigned char **blob_out, SIZE_T *size_out) {
+    if (mad_sc_ram_get(key, blob_out, size_out)) return 1;
+    if (!mad_sc_read_file_disk(key, blob_out, size_out)) return 0;
+    mad_sc_ram_put(key, *blob_out, *size_out);
+    return 1;
+}
+static int mad_sc_read_file_disk(const UINT64 key[2], unsigned char **blob_out, SIZE_T *size_out) {
     WCHAR path[MAX_PATH]; HANDLE f; LARGE_INTEGER sz; unsigned char *blob; DWORD got; int ok = 0;
     mad_sc_path(key, path, 0);
     f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
