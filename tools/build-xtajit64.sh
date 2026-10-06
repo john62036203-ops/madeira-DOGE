@@ -149,6 +149,7 @@ python3 "$R/tools/patch-fex-ios-inline-smc-split.py" "$R/FEX/FEXCore/Source/Inte
 python3 "$R/tools/patch-fex-ios-rwx-section-smc.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-codelock-reentry.py" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp"
 python3 "$R/tools/patch-fex-ios-codelock-why.py" "$R/FEX"
+python3 "$R/tools/patch-fex-ios-callret-trust.py" "$R/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp"
 python3 "$R/tools/patch-fex-ios-smc-read.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-trace-tail.py" "$R/FEX/FEXCore/Source/Interface/Core"
 python3 "$R/tools/patch-fex-ios-branch-history.py" "$R/FEX"
