@@ -1039,6 +1039,11 @@ jobs:
       - name: Patch winemetal RAM cap for 8 GB devices
         run: python3 tools/patch-winemetal-ram-cap.py
 
+      # Sekiro stopped after memmove to address 0 from MTLBuffer_updateContents:
+      # a buffer Metal had not made. Named in the log, and not written through.
+      - name: Patch winemetal to name a buffer Metal did not make
+        run: python3 tools/patch-winemetal-nil-buffer.py
+
       # God of War darkens outdoors (iPhone) and draws a black scene on an M1
       # iPad. Switches, all off by default: MADEIRA_PS_CLAMP=1|2 (pixel output
       # clamp like D3D's float16 conversion), MADEIRA_PRECISE_MINMAX=1
