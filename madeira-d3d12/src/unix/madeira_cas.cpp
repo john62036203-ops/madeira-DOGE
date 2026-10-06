@@ -392,10 +392,82 @@ bool bookkeep(Module &m, Function *kernel, unsigned &ncalls, std::string &why) {
 }
 
 int g_scalar = 0;
+int g_loopcap = 8;
+
+/* madeira-doge: bound the float-counted loops of a culling kernel.
+ *
+ * The main-view Persistent*ClusterCulling tests each cluster against the depth
+ * pyramid with
+ *
+ *     for (x = floor(min.x * s); x <= ceil(max.x * s); x += 1.0)
+ *         for (y = ...; y <= ...; y += 1.0) if (!(depth < Sample(x, y))) visible;
+ *
+ * where s = exp2(-mip) and mip comes from log2 of the rectangle, so the loop is
+ * a few texels wide. Its exit is "x > bound, or unordered": on a D3D GPU a
+ * rectangle that is not a number (a cluster through the eye plane) leaves at
+ * once. Here the bounds go through Metal's fast log2 / exp2 / ceil, which give
+ * no promise for NaN or infinity, and a bound that comes out as a huge finite
+ * number never ends: past 2^24 x + 1.0 is x. The threads in that loop keep the
+ * queue's worker count up, every other thread spins waiting for them, and the
+ * GPU watchdog restarts the GPU (build 129: the shadow variants, which have no
+ * such loop, completed 900 times in 5 ms; the main variants hung every time,
+ * with 75 workers still out).
+ *
+ * Every phi that is stepped by "+ 1.0" on its own back edge gets an integer
+ * trip count beside it, and each "next > bound" exit also leaves once that
+ * count reaches the cap. A valid rectangle never comes near it. */
+unsigned caploops(Function *kernel, unsigned cap) {
+    if (!kernel || !cap) return 0;
+    struct site { PHINode *phi; BinaryOperator *next; };
+    std::vector<site> sites;
+    for (BasicBlock &bb : *kernel)
+        for (Instruction &i : bb) {
+            auto *phi = dyn_cast<PHINode>(&i);
+            if (!phi || !phi->getType()->isFloatTy()) continue;
+            for (unsigned k = 0; k < phi->getNumIncomingValues(); k++) {
+                auto *add = dyn_cast<BinaryOperator>(phi->getIncomingValue(k));
+                if (!add || add->getOpcode() != Instruction::FAdd) continue;
+                Value *other = add->getOperand(0) == phi ? add->getOperand(1) : add->getOperand(1) == phi ? add->getOperand(0) : nullptr;
+                auto *cf = dyn_cast_or_null<ConstantFP>(other);
+                if (!cf || !cf->isExactlyValue(1.0)) continue;
+                bool exits = false;
+                for (User *u : add->users())
+                    if (auto *fc = dyn_cast<FCmpInst>(u))
+                        if (fc->getOperand(0) == add && (fc->getPredicate() == CmpInst::FCMP_UGT || fc->getPredicate() == CmpInst::FCMP_OGT)) exits = true;
+                if (exits) { sites.push_back({ phi, add }); break; }
+            }
+        }
+    unsigned done = 0;
+    for (site &s : sites) {
+        Type *i32 = Type::getInt32Ty(kernel->getContext());
+        PHINode *cnt = PHINode::Create(i32, s.phi->getNumIncomingValues(), "", s.phi);
+        Instruction *after = s.next->getNextNode();
+        if (!after) continue;
+        BinaryOperator *cnext = BinaryOperator::CreateAdd(cnt, ConstantInt::get(i32, 1), "", after);
+        for (unsigned k = 0; k < s.phi->getNumIncomingValues(); k++)
+            cnt->addIncoming(s.phi->getIncomingValue(k) == s.next ? (Value *)cnext : (Value *)ConstantInt::get(i32, 0), s.phi->getIncomingBlock(k));
+        std::vector<FCmpInst *> cmps;
+        for (User *u : s.next->users())
+            if (auto *fc = dyn_cast<FCmpInst>(u))
+                if (fc->getOperand(0) == s.next && (fc->getPredicate() == CmpInst::FCMP_UGT || fc->getPredicate() == CmpInst::FCMP_OGT)) cmps.push_back(fc);
+        for (FCmpInst *fc : cmps) {
+            Instruction *at = fc->getNextNode();
+            if (!at) continue;
+            ICmpInst *over = new ICmpInst(at, CmpInst::ICMP_UGE, cnext, ConstantInt::get(i32, cap));
+            BinaryOperator *either = BinaryOperator::CreateOr(fc, over, "", at);
+            std::vector<Use *> uses;
+            for (Use &u : fc->uses()) if (u.getUser() != either) uses.push_back(&u);
+            for (Use *u : uses) u->set(either);
+        }
+        done++;
+    }
+    return done;
+}
 
 }  // namespace
 
 extern "C" void madeira_cas_scalar(int on) { g_scalar = on; }
+extern "C" void madeira_cas_loopcap(int cap) { g_loopcap = cap < 0 ? 0 : cap; }
 
 /* mode: 2 = the real fix, 1 = loop without the result, 0 = read and write the
  * module unchanged, -1 = 2 for libraries with several call sites and 0,1,2 in
@@ -447,6 +519,7 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
     bool book = false;
     if (g_scalar == 2 && kname.find("ClusterCulling") != std::string::npos) book = bookkeep(**mod, kfn, nsimd, swhy);
     else if (g_scalar && kname.find("ClusterCulling") != std::string::npos) scal = scalarize(**mod, kfn, nsimd, swhy);
+    unsigned ncap = kname.find("ClusterCulling") != std::string::npos ? caploops(kfn, (unsigned)g_loopcap) : 0;
     unsigned n = mode == 0 ? nsites : rewrite(**mod, mode);
     if (!n) { if (note && note_cap) snprintf(note, note_cap, "weak compare-exchange present but no call site matched"); return -1; }
     {
@@ -518,9 +591,9 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
         memcpy(o + hash_at, &h, 32);
     }
     *out = o; *out_len = total;
-    if (note && note_cap) snprintf(note, note_cap, "'%s' mode %d: %u weak compare-exchange(s) %s; %s%s (%u wave calls) (%llu -> %llu bytes of bitcode)", kname.c_str(), mode, n,
+    if (note && note_cap) snprintf(note, note_cap, "'%s' mode %d: %u weak compare-exchange(s) %s; %s%s (%u wave calls); %u float loop(s) capped at %d trips (%llu -> %llu bytes of bitcode)", kname.c_str(), mode, n,
                                    mode == 2 ? "made strong (loop)" : mode == 4 ? "made strong (four attempts, no loop)" : mode == 1 ? "looped without the result (diagnostic)" : "left as they were, module rewritten only (diagnostic)",
-                                   scal ? "one-lane waves" : book ? "per-lane bookkeeping: " : g_scalar ? "waves untouched: " : "waves untouched", scal ? "" : swhy.c_str(), nsimd,
+                                   scal ? "one-lane waves" : book ? "per-lane bookkeeping: " : g_scalar ? "waves untouched: " : "waves untouched", scal ? "" : swhy.c_str(), nsimd, ncap, g_loopcap,
                                    (unsigned long long)bc_size, (unsigned long long)nb.size());
     return 1;
 }
