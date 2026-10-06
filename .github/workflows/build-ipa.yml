@@ -353,6 +353,11 @@ jobs:
       - name: Patch wine to print a hard error's text
         run: python3 tools/patch-wine-harderror-text.py
 
+      # madeira.cfg eco-workers = 1: the ECO QoS class for threads other than
+      # a process's first (build/ntdll-unix/thread_ios.c marks them).
+      - name: Patch wine for eco-workers
+        run: python3 tools/patch-wine-eco-workers.py
+
       # Upstream v0.1.3: on-device pairing for the built-in JIT helper
       # (build/rppairing-ios, Rust). The app target links libmadeira_rppairing.a.
       - name: Build libmadeira_rppairing.a (in-app JIT pairing)

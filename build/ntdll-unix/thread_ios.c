@@ -1268,6 +1268,10 @@ static void start_thread( TEB *teb )
      * instead while the ECO switch is on. */
     {
         extern void ios_eco_apply_self(void);
+        /* madeira-doge: a thread started here is not its process's first; madeira.cfg
+         * eco-workers = 1 gives these the eco class (tools/patch-wine-eco-workers.py) */
+        extern void ios_eco_mark_worker(void);
+        ios_eco_mark_worker();
         ios_eco_apply_self();
     }
 
