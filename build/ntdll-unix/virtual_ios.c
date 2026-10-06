@@ -15416,6 +15416,63 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 }
             }
 
+            /* madeira-doge: find byte patterns in the image MADEIRA_DUMP_MODULE names.
+             * MADEIRA_FIND_HEX is "hex[,hex...]" (at most 6 patterns of 4..64 bytes; "??"
+             * matches any byte). Logs the RVA of the first 12 matches of each, so a patch
+             * known for one build of an engine can be located in another. Pages are read
+             * through mach_vm_read_overwrite: an unreadable page is skipped, not faulted on. */
+            {
+                const char *want = getenv( "MADEIRA_DUMP_MODULE" );
+                const char *find = getenv( "MADEIRA_FIND_HEX" );
+                const char *mn = ios_pe_module_name( image_base, image_size );
+                if (want && *want && find && *find && mn && !strcasecmp( mn, want ))
+                {
+                    enum { CHUNK = 0x40000, MAXP = 64 };
+                    static unsigned char buf[CHUNK + MAXP];
+                    const char *p = find;
+                    int n = 0;
+                    while (*p && n++ < 6)
+                    {
+                        unsigned char pat[MAXP], mask[MAXP];
+                        unsigned plen = 0, hits = 0;
+                        size_t off;
+                        while (plen < MAXP && p[0] && p[1] && p[0] != ',')
+                        {
+                            if (p[0] == '?' && p[1] == '?') { pat[plen] = 0; mask[plen] = 0; }
+                            else
+                            {
+                                int hi = ios_hexval( p[0] ), lo = ios_hexval( p[1] );
+                                if (hi < 0 || lo < 0) break;
+                                pat[plen] = (unsigned char)(hi << 4 | lo); mask[plen] = 0xff;
+                            }
+                            plen++; p += 2;
+                        }
+                        while (*p && *p != ',') p++;
+                        while (*p == ',' || *p == ' ') p++;
+                        if (plen < 4 || !mask[0]) { dprintf( 2, "[rva-find] pattern %d ignored (4..64 bytes, first byte fixed)\n", n ); continue; }
+                        for (off = 0; off < image_size && hits < 12; off += CHUNK)
+                        {
+                            mach_vm_size_t got = 0;
+                            size_t want_len = image_size - off < CHUNK + plen ? image_size - off : CHUNK + plen, i;
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)image_base + off, want_len,
+                                    (mach_vm_address_t)buf, &got ) != KERN_SUCCESS || got < plen) continue;
+                            for (i = 0; i + plen <= got && i < CHUNK && hits < 12; i++)
+                            {
+                                unsigned k;
+                                if (buf[i] != pat[0]) continue;
+                                for (k = 1; k < plen; k++) if ((buf[i + k] ^ pat[k]) & mask[k]) break;
+                                if (k == plen)
+                                {
+                                    hits++;
+                                    dprintf( 2, "[rva-find] %s pattern %d (%u bytes) at rva=0x%lx\n", mn, n, plen, (unsigned long)(off + i) );
+                                }
+                            }
+                        }
+                        dprintf( 2, "[rva-find] %s pattern %d: %u match(es)%s\n", mn, n, hits, hits >= 12 ? " (stopped at 12)" : "" );
+                    }
+                }
+            }
+
             /* madeira-doge: byte-patch guest code of an image at load.
              * MADEIRA_PATCH_RVA is "rva:oldhex>newhex[,rva:oldhex>newhex...]"
              * (at most 8 patches of 64 bytes). A patch applies to any image
