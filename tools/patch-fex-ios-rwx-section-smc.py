@@ -92,7 +92,11 @@ patch("Source/Windows/Common/InvalidationTracker.cpp",
         /* madeira-doge: writable code sections (tools/patch-fex-ios-rwx-section-smc.py) */
         {
           const char* Off = getenv("MADEIRA_FEX_RWX_SMC"); /* opt-in: a game with hot code in such a section would slow down */
-          if (Off && Off[0] == '1') {
+          /* Executables only: steamclient64.dll declares such a section too, and validating it
+           * left Steam's sign-in waiting (the switch reaches every process of the session). */
+          if (Off && Off[0] == '1' && !(Nt->FileHeader.Characteristics & IMAGE_FILE_DLL)) {
+            LogMan::Msg::EFmt("[smc-rwx] {} section {:X}-{:X} is executable and writable: validated before each instruction",
+                              Name, SectionBase, SectionBase + Section->Misc.VirtualSize);
             FEXCore::IosRwxSectionAdd(SectionBase, SectionBase + Section->Misc.VirtualSize);
           }
         }
