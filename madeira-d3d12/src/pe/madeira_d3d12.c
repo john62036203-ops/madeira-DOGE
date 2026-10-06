@@ -755,6 +755,7 @@ struct mad_resource {
      * MTLTextureType2DArray", 6520 reports in one run). Views are cached per
      * (type, levels, slices). */
     enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips, tex_layers; UINT tex_depth;   /* ml924: 3D depth */
+    UINT mip_drop;   /* madeira-doge: tex-mip-drop -- the application's mip N is Metal's mip N - mip_drop; the first mip_drop do not exist */
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
     struct mad_u10 *u10;   /* madeira-doge: unpacked copies of R10G10B10A2_UINT vertex elements */
     unsigned nxview, xview_cap;
@@ -9180,6 +9181,11 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
     struct WMTTextureSwizzleChannels sw;
     static unsigned said, said_fail;
     if (!r->texture) return 0;
+    if (r->mip_drop) {   /* madeira-doge: tex-mip-drop -- lvl0/nlvl arrive in the application's numbering */
+        UINT k = r->mip_drop;
+        if (nlvl != 0 && nlvl != ~0u) { UINT end = lvl0 + nlvl, first = lvl0 > k ? lvl0 : k; nlvl = end > first ? end - first : 1; }
+        lvl0 = lvl0 > k ? lvl0 - k : 0;
+    }
     if (!swz) swz = MAD_SWZ_IDENTITY;
     if (!pf || (r->is_depth && pf != WMTPixelFormatX32_Stencil8)) pf = r->tex_pf;   /* depth textures keep their format: sampled as depth; ml1101: unless a stencil view */
     if (nlvl == 0 || nlvl == ~0u || lvl0 + nlvl > r->tex_mips) nlvl = r->tex_mips > lvl0 ? r->tex_mips - lvl0 : 1;
@@ -10205,6 +10211,51 @@ static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTText
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
                                       struct mad_memheap *ph, UINT64 poff);
+/* madeira-doge: madeira.cfg tex-mip-drop = N (0 = off, the default; 1..3). A
+ * read-only, block-compressed 2D texture with a mip chain is created WITHOUT its
+ * N largest mips: the Metal texture starts at the application's mip N. The top
+ * mip is three quarters of a texture's memory, and RE Engine at its lowest preset
+ * still keeps 0.7 GB of sampled textures on a device whose whole budget is 5.5 GB
+ * (Onimusha, build 131-133: two minutes of play, then the footprint limit).
+ *   - uploads and copies that name a dropped mip are discarded;
+ *   - every other subresource index and every view's first mip is shifted by N;
+ *   - sizes the application sees (the description, GetCopyableFootprints,
+ *     allocation info) are unchanged.
+ * Implicit-LOD sampling then simply never reaches a sharper mip. A shader that
+ * addresses TEXELS of such a texture (Load, GetDimensions) would be wrong, which
+ * is why render targets, UAV textures, uncompressed formats, textures without a
+ * real chain and small ones (tex-mip-drop-min, default 512 on the long side) are
+ * left alone. */
+static volatile LONG g_mip_drop_n; static volatile LONG64 g_mip_drop_saved;
+static UINT mad_mip_drop_for(const D3D12_RESOURCE_DESC *desc, D3D12_HEAP_TYPE heap_type, const struct WMTTextureInfo *ti) {
+    static int k = -1, min_side = 512; UINT bytes = 0, block = 0, mips, w, h, lng, sht;
+    if (k < 0) {
+        int v = (int)mad_cfg_int_pe("tex-mip-drop", 0), m = (int)mad_cfg_int_pe("tex-mip-drop-min", 512);
+        if (v < 0) v = 0; if (v > 3) v = 3; if (m < 64) m = 64;
+        min_side = m; k = v;
+        d3d12_log("[madeira-d3d12] tex-mip-drop = %d (%s; textures from %d on the long side)\n", v,
+                  v ? "read-only block-compressed textures lose their largest mips" : "off: every texture keeps all of its mips", m);
+    }
+    if (!k) return 0;
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || heap_type != D3D12_HEAP_TYPE_DEFAULT) return 0;
+    if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                       D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) return 0;
+    if (ti->sample_count > 1 || ti->type == WMTTextureType3D) return 0;
+    mad_format_info(desc->Format, &bytes, &block);
+    if (block != 4) return 0;
+    mips = desc->MipLevels; w = (UINT)desc->Width; h = desc->Height;
+    lng = w > h ? w : h; sht = w > h ? h : w;
+    if (mips < (UINT)k + 3 || lng < (UINT)min_side) return 0;
+    if ((w & ((4u << k) - 1)) || (h & ((4u << k) - 1)) || (sht >> k) < 4) return 0;
+    return (UINT)k;
+}
+/* The application's mip level of a texture -> Metal's, or 0 when that mip was dropped. */
+static int mad_mip_live(const struct mad_resource *r, UINT *level) {
+    if (!r->mip_drop) return 1;
+    if (*level < r->mip_drop) return 0;
+    *level -= r->mip_drop;
+    return 1;
+}
 static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                    const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out) {
     return mad_create_resource_at(d, heap_type, desc, riid, out, NULL, 0);
@@ -10230,6 +10281,22 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         enum WMTPixelFormat pf;
         int is_depth;
         if (!mad_texinfo_from_desc(desc, &ti, &pf, &is_depth)) { free(r); mad_refuse_log(desc, heap_type, "texture format has no Metal mapping"); return E_NOTIMPL; }
+        {   /* madeira-doge: tex-mip-drop */
+            UINT k = mad_mip_drop_for(desc, heap_type, &ti);
+            if (k) {
+                UINT bytes = 0, block = 0; LONG n; LONG64 full, saved;
+                mad_format_info(desc->Format, &bytes, &block);
+                full = (LONG64)(desc->Width / 4) * (desc->Height / 4) * bytes * (desc->DepthOrArraySize ? desc->DepthOrArraySize : 1);
+                { UINT i; saved = 0; for (i = 0; i < k; i++) saved += full >> (2 * i); }   /* the dropped mips */
+                ti.width >>= k; ti.height >>= k; ti.mipmap_level_count -= k; r->mip_drop = k;
+                n = InterlockedIncrement(&g_mip_drop_n);
+                saved = InterlockedExchangeAdd64(&g_mip_drop_saved, saved) + saved;
+                if (n <= 6 || !(n % 250))
+                    d3d12_log("[madeira-d3d12] tex-mip-drop: %llux%u x%u, %u mips, format %u -> %ux%u, %u mips (%ld textures so far, about %lld MB not allocated)\n",
+                              (unsigned long long)desc->Width, desc->Height, (unsigned)desc->DepthOrArraySize, (unsigned)desc->MipLevels, (unsigned)desc->Format,
+                              (unsigned)ti.width, (unsigned)ti.height, (unsigned)ti.mipmap_level_count, (long)n, (long long)(saved >> 20));
+            }
+        }
         if (ph && ph->mtl) {   /* ml1145: inside the application's heap, at its offset */
             UINT64 psz = 0, pal = 0;
             MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
@@ -11603,7 +11670,10 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
         if (min_lod > 0.0f) {
             UINT c = (UINT)(min_lod + 0.9999f);
             if (nlvl != ~0u && c >= nlvl) c = nlvl ? nlvl - 1 : 0;
-            if (r->tex_mips && lvl0 + c >= r->tex_mips) c = r->tex_mips > lvl0 ? r->tex_mips - 1 - lvl0 : 0;
+            {   /* madeira-doge: tex-mip-drop -- this arithmetic is in the application's mip numbering */
+                UINT app_mips = r->tex_mips ? r->tex_mips + r->mip_drop : 0;
+                if (app_mips && lvl0 + c >= app_mips) c = app_mips > lvl0 ? app_mips - 1 - lvl0 : 0;
+            }
             if (c) {
                 lvl0 += c;
                 if (nlvl != ~0u) nlvl -= c;
@@ -14693,10 +14763,12 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     if (d->texture && !s->texture) {           /* upload: buffer -> texture */
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *f = &src->PlacedFootprint;
         UINT w, h, dd;
+        if (d->mip_drop) { UINT lv, sl, pl; mad_subresource_plane(d, dst->SubresourceIndex, &lv, &sl, &pl); if (lv < d->mip_drop) return; }   /* madeira-doge: tex-mip-drop */
         c = mad_list_push(l, MC_COPY_B2T);
         if (!c) return;
         mad_subresource_plane(d, dst->SubresourceIndex, &c->u.bt.level, &c->u.bt.slice, &c->u.bt.plane);
         mad_mip_dims(d, c->u.bt.level, &w, &h, &dd);
+        mad_mip_live(d, &c->u.bt.level);
         mad_format_info(d->desc.Format, &bytes, &block);
         c->u.bt.tex = d; c->u.bt.buf = s; c->u.bt.off = f->Offset;
         c->u.bt.w = f->Footprint.Width ? f->Footprint.Width : w;
@@ -14719,10 +14791,12 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     if (s->texture && !d->texture) {           /* readback: texture -> buffer */
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *f = &dst->PlacedFootprint;
         UINT w, h, dd;
+        if (s->mip_drop) { UINT lv, sl, pl; mad_subresource_plane(s, src->SubresourceIndex, &lv, &sl, &pl); if (lv < s->mip_drop) return; }   /* madeira-doge: tex-mip-drop */
         c = mad_list_push(l, MC_COPY_T2B);
         if (!c) return;
         mad_subresource_plane(s, src->SubresourceIndex, &c->u.bt.level, &c->u.bt.slice, &c->u.bt.plane);
         mad_mip_dims(s, c->u.bt.level, &w, &h, &dd);
+        mad_mip_live(s, &c->u.bt.level);
         mad_format_info(s->desc.Format, &bytes, &block);
         c->u.bt.tex = s; c->u.bt.buf = d; c->u.bt.off = f->Offset;
         c->u.bt.w = w; c->u.bt.h = h; c->u.bt.d = dd;
@@ -14739,11 +14813,17 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     }
     if (s->texture && d->texture) {            /* texture -> texture */
         UINT w, h, dd;
+        if (d->mip_drop || s->mip_drop) {   /* madeira-doge: tex-mip-drop */
+            UINT lv, sl, pl;
+            mad_subresource_plane(d, dst->SubresourceIndex, &lv, &sl, &pl); if (lv < d->mip_drop) return;
+            mad_subresource_plane(s, src->SubresourceIndex, &lv, &sl, &pl); if (lv < s->mip_drop) return;
+        }
         c = mad_list_push(l, MC_COPY_T2T);
         if (!c) return;
         mad_subresource_plane(d, dst->SubresourceIndex, &c->u.tt.dlevel, &c->u.tt.dslice, &c->u.tt.dplane);
         mad_subresource_plane(s, src->SubresourceIndex, &c->u.tt.slevel, &c->u.tt.sslice, &c->u.tt.splane);
         mad_mip_dims(s, c->u.tt.slevel, &w, &h, &dd);
+        mad_mip_live(d, &c->u.tt.dlevel); mad_mip_live(s, &c->u.tt.slevel);
         c->u.tt.dst = d; c->u.tt.src = s;
         c->u.tt.dx = x; c->u.tt.dy = y; c->u.tt.dz = z;
         c->u.tt.w = w; c->u.tt.h = h; c->u.tt.d = dd;
