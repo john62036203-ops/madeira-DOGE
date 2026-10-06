@@ -974,7 +974,8 @@ static void *ios_pool_warmer_thread( void *arg )
                          * signal there is; after mem-guard-sec seconds of it (madeira.cfg,
                          * default 12, 0 = never) the process ends itself, which is a game that
                          * closes instead of a device that reboots. */
-                        static int guard_s = -1; static time_t crit_since; static unsigned sys_said;
+                        static int guard_s = -1, guard_room = 450; static time_t crit_since; static unsigned sys_said;
+                        unsigned long long room_mb = vmi_cnt >= TASK_VM_INFO_REV4_COUNT ? (unsigned long long)vmi.limit_bytes_remaining >> 20 : 0;
                         extern int ios_mem_pressure_level( void );
                         int lvl = ios_mem_pressure_level();
                         if (guard_s < 0)
@@ -982,7 +983,15 @@ static void *ios_pool_warmer_thread( void *arg )
                             char v[16];
                             guard_s = madeira_cfg_get( "mem-guard-sec", v, sizeof v ) && v[0] ? atoi( v ) : 12;
                             if (guard_s < 0) guard_s = 0;
-                            dprintf( 2, "[mem-guard] madeira-doge: the process ends itself after %d s of critical memory pressure (madeira.cfg mem-guard-sec; 0 = never)\n", guard_s );
+                            /* Build 135 ended Onimusha in its loading screen: critical pressure is
+                             * ordinary there (16 s of it with 1 GB of the process's own limit free,
+                             * and the earlier builds played on from that). What came before every
+                             * reboot was critical pressure AND under 400 MB left of the limit, so
+                             * both are asked for. */
+                            if (madeira_cfg_get( "mem-guard-room-mb", v, sizeof v ) && v[0]) guard_room = atoi( v );
+                            if (guard_room < 0) guard_room = 0;
+                            dprintf( 2, "[mem-guard] madeira-doge: the process ends itself after %d s of critical memory pressure with under %d MB of its limit left "
+                                        "(madeira.cfg mem-guard-sec, 0 = never; mem-guard-room-mb)\n", guard_s, guard_room );
                         }
                         if (lvl >= 1 && (sys_said++ % 8) == 0)
                         {
@@ -996,7 +1005,7 @@ static void *ios_pool_warmer_thread( void *arg )
                                          (unsigned long long)hv.compressor_page_count * vm_kernel_page_size >> 20,
                                          (unsigned long long)hv.wire_count * vm_kernel_page_size >> 20, fp_mb );
                         }
-                        if (lvl >= 2)
+                        if (lvl >= 2 && room_mb && room_mb < (unsigned long long)guard_room)
                         {
                             time_t now = time( NULL );
                             if (!crit_since) crit_since = now;
@@ -1004,6 +1013,7 @@ static void *ios_pool_warmer_thread( void *arg )
                             {
                                 dprintf( 2, "[mem-guard] madeira-doge: %ld s of critical memory pressure at %llu MB -- ending the process now, before the device runs out\n",
                                          (long)(now - crit_since), fp_mb );
+                                dprintf( 2, "[mem-guard] %llu MB of the limit were left\n", room_mb );
                                 usleep( 400000 );   /* let the log line reach its file */
                                 _exit( 0 );
                             }
