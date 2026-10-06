@@ -439,6 +439,11 @@ jobs:
       - name: Patch wineserver thread priorities (keep pthread QoS)
         run: python3 tools/patch-wine-thread-qos.py
 
+      # Opt-in (env.MADEIRA_ECORE_WORKERS = 1): worker threads at NORMAL or
+      # lower go to the efficiency cores, the P cluster is the main thread's.
+      - name: Patch wineserver for E-core worker threads (opt-in)
+        run: python3 tools/patch-wine-ecore-workers.py
+
       - name: Build base libwineserver.a from wine/server sources
         shell: bash
         run: |
