@@ -15428,7 +15428,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 if (want && *want && find && *find && mn && !strcasecmp( mn, want ))
                 {
                     enum { CHUNK = 0x40000, MAXP = 64 };
-                    static unsigned char buf[CHUNK + MAXP];
+                    static unsigned char buf[CHUNK + MAXP + 16];
                     const char *p = find;
                     int n = 0;
                     while (*p && n++ < 6)
@@ -15453,7 +15453,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         for (off = 0; off < image_size && hits < 12; off += CHUNK)
                         {
                             mach_vm_size_t got = 0;
-                            size_t want_len = image_size - off < CHUNK + plen ? image_size - off : CHUNK + plen, i;
+                            size_t want_len = image_size - off < CHUNK + plen + 16 ? image_size - off : CHUNK + plen + 16, i;
                             if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)image_base + off, want_len,
                                     (mach_vm_address_t)buf, &got ) != KERN_SUCCESS || got < plen) continue;
                             for (i = 0; i + plen <= got && i < CHUNK && hits < 12; i++)
@@ -15463,8 +15463,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                 for (k = 1; k < plen; k++) if ((buf[i + k] ^ pat[k]) & mask[k]) break;
                                 if (k == plen)
                                 {
+                                    char hex[(MAXP + 16) * 2 + 1];
+                                    unsigned show = plen + 16, h;
+                                    if (i + show > got) show = (unsigned)(got - i);
+                                    for (h = 0; h < show; h++) snprintf( hex + h * 2, 3, "%02x", buf[i + h] );
                                     hits++;
-                                    dprintf( 2, "[rva-find] %s pattern %d (%u bytes) at rva=0x%lx\n", mn, n, plen, (unsigned long)(off + i) );
+                                    dprintf( 2, "[rva-find] %s pattern %d (%u bytes) at rva=0x%lx: %s\n", mn, n, plen,
+                                             (unsigned long)(off + i), hex );
                                 }
                             }
                         }
