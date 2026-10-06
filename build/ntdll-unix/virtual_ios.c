@@ -25651,6 +25651,53 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
             if (!ios_steered)
                 st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
 
+            /* near-alloc: a hook engine asks for one executable page at an
+             * exact address next to the function it patches and walks upward
+             * until one is granted. On Windows there is free space after
+             * ntdll; here ntdll sits at the top of the map and nothing above
+             * it can be had, so the walk (458,752 requests in Monster Hunter
+             * Rise) never succeeds. Grant the nearest free block within rel32
+             * reach instead: the caller takes the address from the result.
+             * Only for this shape, only after the exact request failed;
+             * env MADEIRA_NEAR_ALLOC=0 turns it off. */
+            if ((st == STATUS_CONFLICTING_ADDRESSES || st == STATUS_NO_MEMORY) &&
+                jumbo_hint && jumbo_size && jumbo_size <= 0x10000 && !zero_bits &&
+                (type & ~MEM_TOP_DOWN) == (MEM_COMMIT | MEM_RESERVE) &&
+                protect == PAGE_EXECUTE_READWRITE &&
+                (UINT64)(ULONG_PTR)jumbo_hint >= 0x100000000ull)
+            {
+                static int na_on = -1;
+                static unsigned na_n;
+                if (na_on < 0)
+                {
+                    const char *e = getenv( "MADEIRA_NEAR_ALLOC" );
+                    na_on = !(e && e[0] == '0');
+                }
+                if (na_on)
+                {
+                    const ULONG_PTR reach = 0x70000000;
+                    ULONG_PTR want = (ULONG_PTR)jumbo_hint & ~(ULONG_PTR)0xffff;
+                    ULONG_PTR lo = want > reach + 0x100000000ull ? want - reach : 0x100000000ull;
+                    ULONG_PTR hi = want + reach;
+                    void *pick = NULL;
+                    SIZE_T psz = jumbo_size;
+                    NTSTATUS nst;
+
+                    if (hi > (ULONG_PTR)host_addr_space_limit) hi = (ULONG_PTR)host_addr_space_limit;
+                    nst = allocate_virtual_memory( &pick, &psz, type | MEM_TOP_DOWN, protect,
+                                                   lo, hi - 1, 0, 0 );
+                    if (na_n < 16)
+                    {
+                        na_n++;
+                        dprintf( 2, "[near-alloc] #%u exact %p+0x%lx refused (%08x) -> %p (%08x), window %#lx..%#lx\n",
+                                 na_n, jumbo_hint, (unsigned long)jumbo_size, (unsigned)st,
+                                 pick, (unsigned)nst, (unsigned long)lo, (unsigned long)hi );
+                    }
+                    if (!nst) { *ret = pick; *size_ptr = psz; st = nst; }
+                    else { *ret = jumbo_hint; *size_ptr = jumbo_size; }
+                }
+            }
+
             /* ml373 census: name what still lands in the guest band once the
              * valve has had its say. The [window] histogram gives sizes but no
              * owner, so a single wrong guess about WHO reserves the 8.4GB costs a
