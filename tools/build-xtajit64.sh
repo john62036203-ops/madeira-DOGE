@@ -146,6 +146,7 @@ python3 "$R/tools/patch-fex-ios-alias-full-quiet.py" "$R/FEX/Source/Windows/ARM6
 python3 "$R/tools/patch-fex-ios-pool-null.py" "$R/FEX/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h"
 python3 "$R/tools/patch-fex-ios-invalid-bytes.py" "$R/FEX/FEXCore/Source/Interface/Core/Frontend.cpp"
 python3 "$R/tools/patch-fex-ios-inline-smc-split.py" "$R/FEX/FEXCore/Source/Interface/Core/Frontend.cpp"
+python3 "$R/tools/patch-fex-ios-rwx-section-smc.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-smc-read.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-trace-tail.py" "$R/FEX/FEXCore/Source/Interface/Core"
 python3 "$R/tools/patch-fex-ios-branch-history.py" "$R/FEX"
