@@ -18028,6 +18028,7 @@ static void ios_swap_tick( int force );
 static unsigned long long ios_swap_footprint_mb( void );   /* after the core: Mach */
 static unsigned long long ios_swap_disk_used( void );      /* after the core: fstat of the file (ml1257) */
 static void ios_swap_cfg( int *mode, int *min_mb );        /* after the core: madeira.cfg swap-mode / swap-min-mb */
+static int ios_swap_random_cfg( void );                    /* after the core: madeira.cfg swap-random */
 
 static size_t ios_swap_env_size( const char *name, size_t def, unsigned shift, size_t lo, size_t hi )
 {
@@ -18455,6 +18456,25 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
         return IOS_SW_MAPFAIL;
     }
 mapped:
+    /* madeira-doge: a fault on the tier reads the pages around it as well (the
+     * kernel's default for a file mapping). With the device out of memory those
+     * neighbours push out pages the game uses next: Onimusha read 20-150 MB/s
+     * from the file for minutes at 5-15 fps (build 136). madeira.cfg
+     * swap-random = 1 marks tier mappings MADV_RANDOM: one page per fault. */
+    {
+        static int rnd = -1;
+        if (rnd < 0)
+        {
+            rnd = ios_swap_random_cfg();
+            dprintf( 2, "[swap] madeira-doge: tier mappings are %s (madeira.cfg swap-random)\n",
+                     rnd ? "MADV_RANDOM: one page per fault" : "default: faults read ahead" );
+        }
+        if (rnd && madvise( hs, len, MADV_RANDOM ))
+        {
+            static int said;
+            if (said++ < 4) dprintf( 2, "[swap] madeira-doge: MADV_RANDOM on %p+0x%zx failed errno=%d\n", hs, len, errno );
+        }
+    }
     ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
     ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size;
     ios_swap_ext[ios_swap_n].born = ios_swap_broad ? ios_swap_now_ns() : 0; ios_swap_n++;
@@ -18777,6 +18797,11 @@ static int ios_swap_whole_resv( struct file_view *view, unsigned int vprot )
     return 1;
 }
 /* swap-tier core end */
+static int ios_swap_random_cfg( void )
+{
+    char v[16];
+    return madeira_cfg_get( "swap-random", v, sizeof v ) && v[0] == '1';
+}
 static unsigned long long ios_swap_footprint_mb( void )
 {
     task_vm_info_data_t vmi;
