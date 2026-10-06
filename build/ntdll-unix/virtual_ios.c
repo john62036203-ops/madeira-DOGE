@@ -963,6 +963,23 @@ static void *ios_pool_warmer_thread( void *arg )
                             (unsigned long long)vmi.compressed >> 20,
                             (unsigned long long)vmi.external >> 20,
                             (unsigned long long)vmi.reusable >> 20, cycle);
+                    /* madeira-doge: whose memory is the footprint? The kernel keeps it by
+                     * tag: graphics (Metal / IOSurface storage charged to us), purgeable,
+                     * media, network, and what is left is ordinary anonymous memory (guest
+                     * heaps, the JIT pool, the emulator's own). Every 10th cycle, and every
+                     * cycle within 400 MB of the peak so the last seconds are covered. */
+                    if (vmi_cnt >= TASK_VM_INFO_REV4_COUNT && (!(cycle % 10) || fp_mb + 400 > peak_mb))
+                    {
+                        long long gfx = (long long)vmi.ledger_tag_graphics_footprint + (long long)vmi.ledger_tag_graphics_footprint_compressed;
+                        long long med = (long long)vmi.ledger_tag_media_footprint + (long long)vmi.ledger_tag_media_footprint_compressed;
+                        long long net = (long long)vmi.ledger_tag_network_nonvolatile + (long long)vmi.ledger_tag_network_nonvolatile_compressed;
+                        long long pnv = (long long)vmi.ledger_purgeable_nonvolatile;
+                        dprintf(2, "[footprint-by] madeira-doge phys=%llu MB: graphics %lld MB (+%lld MB not charged), purgeable nonvolatile %lld MB "
+                                "(volatile %lld MB), media %lld MB, network %lld MB; room left %llu MB (cycle=%u)\n",
+                                fp_mb, gfx >> 20, (long long)vmi.ledger_tag_graphics_nofootprint >> 20, pnv >> 20,
+                                (long long)vmi.ledger_purgeable_volatile >> 20, med >> 20, net >> 20,
+                                (unsigned long long)vmi.limit_bytes_remaining >> 20, cycle);
+                    }
                 }
             }
             /* ml566: WHEN does the host malloc zone become corrupt?
