@@ -2935,6 +2935,53 @@ static void mad_label(obj_handle_t enc, const char *fmt, ...) {
  * gpu-fault-info = 0 turns it off, gpu-fault-skip = 0 keeps faulting
  * pipelines running. */
 static int g_fault_info = -1, g_fault_skip = -1;
+/* madeira-doge: how long does a command buffer that carries RE Engine's culling
+ * kernel take on the GPU, and how big was the dispatch? The kernel hangs the GPU
+ * on some frames; this says whether the frames that finish are already close to
+ * the watchdog (work too long for this GPU) or quick (the hang is a logic fault),
+ * and how long the watchdog lets a hung one run. madeira.cfg pcc-time = 0: off. */
+static struct mad_pcc_time { obj_handle_t cb; char name[40]; UINT n, ind, x, y, z; } g_pcc_time[64];
+static LONG g_pcc_time_lock, g_pcc_time_on = -1;
+static void mad_pcc_time_note(obj_handle_t cb, const char *name, int indirect, UINT x, UINT y, UINT z) {
+    unsigned i, slot = 64;
+    if (g_pcc_time_on < 0) g_pcc_time_on = mad_cfg_int_pe("pcc-time", 1) ? 1 : 0;
+    if (!g_pcc_time_on || !cb) return;
+    while (InterlockedCompareExchange(&g_pcc_time_lock, 1, 0)) YieldProcessor();
+    for (i = 0; i < 64; i++) {
+        if (g_pcc_time[i].cb == cb) { slot = i; break; }
+        if (!g_pcc_time[i].cb && slot == 64) slot = i;
+    }
+    if (slot < 64) {
+        struct mad_pcc_time *p = &g_pcc_time[slot];
+        if (p->cb != cb) { memset(p, 0, sizeof *p); p->cb = cb; }
+        if (!p->n || (UINT64)x * y * z > (UINT64)p->x * p->y * p->z || (indirect && !p->ind)) {
+            lstrcpynA(p->name, name, sizeof p->name); p->ind = indirect; p->x = x; p->y = y; p->z = z;
+        }
+        p->n++;
+    }
+    InterlockedExchange(&g_pcc_time_lock, 0);
+}
+static void mad_pcc_time_done(obj_handle_t cb, int have, double start, double end, int failed) {
+    static LONG nlog, nall, nfail, nslow; static double sum, worst;
+    struct mad_pcc_time p; unsigned i; double ms; LONG k;
+    if (g_pcc_time_on <= 0) return;
+    p.cb = 0;
+    while (InterlockedCompareExchange(&g_pcc_time_lock, 1, 0)) YieldProcessor();
+    for (i = 0; i < 64; i++) if (g_pcc_time[i].cb == cb) { p = g_pcc_time[i]; g_pcc_time[i].cb = 0; break; }
+    InterlockedExchange(&g_pcc_time_lock, 0);
+    if (!p.cb) return;
+    ms = have && end > start ? (end - start) * 1000.0 : -1.0;
+    k = InterlockedIncrement(&nall);
+    if (failed) InterlockedIncrement(&nfail);
+    else if (ms >= 0) { sum += ms; if (ms > worst) worst = ms; if (ms >= 100.0) InterlockedIncrement(&nslow); }
+    if ((k <= 30 || failed || ms >= 100.0) && InterlockedIncrement(&nlog) <= 260)
+        d3d12_log("[madeira-d3d12] pcc-time #%ld: %s, GPU %.1f ms, %u culling dispatch(es), largest '%s' %s %ux%ux%u\n",
+                  (long)k, failed ? "FAILED" : "completed", ms, p.n, p.name, p.ind ? "indirect" : "direct", p.x, p.y, p.z);
+    if (!(k % 300))
+        d3d12_log("[madeira-d3d12] pcc-time tally: %ld command buffers with the culling kernel, %ld failed, %ld completed in 100 ms or more; "
+                  "completed ones average %.1f ms, worst %.1f ms\n", (long)k, (long)nfail, (long)nslow,
+                  k - nfail > 0 ? sum / (double)(k - nfail) : 0.0, worst);
+}
 static struct { obj_handle_t fn; char name[64]; } g_fault_bad[32];
 static volatile LONG g_fault_nbad;
 static LONG g_fault_skipped;
@@ -7035,6 +7082,10 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         d3d12_log("[dispatch-dump] list#%u '%s' %s %ux%ux%u\n", g_list_seq, e->cpso->vs_name,
                   c->kind == MC_DISPATCH_INDIRECT ? "indirect" : "", c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z);
     }
+    if (strstr(e->cpso->vs_name, "ClusterCulling")) {   /* madeira-doge: GPU time of the command buffer this lands in */
+        int ind = c->kind == MC_DISPATCH_INDIRECT;
+        mad_pcc_time_note(e->cb, e->cpso->vs_name, ind, ind ? 0 : c->u.dispatch.x, ind ? 0 : c->u.dispatch.y, ind ? 0 : c->u.dispatch.z);
+    }
     memset(&c_pso, 0, sizeof c_pso);
     c_pso.type = WMTComputeCommandSetPSO; c_pso.pso = e->cpso->cps;
     c_pso.threadgroup_size.width = e->cpso->tg[0]; c_pso.threadgroup_size.height = e->cpso->tg[1]; c_pso.threadgroup_size.depth = e->cpso->tg[2];
@@ -7496,6 +7547,7 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
     memset(&t, 0, sizeof t); t.cb = (UINT64)cb;
     memset(&a, 0, sizeof a); a.op = 3; a.ptr = (UINT64)(ULONG_PTR)&t; a.len = sizeof t;
     MadeiraCtl(&a);
+    mad_pcc_time_done(cb, a.ret != 0, t.start, t.end, MTLCommandBuffer_status(cb) == WMTCommandBufferStatusError);   /* madeira-doge */
     mad_perf_lock();
     g_perf_wait_s += wait_s; g_perf_cbs++;
     if (a.ret && t.end > t.start) {
