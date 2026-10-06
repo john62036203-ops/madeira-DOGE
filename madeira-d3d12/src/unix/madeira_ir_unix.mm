@@ -318,6 +318,7 @@ extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_
 /* madeira-doge: madeira_cas.cpp -- the converter's weak compare-exchange made strong. */
 extern "C" void madeira_cas_scalar(int on);
 extern "C" void madeira_cas_loopcap(int cap);
+extern "C" void madeira_cas_pollcap(int cap);
 extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *out_len,
                                char *note, size_t note_cap, int mode);
 
@@ -1207,7 +1208,7 @@ done:
 
 /* madeira-doge: madeira_cas.cpp's switches, read once. The value returned goes
  * into the conversion cache key. */
-static int g_cas_on = -1, g_cas_mode = -1, g_cas_scalar = 1, g_cas_loopcap = 8;
+static int g_cas_on = -1, g_cas_mode = -1, g_cas_scalar = 1, g_cas_loopcap = 8, g_cas_pollcap = 1024;
 static pthread_once_t g_cas_once = PTHREAD_ONCE_INIT;
 static void mad_cas_cfg_once(void)
 {
@@ -1220,13 +1221,20 @@ static void mad_cas_cfg_once(void)
     /* madeira-doge: trip cap for the culling kernels' float-counted loops (0 = off) */
     if (madeira_cfg_get("pcc-loop-cap", v, sizeof v)) { g_cas_loopcap = atoi(v); if (g_cas_loopcap < 0 || g_cas_loopcap > 64) g_cas_loopcap = 8; }
     madeira_cas_loopcap(g_cas_loopcap);
+    /* madeira-doge: turns of a culling kernel's work loop before a thread gives up (0 = never) */
+    if (madeira_cfg_get("pcc-poll-cap", v, sizeof v)) { g_cas_pollcap = atoi(v); if (g_cas_pollcap < 0 || g_cas_pollcap > 65535) g_cas_pollcap = 1024; }
+    madeira_cas_pollcap(g_cas_pollcap);
     g_cas_on = !(madeira_cfg_get("cas-strong", v, sizeof v) && v[0] == '0');
 }
 static unsigned mad_cas_key(void)
 {
-    enum { CAS_REV = 5 };
+    enum { CAS_REV = 6 };
     pthread_once(&g_cas_once, mad_cas_cfg_once);
-    return (unsigned)CAS_REV << 8 | (unsigned)(g_cas_mode + 1) << 4 | (unsigned)g_cas_scalar << 1 | (unsigned)(g_cas_on > 0) | (unsigned)g_cas_loopcap << 16;
+    {   /* the caller shifts this left by one: keep it to 31 bits, every switch mixed in */
+        unsigned k = (unsigned)CAS_REV << 8 | (unsigned)(g_cas_mode + 1) << 4 | (unsigned)g_cas_scalar << 1 | (unsigned)(g_cas_on > 0);
+        k = k * 2654435761u ^ (unsigned)g_cas_loopcap * 40503u ^ (unsigned)g_cas_pollcap * 2246822519u;
+        return k & 0x7fffffffu;
+    }
 }
 
 /* ---------------------------------------------------------------------------

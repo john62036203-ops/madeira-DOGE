@@ -464,9 +464,68 @@ unsigned caploops(Function *kernel, unsigned cap) {
     return done;
 }
 
+int g_pollcap = 1024;
+
+/* madeira-doge: a culling kernel always ends.
+ *
+ * Its threads loop "while the queue has tasks or anybody is still working", and
+ * on this GPU that condition does not always come true in time: build 130 with
+ * the float loops capped still lost 7 of 11 main-view dispatches to the
+ * watchdog at 0.5 s, each one a frozen frame, a GPU restart that throws away
+ * every command buffer in flight, and then the kernel skipped for the rest of
+ * the run (no terrain). A thread now also leaves after `cap` turns of that
+ * loop. A dispatch that would have hung ends within the watchdog's time with
+ * whatever it had culled so far -- one frame with clusters missing -- and the
+ * next frame starts from a zeroed queue (pcc-reset).
+ *
+ * The loop is found by its exit: the conditional branch into the block that
+ * returns, from a block that can reach itself. The counter lives in an alloca
+ * so no dominance has to be worked out. */
+bool reaches(BasicBlock *from, BasicBlock *to, BasicBlock *avoid) {
+    SmallPtrSet<BasicBlock *, 32> seen; std::vector<BasicBlock *> work{ from };
+    while (!work.empty()) {
+        BasicBlock *b = work.back(); work.pop_back();
+        if (b == to) return true;
+        if (b == avoid || !seen.insert(b).second) continue;
+        if (Instruction *t = b->getTerminator())
+            for (unsigned i = 0; i < t->getNumSuccessors(); i++) work.push_back(t->getSuccessor(i));
+    }
+    return false;
+}
+unsigned cappolls(Function *kernel, unsigned cap) {
+    if (!kernel || !cap || kernel->empty()) return 0;
+    std::vector<BranchInst *> exits;
+    for (BasicBlock &bb : *kernel) {
+        auto *br = dyn_cast<BranchInst>(bb.getTerminator());
+        if (!br || !br->isConditional()) continue;
+        for (unsigned k = 0; k < 2; k++) {
+            BasicBlock *out = br->getSuccessor(k), *in = br->getSuccessor(1 - k);
+            if (!isa<ReturnInst>(out->getFirstNonPHIOrDbg()) || out == in) continue;
+            if (reaches(in, &bb, out)) { exits.push_back(br); break; }
+        }
+    }
+    if (exits.empty()) return 0;
+    Type *i32 = Type::getInt32Ty(kernel->getContext());
+    Instruction *first = &*kernel->getEntryBlock().getFirstInsertionPt();
+    AllocaInst *slot = new AllocaInst(i32, 0, "pcc.turns", first);
+    new StoreInst(ConstantInt::get(i32, 0), slot, first);
+    for (BranchInst *br : exits) {
+        bool ret_on_true = isa<ReturnInst>(br->getSuccessor(0)->getFirstNonPHIOrDbg());
+        LoadInst *cur = new LoadInst(i32, slot, "", br);
+        BinaryOperator *nxt = BinaryOperator::CreateAdd(cur, ConstantInt::get(i32, 1), "", br);
+        new StoreInst(nxt, slot, br);
+        Value *cond = br->getCondition();
+        if (ret_on_true) cond = BinaryOperator::CreateOr(cond, new ICmpInst(br, CmpInst::ICMP_UGE, nxt, ConstantInt::get(i32, cap)), "", br);
+        else cond = BinaryOperator::CreateAnd(cond, new ICmpInst(br, CmpInst::ICMP_ULT, nxt, ConstantInt::get(i32, cap)), "", br);
+        br->setCondition(cond);
+    }
+    return (unsigned)exits.size();
+}
+
 }  // namespace
 
 extern "C" void madeira_cas_scalar(int on) { g_scalar = on; }
+extern "C" void madeira_cas_pollcap(int cap) { g_pollcap = cap < 0 ? 0 : cap; }
 extern "C" void madeira_cas_loopcap(int cap) { g_loopcap = cap < 0 ? 0 : cap; }
 
 /* mode: 2 = the real fix, 1 = loop without the result, 0 = read and write the
@@ -520,6 +579,7 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
     if (g_scalar == 2 && kname.find("ClusterCulling") != std::string::npos) book = bookkeep(**mod, kfn, nsimd, swhy);
     else if (g_scalar && kname.find("ClusterCulling") != std::string::npos) scal = scalarize(**mod, kfn, nsimd, swhy);
     unsigned ncap = kname.find("ClusterCulling") != std::string::npos ? caploops(kfn, (unsigned)g_loopcap) : 0;
+    unsigned npoll = kname.find("ClusterCulling") != std::string::npos ? cappolls(kfn, (unsigned)g_pollcap) : 0;
     unsigned n = mode == 0 ? nsites : rewrite(**mod, mode);
     if (!n) { if (note && note_cap) snprintf(note, note_cap, "weak compare-exchange present but no call site matched"); return -1; }
     {
@@ -591,9 +651,9 @@ extern "C" int madeira_cas_fix(const void *lib, size_t len, void **out, size_t *
         memcpy(o + hash_at, &h, 32);
     }
     *out = o; *out_len = total;
-    if (note && note_cap) snprintf(note, note_cap, "'%s' mode %d: %u weak compare-exchange(s) %s; %s%s (%u wave calls); %u float loop(s) capped at %d trips (%llu -> %llu bytes of bitcode)", kname.c_str(), mode, n,
+    if (note && note_cap) snprintf(note, note_cap, "'%s' mode %d: %u weak compare-exchange(s) %s; %s%s (%u wave calls); %u float loop(s) capped at %d trips, %u work loop exit(s) at %d turns (%llu -> %llu bytes of bitcode)", kname.c_str(), mode, n,
                                    mode == 2 ? "made strong (loop)" : mode == 4 ? "made strong (four attempts, no loop)" : mode == 1 ? "looped without the result (diagnostic)" : "left as they were, module rewritten only (diagnostic)",
-                                   scal ? "one-lane waves" : book ? "per-lane bookkeeping: " : g_scalar ? "waves untouched: " : "waves untouched", scal ? "" : swhy.c_str(), nsimd, ncap, g_loopcap,
+                                   scal ? "one-lane waves" : book ? "per-lane bookkeeping: " : g_scalar ? "waves untouched: " : "waves untouched", scal ? "" : swhy.c_str(), nsimd, ncap, g_loopcap, npoll, g_pollcap,
                                    (unsigned long long)bc_size, (unsigned long long)nb.size());
     return 1;
 }
