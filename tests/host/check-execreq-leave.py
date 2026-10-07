@@ -53,7 +53,7 @@ child = function(loader, 'DECLSPEC_EXPORT void wine_ios_child_main(')
 assert child.index('ios_jit_copy_module_for_child(pLdrInitializeThunk, child_peb)') \
     < child.index('ios_patch_execreq_leave_current( pLdrInitializeThunk )') \
     < child.index('server_init_process_done();'), 'the child copy must be patched before the child runs'
-protect = function(native, 'NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,')
+protect = function(native, 'static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,')
 # build 327: insc= was always 1 inside the syscall (the wrapper sets the flag
 # before it on the notified path too), so [prot-img] no longer prints it.
 assert '[prot-img] #%d tid=%04x' in protect and 'status=%#x | %s' in protect and 'insc=%d' not in protect

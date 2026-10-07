@@ -130,7 +130,7 @@ assert 'ios_sc_grant_add( base, report, s, size, k, peb );' in route
 assert 'ios_sc_grant_has( peb, IOS_SC2_E ),\n                              ios_sc_grant_has( peb, IOS_SC2_L ), ' \
        'ios_sc_grant_has( peb, IOS_SC_K_CAGE ) );' in route, 'Oilpan needs both PartitionAlloc blocks, not the cage'
 
-free = function(native, 'NTSTATUS WINAPI NtFreeVirtualMemory(')
+free = function(native, 'static NTSTATUS ios_na_inner_NtFreeVirtualMemory(')
 assert 'if (ios_sc_grant_release( base, &served, &sc_rehold ))' in free
 assert free.index('ios_sc_grant_release(') < free.index('server_enter_uninterrupted_section( &virtual_mutex')
 assert free.index('server_leave_uninterrupted_section') < free.index('ios_sc_rehold( sc_rehold )')

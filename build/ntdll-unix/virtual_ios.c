@@ -2164,6 +2164,22 @@ static size_t    ios_jumbo_hold_keep;
 static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags );
 
 static void ios_hook_island_init( void );
+/* near-alloc trace: after a hook page is granted, name the next memory calls
+ * the same thread makes (build 149: the game got its page above ntdll and still
+ * reported the hook as failed; nothing in the log says which step refused). */
+static volatile int ios_na_trace_left;
+static volatile unsigned ios_na_trace_tid;
+static void ios_na_trace_arm( void )
+{
+    ios_na_trace_tid = NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
+    ios_na_trace_left = 96;
+}
+static int ios_na_trace_on( void )
+{
+    if (ios_na_trace_left <= 0) return 0;
+    if (!NtCurrentTeb() || (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread != ios_na_trace_tid) return 0;
+    return __atomic_fetch_sub( &ios_na_trace_left, 1, __ATOMIC_RELAXED ) > 0;
+}
 
 void ios_jumbo_holdback_init( void )
 {
@@ -25786,7 +25802,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                                  na_n, jumbo_hint, (unsigned long)jumbo_size, (unsigned)st,
                                  pick, (unsigned)nst, (unsigned long)lo, (unsigned long)hi );
                     }
-                    if (!nst) { *ret = pick; *size_ptr = psz; st = nst; }
+                    if (!nst) { *ret = pick; *size_ptr = psz; st = nst; ios_na_trace_arm(); }
                     else { *ret = jumbo_hint; *size_ptr = jumbo_size; }
                 }
             }
@@ -27533,7 +27549,7 @@ static int ios_fd_take( char *base, SIZE_T *out_size )
 }
 #endif
 
-NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
+static NTSTATUS ios_na_inner_NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
 {
     struct file_view *view;
     char *base;
@@ -27806,7 +27822,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
  *             NtProtectVirtualMemory   (NTDLL.@)
  *             ZwProtectVirtualMemory   (NTDLL.@)
  */
-NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,
+static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,
                                         ULONG new_prot, ULONG *old_prot )
 {
     struct file_view *view;
@@ -29020,7 +29036,7 @@ static unsigned int get_memory_image_info( HANDLE process, LPCVOID addr, MEMORY_
  *             NtQueryVirtualMemory   (NTDLL.@)
  *             ZwQueryVirtualMemory   (NTDLL.@)
  */
-NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
+static NTSTATUS ios_na_inner_NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
                                       MEMORY_INFORMATION_CLASS info_class,
                                       PVOID buffer, SIZE_T len, SIZE_T *res_len )
 {
@@ -29944,7 +29960,7 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
  *             NtReadVirtualMemory   (NTDLL.@)
  *             ZwReadVirtualMemory   (NTDLL.@)
  */
-NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buffer,
+static NTSTATUS ios_na_inner_NtReadVirtualMemory( HANDLE process, const void *addr, void *buffer,
                                      SIZE_T size, SIZE_T *bytes_read )
 {
     unsigned int status;
@@ -29988,7 +30004,7 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
  *             NtWriteVirtualMemory   (NTDLL.@)
  *             ZwWriteVirtualMemory   (NTDLL.@)
  */
-NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *buffer,
+static NTSTATUS ios_na_inner_NtWriteVirtualMemory( HANDLE process, void *addr, const void *buffer,
                                       SIZE_T size, SIZE_T *bytes_written )
 {
     unsigned int status;
@@ -30153,7 +30169,7 @@ NTSTATUS WINAPI NtSetInformationVirtualMemory( HANDLE process,
 /**********************************************************************
  *           NtFlushInstructionCache  (NTDLL.@)
  */
-NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T size )
+static NTSTATUS ios_na_inner_NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T size )
 {
 #if defined(__x86_64__) || defined(__i386__)
     /* no-op */
@@ -30487,3 +30503,71 @@ NTSTATUS WINAPI NtWow64IsProcessorFeaturePresent( UINT feature )
 }
 
 #endif  /* _WIN64 */
+
+/* near-alloc trace wrappers (see ios_na_trace_arm) */
+NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
+{
+    void *a = addr_ptr ? *addr_ptr : NULL; SIZE_T z = size_ptr ? *size_ptr : 0;
+    NTSTATUS st = ios_na_inner_NtFreeVirtualMemory( process, addr_ptr, size_ptr, type );
+    if (ios_na_trace_on())
+        dprintf( 2, "[near-trace] Free %p+0x%lx type=0x%x -> %08x\n", a, (unsigned long)z, (unsigned)type, (unsigned)st );
+    return st;
+}
+
+NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,
+                                        ULONG new_prot, ULONG *old_prot )
+{
+    void *a = addr_ptr ? *addr_ptr : NULL; SIZE_T z = size_ptr ? *size_ptr : 0;
+    NTSTATUS st = ios_na_inner_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
+    if (ios_na_trace_on())
+        dprintf( 2, "[near-trace] Protect %p+0x%lx new=0x%x -> %08x old=0x%x got %p+0x%lx\n", a, (unsigned long)z,
+                 (unsigned)new_prot, (unsigned)st, old_prot ? (unsigned)*old_prot : 0,
+                 addr_ptr ? *addr_ptr : NULL, size_ptr ? (unsigned long)*size_ptr : 0 );
+    return st;
+}
+
+NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
+                                      MEMORY_INFORMATION_CLASS info_class,
+                                      PVOID buffer, SIZE_T len, SIZE_T *res_len )
+{
+    NTSTATUS st = ios_na_inner_NtQueryVirtualMemory( process, addr, info_class, buffer, len, res_len );
+    if (ios_na_trace_on())
+    {
+        if (!st && info_class == MemoryBasicInformation && buffer && len >= sizeof(MEMORY_BASIC_INFORMATION))
+        {
+            const MEMORY_BASIC_INFORMATION *m = buffer;
+            dprintf( 2, "[near-trace] Query %p -> base=%p alloc=%p allocprot=0x%x size=0x%lx state=0x%x prot=0x%x type=0x%x\n",
+                     addr, m->BaseAddress, m->AllocationBase, (unsigned)m->AllocationProtect,
+                     (unsigned long)m->RegionSize, (unsigned)m->State, (unsigned)m->Protect, (unsigned)m->Type );
+        }
+        else
+            dprintf( 2, "[near-trace] Query %p class=%d len=0x%lx -> %08x\n", addr, (int)info_class, (unsigned long)len, (unsigned)st );
+    }
+    return st;
+}
+
+NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buffer,
+                                     SIZE_T size, SIZE_T *bytes_read )
+{
+    NTSTATUS st = ios_na_inner_NtReadVirtualMemory( process, addr, buffer, size, bytes_read );
+    if (ios_na_trace_on())
+        dprintf( 2, "[near-trace] Read %p+0x%lx -> %08x\n", addr, (unsigned long)size, (unsigned)st );
+    return st;
+}
+
+NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *buffer,
+                                      SIZE_T size, SIZE_T *bytes_written )
+{
+    NTSTATUS st = ios_na_inner_NtWriteVirtualMemory( process, addr, buffer, size, bytes_written );
+    if (ios_na_trace_on())
+        dprintf( 2, "[near-trace] Write %p+0x%lx -> %08x\n", addr, (unsigned long)size, (unsigned)st );
+    return st;
+}
+
+NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T size )
+{
+    NTSTATUS st = ios_na_inner_NtFlushInstructionCache( handle, addr, size );
+    if (ios_na_trace_on())
+        dprintf( 2, "[near-trace] Flush %p+0x%lx -> %08x\n", addr, (unsigned long)size, (unsigned)st );
+    return st;
+}
