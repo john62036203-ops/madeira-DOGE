@@ -1,6 +1,7 @@
 /* GPL-3.0-or-later WITH the Madeira Converter Exception, version 1. */
 #include "WiniosGamepad.h"
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ml1920: protect the payload as well as the version. A sequence counter
@@ -21,6 +22,15 @@ void winios_gamepad_set_state(int index, const struct winios_gamepad *state)
     pthread_mutex_lock(&pad_lock);
     next.packet = pads[index].packet;
     if (memcmp(&next, &pads[index], sizeof(next))) {
+        /* madeira-doge [xi-set]: a press that reaches this table but not the game
+         * is the game's side; one that never reaches it is the app's (Devil May
+         * Cry 5, build 170: the on-screen pad does nothing). Slot 0, capped. */
+        static unsigned said;
+        if (!index && next.buttons != pads[index].buttons && said < 40) {
+            said++;
+            fprintf(stderr, "[xi-set] slot 0 buttons %04x -> %04x (connected=%d)\n",
+                    (unsigned)pads[index].buttons, (unsigned)next.buttons, (int)next.connected);
+        }
         next.packet++;
         pads[index] = next;
     }

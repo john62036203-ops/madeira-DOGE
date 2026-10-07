@@ -25,6 +25,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -2492,6 +2493,28 @@ ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
     if (!buffer || index >= 4) return 0;
     connected = winios_gamepad_get_state( index, &pad );
     if (!connected && !index) __atomic_add_fetch( &xi_miss, 1, __ATOMIC_RELAXED );
+    /* madeira-doge: and how often. The 4096-read line never came in a 90 s run
+     * (Devil May Cry 5, build 170), so "not reading" and "reading, no press"
+     * looked the same. Reads per operation, every 5 s while there are any. */
+    {
+        static unsigned xi_ops[4], xi_stamp;
+        struct timespec ts;
+        unsigned now, last;
+        __atomic_add_fetch( &xi_ops[op < 3 ? op : 3], 1, __ATOMIC_RELAXED );
+        clock_gettime( CLOCK_MONOTONIC, &ts );
+        now = (unsigned)ts.tv_sec;
+        last = __atomic_load_n( &xi_stamp, __ATOMIC_RELAXED );
+        if (now - last >= 5 && __atomic_compare_exchange_n( &xi_stamp, &last, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+        {
+            static unsigned lines;
+            if (lines++ < 120)
+                dprintf( 2, "[xi-query] last 5 s: %u state reads, %u capability reads, %u vibration writes, %u other; "
+                         "slot 0 connected=%d buttons=%04x\n",
+                         __atomic_exchange_n( &xi_ops[0], 0, __ATOMIC_RELAXED ), __atomic_exchange_n( &xi_ops[1], 0, __ATOMIC_RELAXED ),
+                         __atomic_exchange_n( &xi_ops[2], 0, __ATOMIC_RELAXED ), __atomic_exchange_n( &xi_ops[3], 0, __ATOMIC_RELAXED ),
+                         index ? -1 : connected, (!index && connected) ? (unsigned)pad.buttons : 0 );
+        }
+    }
     if (n <= 4 || !(n & 4095))
         dprintf( 2, "[xi-query] #%u slot=%u op=%u connected=%d buttons=%04x (slot 0 not connected on %u reads)\n",
                  n, index, op, connected, connected ? (unsigned)pad.buttons : 0, xi_miss );
