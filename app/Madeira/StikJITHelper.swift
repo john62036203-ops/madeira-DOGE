@@ -359,6 +359,13 @@ enum StikJITHelper {
             windowHeld = true
             setenv("WINE_IOS_EXE_WINDOW", String(format: "%lx:%lx", Int(exeWinBase), Int(exeWinSize)), 1)
             LogStore.shared.log("ml1040: executable window [0x140000000,+\(exeWinSize >> 20)MB) held since image load", level: .success)
+            // madeira-doge: P3R (363MB exe, no relocations) died with c0000018 while the
+            // large-executable setting may or may not have been on; say which it was.
+            if NoDesktopSettings.bigExeWindow && (exeWinSize >> 20) < 512 {
+                LogStore.shared.log("[exe-window] madeira-doge: the 512MB window was asked for but that space was not free at this app start; only \(exeWinSize >> 20)MB is held. Close Madeira completely and open it again.", level: .error)
+            } else if !NoDesktopSettings.bigExeWindow {
+                LogStore.shared.log("[exe-window] madeira-doge: \"Room for a large game executable\" is off (Settings, Steam games); a game whose main executable is over 128MB and cannot be relocated will not start.", level: .info)
+            }
         } else if !skipWindow {
             var winAddr: vm_address_t = exeWinBase
             let krWin = vm_allocate(mach_task_self_, &winAddr, vm_size_t(exeWinSize), 0 /* VM_FLAGS_FIXED */)
