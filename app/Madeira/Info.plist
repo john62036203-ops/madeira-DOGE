@@ -38,17 +38,6 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>CFBundleURLTypes</key>
-	<array>
-		<dict>
-			<key>CFBundleURLName</key>
-			<string>com.willfaust.mythicemu.play</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>madeira</string>
-			</array>
-		</dict>
-	</array>
 	<key>GCSupportsGameMode</key>
 	<true/>
 	<key>LSSupportsGameMode</key>

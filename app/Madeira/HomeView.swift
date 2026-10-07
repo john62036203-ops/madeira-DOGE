@@ -794,12 +794,9 @@ struct HomeView: View {
     private func enableJIT() {
         enablingJIT = true
         StikJITHelper.enableJIT { result in
-            // Upstream 0.1.3: the helper reports a Result; only its success matters here.
-            let success: Bool
-            if case .success = result { success = true } else { success = false }
             DispatchQueue.main.async {
                 enablingJIT = false
-                jitOn = success || jit_check_debugged()
+                if case .success = result { jitOn = true } else { jitOn = jit_check_debugged() }
                 if jitOn, let request = pendingAfterJIT {
                     pendingAfterJIT = nil
                     onLaunch(request)

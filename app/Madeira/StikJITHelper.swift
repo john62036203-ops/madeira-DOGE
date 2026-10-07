@@ -76,6 +76,10 @@ enum StikJITHelper {
         }
     }
 
+    /// ml1235 (local, 2026-10-02) is folded in here: upstream's waitForDebugger
+    /// waits for `ready` (CS_DEBUGGED and a live debugger), which is what ml1235's
+    /// pollForJIT did; the flag-only poll reported success at once in the
+    /// flagged-without-debugger state. `ready` reads the flag silently (below).
     /// Opening a URL only proves iOS accepted it. Readiness requires both the
     /// sticky CS_DEBUGGED flag and a live debugger that can answer Madeira's BRK.
     @discardableResult
@@ -201,14 +205,22 @@ enum StikJITHelper {
     /// attached to answer the pool request or this run's pool exists already.
     /// CS_DEBUGGED alone is not enough: it stays set after a debugger leaves, which
     /// is the state StikDebug's own app list (attach, then detach) leaves behind.
+    /// ml1235: the flag is read without jit_check_debugged's log line; the library
+    /// polls this every 2 s for the whole app run (and waitForDebugger every 0.5 s).
     static var ready: Bool {
-        guard jit_check_debugged() else { return false }
+        guard SigningStatus.current.debugged else { return false }
         return !attachCheck || poolTaken || isDebuggerAttached()
     }
 
     /// CS_DEBUGGED is set but nothing can answer a pool request: JIT has to be
     /// enabled again, through Madeira, before a game can start.
-    static var flaggedWithoutDebugger: Bool { jit_check_debugged() && !ready }
+    static var flaggedWithoutDebugger: Bool { SigningStatus.current.debugged && !ready }
+
+    /// ml1234: the early pool placeholder is unmapped once per app run. A launch that
+    /// fails without a debugger now leaves the app up, and a second pool request
+    /// unmapped the placeholder's range again, under whatever had been mapped there
+    /// since (malloc, Metal, IOSurface).
+    private static var earlyPoolReleased = false
 
     /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
     /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
@@ -451,8 +463,12 @@ enum StikJITHelper {
         var pairSingle = 0
         let earlyPoolBase = vm_address_t(madeira_early_pool_base)
         let earlyPoolSize = vm_address_t(madeira_early_pool_size)
-        if earlyPoolBase != 0 {
+        if earlyPoolBase != 0 && earlyPoolReleased {
+            LogStore.shared.log(String(format: "ml1234: the early pool placeholder 0x%lx+%luMB was released by an earlier pool request in this run; not unmapped again",
+                                       Int(earlyPoolBase), Int(earlyPoolSize >> 20)))
+        } else if earlyPoolBase != 0 {
             vm_deallocate(mach_task_self_, earlyPoolBase, vm_size_t(earlyPoolSize))
+            earlyPoolReleased = true
             LogStore.shared.log(String(format: "ml1040: released the early pool placeholder 0x%lx+%luMB for the debugger",
                                        Int(earlyPoolBase), Int(earlyPoolSize >> 20)))
         } else {
@@ -1018,21 +1034,41 @@ enum StikJITHelper {
                            mach_task_self_, vm_address_t(bitPattern: rxPtr), 0, &curProt, &maxProt, VM_INHERIT_NONE)
         }
 
-        // Lets the kernel place the JIT pool's RW alias when the 0x7000000000 hint is
-        // past the end of the address map (63 GB maps); 0 fails at the hint as before.
         // A process without the extended-virtual-addressing entitlement has a map
-        // that ends at 0xfc0000000, and an ANYWHERE search that starts past the end
-        // of the map does not wrap: every alias failed with KERN_NO_SPACE although
-        // ~50 GB was free, no pool was made and no session could start. On such a
-        // map the kernel's choice is directly above the RX pool, below the 16 GB
-        // floor of the small-map guest-window band.
-        if kr1 == KERN_NO_SPACE && MadeiraConfig.flag("MADEIRA_RW_ALIAS_RETRY") {
-            rwAddr = 0
-            kr1 = vm_remap(mach_task_self_, &rwAddr, vm_size_t(poolSize), 0, VM_FLAGS_ANYWHERE,
-                           mach_task_self_, vm_address_t(bitPattern: rxPtr), 0,
-                           &curProt, &maxProt, VM_INHERIT_NONE)
-            LogStore.shared.log(String(format: "[rw-alias] high hint out of reach; kernel placement kr=%d RW=0x%lx",
-                                       kr1, Int(rwAddr)), level: kr1 == KERN_SUCCESS ? .info : .error)
+        // that ends at 0xfc0000000 (63 GB). The 0x7000000000 hint is past its end,
+        // and an ANYWHERE search that starts past the end of the map does not
+        // wrap: every alias failed with KERN_NO_SPACE although ~50 GB was free.
+        // Upstream (ba3ab26) then retries once with no hint. The kernel's choice
+        // is the LOWEST hole that fits: with a pool small enough for the hole
+        // below the executable window, ml1040's plug there is released just
+        // before this remap, so a hint-less alias would take [0x11e800000,..),
+        // where Wine later maps sub-floor x64 images. So ask just above the RX
+        // pool first (0x300000000 on the device's 2026-10-02 census), and only
+        // then take the kernel's choice. On a 512 GB map the first request
+        // (above: the high hint, or layout 2's fixed alias) succeeds as before.
+        // Places the JIT pool's RW alias lower when the 0x7000000000 hint is past the end of the address map (63 GB maps): just above the RX pool, then where the kernel chooses; 0 fails at the hint as before.
+        let aliasRetry = MadeiraConfig.flag("MADEIRA_RW_ALIAS_RETRY")
+        if kr1 == KERN_NO_SPACE && aliasRetry {
+            for hint in [rxAddrV + vm_address_t(poolSize), 0] {
+                rwAddr = hint
+                kr1 = vm_remap(
+                    mach_task_self_,
+                    &rwAddr,
+                    vm_size_t(poolSize),
+                    0,
+                    VM_FLAGS_ANYWHERE,
+                    mach_task_self_,
+                    vm_address_t(bitPattern: rxPtr),
+                    0, // copy = false
+                    &curProt,
+                    &maxProt,
+                    VM_INHERIT_NONE
+                )
+                LogStore.shared.log(String(format: "[rw-alias] high hint out of reach; %@ kr=%d RW=0x%lx",
+                                           hint == 0 ? "kernel placement" : String(format: "above the RX pool (hint 0x%lx)", Int(hint)),
+                                           kr1, Int(rwAddr)), level: kr1 == KERN_SUCCESS ? .info : .error)
+                if kr1 != KERN_NO_SPACE { break }
+            }
         }
 
         guard kr1 == KERN_SUCCESS else {

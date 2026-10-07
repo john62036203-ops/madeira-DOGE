@@ -51,7 +51,11 @@ wait = function(stik, "static func waitForDebugger(")
 require("timeout: TimeInterval = 90" in wait and "if ready {" in wait,
         "StikDebug attach has a finite 90-second readiness timeout")
 ready = function(stik, "static var ready: Bool")
-require("jit_check_debugged()" in ready and "isDebuggerAttached()" in ready,
+# ml1235 (local): `ready` reads CS_DEBUGGED through SigningStatus.current.debugged,
+# the same csops query without jit_check_debugged's log line (the library polls
+# `ready` every 2 s and waitForDebugger every 0.5 s).
+require(("jit_check_debugged()" in ready or "SigningStatus.current.debugged" in ready)
+        and "isDebuggerAttached()" in ready,
         "readiness requires CS_DEBUGGED and a live debugger")
 
 # Automatic selection is deterministic: installed StikDebug first, otherwise
@@ -133,7 +137,7 @@ project = (root / "app/Madeira.xcodeproj/project.pbxproj").read_text()
 helper_source = (root / "app/MadeiraJITHelper/MadeiraJITHelper.swift").read_text()
 require(project.count('PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER)";') == 2
         and project.count('PRODUCT_BUNDLE_IDENTIFIER = "$(MADEIRA_BUNDLE_IDENTIFIER).JITHelper";') == 2
-        and project.count("MADEIRA_BUNDLE_IDENTIFIER = com.willfaust.madeora;") == 2
+        and project.count("MADEIRA_BUNDLE_IDENTIFIER = com.willfaust.mythicemu;") == 2   # fork keeps its bundle id: app data and the signing profile are tied to it
         and "AppExtensionPoint" not in helper_source,
         "one setting, MADEIRA_BUNDLE_IDENTIFIER, names the app and the helper")
 

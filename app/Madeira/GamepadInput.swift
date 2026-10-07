@@ -22,9 +22,16 @@ final class GamepadInput: @unchecked Sendable {
         return enabled && value != "0"
     }()
 
-    @MainActor func configureTouch(controls: Set<UUID>) {
+    @MainActor func configureTouch(controls: Set<UUID>, acceptingInput: Bool = true) {
         let allowed = Self.touchEnabled ? controls : []
-        queue.async { [self] in touchState.configure(allowed); sample() }
+        queue.async { [self] in
+            let wasConnected = touchState.connected, wasAccepting = touchState.acceptingInput
+            touchState.configure(allowed, acceptingInput: acceptingInput)
+            if wasConnected != touchState.connected || wasAccepting != touchState.acceptingInput {
+                LogStore.shared.log("[touch-xinput] connected=\(touchState.connected ? 1 : 0) accepting=\(acceptingInput ? 1 : 0) controls=\(allowed.count)")
+            }
+            sample()
+        }
     }
 
     /// Publish player 1 before the game looks (MADEIRA_PAD_EARLY_SLOT=1; default OFF).
@@ -67,9 +74,9 @@ final class GamepadInput: @unchecked Sendable {
     }
 
     /// ml2106: what of a game's controller output reaches the physical pad
-    /// (app/Madeira/PadOutput.m, docs/dualsense-output.md): XInputSetState
-    /// rumble on any XInput pad, and the virtual DualSense's output reports
-    /// (rumble, adaptive triggers, lightbar, player LEDs) on player 1's pad.
+    /// (app/Madeira/PadOutput.m, docs/CONTROLLERS.md): XInputSetState rumble on
+    /// any XInput pad, and the virtual DualSense's output reports (rumble,
+    /// adaptive triggers, lightbar, player LEDs) on player 1's pad.
     /// `env.MADEIRA_PAD_OUTPUT`, the game's file first: unset or 1 both, 0
     /// none, hid only the DualSense's, xinput only XInput rumble.
     static let padOutputKey = "env.MADEIRA_PAD_OUTPUT"
@@ -97,6 +104,9 @@ final class GamepadInput: @unchecked Sendable {
         let mode = Self.configuredPadMode()
         let output = Self.configuredPadOutput()
         unsetenv("MADEIRA_HIDPAD"); unsetenv("MADEIRA_HIDPAD_NAME")
+        // An earlier session in this app run may have taken player 1 off XInput.
+        queue.async { [self] in hidActive = false; hidKeepsXInput = false }
+        Self.sessionHIDKind = nil
         guard ["hid", "dualsense", "generic"].contains(mode.value) else {
             LogStore.shared.log("[hid-pad] ml2100 session mode=xinput source=\(mode.source)")
             beginPadOutput(xinput: output.xinput && Self.enabled, hid: false, value: output.value)
@@ -190,7 +200,7 @@ final class GamepadInput: @unchecked Sendable {
     private var active = false
     /// ml2100: player 1 goes to the HID controller (beginPadSession); queue-owned.
     private var hidActive = false
-    /// MADEIRA_HIDPAD_XINPUT=1: player 1 stays an XInput pad as well (CrossOver-like).
+    /// MADEIRA_HIDPAD_XINPUT=1: player 1 stays an XInput pad as well.
     private var hidKeepsXInput = false
     private var hidBattery: (level: UInt8, charging: UInt8) = (UInt8(WINIOS_HIDPAD_BATTERY_UNKNOWN), 0)
     private var hidBatteryCountdown = 0
@@ -238,6 +248,9 @@ final class GamepadInput: @unchecked Sendable {
                 profiles[i]?.valueChangedHandler = nil
                 controllers[i] = nil
                 profiles[i] = nil
+                // ml2106: a game's "motors off" for a pad that left is dropped (the
+                // slot reads disconnected), so the slot's motors end here.
+                winios_gamepad_set_vibration(Int32(i), 0, 0)
                 fputs("[xinput] ml1920 slot=\(i) disconnected\n", stderr)
             }
             for (controller, profile) in live {
@@ -245,6 +258,9 @@ final class GamepadInput: @unchecked Sendable {
                       let i = controllers.firstIndex(where: { $0 == nil }) else { continue }
                 controllers[i] = controller
                 profiles[i] = profile
+                // A pad joining a slot starts still, before sample() publishes it,
+                // rather than replaying the level the slot had before.
+                winios_gamepad_set_vibration(Int32(i), 0, 0)
                 profile.valueChangedHandler = { [weak self] _, _ in
                     // Explicit queue hop also serializes callbacks already in flight
                     // when a controller is disconnected or the app resigns active.
@@ -301,12 +317,12 @@ final class GamepadInput: @unchecked Sendable {
         for i in profiles.indices {
             let pad = profiles[i]
             let touchConnected = i == 0 && touchState.connected
-            let hid = i == 0 && hidActive
             // Player 1's pad went away mid-press: nothing feeds the driver now, so
             // release the keys and buttons it holds.
             if i == 0, pad == nil, keyboardMouse != nil, PadKeyboardMouse.shared.holding {
                 PadKeyboardMouse.shared.releaseAll("controller disconnected")
             }
+            let hid = i == 0 && hidActive
             guard pad != nil || touchConnected else {
                 winios_gamepad_set_state(Int32(i), nil)
                 if hid { winios_hidpad_set_state(nil) }
@@ -351,12 +367,15 @@ final class GamepadInput: @unchecked Sendable {
                     } else if let kbm = keyboardMouse {
                         // Keyboard-and-mouse mode: the pad becomes keys and mouse
                         // motion; XInput sees no physical player 1 (touch may still
-                        // connect it below).
+                        // connect it below). The HID controller, when on, likewise
+                        // stays but gets none of the physical pad's input.
                         PadKeyboardMouse.shared.feed(buttons: state.buttons, lt: state.left_trigger, rt: state.right_trigger,
                                                      lx: state.lx, ly: state.ly, rx: state.rx, ry: state.ry,
                                                      bindings: kbm, focused: HardwareInput.shared.baseFocused)
+                        hidLive = nil
                         guard touchConnected else {
                             winios_gamepad_set_state(Int32(i), nil)
+                            if hid { winios_hidpad_set_state(nil) }
                             continue
                         }
                         state = winios_gamepad()

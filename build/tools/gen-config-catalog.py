@@ -62,6 +62,19 @@ OVERLAY = {
                         "image, as 32-bit programs already do, and its executable protections are applied without "
                         "EXEC. Frees the pool for hybrid DLL copies and code buffers. Hybrid images keep their "
                         "copy. Set it in the game's own file; restart the session after changing it."},
+    "env.MADEIRA_EC_HOOK_TRACE": {"category": "Debugging / logs", "title": "Log code patches the emulated copy misses",
+                "kind": "bool", "default": "1",
+                "note": "Default on, logging only. Compare executable PE sections and their pool copies before "
+                        "sync, including x64 entry thunks. Separate budgets preserve later graphics-jump records "
+                        "after native startup rewrites. A difference alone does not prove an inline hook. 0 disables it."},
+    "env.MADEIRA_X64_GRAPHICS_ENTRY": {"category": "Direct3D 12 (Madeira)", "title": "Patchable x64 graphics method entries",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1 exposes typed x64 ARM64EC entries for swapchain Present/Present1, "
+                        "ResizeBuffers/ResizeBuffers1 and queue ExecuteCommandLists/GetTimestampFrequency/GetClockCalibration/GetDesc/Signal/Wait. "
+                        "With MADEIRA_DXGI_SRC=1, "
+                        "also selects the factory's patchable MakeWindowAssociation and swapchain-creation entries. "
+                        "The x64 entries use the loader's PE addresses so code patches and nearby allocations agree. "
+                        "Existing native implementations remain behind the entries. Restart the game session."},
     "env.MADEIRA_POOL_LOW_IMAGES": {"category": "Memory & JIT pool", "title": "Small images in spare code-buffer space",
                 "kind": "bool", "default": "0",
                 "note": "Default off. If the normal JIT image allocation fails, copies up to 16 MB may use "
@@ -100,14 +113,24 @@ OVERLAY = {
                 "choices": [("", "Utility (default)"), ("background", "Background"), ("initiated", "User initiated")]},
     "env.MADEIRA_WG_VIDEO": {"title": "Media: MP4 video (32-bit programs)",
                 "note": "0 limits the media parser to MP3/WAV; by default MP4 with H.264/HEVC video decodes through VideoToolbox."},
+    "env.MADEIRA_WOW_RWX_PLAIN": {"category": "Memory & JIT pool", "note": "Unset: a 32-bit window's anonymous RWX memory is plain read/write to the host once Wine Mono's libmono-2.0-x86.dll is mapped there (ml1279/ml1282). 1: in every 32-bit window. 0: never (stores go through the JIT pool's alias, and FEX's Mono bridge stays off)."},
+    "env.MADEIRA_WINEMONO_BRIDGE": {"note": "FEX's Mono backpatcher bridge (ml712). On by itself for Wine Mono, 32- and 64-bit (ml1282/ml1286); for the 32-bit runtime in a guest window it also turns SMC detection off once the backpatcher is found (ml1280). 0 keeps it off."},
+    "env.MADEIRA_MONO_DEFAULTS": {"category": "Wine libraries", "note": "Wine Mono, 32- and 64-bit: mscoree sets MONO_THREADS_SUSPEND=coop and adds keep-delegates to MONO_DEBUG before Mono loads, and puts the previous values back once Mono has read them (ml1282); values already set win. 0 sets nothing."},
     "cpu-count": {"title": "Reported CPU count (0 = device)"},
-    "desktop-size": {"title": "Virtual desktop size (WxH)"},
+    "desktop-size": {"title": "Virtual desktop size (WxH)",
+                     "note": "The developer interface's Wine desktop size (ml1127); its Resolution menu writes it (ml1157). Madeira Dock sessions without a game's Resolution use it too. Unset: this screen's shape at 1280x720's pixel count (ml1172: 1408x648 on a 19.5:9 iPhone, 1152x800 on an 11-inch iPad). Applies at the next app start."},
     "d3d9": {"title": "Direct3D 9 frontend (32-bit)", "kind": "choice",
              "choices": [("", "Default (emulated)"), ("native", "Native ARM64 frontend")]},
     "fence-chain": {"title": "D3D12 fence chain mode"},
     "async-submit": {"title": "D3D12 asynchronous submission"},
     "upload-swap": {"title": "D3D12 upload buffers on file-backed memory"},
     "d3d12-typed-uav-load": {"title": "D3D12 typed UAV loads (report support)"},
+    # Read by DXMT's DXGI and by win32u's display adapter (sysparams_ios.c); a
+    # library entry's "Report an NVIDIA GPU" sets it.
+    "env.DXMT_ENABLE_NVEXT": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Report an NVIDIA GPU (all games)",
+                "note": "1: DXGI names NVIDIA as the vendor, DXMT's NVAPI answers and win32u registers the display "
+                        "adapter as a GeForce RTX 3060 (driver 581.57). Per game: Game details > Report an NVIDIA GPU, "
+                        "which also sets the matching DXGI device id."},
     "ags-rewrite": {"title": "D3D12 AMD AGS 64-bit atomics rewrite"},
     "env.MADEIRA_EXE": {"title": "Program to start at launch (Windows path or name)"},
     "env.MADEIRA_ONBOARDING": {"title": "First-run Steam setup"},
@@ -129,10 +152,10 @@ OVERLAY = {
                 "note": "Set by the app: the product string a generic HID gamepad reports (the physical pad's name)."},
     "env.MADEIRA_HIDPAD_XINPUT": {"category": "Controllers", "title": "HID mode: keep player 1 on XInput too", "kind": "bool",
                 "default": "0",
-                "note": "1: with the HID controller on, player 1 also stays an XInput pad (CrossOver-like). Off by default, "
-                        "so a game that reads both APIs does not see the same pad twice.",
+                "note": "1: with the HID controller on, player 1 also stays an XInput pad. Off by default, so a game "
+                        "that reads both APIs does not see the same pad twice.",
                 "sources": ["app/Madeira/GamepadInput.swift"]},
-    # ml2106: game output to the physical pad (app/Madeira/PadOutput.m, docs/dualsense-output.md).
+    # ml2106: game output to the physical pad (app/Madeira/PadOutput.m).
     "env.MADEIRA_PAD_OUTPUT": {"category": "Controllers", "title": "Rumble, adaptive triggers and lightbar to the pad",
                 "kind": "choice",
                 "note": "On (default): XInput rumble plays on the controller (CoreHaptics), and in DualSense HID mode the "
@@ -210,10 +233,16 @@ OVERLAY = {
                 "kind": "bool", "default": "0",
                 "note": "1: D3DKMTEnumAdapters2 lists the GPU DXGI and D3D12 report (same LUID) and "
                         "D3DKMTQueryAdapterInfo answers like a WDDM 3.1 driver (driver version, caps, device ids, "
-                        "memory); with env.MADEIRA_DXGI_SRC = 1 DXGI's CheckInterfaceSupport gives the same driver "
-                        "version. Off (default): no adapter is listed, as before. Set it in the game's own file; read "
-                        "at session start."},
-    "dxmt": {"title": "DXMT options (a=b;c=d)"},
+                        "memory, performance data); with env.MADEIRA_DXGI_SRC = 1 DXGI's CheckInterfaceSupport gives "
+                        "the same driver version. Off (default): no adapter is listed, as before. Set it in the game's "
+                        "own file; read at session start."},
+    "dxmt": {"title": "DXMT options (a=b;c=d)",
+             "note": "Exported as DXMT_CONFIG with the options joined by ';', a library game's own dxmt options after these: "
+                     "e.g. d3d11.mipClampBC=1;d3d11.preferredMaxFrameRate=30. DXMT reads at most 259 characters of it, "
+                     "and nothing at all from a longer value (ml1255)."},
+    "metalfx-upscale": {"title": "MetalFX upscaling factor", "kind": "choice",
+             "note": "Scales the presented picture with Apple's MetalFX spatial scaler (Direct3D 11 and 12). Usually set per game in Game details > Display.",
+             "choices": [("", "Off"), ("1.5", "1.5x"), ("2", "2x")]},
 }
 
 
