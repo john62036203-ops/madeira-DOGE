@@ -2164,6 +2164,7 @@ static size_t    ios_jumbo_hold_keep;
 static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags );
 
 static void ios_hook_island_init( void );
+static int ios_hook_island_release( uintptr_t hint, size_t size );
 /* near-alloc trace: after a hook page is granted, name the next memory calls
  * the same thread makes (build 149: the game got its page above ntdll and still
  * reported the hook as failed; nothing in the log says which step refused). */
@@ -2172,7 +2173,7 @@ static volatile unsigned ios_na_trace_tid;
 static void ios_na_trace_arm( void )
 {
     ios_na_trace_tid = NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
-    ios_na_trace_left = 96;
+    ios_na_trace_left = 160;
 }
 static int ios_na_trace_on( void )
 {
@@ -2282,7 +2283,6 @@ void ios_jumbo_holdback_init( void )
  * env MADEIRA_NEAR_ALLOC=0 disables both. */
 #define IOS_HOOK_ISLAND_SIZE 0x400000
 static uintptr_t ios_hook_island_base;
-static uintptr_t ios_hook_island_next;
 
 static void ios_hook_island_init( void )
 {
@@ -2325,27 +2325,32 @@ static void ios_hook_island_init( void )
             dprintf( 2, "[near-alloc] island at 0x%llx not held (errno=%d)\n", (unsigned long long)base, errno );
             return;
         }
-        ios_hook_island_base = ios_hook_island_next = (uintptr_t)got;
+        ios_hook_island_base = (uintptr_t)got;
         dprintf( 2, "[near-alloc] island held 0x%llx +%u KB (ceiling 0x%llx)\n",
                  (unsigned long long)ios_hook_island_base, IOS_HOOK_ISLAND_SIZE >> 10, ceiling );
     }
 }
 
-/* The next 64K of the island if it lies above `hint` within `reach`, released
- * so the caller can map there; 0 otherwise. */
-static uintptr_t ios_hook_island_take( uintptr_t hint, uintptr_t reach )
+/* Release the 64K chunks of the island that an exact request [hint, hint+size)
+ * covers, so the caller can map there. 0 if the request is not inside the
+ * island or a chunk was already handed out. */
+static int ios_hook_island_release( uintptr_t hint, size_t size )
 {
-    uintptr_t at = __atomic_load_n( &ios_hook_island_next, __ATOMIC_RELAXED );
+    static unsigned long long given;   /* one bit per 64K chunk */
+    uintptr_t base = ios_hook_island_base, lo, hi, at;
 
-    for (;;)
+    if (!base) return 0;
+    lo = hint & ~(uintptr_t)0xffff;
+    hi = (hint + size + 0xffff) & ~(uintptr_t)0xffff;
+    if (lo < base || hi > base + IOS_HOOK_ISLAND_SIZE || hi <= lo) return 0;
+    for (at = lo; at < hi; at += 0x10000)
+        if (__atomic_load_n( &given, __ATOMIC_RELAXED ) & (1ull << ((at - base) >> 16))) return 0;
+    for (at = lo; at < hi; at += 0x10000)
     {
-        if (!ios_hook_island_base || at + 0x10000 > ios_hook_island_base + IOS_HOOK_ISLAND_SIZE) return 0;
-        if (at <= hint || at - hint >= reach) return 0;
-        if (__atomic_compare_exchange_n( &ios_hook_island_next, &at, at + 0x10000, 0,
-                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED )) break;
+        __atomic_fetch_or( &given, 1ull << ((at - base) >> 16), __ATOMIC_RELAXED );
+        munmap( (void *)at, 0x10000 );
     }
-    munmap( (void *)at, 0x10000 );
-    return at;
+    return 1;
 }
 
 /* Returns the held base if this request can be served from it, else 0. The
@@ -25752,59 +25757,36 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
             if (!ios_steered)
                 st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
 
-            /* near-alloc: a hook engine asks for one executable page at an
-             * exact address next to the function it patches and walks upward
-             * until one is granted. On Windows there is free space after
-             * ntdll; here ntdll sits at the top of the map and nothing above
-             * it can be had, so the walk (458,752 requests in Monster Hunter
-             * Rise) never succeeds. Grant the nearest free block within rel32
-             * reach instead: the caller takes the address from the result.
-             * Only for this shape, only after the exact request failed;
-             * env MADEIRA_NEAR_ALLOC=0 turns it off. */
-            if ((st == STATUS_CONFLICTING_ADDRESSES || st == STATUS_NO_MEMORY) &&
+            /* near-alloc: a hook engine asks for one executable page at exact
+             * addresses, walking upward a page at a time from the function it
+             * patches (Monster Hunter Rise: 458,752 requests from an ntdll
+             * stub). On Windows the first free address after ntdll is granted
+             * AT the address asked for. Here nothing above ntdll is free, so
+             * the hook island (ios_hook_island_init) is held there from
+             * start-up; a request that lands in it gets that exact address.
+             * Builds 147 and 149 granted a different address instead (below,
+             * then above the function): the game reported the hook as failed
+             * both times, so the address asked for is the one it uses.
+             * env MADEIRA_NEAR_ALLOC=0 turns this off. */
+            if (st == STATUS_CONFLICTING_ADDRESSES &&
                 jumbo_hint && jumbo_size && jumbo_size <= 0x10000 && !zero_bits &&
                 (type & ~MEM_TOP_DOWN) == (MEM_COMMIT | MEM_RESERVE) &&
                 protect == PAGE_EXECUTE_READWRITE &&
-                (UINT64)(ULONG_PTR)jumbo_hint >= 0x100000000ull)
+                ios_hook_island_release( (uintptr_t)jumbo_hint, jumbo_size ))
             {
-                static int na_on = -1;
                 static unsigned na_n;
-                if (na_on < 0)
+                *ret = jumbo_hint;
+                *size_ptr = jumbo_size;
+                st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+                if (na_n < 16)
                 {
-                    const char *e = getenv( "MADEIRA_NEAR_ALLOC" );
-                    na_on = !(e && e[0] == '0');
+                    na_n++;
+                    dprintf( 2, "[near-alloc] #%u exact %p+0x%lx from the island -> %p+0x%lx (%08x)\n",
+                             na_n, jumbo_hint, (unsigned long)jumbo_size, st ? NULL : *ret,
+                             (unsigned long)*size_ptr, (unsigned)st );
                 }
-                if (na_on)
-                {
-                    const ULONG_PTR reach = 0x70000000;
-                    ULONG_PTR want = (ULONG_PTR)jumbo_hint & ~(ULONG_PTR)0xffff;
-                    ULONG_PTR lo = want > reach + 0x100000000ull ? want - reach : 0x100000000ull;
-                    ULONG_PTR hi = want + reach;
-                    void *pick = NULL;
-                    SIZE_T psz = jumbo_size;
-                    NTSTATUS nst;
-
-                    if (hi > (ULONG_PTR)host_addr_space_limit) hi = (ULONG_PTR)host_addr_space_limit;
-                    /* above the function first: that is where the caller is looking */
-                    nst = STATUS_NO_MEMORY;
-                    if ((pick = (void *)ios_hook_island_take( (uintptr_t)jumbo_hint, reach )))
-                    {
-                        nst = allocate_virtual_memory( &pick, &psz, type, protect, 0, 0, 0, 0 );
-                        if (nst) { pick = NULL; psz = jumbo_size; }
-                    }
-                    if (nst)
-                        nst = allocate_virtual_memory( &pick, &psz, type | MEM_TOP_DOWN, protect,
-                                                       lo, hi - 1, 0, 0 );
-                    if (na_n < 16)
-                    {
-                        na_n++;
-                        dprintf( 2, "[near-alloc] #%u exact %p+0x%lx refused (%08x) -> %p (%08x), window %#lx..%#lx\n",
-                                 na_n, jumbo_hint, (unsigned long)jumbo_size, (unsigned)st,
-                                 pick, (unsigned)nst, (unsigned long)lo, (unsigned long)hi );
-                    }
-                    if (!nst) { *ret = pick; *size_ptr = psz; st = nst; ios_na_trace_arm(); }
-                    else { *ret = jumbo_hint; *size_ptr = jumbo_size; }
-                }
+                if (st) { *ret = jumbo_hint; *size_ptr = jumbo_size; }
+                else ios_na_trace_arm();
             }
 
             /* ml373 census: name what still lands in the guest band once the
@@ -30566,8 +30548,6 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
 
 NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T size )
 {
-    NTSTATUS st = ios_na_inner_NtFlushInstructionCache( handle, addr, size );
-    if (ios_na_trace_on())
-        dprintf( 2, "[near-trace] Flush %p+0x%lx -> %08x\n", addr, (unsigned long)size, (unsigned)st );
-    return st;
+    /* not traced: the emulator flushes after every block it compiles (build 151: all 96 lines) */
+    return ios_na_inner_NtFlushInstructionCache( handle, addr, size );
 }
