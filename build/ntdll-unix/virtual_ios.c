@@ -2163,6 +2163,8 @@ static size_t    ios_jumbo_hold_keep;
 
 static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags );
 
+static void ios_hook_island_init( void );
+
 void ios_jumbo_holdback_init( void )
 {
     static int done;
@@ -2175,6 +2177,8 @@ void ios_jumbo_holdback_init( void )
 
     if (done) return;
     done = 1;
+
+    ios_hook_island_init();
 
     want = (size_t)(madeira_cfg_int( "jumbo-mb", 0 ) * 1024ll * 1024ll);   /* ml1095: madeira.cfg jumbo-mb = N */
     if (!want) return;                       /* opt-in: absent or 0 => off */
@@ -2245,6 +2249,87 @@ void ios_jumbo_holdback_init( void )
                  "large guest reservation\n",
                  (unsigned long long)ios_jumbo_hold_base, want >> 20 );
     }
+}
+
+/* hook island: a small range held at the top of the address map from start-up.
+ *
+ * A hook engine that wants a trampoline for an ntdll function asks for one
+ * executable page at exact addresses, walking UPWARD from the function for
+ * 0x70000000 bytes (Monster Hunter Rise, build 144 log 2026-10-07 01:28). On
+ * Windows the space after ntdll is free. Here every pseudo-process loads its
+ * system DLLs top-down in one shared map, so by the time a game runs nothing
+ * above its ntdll is free, and a block BELOW the function is not accepted
+ * (build 147, log 08:22: granted 0xfb06a0000 for a function at 0xfb61b5a00,
+ * the game still reported the hook as failed). Holding this range before the
+ * first image is mapped keeps something above every later ntdll; it is handed
+ * out 64K at a time by the near-alloc path in NtAllocateVirtualMemory.
+ * env MADEIRA_NEAR_ALLOC=0 disables both. */
+#define IOS_HOOK_ISLAND_SIZE 0x400000
+static uintptr_t ios_hook_island_base;
+static uintptr_t ios_hook_island_next;
+
+static void ios_hook_island_init( void )
+{
+    const char *e = getenv( "MADEIRA_NEAR_ALLOC" );
+    mach_vm_address_t addr = 0, prev_end = 0, top_hole = 0;
+    unsigned long long ceiling = 0;
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    void *got;
+
+    if (e && e[0] == '0') return;
+    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS)
+        ceiling = (unsigned long long)vmi.max_address;
+    if (!ceiling) return;
+
+    /* the highest free hole that can hold the island */
+    while (addr < ceiling)
+    {
+        mach_vm_size_t size = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t c2 = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+        if (mach_vm_region_recurse( mach_task_self(), &addr, &size, &depth,
+                                    (vm_region_recurse_info_t)&info, &c2 ) != KERN_SUCCESS)
+            break;
+        if (addr >= ceiling) break;
+        if (addr > prev_end && addr - prev_end >= IOS_HOOK_ISLAND_SIZE + 0x20000) top_hole = addr;
+        prev_end = addr + size;
+        addr = prev_end;
+    }
+    if (prev_end < ceiling && ceiling - prev_end >= IOS_HOOK_ISLAND_SIZE + 0x20000) top_hole = ceiling;
+    if (!top_hole) return;
+
+    {
+        uintptr_t base = ((uintptr_t)top_hole - IOS_HOOK_ISLAND_SIZE) & ~(uintptr_t)0xffff;
+        got = anon_mmap_tryfixed( (void *)base, IOS_HOOK_ISLAND_SIZE, PROT_NONE, MAP_NORESERVE );
+        if (got == MAP_FAILED)
+        {
+            dprintf( 2, "[near-alloc] island at 0x%llx not held (errno=%d)\n", (unsigned long long)base, errno );
+            return;
+        }
+        ios_hook_island_base = ios_hook_island_next = (uintptr_t)got;
+        dprintf( 2, "[near-alloc] island held 0x%llx +%u KB (ceiling 0x%llx)\n",
+                 (unsigned long long)ios_hook_island_base, IOS_HOOK_ISLAND_SIZE >> 10, ceiling );
+    }
+}
+
+/* The next 64K of the island if it lies above `hint` within `reach`, released
+ * so the caller can map there; 0 otherwise. */
+static uintptr_t ios_hook_island_take( uintptr_t hint, uintptr_t reach )
+{
+    uintptr_t at = __atomic_load_n( &ios_hook_island_next, __ATOMIC_RELAXED );
+
+    for (;;)
+    {
+        if (!ios_hook_island_base || at + 0x10000 > ios_hook_island_base + IOS_HOOK_ISLAND_SIZE) return 0;
+        if (at <= hint || at - hint >= reach) return 0;
+        if (__atomic_compare_exchange_n( &ios_hook_island_next, &at, at + 0x10000, 0,
+                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED )) break;
+    }
+    munmap( (void *)at, 0x10000 );
+    return at;
 }
 
 /* Returns the held base if this request can be served from it, else 0. The
@@ -25684,8 +25769,16 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                     NTSTATUS nst;
 
                     if (hi > (ULONG_PTR)host_addr_space_limit) hi = (ULONG_PTR)host_addr_space_limit;
-                    nst = allocate_virtual_memory( &pick, &psz, type | MEM_TOP_DOWN, protect,
-                                                   lo, hi - 1, 0, 0 );
+                    /* above the function first: that is where the caller is looking */
+                    nst = STATUS_NO_MEMORY;
+                    if ((pick = (void *)ios_hook_island_take( (uintptr_t)jumbo_hint, reach )))
+                    {
+                        nst = allocate_virtual_memory( &pick, &psz, type, protect, 0, 0, 0, 0 );
+                        if (nst) { pick = NULL; psz = jumbo_size; }
+                    }
+                    if (nst)
+                        nst = allocate_virtual_memory( &pick, &psz, type | MEM_TOP_DOWN, protect,
+                                                       lo, hi - 1, 0, 0 );
                     if (na_n < 16)
                     {
                         na_n++;
