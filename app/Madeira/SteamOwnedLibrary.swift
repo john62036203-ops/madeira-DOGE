@@ -39,6 +39,11 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
     /// Steam's launch configuration, for "Start with: The game" (SteamDirectStart);
     /// nil in older caches, which then ask Steam once (SteamOwnedLibrary.launchOptions).
     var launches: [SteamLaunchOption]?
+    /// madeira-doge: about how much the Windows install downloads and takes on
+    /// disk (SteamAppInfo.downloadSize / installSize), shown before Install.
+    /// nil in older caches and when Steam publishes no size.
+    var downloadBytes: UInt64?
+    var installBytes: UInt64?
 
     init(_ info: SteamAppInfo) {
         id = Int(info.appID)
@@ -48,6 +53,9 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
         libraryCapsule = info.libraryCapsule; libraryHero = info.libraryHero; headerImage = info.headerImage
         parentID = info.parentID.map(Int.init)
         launches = info.launches
+        let download = info.downloadSize(for: "windows"), install = info.installSize(for: "windows")
+        downloadBytes = download > 0 && download != .max ? download : nil
+        installBytes = install > 0 && install != .max ? install : nil
     }
 
     var folderName: String { SteamInstallFiles.safeFolderName(installDir.isEmpty ? "app_\(id)" : installDir) }

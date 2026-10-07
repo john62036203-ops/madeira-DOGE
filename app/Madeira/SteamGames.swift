@@ -896,6 +896,23 @@ struct SteamGameSheet: View {
                         }
                     }
                     Section {
+                        // madeira-doge: the game's size before Install (from Steam's own figures).
+                        if item.installed == nil, let owned = item.owned {
+                            if let bytes = owned.downloadBytes {
+                                LabeledContent("Download size", value: "about " + formatBytes(Int64(min(bytes, UInt64(Int64.max)))))
+                            }
+                            if let bytes = owned.installBytes {
+                                LabeledContent("Size when installed", value: "about " + formatBytes(Int64(min(bytes, UInt64(Int64.max)))))
+                            }
+                            if owned.downloadBytes == nil && owned.installBytes == nil {
+                                LabeledContent("Size", value: "not published by Steam; refresh the library")
+                            }
+                            if let need = owned.installBytes ?? owned.downloadBytes, let freeSpace,
+                               need > UInt64(max(0, freeSpace)) {
+                                Label("Larger than the free space on this device.", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.callout).foregroundStyle(.orange)
+                            }
+                        }
                         if let freeSpace { LabeledContent("Free space on this device", value: formatBytes(freeSpace)) }
                         Text(SteamGameSheet.downloadNote)
                             .font(.footnote).foregroundStyle(.secondary)
