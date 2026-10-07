@@ -82,7 +82,21 @@ static void d3d12_log(const char *fmt, ...) {
         if (len >= sizeof buf - 1) { buf[sizeof buf - 2] = '\n'; buf[sizeof buf - 1] = 0; }
         else { buf[len] = '\n'; buf[len + 1] = 0; }
     }
-    OutputDebugStringA(buf);
+    /* madeira-doge: OutputDebugStringA raises a debug-string exception for every
+     * line, and the lines reach the log through __wine_dbg_output below anyway.
+     * Monster Hunter Rise (builds 166 and 170, logs 2026-10-07 20:45 and 22:11)
+     * hung twice with a thread parked inside OutputDebugStringA, called from here,
+     * while other threads waited 60 s at a time for the process heap lock it was
+     * reported to hold. MADEIRA_D3D12_ODS=1 in the environment restores the call. */
+    {
+        static int ods = -1;
+        if (ods < 0) {
+            char v[4] = {0};
+            DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_ODS", v, sizeof v);
+            ods = (n == 1 && v[0] == '1') ? 1 : 0;
+        }
+        if (ods) OutputDebugStringA(buf);
+    }
     /* Wine's own debug output: an unbuffered write on the log's file
      * descriptor from unix ntdll, which reaches the log from EVERY process.
      * The engine launched from the desktop is a child of its launcher and has

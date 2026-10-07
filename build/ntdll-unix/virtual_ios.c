@@ -11135,6 +11135,13 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
          * so they have no layout to get wrong. */
         const char *libname = NULL;
         const void *funcs64 = NULL, *funcs_wow64 = NULL;
+        /* madeira-doge: a 64-bit game that opens a video without the opt-in gets the
+         * stub table and fails with 0x8007000e and no other line (Monster Hunter
+         * Rise, build 170). Name the setting. */
+        if (match && strstr(match, "winegstreamer") && !wow && !ios_wg_64bit_opted_in())
+            dprintf( 2, "[wg-parser] madeira-doge: this 64-bit game loaded the media library but the media backend is "
+                     "off for 64-bit games; videos and some audio will fail to open. Add env.MADEIRA_WG_64BIT = 1 to "
+                     "the game's settings.\n" );
         if (match && strstr(match, "winemetal")) {
             libname = "winemetal";
             funcs64 = (const void *)dxmt_winemetal_unix_call_funcs;
