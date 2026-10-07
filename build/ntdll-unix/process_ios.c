@@ -2927,6 +2927,67 @@ static void ios_guest_branch_history_dump( const void *frame, uint64_t fault_rip
     }
 }
 
+/* madeira-doge: the newest executed exit was a call through an import slot
+ * (FF 15 / FF 25 disp32) that reached address 0 (MHR Sunbreak demo: a
+ * D3D12CreateDevice-shaped call). Show the slot, its neighbours and the module
+ * each neighbour points into, so the empty import can be named. Reads only. */
+static void ios_guest_null_call_dump( const void *frame )
+{
+    extern unsigned ios_fex_branch_history_offset( void );
+    extern const char *ios_pe_module_name_ext( uint64_t base );
+    struct { uint64_t magic, serial; struct { uint64_t source, target, block, hint; } edges[8]; } history;
+    uint64_t address = (uint64_t)(uintptr_t)frame, source, slot, values[17];
+    unsigned offset = ios_fex_branch_history_offset(), i;
+    unsigned char code[6];
+    mach_vm_size_t got = 0;
+    int32_t disp;
+
+    if (!offset || !address ||
+        mach_vm_read_overwrite( mach_task_self(), address + offset, sizeof(history),
+            (mach_vm_address_t)&history, &got ) != KERN_SUCCESS || got != sizeof(history) ||
+        history.magic != UINT64_C(0x314744454742444d) || !history.serial) return;
+    i = (unsigned)((history.serial - 1) & 7);
+    source = history.edges[i].source;
+    if (history.edges[i].target >= 0x10000 || source < 0x10000) return;
+    got = 0;
+    if (mach_vm_read_overwrite( mach_task_self(), source, sizeof(code),
+            (mach_vm_address_t)code, &got ) != KERN_SUCCESS || got != sizeof(code) ||
+        code[0] != 0xff || (code[1] != 0x15 && code[1] != 0x25))
+    {
+        dprintf( 2, "[null-call] source=%#llx is not a call/jmp through a rip-relative slot\n",
+                 (unsigned long long)source );
+        return;
+    }
+    memcpy( &disp, code + 2, 4 );
+    slot = source + 6 + (int64_t)disp;
+    dprintf( 2, "[null-call] source=%#llx %s [slot %#llx]\n", (unsigned long long)source,
+             code[1] == 0x15 ? "call" : "jmp", (unsigned long long)slot );
+    got = 0;
+    if (slot < 0x10000 + 64 ||
+        mach_vm_read_overwrite( mach_task_self(), slot - 64, sizeof(values),
+            (mach_vm_address_t)values, &got ) != KERN_SUCCESS || got != sizeof(values))
+    {
+        dprintf( 2, "[null-call] slot unreadable\n" );
+        return;
+    }
+    for (i = 0; i < 17; i++)
+    {
+        MEMORY_BASIC_INFORMATION info;
+        const char *name = "";
+        uint64_t base = 0;
+        if (values[i] >= 0x10000 && values[i] < UINT64_C(0x800000000000) &&
+            !NtQueryVirtualMemory( NtCurrentProcess(), (void *)(uintptr_t)values[i], MemoryBasicInformation,
+                                   &info, sizeof(info), NULL ) && info.AllocationBase)
+        {
+            base = (uint64_t)(uintptr_t)info.AllocationBase;
+            name = ios_pe_module_name_ext( base );
+        }
+        dprintf( 2, "[null-call]   %s%#llx: %#llx base=%#llx %s\n", i == 8 ? "->" : "  ",
+                 (unsigned long long)(slot - 64 + i * 8), (unsigned long long)values[i],
+                 (unsigned long long)base, name ? name : "" );
+    }
+}
+
 static int ios_dump_guest_instruction( HANDLE handle, LONG exit_code, uint64_t rip, void *owner )
 {
     extern int ios_jit_guest_code_window( uint64_t, uint64_t *, uint64_t *, size_t * );
@@ -3047,6 +3108,7 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                             uint64_t from = rip >= 512 ? rip - 512 : 0, at;
                             ios_guest_block_dump( fx[0], rip, cur_teb->Peb, 0 );
                             ios_guest_branch_history_dump( fex_state, rip, cur_teb->Peb );
+                            ios_guest_null_call_dump( fex_state );
                             for (at = from; at < rip + 64; at += 32)
                             {
                                 unsigned char row[32];
