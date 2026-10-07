@@ -353,6 +353,11 @@ jobs:
       - name: Patch wine with the guest file trace
         run: python3 tools/patch-wine-file-trace.py wine/dlls/ntdll/unix/file.c
 
+      # MHR asked for 12on7\d3d12.dll (Direct3D 12 for Windows 7); the loader's
+      # fallback handed it the system d3d12.dll and the game took the wrong path.
+      - name: Patch wine so a missing 12on7 d3d12 stays missing
+        run: python3 tools/patch-wine-12on7.py wine/dlls/ntdll/unix/file.c
+
       # [hard-error]: the text of a fatal error a game raises through
       # NtRaiseHardError (a stub), e.g. before it ends itself at start-up.
       - name: Patch wine to print a hard error's text
