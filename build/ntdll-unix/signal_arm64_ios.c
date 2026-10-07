@@ -5096,6 +5096,29 @@ skip_reclaim_band: ;
                                          code[8],code[9],code[10],code[11],code[12],code[13],code[14],code[15] );
                             else
                                 dprintf( STDERR_FILENO, "[rsp-trunc]   x86 @rip UNREADABLE\n" );
+                            /* madeira-doge: the instruction BEFORE rip (the call that got here)
+                             * and the top of the guest stack. Monster Hunter Rise (build 159, log
+                             * 2026-10-07 14:03) ends on a branch to address 0 with rip just past a
+                             * call, and the 16 bytes at rip say nothing about the call's form. */
+                            {
+                                unsigned char pre[16];
+                                uint64_t stk[4] = {0};
+                                g = 0;
+                                if (cs[0] > 16 && mach_vm_read_overwrite( mach_task_self(),
+                                        (mach_vm_address_t)(cs[0] - 16), sizeof(pre),
+                                        (mach_vm_address_t)pre, &g ) == KERN_SUCCESS && g == sizeof(pre))
+                                    dprintf( STDERR_FILENO,
+                                             "[rsp-trunc]   x86 before rip: %02x %02x %02x %02x %02x %02x %02x %02x"
+                                             " %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                             pre[0],pre[1],pre[2],pre[3],pre[4],pre[5],pre[6],pre[7],
+                                             pre[8],pre[9],pre[10],pre[11],pre[12],pre[13],pre[14],pre[15] );
+                                g = 0;
+                                if (rsp && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)rsp, sizeof(stk),
+                                        (mach_vm_address_t)stk, &g ) == KERN_SUCCESS && g == sizeof(stk))
+                                    dprintf( STDERR_FILENO, "[rsp-trunc]   guest stack: %llx %llx %llx %llx\n",
+                                             (unsigned long long)stk[0], (unsigned long long)stk[1],
+                                             (unsigned long long)stk[2], (unsigned long long)stk[3] );
+                            }
 
                             /* iOS-Madeira ml333: is the guest code we EXECUTE the guest code that was
                              * LOADED?
