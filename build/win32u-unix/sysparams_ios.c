@@ -3904,6 +3904,55 @@ static BOOL source_mode_exists( const DISPLAYCONFIG_MODE_INFO *modes, UINT32 mod
     return FALSE;
 }
 
+#ifdef WINE_IOS
+/* madeira-doge: vmon-path. The virtual monitor has no source, so
+ * GetDisplayConfigBufferSizes counted it (1 path, 2 modes) and QueryDisplayConfig
+ * then succeeded with 0 paths. Sora no Kiseki the 1st (demo, build 149 log
+ * 2026-10-07 09:37) asks four times, gets nothing, and reads through a null
+ * pointer right after (sora_1st.exe+0x54be10). Report one path for it: source
+ * 0 = \\.\DISPLAY1 on the adapter DXGI reports, at the monitor's size, 60 Hz,
+ * SDR. env MADEIRA_VMON_PATH=0 restores the empty answer. */
+static int ios_vmon_path_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_VMON_PATH" );
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static void ios_vmon_path_luid( LUID *luid )
+{
+    if (!madeira_kmt_adapter_luid( luid ) || (!luid->LowPart && !luid->HighPart))
+    {
+        luid->LowPart = 0x4d41;
+        luid->HighPart = 0;
+    }
+}
+
+static void ios_vmon_path_devmode( DEVMODEW *devmode )
+{
+    memset( devmode, 0, sizeof(*devmode) );
+    devmode->dmSize = sizeof(*devmode);
+    devmode->dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY | DM_POSITION;
+    devmode->dmPelsWidth = virtual_monitor.rc_work.right - virtual_monitor.rc_work.left;
+    devmode->dmPelsHeight = virtual_monitor.rc_work.bottom - virtual_monitor.rc_work.top;
+    devmode->dmBitsPerPel = 32;
+    devmode->dmDisplayFrequency = 60;
+}
+
+/* is this packet about the virtual monitor's synthesized path? */
+static int ios_vmon_path_match( const struct monitor *monitor, const LUID *adapter )
+{
+    LUID luid;
+    if (monitor != &virtual_monitor || monitor->source || !ios_vmon_path_enabled()) return 0;
+    ios_vmon_path_luid( &luid );
+    return !memcmp( adapter, &luid, sizeof(luid) );
+}
+#endif
+
 /***********************************************************************
  *              NtUserQueryDisplayConfig (win32u.@)
  */
@@ -3960,8 +4009,23 @@ LONG WINAPI NtUserQueryDisplayConfig( UINT32 flags, UINT32 *paths_count, DISPLAY
     LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
     {
         if (!is_monitor_active( monitor )) continue;
+#ifdef WINE_IOS
+        if (!monitor->source)
+        {
+            static LUID vmon_luid;
+            if (monitor != &virtual_monitor || !ios_vmon_path_enabled()) continue;
+            ios_vmon_path_luid( &vmon_luid );
+            source_index = 0;
+            gpu_luid = &vmon_luid;
+            output_id = monitor->output_id;
+            ios_vmon_path_devmode( &devmode );
+        }
+        else
+        {
+#else
         if (!monitor->source) continue;
-
+        {
+#endif
         source_index = monitor->source->id;
         gpu_luid = &monitor->source->gpu->luid;
         output_id = monitor->output_id;
@@ -3971,6 +4035,7 @@ LONG WINAPI NtUserQueryDisplayConfig( UINT32 flags, UINT32 *paths_count, DISPLAY
         if (!source_get_current_settings( monitor->source, &devmode ))
         {
             goto done;
+        }
         }
 
         if (path_index == *paths_count || mode_index == *modes_count)
@@ -4022,7 +4087,7 @@ done:
     unlock_display_devices();
 #ifdef WINE_IOS
     {
-        static int logged;   /* madeira-bcd: the virtual monitor has no path (no source) */
+        static int logged;   /* madeira-bcd: the virtual monitor had no path; madeira-doge vmon-path gives it one */
         if (logged++ < 4)
             dprintf( 2, "[vdcfg] QueryDisplayConfig flags=%#x -> %ld, %u paths %u modes\n",
                      (unsigned)flags, (long)ret, (unsigned)path_index, (unsigned)mode_index );
@@ -8621,6 +8686,15 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
 
         if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
 
+#ifdef WINE_IOS
+        if (!source_name->header.id && list_head( &monitors ) == &virtual_monitor.entry &&
+            ios_vmon_path_match( &virtual_monitor, &source_name->header.adapterId ))
+        {
+            asciiz_to_unicode( source_name->viewGdiDeviceName, "\\\\.\\DISPLAY1" );
+            unlock_display_devices();
+            return STATUS_SUCCESS;
+        }
+#endif
         LIST_FOR_EACH_ENTRY(source, &sources, struct source, entry)
         {
             if (source_name->header.id != source->id) continue;
@@ -8653,6 +8727,15 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (target_name->header.id != monitor->output_id) continue;
+#ifdef WINE_IOS
+            if (ios_vmon_path_match( monitor, &target_name->header.adapterId ))
+            {
+                target_name->outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL;
+                asciiz_to_unicode( target_name->monitorFriendlyDeviceName, "Display1" );
+                ret = STATUS_SUCCESS;
+                break;
+            }
+#endif
             /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
              * series) has no source; QueryDisplayConfig reports no path for it either. */
             if (!monitor->source) continue;
@@ -8703,6 +8786,26 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (preferred_mode->header.id != monitor->output_id) continue;
+#ifdef WINE_IOS
+            if (ios_vmon_path_match( monitor, &preferred_mode->header.adapterId ))
+            {
+                DEVMODEW vm;
+                ios_vmon_path_devmode( &vm );
+                preferred_mode->width = vm.dmPelsWidth;
+                preferred_mode->height = vm.dmPelsHeight;
+                signal_info->pixelRate = (UINT64)vm.dmDisplayFrequency * vm.dmPelsWidth * vm.dmPelsHeight;
+                signal_info->hSyncFreq.Numerator = vm.dmDisplayFrequency * vm.dmPelsWidth;
+                signal_info->hSyncFreq.Denominator = 1;
+                signal_info->vSyncFreq.Numerator = vm.dmDisplayFrequency;
+                signal_info->vSyncFreq.Denominator = 1;
+                signal_info->activeSize.cx = signal_info->totalSize.cx = vm.dmPelsWidth;
+                signal_info->activeSize.cy = signal_info->totalSize.cy = vm.dmPelsHeight;
+                signal_info->videoStandard = D3DKMDT_VSS_OTHER;
+                signal_info->scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+                ret = STATUS_SUCCESS;
+                break;
+            }
+#endif
             /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
              * series) has no source; QueryDisplayConfig reports no path for it either. */
             if (!monitor->source) continue;
@@ -8811,6 +8914,19 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (color_info->header.id != monitor->output_id) continue;
+#ifdef WINE_IOS
+            if (ios_vmon_path_match( monitor, &color_info->header.adapterId ))
+            {
+                color_info->advancedColorSupported = 0;
+                color_info->advancedColorEnabled = 0;
+                color_info->bitsPerColorChannel = 8;
+                color_info->wideColorEnforced = 0;
+                color_info->advancedColorForceDisabled = 0;
+                color_info->colorEncoding = DISPLAYCONFIG_COLOR_ENCODING_RGB;
+                ret = STATUS_SUCCESS;
+                break;
+            }
+#endif
             /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
              * series) has no source; QueryDisplayConfig reports no path for it either. */
             if (!monitor->source) continue;
