@@ -1605,7 +1605,35 @@ void main_loop(void)
                     ios_pipe_poll = !(e && *e == '0');
                     ws_log( "[srv-poll] madeira-doge pipe poll %s", ios_pipe_poll ? "ON" : "off" );
                 }
-                if (ios_pipe_poll && !ios_pipe_idle && (ios_iter & 15) && ios_client_fd_start >= 0)
+                /* madeira-doge: the full scan (one failing read() per thread of
+                 * every process) ran on every idle millisecond tick and on every
+                 * 16th busy iteration: with ~460 users that is 460 k reads a
+                 * second while a game sits in a menu, and a fifth of a core
+                 * (Sekiro and MHR logs of 2026-10-07). poll() on a pipe is
+                 * reliable, so idle ticks ask the pipes too and the full scan is
+                 * kept as the same safety net at a lower rate: every 16th idle
+                 * tick in a row (16 ms) and every 64th busy iteration.
+                 * MADEIRA_SRV_SCAN_EVERY=16 with MADEIRA_SRV_LAZY_IDLE=0 is the
+                 * old loop. */
+                static int ios_scan_every = -1, ios_lazy_idle = 1;
+                static unsigned ios_idle_run;
+                int want_poll;
+                if (ios_scan_every < 0)
+                {
+                    const char *e = getenv( "MADEIRA_SRV_SCAN_EVERY" ), *l = getenv( "MADEIRA_SRV_LAZY_IDLE" );
+                    ios_scan_every = e ? atoi( e ) : 64;
+                    if (ios_scan_every < 2 || ios_scan_every > 4096) ios_scan_every = 64;
+                    ios_lazy_idle = !(l && *l == '0');
+                    ws_log( "[srv-poll] madeira-doge full scan every %d busy iterations, idle ticks %s",
+                            ios_scan_every, ios_lazy_idle ? "poll the pipes (full scan every 16th)" : "scan everything" );
+                }
+                if (ios_pipe_idle == 1) want_poll = ios_lazy_idle && (++ios_idle_run & 15);
+                else
+                {
+                    ios_idle_run = 0;
+                    want_poll = !ios_pipe_idle && (ios_iter % ios_scan_every);
+                }
+                if (ios_pipe_poll && want_poll && ios_client_fd_start >= 0)
                 {
                     if (nb_users > ios_pipe_rev_size)
                     {
