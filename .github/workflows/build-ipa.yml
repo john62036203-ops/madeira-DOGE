@@ -358,6 +358,11 @@ jobs:
       - name: Patch wine for eco-workers
         run: python3 tools/patch-wine-eco-workers.py
 
+      # The orphan-lock reaper force-released a busy D3D11 lock (Sekiro); only
+      # a lock whose waiters stay parked for seconds counts. lock-reap = 0 = off.
+      - name: Patch wine so busy locks are not reaped
+        run: python3 tools/patch-wine-orphan-age.py
+
       # Upstream v0.1.3: on-device pairing for the built-in JIT helper
       # (build/rppairing-ios, Rust). The app target links libmadeira_rppairing.a.
       - name: Build libmadeira_rppairing.a (in-app JIT pairing)
