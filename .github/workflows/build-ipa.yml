@@ -1057,6 +1057,11 @@ jobs:
       - name: Patch winemetal to name a buffer Metal did not make
         run: python3 tools/patch-winemetal-nil-buffer.py
 
+      # madeira-doge: Devil May Cry 5 stops with dxmt-finish-thr inside
+      # waitUntilCompleted; say which command buffer and in what state.
+      - name: Patch winemetal to name a command buffer a wait is stuck on
+        run: python3 tools/patch-winemetal-wait-watch.py
+
       # God of War darkens outdoors (iPhone) and draws a black scene on an M1
       # iPad. Switches, all off by default: MADEIRA_PS_CLAMP=1|2 (pixel output
       # clamp like D3D's float16 conversion), MADEIRA_PRECISE_MINMAX=1
