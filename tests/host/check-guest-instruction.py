@@ -33,8 +33,12 @@ functions += function(process, 'static void ios_guest_code_pair(')
 functions += function(process, 'static int ios_guest_call_decode(')
 functions += function(process, 'static const char *ios_guest_return_kind(')
 functions += function(process, 'static void ios_guest_call_dump(')
+functions += function(process, 'static int ios_guest_block_code_dump(')
+functions += function(process, 'static void ios_guest_jit_body_dump(')
+functions += function(process, 'static void ios_guest_jit_map_dump(')
 functions += function(process, 'static void ios_guest_block_dump(')
 functions += function(native, 'static unsigned ios_fex_branch_layout_offset(')
+functions += function(process, 'static void ios_guest_branch_operand_dump(')
 functions += function(process, 'static void ios_guest_branch_history_dump(')
 functions += function(process, 'static int ios_dump_guest_instruction(')
 loop_start = native.index('while (p < end_p)', native.index('/* ml102 FIX:'))
@@ -67,7 +71,7 @@ static char output[65536];
 static size_t output_size, reads;
 static unsigned history_offset;
 unsigned ios_fex_branch_history_offset(void) { return history_offset; }
-static int empty_success;
+static int empty_success, short_success;
 static struct { uintptr_t low, high; } allowed[3], denied[4];
 static unsigned allowed_count, denied_count;
 static void permit(void *base, size_t size)
@@ -119,7 +123,7 @@ static int mach_vm_read_overwrite(int task, mach_vm_address_t address, mach_vm_s
     for (unsigned i = 0; i < denied_count; i++)
         if (address < denied[i].high && address + size > denied[i].low) return 1;
     memcpy((void *)destination, (const void *)address, (size_t)size);
-    *got = size;
+    *got = short_success ? size / 2 : size;
     return KERN_SUCCESS;
 }
 ''' + mapping + r'''
@@ -325,16 +329,16 @@ int main(int argc, char **argv)
         memcpy((void *)(uintptr_t)block, &offset, 4);
         memcpy((void *)(uintptr_t)(block + offset), &tail, sizeof(tail));
         reset_output();
-        ios_guest_block_dump(block, b + 0x1100, owner);
+        ios_guest_block_dump(block, b + 0x1100, owner, 0);
         assert(strstr(output, "contains-fault=1") && strstr(output, "guest-size=128"));
         assert(strstr(output, "block-entry snapshot=MATCH") && strstr(output, "not compile history"));
         reset_output();
-        ios_guest_block_dump(block, b + 0x4000, owner);
+        ios_guest_block_dump(block, b + 0x4000, owner, 0);
         assert(strstr(output, "contains-fault=0"));
         reset_output();
         tail.rip = b + 0x3000; /* metadata readable but guest entry is data */
         memcpy((void *)(uintptr_t)(block + offset), &tail, sizeof(tail));
-        ios_guest_block_dump(block, tail.rip, owner);
+        ios_guest_block_dump(block, tail.rip, owner, 0);
         assert(reads == 2 && !strstr(output, "block-entry"));
         for (unsigned i = 0; i < 5; i++)
         {
@@ -345,24 +349,97 @@ int main(int argc, char **argv)
             if (i == 3) tail.count=65537;
             if (i == 4) tail.single=2;
             memcpy((void *)(uintptr_t)(block + offset), &tail, sizeof(tail));
-            reset_output(); ios_guest_block_dump(block, b+0x1100, owner);
+            reset_output(); ios_guest_block_dump(block, b+0x1100, owner, 0);
             assert(strstr(output, "tail unavailable/invalid") && reads == 2);
         }
         offset=UINT32_MAX; memcpy((void *)(uintptr_t)block, &offset, 4);
-        reset_output(); ios_guest_block_dump(block, b+0x1100, owner);
+        reset_output(); ios_guest_block_dump(block, b+0x1100, owner, 0);
         assert(strstr(output, "header unavailable/invalid") && reads == 1);
-        reset_output(); ios_guest_block_dump(0, b+0x1100, owner);
+        reset_output(); ios_guest_block_dump(0, b+0x1100, owner, 0);
         assert(!reads);
         offset=64; memcpy((void *)(uintptr_t)block, &offset, 4);
         reset_output(); empty_success=1;
-        ios_guest_block_dump(block, b+0x1100, owner);
+        ios_guest_block_dump(block, b+0x1100, owner, 0);
         assert(strstr(output, "header unavailable/invalid") && reads == 1);
         empty_success=0;
         assert(!mprotect(child+0x7000, page, PROT_NONE));
-        reset_output(); ios_guest_block_dump(block, b+0x1100, owner);
+        reset_output(); ios_guest_block_dump(block, b+0x1100, owner, 0);
         assert(strstr(output, "header unavailable/invalid"));
         assert(!mprotect(child+0x7000, page, PROT_READ | PROT_WRITE));
         puts("PASS: pinned FEX tail metadata, fault containment, code-only snapshots and malformed/inaccessible refusal");
+    }
+    else if (!strcmp(argv[1], "source-body"))
+    {
+        uint64_t block = (uintptr_t)(child + 0x2000);
+        uint32_t offset = 0x2400;
+        struct { uint64_t size, rip, guest_size; uint32_t count, entries, spin;
+                 uint8_t single, pad[3]; } tail = { .size=offset+88, .rip=b+0x1100,
+                     .guest_size=58, .count=12, .entries=40 };
+        for (unsigned i=1;i<offset/4;i++)
+        {
+            uint32_t word=0x10000000+i;
+            memcpy((void *)(uintptr_t)(block+4*i),&word,4);
+        }
+        memcpy((void *)(uintptr_t)block,&offset,4);
+        memcpy((void *)(uintptr_t)(block+offset),&tail,sizeof(tail));
+        for (unsigned i=0;i<48;i++) child[0x2000+offset+40+i]=(unsigned char)(0xff-i);
+        for (unsigned i=0;i<58;i++) pe[0x1100+i]=child[0x1100+i]=(unsigned char)(0xd0+i);
+        pe[0x113a]=0xaa;
+        unsigned char saved_child[0x8000], saved_pe[0x8000];
+        memcpy(saved_child,child,sizeof(saved_child)); memcpy(saved_pe,pe,sizeof(saved_pe));
+        reset_output(); ios_guest_block_dump(block,b+0x1136,owner,0);
+        assert(!strstr(output,"[guest-jit]") && !strstr(output,"[guest-block-code]"));
+        reset_output(); ios_guest_block_dump(block,b+0x1136,owner,1);
+        assert(strstr(output,"guest-size=58 selected=58 cap=256"));
+        assert(strstr(strstr(output,"[guest-block-code]"),"f0 f1 f2 f3 f4 f5")); /* six bytes missed by the old windows */
+        assert(!strstr(strstr(output,"[guest-block-code]"),"08 09 aa"));
+        assert(strstr(output,"body-bytes=9212 selected=8192 cap=8192"));
+        assert(strstr(output,"words=10000001 10000002"));
+        assert(strstr(output,"10000800 ") && !strstr(output,"10000801 "));
+        assert(strstr(output,"count=12 available=48 selected=48 cap=256"));
+        assert(strstr(output,"block-rip-table") && strstr(output,"ff fe fd fc fb fa"));
+        assert(!memcmp(saved_child,child,sizeof(saved_child)) && !memcmp(saved_pe,pe,sizeof(saved_pe)));
+        reset_output(); ios_guest_block_dump(block,b+0x1800,owner,1);
+        assert(!strstr(output,"[guest-jit]") && !strstr(output,"[guest-block-code]"));
+        tail.rip=b+0x3000;
+        memcpy((void *)(uintptr_t)(block+offset),&tail,sizeof(tail));
+        reset_output(); ios_guest_block_dump(block,tail.rip,owner,1);
+        assert(reads==2 && !strstr(output,"[guest-jit]") && !strstr(output,"[guest-block-code]"));
+        reset_output(); assert(ios_guest_block_code_dump(b+0x1ff0,58,owner));
+        assert(reads==32 && strstr(output,"stopped at +16 (outside registered x64 code)"));
+        reset_output(); assert(ios_guest_block_code_dump(b+0x1100,0x1000,owner));
+        assert(reads==512 && strstr(output,"selected=256 cap=256"));
+        reset_output(); assert(!ios_guest_block_code_dump(b+0x3000,58,owner));
+        assert(!ios_guest_block_code_dump(UINT64_MAX-8,58,owner));
+        assert(!ios_guest_block_code_dump(b+0x1100,0,owner));
+        assert(!reads && !output_size);
+        reset_output(); ios_guest_jit_map_dump(block,offset,offset+0x1000,40,12);
+        assert(reads==256 && strstr(output,"selected=256 cap=256"));
+        reset_output(); ios_guest_jit_map_dump(block,offset,offset+88,39,12);
+        ios_guest_jit_map_dump(block,offset,offset+88,88,12);
+        ios_guest_jit_map_dump(block,offset,offset-1,40,12);
+        ios_guest_jit_map_dump(block,offset,offset+88,40,0);
+        ios_guest_jit_map_dump(block,offset,offset+88,40,65537);
+        ios_guest_jit_map_dump(UINT64_MAX-3,offset,offset+88,40,12);
+        assert(!reads && !output_size);
+        const uint32_t invalid_offsets[]={0,3,5,(64u<<20)+4};
+        for (unsigned i=0;i<sizeof(invalid_offsets)/sizeof(invalid_offsets[0]);i++)
+        {
+            reset_output(); ios_guest_jit_body_dump(block,invalid_offsets[i]);
+            assert(!reads && !output_size);
+        }
+        reset_output(); ios_guest_jit_body_dump(UINT64_MAX-3,8);
+        ios_guest_jit_body_dump(block+1,64); ios_guest_jit_body_dump(0,64);
+        assert(!reads && !output_size);
+        reset_output(); short_success=1; ios_guest_jit_body_dump(block,offset); short_success=0;
+        assert(reads==1 && strstr(output,"stopped at +4 (unreadable/short row)") && !strstr(output,"words="));
+        reset_output(); empty_success=1; ios_guest_jit_body_dump(block,offset); empty_success=0;
+        assert(reads==1 && !strstr(output,"words="));
+        assert(!mprotect(child+0x3000,page,PROT_NONE));
+        reset_output(); ios_guest_jit_body_dump(block,offset);
+        assert(strstr(output,"stopped at +4036 (unreadable/short row)") && reads==64);
+        assert(!mprotect(child+0x3000,page,PROT_READ|PROT_WRITE));
+        puts("PASS: complete 58-byte source, exact child code, data boundary, ARM64 body cap, no mutation and short/unreadable refusal");
     }
     else if (!strcmp(argv[1], "edges"))
     {
@@ -424,6 +501,60 @@ int main(int argc, char **argv)
         empty_success=0;
         puts("PASS: versioned DATA layout, bounded live branch ordering, child snapshots, inactive/unreadable/overflow refusal");
     }
+    else if (!strcmp(argv[1], "operand"))
+    {
+        unsigned char *frame=child+0x6000, *code=pe+0x1100;
+        uint64_t rsp=(uintptr_t)(child+0x5000), target=b+0x1800;
+        const int displacements[] = {-128,-8,0,8,127};
+        memcpy(frame+0x40,&rsp,sizeof(rsp));
+        for (unsigned i=0;i<sizeof(displacements)/sizeof(displacements[0]);i++)
+        {
+            int displacement=displacements[i];
+            code[0]=0xff; code[1]=0x64; code[2]=0x24; code[3]=(unsigned char)displacement;
+            memcpy((void *)(uintptr_t)(rsp+displacement),&target,sizeof(target));
+            reset_output(); ios_guest_branch_operand_dump((uintptr_t)code,target,frame);
+            assert(reads==3 && strstr(output,"matches-target=1 (current snapshot, not historical)"));
+            char expected[64]; snprintf(expected,sizeof(expected),"disp=%d address=%#llx",displacement,
+                                       (unsigned long long)(rsp+displacement));
+            assert(strstr(output,expected));
+            reset_output(); ios_guest_branch_operand_dump((uintptr_t)code,target+1,frame);
+            assert(reads==3 && strstr(output,"matches-target=0"));
+        }
+        code[1]=0x54;
+        reset_output(); ios_guest_branch_operand_dump((uintptr_t)code,target,frame);
+        assert(reads==1 && !output_size);
+        code[1]=0x64; code[3]=0xf8;
+        reset_output(); ios_guest_branch_operand_dump(b+0x3000,target,frame);
+        assert(!reads && !output_size);
+        reset_output(); ios_guest_branch_operand_dump(b+0x1ffd,target,frame);
+        assert(!reads && !output_size);
+        reset_output(); ios_guest_branch_operand_dump((uintptr_t)code,target,(void *)(uintptr_t)UINT64_MAX);
+        assert(reads==1 && strstr(output,"operand unavailable"));
+        reset_output(); ios_guest_branch_operand_dump((uintptr_t)code,target,NULL);
+        assert(reads==1 && strstr(output,"operand unavailable"));
+        uint64_t invalid[] = {0,UINT64_MAX,0x10000,UINT64_C(0x800000000000),UINT64_C(0x7fffffffffff)};
+        for (unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++)
+        {
+            memcpy(frame+0x40,&invalid[i],sizeof(rsp));
+            reset_output(); ios_guest_branch_operand_dump((uintptr_t)code,target,frame);
+            assert(strstr(output,"operand unavailable"));
+        }
+        memcpy(frame+0x40,&rsp,sizeof(rsp));
+        assert(!mprotect(frame,page,PROT_NONE));
+        reset_output(); ios_guest_branch_operand_dump((uintptr_t)code,target,frame);
+        assert(reads==2 && strstr(output,"operand unavailable"));
+        assert(!mprotect(frame,page,PROT_READ | PROT_WRITE));
+        assert(!mprotect(child+0x5000,page,PROT_NONE));
+        code[3]=0;
+        reset_output(); ios_guest_branch_operand_dump((uintptr_t)code,target,frame);
+        assert(reads==3 && strstr(output,"operand unavailable"));
+        assert(!mprotect(child+0x5000,page,PROT_READ | PROT_WRITE));
+        empty_success=1;
+        reset_output(); ios_guest_branch_operand_dump((uintptr_t)code,target,frame);
+        assert(reads==1 && !output_size);
+        empty_success=0;
+        puts("PASS: stack JMP signed operand snapshots, current-value comparison and inaccessible/overflow/code-boundary refusal");
+    }
     else abort();
     assert(!munmap(pe, 0x8000) && !munmap(parent, 0x8000) && !munmap(child, 0x8000));
     return 0;
@@ -441,7 +572,7 @@ with tempfile.TemporaryDirectory(prefix='guest-instruction-') as directory:
     unit.write_text(code)
     binary = folder / 'check'
     subprocess.run([cc, *flags, str(unit), '-o', str(binary)], check=True)
-    for case in ('targets', 'snapshot', 'calls', 'block', 'edges'):
+    for case in ('targets', 'snapshot', 'calls', 'block', 'source-body', 'edges', 'operand'):
         subprocess.run([str(binary), case], env=env, check=True)
     legacy = 'if (!ios_jit_code_bounds( &ios_jit_mappings[i], off, &t_off, &t_sz )) return 0;'
     assert code.count(legacy) == 1
@@ -459,3 +590,13 @@ with tempfile.TemporaryDirectory(prefix='guest-instruction-') as directory:
     failed = subprocess.run([str(binary), 'calls'], env=env, capture_output=True, text=True)
     assert failed.returncode != 0 and 'stack-buffer-overflow' in failed.stderr, failed.stderr
     print('PASS: negative control catches the original trailing-FF out-of-bounds probe')
+    gap = 'done += chunk;'
+    body_start = code.index('static int ios_guest_block_code_dump(')
+    body_end = code.index('\n}',body_start)+2
+    body = code[body_start:body_end]
+    assert body.count(gap)==1
+    unit.write_text(code[:body_start]+body.replace(gap,'done += chunk + 6;')+code[body_end:])
+    subprocess.run([cc, *flags, str(unit), '-o', str(binary)], check=True)
+    failed = subprocess.run([str(binary), 'source-body'], env=env, capture_output=True, text=True)
+    assert failed.returncode != 0 and 'f0 f1 f2 f3 f4 f5' in failed.stderr, failed.stderr
+    print('PASS: negative control detects a six-byte gap in the source block')

@@ -51,6 +51,9 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           clang --version
 
+      - name: Check generated settings catalog
+        run: python3 tests/host/check-config-catalog.py
+
       # --- UNVERIFIED: exact configure invocation for the wine fork's
       # iOS/arm64 cross target isn't documented anywhere in the repo.
       # This is a best guess and will likely need correcting once we see
@@ -340,7 +343,9 @@ jobs:
       # Patches wine/dlls/ntdll/unix/file.c in place; the submodule pin and the
       # cache keys (wine revision) do not change. MADEIRA_GUEST_LOG=all|0.
       - name: Patch wine with the game text-log mirror
-        run: python3 tools/patch-wine-guest-log.py wine/dlls/ntdll/unix/file.c
+        run: |
+          python3 tests/host/check-guest-log.py
+          python3 tools/patch-wine-guest-log.py wine/dlls/ntdll/unix/file.c
 
       # [file-trace]: every guest open / attribute query with its status when
       # MADEIRA_FILE_TRACE=1 (GTA V Enhanced's "incomplete installation"
@@ -371,6 +376,56 @@ jobs:
           rustup target add aarch64-apple-ios
           bash build/rppairing-ios/build.sh
           ls -la app/Madeira/libmadeira_rppairing.a
+      - name: Check and patch opt-in app-local DLL reads
+        run: |
+          python3 tests/host/check-app-local-dll.py
+          python3 tools/patch-wine-app-local-dll.py wine/dlls/ntdll/unix/file.c
+
+      - name: Check opt-in graphics DLL lifetime
+        run: python3 tests/host/check-graphics-pin.py
+
+      - name: Check ARM64EC allocator span geometry
+        run: python3 tests/host/check-rpmalloc-span8.py
+
+      - name: Check pool failure capacity diagnostics
+        run: python3 tests/host/check-pool-failure-census.py
+
+      - name: Check per-thread trampoline capacity
+        run: python3 tests/host/check-teb-trampoline-capacity.py
+
+      - name: Check read-only image patch diagnostics
+        run: |
+          python3 tests/host/check-image-patch-trace.py
+          python3 tests/host/check-iat-sync-owner.py
+
+      - name: Check virtual storage device contracts
+        run: python3 tests/host/check-storage-device.py
+
+      - name: Check paired IPA and OTA publication contracts
+        run: python3 tests/host/check-ota-variants.py
+
+      - name: Check WoW window guard reservation contracts
+        run: |
+          python3 tests/host/check-wow-guard.py
+          python3 tests/host/check-lazy-windows.py
+
+      - name: Check JIT pool image placement contracts
+        run: |
+          python3 tests/host/check-pool-low-images.py
+          python3 tests/host/check-x64-image-nocopy.py
+          python3 tests/host/check-pool-startup-budget.py --require-swift
+          python3 tests/host/check-pool-placement.py
+          python3 tests/host/check-pool-split.py
+          python3 tests/host/check-pool-low.py
+
+      # [dns]: every guest getaddrinfo by name, and MADEIRA_DNS_TIMEOUT_MS to
+      # bound one (Social Club's Chromium sat in three getaddrinfo calls for a
+      # minute, GTA V Enhanced build 378). Patches wine/dlls/ws2_32/unixlib.c.
+      - name: Patch wine with the DNS trace
+        run: python3 tools/patch-wine-dns-trace.py wine/dlls/ws2_32/unixlib.c
+
+      - name: Patch wine with fault-safe waiter diagnostics
+        run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and
@@ -1237,6 +1292,12 @@ jobs:
         continue-on-error: true
         run: bash tools/build-wine-extra-dlls.sh "$GITHUB_WORKSPACE/wine/build-native"
 
+      # Launcher error117 in406: WMVCORE.DLL was never packaged. Its genuine
+      # Wine reader imports winegstreamer; both must build despite the optional
+      # handling of unrelated extra DLLs above. Do not ship another missing farm.
+      - name: Verify Wine media reader DLLs
+        run: python3 tools/check-wine-media-dlls.py app/Madeira/arm64ec-windows
+
       - name: Save wine arm64ec build
         if: steps.wineeccache.outputs.cache-hit != 'true' && hashFiles('wine/build-arm64ec/dlls/msvcr80/arm64ec-windows/msvcr80.dll') != ''
         continue-on-error: true
@@ -1284,6 +1345,19 @@ jobs:
             exit 1
           fi
           echo "::notice::all PE DLLs present"
+          # The ARM64EC source build permits a fallback on failure. This
+          # allocator change requires its rebuilt module before archiving.
+          python3 - <<'PYEOF'
+          from pathlib import Path
+          module = Path('app/Madeira/arm64ec-windows/xtajit64.dll').read_bytes()
+          if b'rpmalloc-span4 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC rpmalloc span4 module was not built; refusing the fallback IPA')
+          if b'branch-history-v1 madeira-bcd' not in module or b'IosGuestBranchTraceLayout' not in module:
+              raise SystemExit('Required ARM64EC branch-history module was not built; refusing the fallback IPA')
+          if b'launcher-smc-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC Launcher SMC module was not built; refusing the fallback IPA')
+          print('ARM64EC rpmalloc: span4 build marker verified')
+          PYEOF
           # The opt-in source build of dxgi.dll (tools/build-dxgi-dll.sh) is not
           # required: without it env.MADEIRA_DXGI_SRC = 1 keeps upstream's.
           if [ -f app/Madeira/arm64ec-windows/dxgi-src.dll ]; then
@@ -1624,12 +1698,13 @@ jobs:
           cd build-out && ditto -c -k --keepParent Payload Madeira-0.1.${{ github.run_number }}-unsigned.ipa
 
       # Over-the-air install: sign with the owner's certificate (kept in the
-      # owner's PRIVATE Backblaze B2 bucket, never in the repository) and put the
-      # signed IPA plus kurulum.html (7-day pre-signed links) in the same bucket.
-      # Does nothing until the secrets listed in tools/sign-and-publish-ota.sh
-      # exist; never fails the build.
+      # owner's PRIVATE bucket, never in the repository) and put both signed IPAs
+      # plus installation pages (7-day pre-signed links) in the same bucket.
+      # A signing/upload failure is caught by the private-bucket gate below.
       - name: Sign for OTA install (private bucket)
         id: ota
+        # madeira-doge: the owner's repository only; this fork has no bucket.
+        if: github.repository == 'bahacan16/madeira-bcd'
         continue-on-error: true
         env:
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
@@ -1644,7 +1719,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: bash tools/sign-and-publish-ota.sh build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa ${{ github.run_number }}
+        run: bash tools/sign-and-publish-ota.sh build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa ${{ github.run_number }} build-out/Madeira2-0.1.${{ github.run_number }}-unsigned.ipa
 
       # Update packs (tools/pack-index.py): record this build's native ABI in
       # the packs index -- metadata only, the IPA itself is not published --
@@ -1665,7 +1740,7 @@ jobs:
       # private R2 bucket (the OTA step above). If that step did not succeed,
       # the build fails here instead of keeping the IPA somewhere public.
       - name: Check the IPA reached the private bucket
-        if: steps.ota.outcome != 'success'
+        if: github.repository == 'bahacan16/madeira-bcd' && steps.ota.outcome != 'success'
         run: |
           echo "::error::OTA signing/upload did not succeed: this build's IPA was not kept anywhere (no GitHub artifact by design)"
           exit 1

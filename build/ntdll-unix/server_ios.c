@@ -1039,6 +1039,7 @@ static void ios_guest_rip_profile( int gen )
      * 2 = native (Madeira dylib = Wine unix + madsync + bridge, system libs). */
     extern void *ios_jit_rx_base_global; extern size_t ios_jit_pool_size_global;
     extern int ios_jit_pool_image_pc(uintptr_t pc, uintptr_t *pe_addr_out);
+    extern int ios_jit_low_contains( uintptr_t a );   /* madeira-bcd pool-low: region C, FEX code only */
     unsigned cls[3] = {0, 0, 0};
     struct { uint64_t key; unsigned n; } ib[48], xnb[48], jb[64]; int nib = 0, nnb = 0, njb = 0;   /* ml1124: jb = JIT host pc /64 */
     memset( rb, 0, sizeof(rb) ); memset( hb, 0, sizeof(hb) );
@@ -1082,6 +1083,7 @@ static void ios_guest_rip_profile( int gen )
                     uintptr_t rx0 = (uintptr_t)ios_jit_rx_base_global, pe_at = 0; int c;
                     if (st.__pc >= rx0 && st.__pc < rx0 + ios_jit_pool_size_global)
                         c = ios_jit_pool_image_pc( st.__pc, &pe_at ) ? 1 : 0;
+                    else if (ios_jit_low_contains( st.__pc )) c = 0;
                     else c = 2;
                     cls[c]++;
                     if (c == 0) {   /* ml1124 */
@@ -1888,9 +1890,12 @@ static int ios_wp_desc( uint64_t a, struct ios_ts_map *mp, char *out, size_t cap
 {
     extern void *ios_jit_rx_base_global; extern size_t ios_jit_pool_size_global;
     extern int ios_jit_pool_image_pc(uintptr_t pc, uintptr_t *pe_addr_out);
+    extern int ios_jit_low_contains( uintptr_t a );
     uintptr_t rx0 = (uintptr_t)ios_jit_rx_base_global, pe = 0; uint64_t rva = 0; const char *mod;
     Dl_info di;
     *kind = 0;
+    /* madeira-bcd pool-low: region C holds FEX code buffers only */
+    if (ios_jit_low_contains( (uintptr_t)a )) { snprintf( out, cap, "x64-JIT" ); *kind = 3; return 1; }
     if (a >= rx0 && a < rx0 + ios_jit_pool_size_global)
     {
         if (!ios_jit_pool_image_pc( a, &pe )) { snprintf( out, cap, "x64-JIT" ); *kind = 3; return 1; }

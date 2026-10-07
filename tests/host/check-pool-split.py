@@ -57,8 +57,9 @@ runs = function(native, 'static int ios_pool_execable_runs(')
 
 # --- call sites ---------------------------------------------------------------
 bump = native[native.index('/* madeira-bcd split pool: never into the hole (ios_jit_hole_off).'):][:2600]
-assert 'ios_pool_hole_head_place( jit_pool_offset, alloc_size,\n                                                ios_jit_hole_off, ios_jit_hole_end_eff );' in bump
-assert native.count('ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off, ios_jit_hole_end_eff );') == 2
+assert 'ios_pool_hole_head_place( jit_pool_offset, alloc_size,\n                                                ios_jit_hole_off_eff, ios_jit_hole_end_eff );' in bump
+assert native.count('ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff );') == 2
+assert 'ios_jit_hole_off_eff - jit_pool_offset' in bump, 'the leftover freelist range excludes a lower image slot'
 assert 'ios_jit_hole_end );' not in native.replace('ios_jit_hole_end_eff );', ''), 'no placement uses the bare hole end'
 assert '#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off)' in native, \
     'the warmer still warms the slot'
@@ -73,9 +74,10 @@ assert 'ios_pool_big_taken = 0;' in slot_free and 'ios_pool_big_freed_at = time(
 assert 'ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];\n            continue;' in slot_free
 assert reclaim.index('if (ios_pool_big_size && off <') < reclaim.index('ios_pool_free_put( ios_pool_freelist'), \
     'the slot is given back before the freelist would take it'
-big_init = native[native.index('const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );'):][:1400]
-assert 'ios_jit_hole_end > ios_jit_hole_off && want >= IOS_POOL_BIG_MIN' in big_init
-assert 'ios_jit_hole_end + want <= jit_pool_size' in big_init and 'ios_jit_hole_end_eff = ios_jit_hole_end + want;' in big_init
+big_init = native[native.index('const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );'):][:3500]
+assert 'ios_pool_big_layout( jit_pool_size, ios_jit_hole_off,' in big_init
+assert 'ios_pool_big_off = slot;' in big_init and 'ios_jit_hole_end_eff = skip_end;' in big_init
+assert 'ios_jit_hole_off_eff = skip_off;' in big_init
 assert native.index('ios_jit_hole_end_eff = (size_t)h1;') < native.index('const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );')
 assert 'jit_pool_offset = cand + alloc_size;' in bump
 assert 'ios_pool_freelist[ios_pool_free_count].off = jit_pool_offset;' in bump
@@ -88,12 +90,13 @@ assert 'ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,' in
 assert tail.count('ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,') == 2
 assert '__sync_fetch_and_sub(&ios_jit_tail_reserved' not in tail, 'every rollback goes through ios_pool_tail_unreserve'
 assert 'ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end_eff;' in tail
-assert 'ios_jit_hole_off, ios_jit_hole_end_eff );' in tail, 'the tail jumps the slot with the hole'
+assert 'ios_jit_hole_off_eff, ios_jit_hole_end_eff );' in tail, 'the tail jumps either slot placement with the hole'
 assert 'ios_jit_pool_size_global - cur - ios_jit_hole_end_eff' in tail
 
-cap = native[native.index('enum { TAIL_SMALL = 0x1000000, TAIL_MAX = 0x8000000'):][:900]
-assert 'ios_pool_hole_between( ios_jit_pool_size_global, head_now, tail_now,' in cap
-assert 'head_now - tail_now - hole_now - HEAD_RESERVE' in cap
+cap = native[native.index('enum { TAIL_SMALL = 0x1000000 };'):][:1800]
+assert 'ios_pool_code_cap( ios_jit_pool_size_global, head_now, tail_now,' in cap
+assert 'ios_jit_hole_off_eff, ios_jit_hole_end_eff, ios_pool_head_reserve );' in cap
+assert 'if (alloc_size > cap && !low_fits)' in cap, 'region C still bypasses the tail cap'
 
 init = native[native.index('const char *hole = getenv( "WINE_IOS_JIT_HOLE" );'):][:1400]
 assert 'h1 < jit_pool_size' in init and '!(h0 & 0x3fff) && !(h1 & 0x3fff)' in init

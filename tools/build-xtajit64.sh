@@ -132,6 +132,9 @@ fi
 #  - patch-fex-ios-pool-null.py: a pooled buffer the band refused is never NULL.
 #  - patch-fex-ios-invalid-bytes.py: the bytes of an instruction the decoder refused.
 #  - patch-fex-ios-inline-smc-split.py: a write into the following bytes ends the block.
+#  - patch-fex-ios-alias-retire-jit.py: a new image copy on a reused JIT range
+#    retires the dead entry that still covers it (reverse translation walks
+#    oldest-first and found the dead image).
 #  - patch-fex-ios-avx.py: AVX/AVX2 only when MADEIRA_FEX_AVX=1 at launch, so
 #    the same module serves both; xtajit64-avx.dll is kept as a copy for the
 #    bridge's existing switch.
@@ -153,9 +156,15 @@ python3 "$R/tools/patch-fex-ios-callret-trust.py" "$R/FEX/FEXCore/Source/Interfa
 python3 "$R/tools/patch-fex-ios-ssa-bytes.py" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
 python3 "$R/tools/patch-fex-ios-smc-read.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-trace-tail.py" "$R/FEX/FEXCore/Source/Interface/Core"
+python3 "$R/tools/patch-fex-ios-alias-retire-jit.py" "$R/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp"
+# Keep the pinned allocator intact; only the patched ARM64EC rebuild uses
+# coherent 4 MiB spans. The unpatched fingerprint above retains its geometry.
+python3 "$R/tools/patch-fex-ios-rpmalloc-span8.py" "$R/FEX/External/rpmalloc/rpmalloc/rpmalloc.c" --span-mb 4
 python3 "$R/tools/patch-fex-ios-branch-history.py" "$R/FEX"
+python3 "$R/tools/patch-fex-ios-launcher-smc.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 build
 git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/CPUID.h FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def
+git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
 cp "$B/Bin/libarm64ecfex.dll" "$AVX"
 echo "::notice::xtajit64.dll (and xtajit64-avx.dll) built from FEX $(git -C FEX rev-parse --short HEAD) with the map-notification and IntervalsLock self-deadlock fixes, IRCapRIP out of the game's TLS, the TSD-slot TEB for the WinAPI shims, the CPUID index wrap, and the MADEIRA_FEX_AVX opt-in, and shipped"

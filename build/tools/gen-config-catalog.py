@@ -43,6 +43,39 @@ INT_READERS = {"madeira_cfg_int", "mad_cfg_int_pe"}
 # Titles, kinds and fixed choices for options with a dedicated Settings row.
 # "choices" are (value, label); the empty value means "remove the key".
 OVERLAY = {
+    "env.MADEIRA_PIN_GRAPHICS_DLLS": {"category": "Memory & JIT pool", "title": "Keep graphics DLLs loaded",
+                "kind": "bool", "default": "0",
+                "note": "Default off. On a D3D12 device/probe call, pins already loaded D3D12, DXGI and Wine Metal "
+                        "DLLs until normal process shutdown, preventing repeated unload/reload copies. Keeps DLL "
+                        "data live; does not recycle executable ranges or change GPU capabilities. Restart the "
+                        "session after changing it.",
+                "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"]},
+    "env.MADEIRA_POOL_RECYCLE_IMAGES": {"category": "Memory & JIT pool", "title": "Images in retired code-buffer space",
+                "kind": "bool", "default": "0",
+                "note": "Default off. If other image allocations fail, retired region-C code buffers up to 64 MB "
+                        "may enter the image freelist after a 3-second grace, executable-page and thread-PC checks. "
+                        "Requires pool-low; 64-bit processes only. Live buffers and the pool-low-margin stay unchanged."},
+    "env.MADEIRA_X64_IMAGE_NOCOPY": {"category": "Memory & JIT pool", "title": "Pure-x64 images without a JIT-pool copy",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: an x64-only image (not ARM64EC hybrid, not a Wine builtin) in a 64-bit "
+                        "process is not copied into the JIT pool; the emulator runs its code from the loaded "
+                        "image, as 32-bit programs already do, and its executable protections are applied without "
+                        "EXEC. Frees the pool for hybrid DLL copies and code buffers. Hybrid images keep their "
+                        "copy. Set it in the game's own file; restart the session after changing it."},
+    "env.MADEIRA_POOL_LOW_IMAGES": {"category": "Memory & JIT pool", "title": "Small images in spare code-buffer space",
+                "kind": "bool", "default": "0",
+                "note": "Default off. If the normal JIT image allocation fails, copies up to 16 MB may use "
+                        "unallocated region C, preserving 4 MB for code buffers. Requires pool-low; 64-bit "
+                        "processes only. Does not shrink live buffers or the pool-low-margin."},
+    "env.MADEIRA_IMAGE_PATCH_TRACE": {"category": "Debugging / logs", "title": "DLL code patch trace", "kind": "bool", "default": "0",
+                "note": "1 logs up to 64 successful 1–16 byte executable-image protection requests and their PE/pool bytes. Read-only, owner-aware diagnostics; does not alter hooks or code."},
+    "env.MADEIRA_DLL_LOCAL": {"category": "Wine core (ntdll)", "title": "App-local DLL reads", "kind": "text", "default": "",
+                "note": "Optional semicolon-separated DLL filenames, including .dll. A source.dll=proxy.dll entry "
+                        "redirects requests outside the executable's directory to that local proxy, preserving initial "
+                        "loads from the executable's own directory. Bare filenames prefer the same local DLL. "
+                        "Only read-only opens and attribute queries are redirected. Missing local files, "
+                        "writes, create/delete operations, relative paths and non-file devices keep the normal path. "
+                        "Off by default; set only in the game's own file."},
     "swap-mb": { "note": "Moves game data to a file on this device's storage when memory runs short, up to this size. Off by default; read at launch.", "category": "Memory & JIT pool","title": "Swap tier size", "kind": "choice",
                 "choices": [("", "Off"), ("1024", "1 GB"), ("2048", "2 GB"), ("3072", "3 GB"), ("4096", "4 GB")]},
     "env.MADEIRA_SWAP_COVERAGE": {"category": "Memory & JIT pool", "note": "Which allocations the swap tier backs with its file (only when the tier is on). Large allocations (classic, the default): single 8 MB+ commits in the guest band. All allocations of 1 MB+ (blocks). 1 MB+ and overflow (wide): blocks plus allocations outside the band and fresh reservations. Whole reservations 4 MB+ (broad, ml1257): every new reservation of at least swap-min-mb (4 MB) below FEX's band backed whole when made, holes punched on decommit, swap-mb caps the disk it uses (a soft cap, checked when a block is backed). Unset: broad if swap-mode = 2, else classic.", "title": "Swap tier coverage", "kind": "choice",
@@ -118,12 +151,28 @@ OVERLAY = {
                         "second debugger region and both form one pool (about 880 MB instead of 560-630 MB). Costs "
                         "the second region's size in memory. Off by default; read at launch, the game's own file "
                         "wins."},
+    "pool-page-fit": {"category": "Memory & JIT pool", "title": "Fit split pool regions to memory pages",
+                "kind": "bool", "default": "0",
+                "note": "With pool-split on: fit regions A/B to 16 KB pages instead of 16 MB steps, retaining small "
+                        "remainders in free runs without increasing the requested pool budget. With pool-low on, "
+                        "also fit region C to pages while preserving pool-low-margin. Costs the additional pages in memory. Off by default; read at "
+                        "launch, the game's own file wins. Restart Madeira and enable JIT again after changing it."},
     "pool-pair": {"category": "Memory & JIT pool", "title": "Split JIT pool: prefer two runs above the window",
                 "kind": "bool", "default": "1",
                 "note": "With pool-split on: when the largest free run lies below the 0x140000000 executable window "
                         "(where the pool cannot split), the pool takes two runs above the window instead if together "
                         "they are larger (GTA V: 368 + 320 MB instead of 464 MB). Falls back to the single run if the "
                         "placement misses. On by default; 0 turns it off. Read at launch, the game's own file wins."},
+    "pool-low": {"category": "Memory & JIT pool", "title": "JIT code buffers below the executable window",
+                "kind": "bool", "default": "0",
+                "note": "1: the largest free run below the 0x140000000 executable window (less pool-low-margin) "
+                        "becomes a third debugger region for the emulator's code buffers, so the whole JIT pool is "
+                        "left to DLL copies (GTA V: about 300 MB more). Needs the pool above the window; costs the "
+                        "region's size in memory. Off by default; read at launch, the game's own file wins."},
+    "pool-low-margin": {"category": "Memory & JIT pool", "title": "Code-buffer region: MB left free below the window",
+                "kind": "int", "default": "128",
+                "note": "With pool-low on: how much of the free run below the executable window stays free for "
+                        "programs that load there (child processes' main executables). 128 by default."},
     "env.MADEIRA_SC_CEF": {"category": "Wine core (ntdll)", "title": "Social Club's Chromium in one process",
                 "kind": "bool", "default": "1",
                 "note": "On by default; 0 turns it off. SocialClubHelper.exe runs --single-process with "

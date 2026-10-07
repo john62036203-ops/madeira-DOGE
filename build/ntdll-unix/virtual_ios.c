@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -225,13 +226,57 @@ static size_t ios_jit_hole_off, ios_jit_hole_end;
  * EXHAUSTED for every SocialClubHelper.exe, "SC_INIT_ERR_WEBSITE_FAILED_LOAD".
  * With the slot, the N MB right above the hole go to one image of
  * IOS_POOL_BIG_MIN or more; for everything else (smaller images, the bump, the
- * tail) the hole ends at ios_jit_hole_end_eff, above the slot. When the slot's
+ * tail) the allocator hole includes the slot, between ios_jit_hole_off_eff and
+ * ios_jit_hole_end_eff. MADEIRA_POOL_BIG_SLOT_BELOW=1 puts the same slot below
+ * the native hole instead; its default placement is still above. When the slot's
  * process dies, the slot is free again after the reuse grace. */
-static size_t ios_jit_hole_end_eff;        /* ios_jit_hole_end + the slot */
+static size_t ios_jit_hole_off_eff, ios_jit_hole_end_eff; /* native hole plus the image slot */
 static size_t ios_pool_big_off, ios_pool_big_size;
 static int ios_pool_big_taken;
 static time_t ios_pool_big_freed_at;
 #define IOS_POOL_BIG_MIN (64u * 1024 * 1024)
+static size_t ios_pool_head_reserve = 48u * 1024 * 1024;
+
+/* A slot may sit on either side of the native hole. The default is still above
+ * it; MADEIRA_POOL_BIG_SLOT_BELOW=1 opts into the lower side, leaving the upper
+ * run contiguous for a later image. Keep at least 256MB below a lower slot for
+ * the startup images. Both placements use the same ledger and reuse grace.
+ * Only allocator bounds include the slot: the warmer's native hole is unchanged. */
+static int ios_pool_big_layout( size_t total, size_t hole_off, size_t hole_end,
+                                size_t want, int below, size_t *slot_off,
+                                size_t *skip_off, size_t *skip_end )
+{
+    if (hole_end <= hole_off || hole_end > total || want < IOS_POOL_BIG_MIN ||
+        (want & 0x3fff)) return 0;
+    if (below)
+    {
+        if (want > hole_off || hole_off - want < 256u * 1024 * 1024) return 0;
+        *slot_off = *skip_off = hole_off - want;
+        *skip_end = hole_end;
+    }
+    else
+    {
+        if (want > total - hole_end) return 0;
+        *slot_off = hole_end;
+        *skip_off = hole_off;
+        *skip_end = hole_end + want;
+    }
+    return 1;
+}
+
+/* Per-game headroom for future image copies, never less than the existing
+ * 48MB guard. Larger code buffers that fit region C, and recycled buffers,
+ * still bypass the pool-tail cap. Invalid values retain the old behavior. */
+static size_t ios_pool_parse_head_reserve( const char *value )
+{
+    char *end;
+    unsigned long mb;
+
+    if (!value || *value < '0' || *value > '9') return 48u * 1024 * 1024;
+    mb = strtoul( value, &end, 10 );
+    if (*end || mb < 48 || mb > 256) return 48u * 1024 * 1024;
+    return (size_t)mb << 20;
+}
 
 /* The offset a head allocation of `size` gets with the bump cursor at `cur`:
  * `cur`, or the end of the hole when [cur, cur + size) would reach into it. */
@@ -265,8 +310,133 @@ static size_t ios_pool_hole_between( size_t total, size_t head, size_t tail,
     return (head <= hole_off && total - tail >= hole_end) ? hole_end - hole_off : 0;
 }
 
+static size_t ios_pool_code_cap( size_t total, size_t head, size_t tail,
+                                 size_t hole_off, size_t hole_end, size_t reserve )
+{
+    size_t hole = ios_pool_hole_between( total, head, tail, hole_off, hole_end );
+    size_t room = 0, cap = 16u * 1024 * 1024;
+
+    /* Subtract in stages so malformed or transient cursor values cannot wrap
+     * into a generous budget. The existing 16MB minimum is unchanged. */
+    if (head <= total && tail <= total - head && hole <= total - head - tail &&
+        reserve < total - head - tail - hole)
+        room = total - head - tail - hole - reserve;
+    while (cap < 128u * 1024 * 1024 && cap * 2 <= room) cap *= 2;
+    return cap;
+}
+
 /* 1 for a pool offset inside the hole (always 0 without a split). */
 #define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off)
+
+/* madeira-bcd POOL-LOW (StikJITHelper.swift, `pool-low = 1` in madeira.cfg or in a
+ * game's own file; env WINE_IOS_JIT_TAIL_REGION="<rx>:<size>", hex). Off by default.
+ *
+ * Every GTA V Enhanced log has a 416-476 MB free run BELOW the executable window
+ * (ml1036 census: 0x126000000+416MB .. 0x122400000+476MB, ending at 0x140000000),
+ * and build 374 (2026-10-04 09:25) ran the head dry at 557 of the 560 MB below the
+ * hole while 112 MB of the pool were FEX code buffers. The run cannot join the pool
+ * span: [rx, rx + size) would then contain the executable window, and everything
+ * here and in FEX treats that range as pool memory. So the app takes it as a THIRD
+ * debugger region, region C, outside the span, and maps its RW alias at the SAME
+ * RX->RW distance as the pool (one reservation [C's RW, pool RW + size), the
+ * part in between PROT_NONE), because FEX applies one DualMap::WriteOffset to
+ * every code buffer. EC_CODE carves (FEX code buffers) come from C first,
+ * and the pool tail takes over when C is full. Image copies stay in the main
+ * pool by default; MADEIRA_POOL_LOW_IMAGES opts small failed copies into spare
+ * C space. MADEIRA_POOL_RECYCLE_IMAGES can also return retired C code-buffer
+ * ranges to the image freelist. Anonymous RWX stays in the main pool. C carves
+ * live in ios_tail_carves like any other carve, their `off` the
+ * (wrapping) distance from the pool's RX base, so rx + off and rw + off hold for
+ * them too. What still has to know about C is everything that asks "is this
+ * address in the pool?" for code: the signal and Mach handlers, NtContinue's
+ * native resume, the carve free and lookup, the warmer, Wine's free-area scan and
+ * the tripwires; they call ios_jit_low_contains / ios_jit_low_rw_contains. WoW64
+ * processes never get a C carve: their FEX refuses an executable allocation
+ * outside [WINE_IOS_JIT_RX, +SIZE) (AllocatorHooks.h). Without the env var the
+ * size is 0 and every test below is false. */
+uintptr_t ios_jit_low_rx_global, ios_jit_low_rw_global;
+size_t ios_jit_low_size_global;
+static volatile size_t ios_jit_low_reserved;   /* C's bump: bytes carved from its bottom */
+static int ios_jit_low_full_logged;
+#define IOS_POOL_LOW_MIN       (16u * 1024 * 1024)
+#define IOS_POOL_LOW_CARVE_MAX 0x8000000u         /* TAIL_MAX: FEX's own branch-range limit */
+
+/* 1 for an address in region C's RX side / RW side. Lock-free and async-signal-safe:
+ * the Mach and signal handlers in signal_arm64_ios.c call these. */
+int ios_jit_low_contains( uintptr_t a )
+{
+    size_t n = ios_jit_low_size_global;
+    return n && a - ios_jit_low_rx_global < n;
+}
+
+int ios_jit_low_rw_contains( uintptr_t a )
+{
+    size_t n = ios_jit_low_size_global;
+    return n && a - ios_jit_low_rw_global < n;
+}
+
+/* 1 when [a, a + size) touches region C's RX side, 2 its RW side, else 0. */
+static int ios_jit_low_overlaps( uintptr_t a, size_t size )
+{
+    size_t n = ios_jit_low_size_global;
+
+    if (!n || !size) return 0;
+    if (a < ios_jit_low_rx_global + n && a + size > ios_jit_low_rx_global) return 1;
+    if (a < ios_jit_low_rw_global + n && a + size > ios_jit_low_rw_global) return 2;
+    return 0;
+}
+
+/* WINE_IOS_JIT_TAIL_REGION against the pool: 1 with C's RX base and size when it
+ * is page-aligned, at least IOS_POOL_LOW_MIN, entirely below the pool span (so it
+ * can never overlap it or its hole) and its RW alias at the pool's distance does
+ * not wrap; 0 for anything else, which leaves pool-low off. */
+static int ios_pool_low_parse( const char *env, uint64_t pool_rx, uint64_t pool_rw, uint64_t pool_size,
+                               uint64_t *rx_out, uint64_t *size_out )
+{
+    char *sep = NULL;
+    uint64_t rx, size;
+
+    if (!env || !*env || !pool_rx || !pool_rw || !pool_size) return 0;
+    rx = strtoull( env, &sep, 16 );
+    if (!sep || *sep != ':') return 0;
+    size = strtoull( sep + 1, NULL, 16 );
+    if (!rx || (rx & 0x3fff) || (size & 0x3fff) || size < IOS_POOL_LOW_MIN) return 0;
+    if (rx < 0x100000000ULL || rx + size < rx || rx + size > pool_rx) return 0;
+    if (pool_rw < pool_rx - rx) return 0;
+    *rx_out = rx;
+    *size_out = size;
+    return 1;
+}
+
+/* Region C's bump: `want` bytes from C's bottom, or 0 when it does not fit (the
+ * pool tail serves it then). Never consumes anything on failure. */
+static int ios_pool_low_take( volatile size_t *reserved, size_t low_size, size_t want, size_t *off_out )
+{
+    size_t cur;
+
+    do
+    {
+        cur = *reserved;
+        if (want > low_size || cur > low_size - want) return 0;
+    } while (!__sync_bool_compare_and_swap( reserved, cur, cur + want ));
+    *off_out = cur;
+    return 1;
+}
+
+/* The RW alias of a pool with region C is one reservation from C's RW side to the
+ * pool's RW end: its base and length (what the Social Club layout checks). Without
+ * C it is [rw, rw + size). */
+static void ios_pool_alias_extent( uint64_t pool_rx, uint64_t pool_rw, uint64_t pool_size,
+                                   uint64_t low_rx, uint64_t low_size, uint64_t *lo, uint64_t *span )
+{
+    *lo = pool_rw;
+    *span = pool_size;
+    if (low_size && low_rx < pool_rx && pool_rw >= pool_rx - low_rx)
+    {
+        *lo = pool_rw - (pool_rx - low_rx);
+        *span = pool_size + (pool_rx - low_rx);
+    }
+}
 
 /* Gives back a refused tail carve's reservation: `added` bytes taken when the
  * counter went to `mine`. Unsplit this is the old fetch-and-sub. Split, a carve
@@ -358,6 +528,17 @@ void ios_jit_describe_pool_addr( const void *addr, char *buf, size_t buflen )
     if (!buf || !buflen) return;
     buf[0] = 0;
     if (!ps) { snprintf( buf, buflen, "pool not initialised" ); return; }
+
+    /* madeira-bcd pool-low: region C holds FEX code buffers only */
+    if (ios_jit_low_contains( a ) || ios_jit_low_rw_contains( a ))
+    {
+        int is_rx = ios_jit_low_contains( a );
+        size_t loff = a - (is_rx ? ios_jit_low_rx_global : ios_jit_low_rw_global);
+        snprintf( buf, buflen, "%s pool-low (region C) off=0x%lx of 0x%lx, carved 0x%lx -> FEX code buffer%s",
+                  is_rx ? "RX" : "RW", (unsigned long)loff, (unsigned long)ios_jit_low_size_global,
+                  (unsigned long)ios_jit_low_reserved, loff < ios_jit_low_reserved ? "" : " (NOT CARVED YET)" );
+        return;
+    }
 
     if (rw && a >= rw && a < rw + ps)      { base = rw; which = "RW"; }
     else if (rx && a >= rx && a < rx + ps) { base = rx; which = "RX"; }
@@ -805,6 +986,16 @@ static void *ios_pool_warmer_thread( void *arg )
             {
                 for (o = 0; o < head; o += 0x4000) { if (IOS_POOL_IN_HOLE(o)) continue; sink += rx[o]; touched++; }
                 for (o = total - tail; o < total; o += 0x4000) { if (IOS_POOL_IN_HOLE(o)) continue; sink += rx[o]; touched++; }
+            }
+            /* madeira-bcd pool-low: region C's carved part holds FEX code buffers
+             * exactly like the tail -- warm both of its aliases too. */
+            if (ios_jit_low_size_global)
+            {
+                volatile const char *lrw = (volatile const char *)ios_jit_low_rw_global;
+                volatile const char *lrx = (volatile const char *)ios_jit_low_rx_global;
+                size_t used = ios_jit_low_reserved;
+                if (used > ios_jit_low_size_global) used = ios_jit_low_size_global;
+                for (o = 0; o < used; o += 0x4000) { sink += lrw[o]; sink += lrx[o]; touched += 2; }
             }
             (void)sink;
             cycle++;
@@ -2765,6 +2956,14 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
     time_t now = time( NULL );
     int i, bump_ok;
 
+    /* Reclaimed image ranges can also live in region C. WoW64's emulator
+     * accepts executable storage only inside the main pool span. */
+    if (ios_jit_low_size_global && ios_wow_base() && anchor_off == (size_t)-1)
+    {
+        anchor_off = 0;
+        max_dist = ios_jit_pool_size_global;
+    }
+
 #define IOS_POOL_IN_REACH(o) \
     (anchor_off == (size_t)-1 || \
      ((o) > anchor_off ? (o) + alloc_size - anchor_off : anchor_off - (o)) <= max_dist)
@@ -2821,7 +3020,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                 : now - ios_pool_big_freed_at < IOS_POOL_REUSE_GRACE_SEC ? "in its reuse grace" : "out of reach");
     if (pool_limit && off == (size_t)-1)
     {
-        size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off, ios_jit_hole_end_eff );
+        size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff );
         bump_short = cand + alloc_size > pool_limit;
     }
     if (off == (size_t)-1 && (alloc_size >= 32u * 1024 * 1024 || bump_short))
@@ -2918,7 +3117,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
 
     /* each `continue` below has dropped or replaced entry i: pick again */
     {
-        size_t bump_cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off, ios_jit_hole_end_eff );
+        size_t bump_cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff );
         bump_ok = bump_cand + alloc_size <= pool_limit && IOS_POOL_IN_REACH(bump_cand);
     }
     while (off == (size_t)-1 &&
@@ -3039,7 +3238,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
         /* madeira-bcd split pool: never into the hole (ios_jit_hole_off). Without
          * a split `cand` is the cursor itself and this is the old bump. */
         size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size,
-                                                ios_jit_hole_off, ios_jit_hole_end_eff );
+                                                ios_jit_hole_off_eff, ios_jit_hole_end_eff );
         if (cand + alloc_size <= pool_limit
             && IOS_POOL_IN_REACH(cand))
         {
@@ -3048,7 +3247,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                 /* The run below the hole stays usable: hand it to the freelist as
                  * a never-used range (no grace, nothing to advise), so the next
                  * image that fits there goes there. */
-                size_t below = ios_jit_hole_off > jit_pool_offset ? ios_jit_hole_off - jit_pool_offset : 0;
+                size_t below = ios_jit_hole_off_eff > jit_pool_offset ? ios_jit_hole_off_eff - jit_pool_offset : 0;
                 static int jump_n;
                 if (below >= 0x4000 && ios_pool_free_count < IOS_POOL_FREE_MAX)
                 {
@@ -3062,7 +3261,7 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                     dprintf(2, "[jit-pool] split pool: head 0x%lx+0x%lx would reach the hole [0x%lx,0x%lx) "
                             "-- placed above it at 0x%lx; the 0x%lx below it stays on the freelist\n",
                             (unsigned long)jit_pool_offset, (unsigned long)alloc_size,
-                            (unsigned long)ios_jit_hole_off, (unsigned long)ios_jit_hole_end_eff,
+                            (unsigned long)ios_jit_hole_off_eff, (unsigned long)ios_jit_hole_end_eff,
                             (unsigned long)cand, (unsigned long)below);
             }
             off = cand;
@@ -3223,6 +3422,107 @@ static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
     return off;
 }
 
+/* Default-off overflow for small image copies. EC_CODE and images reserve
+ * from the same atomic region-C cursor, so neither can overwrite the other.
+ * Live code buffers, the low-VA margin and existing reuse grace are untouched. */
+static size_t ios_pool_low_image_range( size_t alloc_size )
+{
+    const size_t reserve = 4u * 1024 * 1024;
+    const char *env = getenv( "MADEIRA_POOL_LOW_IMAGES" );
+    size_t off = (size_t)-1, cur = 0;
+    void *peb;
+
+    if (!env || strcmp( env, "1" ) || ios_wow_base() ||
+        !ios_jit_low_size_global || !ios_jit_rx_base_global || !ios_jit_low_rw_global ||
+        !alloc_size || (alloc_size & 0x3fff) || alloc_size > 16u * 1024 * 1024 ||
+        ios_jit_low_size_global < reserve) return off;
+
+    peb = ios_jit_current_peb();
+    pthread_mutex_lock( &ios_pool_lock );
+    if (ios_pool_ledger_count < IOS_POOL_LEDGER_MAX)
+    {
+        for (;;)
+        {
+            cur = ios_jit_low_reserved;
+            if (alloc_size > ios_jit_low_size_global - reserve ||
+                cur > ios_jit_low_size_global - reserve - alloc_size) break;
+            off = (size_t)(ios_jit_low_rx_global + cur - (uintptr_t)ios_jit_rx_base_global);
+            if (!ios_pool_range_clean( off, alloc_size ))
+            {
+                off = (size_t)-1;
+                break;
+            }
+            if (__sync_bool_compare_and_swap( &ios_jit_low_reserved, cur, cur + alloc_size )) break;
+            off = (size_t)-1;
+        }
+        if (off != (size_t)-1)
+        {
+            ios_pool_ledger[ios_pool_ledger_count].off = off;
+            ios_pool_ledger[ios_pool_ledger_count].size = alloc_size;
+            ios_pool_ledger[ios_pool_ledger_count].peb = peb;
+            ios_pool_ledger_count++;
+            ios_pool_last_alloc_reused = 0;
+        }
+    }
+    pthread_mutex_unlock( &ios_pool_lock );
+    if (off != (size_t)-1)
+        dprintf( 2, "[pool-low] IMAGE rx=%p size=0x%lx peb=%p used=0x%lx/0x%lx "
+                    "code_reserve=0x%lx head_used=0x%lx unchanged\n",
+                 (void *)(ios_jit_low_rx_global + cur), (unsigned long)alloc_size, peb,
+                 (unsigned long)(cur + alloc_size), (unsigned long)ios_jit_low_size_global,
+                 (unsigned long)reserve, (unsigned long)jit_pool_offset );
+    return off;
+}
+
+/* Failure-only, bounded bookkeeping snapshot. A grace-expired size fit is
+ * not a promise of executable/owner-safe reuse; the normal allocator still
+ * performs all of those checks. Never touch mappings or FEX/guest payloads. */
+static void ios_pool_failure_census( size_t want )
+{
+    static size_t requests[8];
+    static unsigned count;
+    size_t free_bytes = 0, largest = 0, aged_bytes = 0, aged_largest = 0, poisoned = 0;
+    size_t main_virgin = 0, c_used, c_virgin, c_image_virgin, hole;
+    const size_t code_reserve = 4u * 1024 * 1024;
+    unsigned raw_fit = 0, aged_fit = 0, i;
+    time_t now = time( NULL );
+
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < count; i++) if (requests[i] == want) goto done;
+    if (count == ARRAY_SIZE(requests)) goto done;
+    requests[count++] = want;
+    for (i = 0; i < (unsigned)ios_pool_free_count; i++)
+    {
+        const struct ios_pool_free *entry = &ios_pool_freelist[i];
+        free_bytes += entry->size;
+        if (entry->size > largest) largest = entry->size;
+        if (entry->size >= want) raw_fit++;
+        if (entry->advised & 2) poisoned += entry->size;
+        if (now - entry->freed_at < IOS_POOL_REUSE_GRACE_SEC) continue;
+        aged_bytes += entry->size;
+        if (entry->size > aged_largest) aged_largest = entry->size;
+        if (entry->size >= want) aged_fit++;
+    }
+    hole = ios_pool_hole_between( ios_jit_pool_size_global, jit_pool_offset, ios_jit_tail_reserved,
+                                  ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+    if (jit_pool_offset <= ios_jit_pool_size_global && ios_jit_tail_reserved <= ios_jit_pool_size_global - jit_pool_offset &&
+        hole <= ios_jit_pool_size_global - jit_pool_offset - ios_jit_tail_reserved)
+        main_virgin = ios_jit_pool_size_global - jit_pool_offset - ios_jit_tail_reserved - hole;
+    c_used = ios_jit_low_reserved;
+    c_virgin = c_used < ios_jit_low_size_global ? ios_jit_low_size_global - c_used : 0;
+    c_image_virgin = c_virgin > code_reserve ? c_virgin - code_reserve : 0;
+    dprintf( 2, "[pool-capacity] failed_want=0x%lx entries=%u free_bytes=0x%lx largest=0x%lx "
+                "aged_bytes=0x%lx aged_largest=0x%lx raw_size_fit=%u aged_size_fit=%u "
+                "poison_marked_bytes=0x%lx main_virgin=0x%lx c_virgin=0x%lx c_image_virgin=0x%lx "
+                "(bookkeeping only; reuse guards unchanged)\n",
+             (unsigned long)want, (unsigned)ios_pool_free_count, (unsigned long)free_bytes,
+             (unsigned long)largest, (unsigned long)aged_bytes, (unsigned long)aged_largest,
+             raw_fit, aged_fit, (unsigned long)poisoned, (unsigned long)main_virgin,
+             (unsigned long)c_virgin, (unsigned long)c_image_virgin );
+done:
+    pthread_mutex_unlock( &ios_pool_lock );
+}
+
 /* ml1039: hand a RECLAIMED head range to the code-buffer tail.
  *
  * The pool is two allocators facing each other: PE-image copies bump up from
@@ -3284,7 +3584,22 @@ static volatile size_t ios_jit_tail_reserved = 0;
  * (1..32MB after the ml437 MAX_CODE_SIZE cap), so first-fit-larger waste is
  * bounded and reuse is usually exact. */
 #define IOS_TAIL_CARVE_MAX 256
-static struct { size_t off; size_t size; int free; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
+static struct { size_t off; size_t size; int free; time_t freed_at; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
+
+/* madeira-bcd pool-low: 1 for a carve offset in region C (`off` is its wrapping
+ * distance from the pool's RX base, see ios_jit_low_rx_global). */
+static int ios_tail_carve_in_low( size_t off )
+{
+    return ios_jit_low_contains( (uintptr_t)ios_jit_rx_base_global + off );
+}
+
+/* A tiny dispatcher allocation must not consume a whole retired code buffer
+ * while region C can serve the tiny request. Keep the large buffer intact for
+ * the next code-cache allocation; no live carve is split or migrated. */
+static int ios_pool_preserve_code_carve( size_t available, size_t want, int low_fits )
+{
+    return low_fits && want <= 0x10000 && available >= 0x100000 && available / 4 >= want;
+}
 
 /* ml557 (#74 REGRESSION): is any thread's PC currently INSIDE this tail carve?
  *
@@ -3308,7 +3623,7 @@ static struct { size_t off; size_t size; int free; } ios_tail_carves[IOS_TAIL_CA
  * which is what ml438 set out to fix — but a leak is strictly better than
  * executing recycled code, and the carve becomes freeable on the next release
  * once the thread has left. */
-static int ios_tail_carve_occupied( const void *base, size_t size )
+static int ios_tail_carve_scan( const void *base, size_t size, int strict )
 {
     thread_act_array_t threads = NULL;
     mach_msg_type_number_t count = 0, i;
@@ -3317,17 +3632,23 @@ static int ios_tail_carve_occupied( const void *base, size_t size )
     int occupied = 0;
 
     if (task_threads( mach_task_self(), &threads, &count ) != KERN_SUCCESS)
-        return 0;                                  /* cannot tell -> old behaviour */
+    {
+        mach_port_deallocate( mach_task_self(), self );
+        return strict;                             /* unknown: old free policy, fail-closed transfer */
+    }
     for (i = 0; i < count; i++)
     {
         arm_thread_state64_t st;
         mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
-        if (threads[i] != self &&
-            thread_get_state( threads[i], ARM_THREAD_STATE64,
-                              (thread_state_t)&st, &sc ) == KERN_SUCCESS)
+        if (threads[i] != self)
         {
-            uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc( st );
-            if (pc >= lo && pc < hi) { occupied = 1; }
+            if (thread_get_state( threads[i], ARM_THREAD_STATE64,
+                                  (thread_state_t)&st, &sc ) == KERN_SUCCESS)
+            {
+                uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc( st );
+                if (pc >= lo && pc < hi) occupied = 1;
+            }
+            else if (strict) occupied = 1;
         }
         mach_port_deallocate( mach_task_self(), threads[i] );
     }
@@ -3336,8 +3657,115 @@ static int ios_tail_carve_occupied( const void *base, size_t size )
     mach_port_deallocate( mach_task_self(), self );
     return occupied;
 }
+static int ios_tail_carve_occupied( const void *base, size_t size )
+{
+    return ios_tail_carve_scan( base, size, 0 );
+}
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Unlike the existing freelist's best-effort check, a cross-allocator transfer
+ * needs proof that every byte is mapped and currently readable/executable.
+ * A guard page, a gap, a failed query or narrowed max_prot refuses the transfer. */
+static int ios_pool_recycle_range_ready( size_t off, size_t size )
+{
+    mach_vm_address_t a = (uintptr_t)ios_jit_rx_base_global + off, end = a + size;
+
+    if (!size || end <= a) return 0;
+    while (a < end)
+    {
+        mach_vm_address_t q = a;
+        mach_vm_size_t n = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        kern_return_t status = mach_vm_region( mach_task_self(), &q, &n, VM_REGION_BASIC_INFO_64,
+                                               (vm_region_info_t)&info, &count, &object );
+
+        if (object != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), object );
+        if (status != KERN_SUCCESS || q > a || !n || n > ~(mach_vm_size_t)0 - q || q + n <= a ||
+            !(info.max_protection & VM_PROT_EXECUTE) ||
+            (info.protection & (VM_PROT_READ | VM_PROT_EXECUTE)) != (VM_PROT_READ | VM_PROT_EXECUTE)) return 0;
+        a = q + n < end ? q + n : end;
+    }
+    return 1;
+}
+
+/* Default-off transfer of a retired code-buffer range to the image allocator.
+ * The free flag comes from FEX's normal release path; additionally require the
+ * image reuse grace, clean executable pages and a successful empty PC scan.
+ * Only region C is eligible, and only ranges/requests up to 64 MB. The normal
+ * allocator then splits it, purges old aliases and records the image's owner.
+ * No live buffer is resized and neither bump cursor nor tail budget changes.
+ * Lock order is carve -> pool; other carve paths release one before taking the
+ * other. Removal under both locks prevents code and image double-handout. */
+static int ios_pool_recycle_code_range( size_t want )
+{
+    const char *env = getenv( "MADEIRA_POOL_RECYCLE_IMAGES" );
+    const size_t limit = 64u * 1024 * 1024;
+    unsigned i, best = ~0u;
+    unsigned fitting = 0, recent = 0, dirty = 0, occupied = 0, carve_count;
+    size_t off = 0, size = 0;
+    time_t now = time( NULL ), freed_at = 0;
+    int transferred = 0;
+
+    if (!env || strcmp( env, "1" ) || ios_wow_base() ||
+        !ios_jit_low_size_global || !ios_jit_rx_base_global || !ios_jit_rw_base_global ||
+        !want || (want & 0x3fff) || want > limit) return 0;
+
+    pthread_mutex_lock( &ios_tail_carve_lock );
+    for (i = 0; i < ios_tail_carve_n; i++)
+    {
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global + ios_tail_carves[i].off;
+        size_t loff = rx - ios_jit_low_rx_global;
+        size_t n = ios_tail_carves[i].size;
+        time_t retired = ios_tail_carves[i].freed_at;
+
+        if (!ios_tail_carves[i].free || n < want || n > limit || (n & 0x3fff) ||
+            (rx & 0x3fff) || loff >= ios_jit_low_size_global || n > ios_jit_low_size_global - loff ||
+            (best != ~0u && n >= ios_tail_carves[best].size)) continue;
+        fitting++;
+        if (!retired || retired > now || now - retired < IOS_POOL_REUSE_GRACE_SEC) { recent++; continue; }
+        if (!ios_pool_recycle_range_ready( ios_tail_carves[i].off, n )) { dirty++; continue; }
+        if (ios_tail_carve_scan( (void *)rx, n, 1 )) { occupied++; continue; }
+        best = i;
+    }
+    if (best != ~0u)
+    {
+        size_t live_off;
+        void *live_peb;
+
+        off = ios_tail_carves[best].off;
+        size = ios_tail_carves[best].size;
+        freed_at = ios_tail_carves[best].freed_at;
+        pthread_mutex_lock( &ios_pool_lock );
+        if (ios_pool_ledger_count < IOS_POOL_LEDGER_MAX && ios_pool_free_count < IOS_POOL_FREE_MAX &&
+            !ios_pool_live_overlap( (uintptr_t)ios_jit_rw_base_global + off, size, &live_off, &live_peb ) &&
+            ios_pool_free_put( ios_pool_freelist, &ios_pool_free_count, IOS_POOL_FREE_MAX,
+                               off, size, freed_at, ios_pool_range_clean ))
+        {
+            ios_tail_carves[best] = ios_tail_carves[--ios_tail_carve_n];
+            transferred = 1;
+        }
+        pthread_mutex_unlock( &ios_pool_lock );
+    }
+    carve_count = ios_tail_carve_n;
+    pthread_mutex_unlock( &ios_tail_carve_lock );
+    if (transferred)
+        dprintf( 2, "[pool-recycle] retired code rx=%p size=0x%lx age=%lus -> image freelist "
+                    "(want=0x%lx, C cursor and live buffers unchanged)\n",
+                 (void *)((uintptr_t)ios_jit_rx_base_global + off), (unsigned long)size,
+                 (unsigned long)(now - freed_at), (unsigned long)want );
+    else
+    {
+        static unsigned refused;
+        if (__sync_add_and_fetch( &refused, 1 ) <= 16)
+            dprintf( 2, "[pool-recycle] no transfer: want=0x%lx carves=%u free_fit=%u recent=%u "
+                        "nonexec=%u occupied_or_unknown=%u (guards kept)\n",
+                     (unsigned long)want, carve_count, fitting, recent, dirty, occupied );
+    }
+    return transferred;
+}
 
 /* iOS-Madeira ml613: WHICH TAIL CARVE DOES THIS HOST PC LIVE IN, AND IS IT FREE?
  *
@@ -3364,7 +3792,9 @@ int ios_tail_carve_lookup_trylock( unsigned long long rx_addr, unsigned *idx_out
     unsigned i;
     int found = 0;
 
-    if (!rx_base || rx_addr < rx_base) return 0;
+    /* madeira-bcd pool-low: a carve in region C lies below the pool (its `off`
+     * wraps, rx_base + off is still its address) */
+    if (!rx_base || (rx_addr < rx_base && !ios_jit_low_contains( (uintptr_t)rx_addr ))) return 0;
     if (pthread_mutex_trylock( &ios_tail_carve_lock ) != 0) return -1;
     for (i = 0; i < ios_tail_carve_n; i++)
     {
@@ -3417,6 +3847,12 @@ void ios_pool_va_warn( const char *who, const void *addr, size_t size )
         dprintf( 2, "[pool-va] %s addr=%p size=0x%lx INSIDE RW pool off=0x%lx  <== foreign map/unmap\n",
                  who, addr, (unsigned long)size, (unsigned long)(a - rw) );
     }
+    else if (ios_jit_low_overlaps( a, size ))
+    {
+        warned++;
+        dprintf( 2, "[pool-va] [pool-low] %s addr=%p size=0x%lx INSIDE region C's %s side  <== foreign map/unmap\n",
+                 who, addr, (unsigned long)size, ios_jit_low_overlaps( a, size ) == 1 ? "RX" : "RW" );
+    }
 }
 
 void *ios_jit_rx_base_global = NULL;
@@ -3439,14 +3875,18 @@ int ios_fast_footprint = 0;                    /* ml670: set when d3d11 loads */
  *
  * Each Wine "process" thread gets its own slot with its own TEB address.
  * Slot 0 is the default (backward compatible with ios_jit_teb_trampoline).
- * Max 256 slots in one 16KB page (256 * 16 = 4096, well within 0x4000).
+ * Use all 1024 slots in the reserved 16KB page (1024 * 16 = 0x4000).
  *
  * Usage: SEGV/Mach handler sets x17 = target_PC, PC = thread's trampoline.
  * Trampoline runs: loads x18 = thread's TEB, jumps to x17 = target PC.
  */
 void *ios_jit_teb_trampoline = NULL;  /* RX address of slot 0 trampoline (offset 8) */
 #define IOS_JIT_TRAMPOLINE_SIZE 16    /* Bytes per trampoline slot */
-#define IOS_JIT_MAX_SLOTS 256         /* Max threads with trampolines */
+/* Each fallback to slot 0 overwrites another thread's saved TEB. The page
+ * is already reserved in full; slots above 255 require no new mapping or
+ * pool budget. Keep lifetime-monotonic allocation; never recycle a slot
+ * whose trampoline may still be referenced. */
+#define IOS_JIT_MAX_SLOTS (0x4000 / IOS_JIT_TRAMPOLINE_SIZE)
 static volatile int32_t ios_jit_next_slot = 0;  /* Next slot to allocate */
 
 /* Allocate a per-thread trampoline slot. Returns slot index (0-based). */
@@ -3533,109 +3973,94 @@ static int ios_jit_alias_has_emulator( void *peb )
     return 0;
 }
 
-/* madeira-doge ml2100: ONE CALLBACK PER FEX INSTANCE.
+/* madeira-bcd: PER-PROCESS alias pushes (env MADEIRA_ALIAS_PER_PROCESS, default
+ * on; 0 restores the single last-registrant callback above).
  *
- * Every x64 pseudo-process loads its own libarm64ecfex.dll, with its own
- * IosAliasEntries table, and registers its own push callback.  The single
- * global above kept only the LAST registrant, so an image loaded later in an
- * older process was pushed into the NEWEST process's table instead of its own.
- * Among Us through Madeira Dock: the game spawns crashpad_handler.exe (whose
- * FEX registers next), then loads cryptnet.dll; the game's FEX never heard of
- * cryptnet's pool copy, an EC call into it reached FEX at the pool address,
- * [iOS-xquery] MISSed with rev == addr, NoExec, and the game was killed.
+ * Each x64 pseudo-process has its own 256-entry IosAliasEntries table. Two
+ * things filled the wrong ones (GTA V Enhanced, build 372, 2026-10-04 08:08 log):
+ * an image mapped after a later process registered went to THAT process's table
+ * (Launcher's d3d11/dxgi/oleaut32 to the RockstarService start helper's), and
+ * every registration drained every process's mappings into the new table
+ * (28, 114, 141, 166, 196, 232, then 250-268 pushes), so a RockstarService
+ * started with a nearly full table. Its later WINTRUST.dll / cryptnet.dll
+ * stayed unregistered, the delay-load stub ran from the pool copy with no
+ * pool -> PE translation ("[iOS-xquery] MISS ... rev=" the same address,
+ * "NoExec instruction in entry block"), the service died with c0000005, the
+ * launcher reported "Failed to connect to the Rockstar Games Library Service",
+ * and five restarts later the JIT pool was exhausted.
  *
- * Now every registrant is kept (keyed by its PEB, replaced on re-registration,
- * forgotten at process exit) and each new mapping is pushed to all of them --
- * the same set the catch-up drain at registration already gives a new FEX.
- * The plain global stays the newest one, for the sub-floor windows, which are
- * per-process and keep their old routing.  MADEIRA_JIT_ALIAS_PUSH_ALL=0
- * restores last-registrant-only pushing. */
-#define IOS_JIT_ALIAS_CB_MAX 32
-static struct { void *peb; void (*cb)(unsigned long long, unsigned long long, unsigned long long); }
-    ios_jit_alias_cbs[IOS_JIT_ALIAS_CB_MAX];
-static pthread_mutex_t ios_jit_alias_cb_lock = PTHREAD_MUTEX_INITIALIZER;
-static int ios_jit_alias_push_all = -1;
+ * Now each registered emulator keeps its own callback: an image goes to the
+ * emulator of the process that maps it; a known process without one yet keeps
+ * the image for its own drain, and only an image mapped with no PEB at all
+ * goes to the last registrant as before. The drain pushes the registering
+ * process's own and unattributed mappings first and other processes' only
+ * while the table keeps IOS_ALIAS_DRAIN_RESERVE entries free. */
+#define IOS_FEX_ALIAS_MAX       256   /* kMaxEntries in FEX's IosJitAlias.cpp */
+#define IOS_ALIAS_DRAIN_RESERVE 96
+typedef void (*ios_alias_cb_t)(unsigned long long, unsigned long long, unsigned long long);
+static struct { void *peb; ios_alias_cb_t cb; } ios_alias_cbs[IOS_ALIAS_REG_MAX];
 
-static int ios_jit_alias_push_all_on(void)
+static int ios_alias_per_process_enabled(void)
 {
-    if (ios_jit_alias_push_all < 0)
+    static int enabled = -1;
+    if (enabled < 0)
     {
-        const char *v = getenv( "MADEIRA_JIT_ALIAS_PUSH_ALL" );
-        ios_jit_alias_push_all = !(v && v[0] == '0');
-        dprintf( 2, "[jit-alias] ml2100 push-all=%d (MADEIRA_JIT_ALIAS_PUSH_ALL=0 pushes to the newest FEX only)\n",
-                 ios_jit_alias_push_all );
+        /* Default on. 0 restores the old pushes: every image goes to the emulator
+         * that registered last, and a registration drains every process's images. */
+        const char *env = getenv( "MADEIRA_ALIAS_PER_PROCESS" );
+        enabled = !(env && env[0] == '0' && !env[1]);
     }
-    return ios_jit_alias_push_all;
+    return enabled;
 }
 
-static void ios_jit_alias_cb_remember( void *peb, void (*cb)(unsigned long long, unsigned long long, unsigned long long) )
-{
-    int i, free_slot = -1;
-    pthread_mutex_lock( &ios_jit_alias_cb_lock );
-    for (i = 0; i < IOS_JIT_ALIAS_CB_MAX; i++)
-    {
-        if (ios_jit_alias_cbs[i].cb && ios_jit_alias_cbs[i].peb == peb)
-        {
-            ios_jit_alias_cbs[i].cb = cb;
-            pthread_mutex_unlock( &ios_jit_alias_cb_lock );
-            return;
-        }
-        if (!ios_jit_alias_cbs[i].cb && free_slot < 0) free_slot = i;
-    }
-    if (free_slot >= 0)
-    {
-        ios_jit_alias_cbs[free_slot].peb = peb;
-        __sync_synchronize();
-        ios_jit_alias_cbs[free_slot].cb = cb;
-    }
-    pthread_mutex_unlock( &ios_jit_alias_cb_lock );
-    dprintf( 2, "[jit-alias] ml2100 FEX alias callback %s peb=%p cb=%p\n",
-             free_slot >= 0 ? "registered" : "NOT KEPT (table full)", peb, (void *)cb );
-}
-
-/* Called from process_exit_wrapper (server_ios.c) before the dead process's
- * pool copies -- its libarm64ecfex.dll among them -- are reclaimed. */
-void ios_jit_alias_cb_forget( void *peb )
+static ios_alias_cb_t ios_alias_cb_for( void *peb )
 {
     int i;
-    if (!peb) return;
-    pthread_mutex_lock( &ios_jit_alias_cb_lock );
-    for (i = 0; i < IOS_JIT_ALIAS_CB_MAX; i++)
-        if (ios_jit_alias_cbs[i].cb && ios_jit_alias_cbs[i].peb == peb)
-        {
-            ios_jit_alias_cbs[i].cb = NULL;
-            __sync_synchronize();
-            ios_jit_alias_cbs[i].peb = NULL;
-        }
-    pthread_mutex_unlock( &ios_jit_alias_cb_lock );
+
+    if (!peb || !ios_alias_per_process_enabled()) return NULL;
+    for (i = 0; i < IOS_ALIAS_REG_MAX; i++)
+        if (ios_alias_cbs[i].peb == peb) return ios_alias_cbs[i].cb;
+    return NULL;
 }
 
-static void ios_jit_alias_push_new( unsigned long long pe, unsigned long long jit, unsigned long long size )
+static void ios_alias_cb_set( void *peb, ios_alias_cb_t cb )
 {
-    void (*cbs[IOS_JIT_ALIAS_CB_MAX])(unsigned long long, unsigned long long, unsigned long long);
-    int i, n = 0;
+    int i, slot = -1;
 
-    if (!ios_jit_alias_push_all_on())
+    if (!peb) return;
+    for (i = 0; i < IOS_ALIAS_REG_MAX; i++)
     {
-        if (ios_jit_alias_pushback_cb) ios_jit_alias_pushback_cb( pe, jit, size );
+        if (ios_alias_cbs[i].peb == peb) { slot = i; break; }
+        if (slot < 0 && !ios_alias_cbs[i].peb) slot = i;
+    }
+    if (slot < 0)
+    {
+        dprintf(2, "[alias-push] madeira-bcd peb=%p: no free per-process callback slot (%d), "
+                "its images go to the last registrant\n", peb, IOS_ALIAS_REG_MAX);
         return;
     }
-    /* Snapshot under the lock, call outside it: a callback is FEX code that may
-     * itself map memory and come back through ios_jit_add_mapping. */
-    pthread_mutex_lock( &ios_jit_alias_cb_lock );
-    for (i = 0; i < IOS_JIT_ALIAS_CB_MAX; i++)
-        if (ios_jit_alias_cbs[i].cb) cbs[n++] = ios_jit_alias_cbs[i].cb;
-    pthread_mutex_unlock( &ios_jit_alias_cb_lock );
-    if (!n)
-    {
-        if (ios_jit_alias_pushback_cb) ios_jit_alias_pushback_cb( pe, jit, size );
-        return;
-    }
-    for (i = 0; i < n; i++) cbs[i]( pe, jit, size );
+    ios_alias_cbs[slot].cb = cb;
+    __sync_synchronize();
+    ios_alias_cbs[slot].peb = peb;
+}
+
+static void ios_alias_cb_drop( void *peb )
+{
+    int i;
+
+    if (!peb) return;
+    for (i = 0; i < IOS_ALIAS_REG_MAX; i++)
+        if (ios_alias_cbs[i].peb == peb)
+        {
+            ios_alias_cbs[i].peb = NULL;
+            __sync_synchronize();
+            ios_alias_cbs[i].cb = NULL;
+        }
 }
 
 void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
+    ios_alias_cb_t own_cb;
     int i;
 
     /* Task #33: purge every entry whose PE range OVERLAPS the new image's.
@@ -3719,7 +4144,18 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
      * (via the unix_ios_push_jit_aliases unix-call), forward this new
      * mapping to it too. Early mappings (added before xtajit64 loads) are
      * picked up by the iteration in unix_ios_push_jit_aliases. */
-    if (ios_jit_alias_pushback_cb)
+    if ((own_cb = ios_alias_cb_for( ios_jit_current_peb() )))
+        own_cb((unsigned long long)(uintptr_t)pe_base, (unsigned long long)(uintptr_t)jit_base,
+               (unsigned long long)size);
+    /* madeira-bcd: per-process, a known process whose emulator has not
+     * registered yet keeps its image to itself -- its drain pushes it (map_peb
+     * == self). Handing it to the last registrant left a dead entry there once
+     * the process exited and its pool range was reused: GTA V Enhanced build
+     * 376 (2026-10-04 10:29), RockstarService.exe's "start" instance mapped its
+     * exe before registering, the launcher's emulator got it, and the
+     * launcher's cryptnet.dll later landed on that range and was reverse-
+     * translated to the dead exe (see tools/patch-fex-ios-alias-retire-jit.py). */
+    else if (ios_jit_alias_pushback_cb && !(ios_alias_per_process_enabled() && ios_jit_current_peb()))
     {
         /* madeira-bcd diagnostic, no behaviour change: name an image that a
          * process maps after ANOTHER process registered its emulator. The push
@@ -3742,15 +4178,10 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
                         cur, ios_jit_alias_pushback_peb, cross_n);
             }
         }
+        ios_jit_alias_pushback_cb((unsigned long long)(uintptr_t)pe_base,
+                                  (unsigned long long)(uintptr_t)jit_base,
+                                  (unsigned long long)size);
     }
-    /* madeira-doge ml2100: to EVERY registered emulator, not only the newest
-     * (ios_jit_alias_push_new; it falls back to the single callback above when
-     * none is kept). Among Us, build 90: cryptnet.dll mapped by the game went to
-     * Steam's emulator only, and the game then ran the image's pool copy as x86
-     * ("AV EXEC" at a pool address) and ended with 0xc0000005 before its window. */
-    ios_jit_alias_push_new((unsigned long long)(uintptr_t)pe_base,
-                           (unsigned long long)(uintptr_t)jit_base,
-                           (unsigned long long)size);
 }
 
 /* ml951: hand a sub-floor image window to FEX so QueryGuestExecutableRange can
@@ -4117,7 +4548,7 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
      * both exports are resolved from the mapped module at the end of this call. */
     struct ios_push_jit_aliases_args *params = args;
     void *self, *own, *prev_peb;
-    int i, pushed = 0, own_pushed = 0, parent_skipped = 0;
+    int i, pass, pushed = 0, own_pushed = 0, parent_skipped = 0, others_left = 0;
     if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
     /* madeira-bcd: the process registering is the one running this unix call
      * (PE ntdll's arm64ec_process_init_dispatchers, on its first thread). */
@@ -4126,7 +4557,7 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     prev_peb = ios_jit_alias_pushback_peb;
     ios_jit_alias_pushback_cb = params->callback;
     ios_jit_alias_pushback_peb = self;
-    ios_jit_alias_cb_remember( self, params->callback );   /* madeira-doge ml2100 */
+    if (ios_alias_per_process_enabled()) ios_alias_cb_set( self, params->callback );
     if (self && !ios_jit_alias_has_emulator( self ) && ios_jit_alias_registered_n < IOS_ALIAS_REG_MAX)
     {
         ios_jit_alias_registered[ios_jit_alias_registered_n] = self;
@@ -4151,8 +4582,26 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
      * one of the two is pushed: the registering process's own copy if it has
      * one (madeira-bcd, see ios_jit_alias_drain_wants above), else the parent
      * entry. Other processes' copies are never pushed. */
+    /* madeira-bcd: pass 0 pushes this process's own and unattributed mappings,
+     * pass 1 other processes' while the table keeps IOS_ALIAS_DRAIN_RESERVE
+     * free (see ios_alias_per_process_enabled); one pass when that is off. */
+    for (pass = 0; pass < 2; pass++)
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
+        if (ios_alias_per_process_enabled() && self)
+        {
+            void *mapper = ios_jit_mappings[i].map_peb;
+            int mine = ios_jit_mappings[i].owner_peb == self || !mapper || mapper == self;
+
+            if (mine != !pass) continue;
+            if (pass && ios_jit_alias_drain_wants( i, own ) &&
+                pushed >= IOS_FEX_ALIAS_MAX - IOS_ALIAS_DRAIN_RESERVE)
+            {
+                others_left++;
+                continue;
+            }
+        }
+        else if (pass) break;
         if (!ios_jit_alias_drain_wants( i, own ))
         {
             if (!ios_jit_mappings[i].owner_peb)
@@ -4179,8 +4628,9 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
         pushed++;
     }
     dprintf(2, "[alias-push] madeira-bcd peb=%p registered its emulator (cb=%p; later pushes went to "
-            "peb=%p until now): %d mapping(s) pushed, %d own copy(ies), %d parent copy(ies) left out%s\n",
-            self, (void *)params->callback, prev_peb, pushed, own_pushed, parent_skipped,
+            "peb=%p until now): %d mapping(s) pushed, %d own copy(ies), %d parent copy(ies) left out, "
+            "%d of other processes left out%s\n",
+            self, (void *)params->callback, prev_peb, pushed, own_pushed, parent_skipped, others_left,
             own ? "" : (self ? " [MADEIRA_CHILD_OWN_NTDLL=0: old drain]" : " [no PEB]"));
     /* ml613: the guaranteed init path — resolve both FEX exports here, where the
      * emulator module is certainly mapped, instead of from a diagnostic probe
@@ -4343,8 +4793,11 @@ void ios_mono_bridge_capture( uint64_t teb, uint64_t frame, uint64_t host_pc, ui
      * from a register in a faulting thread and is not trusted. */
     if (ios_safe_read64( frame + b->off_inline_jit_block_header, &block_begin ) || !block_begin)
     { __atomic_add_fetch( &b->n_reject_bad_block, 1, __ATOMIC_RELAXED ); return; }
-    /* Must look like a JIT block, or we would hand FEX a wild pointer. */
-    if (b->code_lo && (block_begin < b->code_lo || block_begin >= b->code_hi))
+    /* Must look like a JIT block, or we would hand FEX a wild pointer. madeira-bcd
+     * pool-low: FEX's code buffers may also live in region C, outside [code_lo,
+     * code_hi) (the pool span). */
+    if (b->code_lo && (block_begin < b->code_lo || block_begin >= b->code_hi) &&
+        !ios_jit_low_contains( (uintptr_t)block_begin ))
     { __atomic_add_fetch( &b->n_reject_outside_code, 1, __ATOMIC_RELAXED ); return; }
 
     for (i = 0; i < IOS_MONO_MAX_CONTEXTS; i++)
@@ -4853,6 +5306,67 @@ int ios_iat_sync_pick_mapping( uintptr_t rgn_start, uintptr_t rgn_end, void *peb
     }
     return fallback >= 0 ? fallback : first;
 }
+
+/* image-patch-test:begin (tests/host/check-image-patch-trace.py) */
+/* Read-only diagnostics for short protect/write/restore sequences on DLL code.
+ * Capture the requested byte range, not NtProtect's rounded page. The existing
+ * owner-aware sync remains the authority; this does not repair a hook, change
+ * permissions, copy code, or redirect native calls to an x64 stub. */
+static void ios_trace_image_patch( void *requested, size_t length, unsigned int prot,
+                                   unsigned int status )
+{
+    static unsigned int emitted;
+    const char *enabled;
+    uintptr_t start = (uintptr_t)requested, pe, pool;
+    void *owner, *caller;
+    unsigned int serial, i, n;
+    unsigned char a[16], b[16];
+    char parent[33], copy[33];
+    mach_vm_size_t actual;
+    int idx, got_parent, got_copy, saved_errno = errno;
+    unsigned int read_bits = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                             PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    unsigned int exec_bits = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                             PAGE_EXECUTE_WRITECOPY;
+
+    enabled = getenv( "MADEIRA_IMAGE_PATCH_TRACE" );
+    if (!enabled || strcmp( enabled, "1" ) || status || !length || length > 16 ||
+        start > UINTPTR_MAX - length || !(prot & read_bits) || !(prot & exec_bits) || (prot & PAGE_GUARD) ||
+        __atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 64) goto out;
+    if (!NtCurrentTeb()) goto out;
+    caller = ios_jit_current_peb();
+    idx = ios_iat_sync_pick_mapping( start, start + length, caller );
+    if (idx < 0) goto out;
+    pe = (uintptr_t)ios_jit_mappings[idx].pe_base;
+    pool = (uintptr_t)ios_jit_mappings[idx].jit_base;
+    owner = ios_jit_mappings[idx].owner_peb;
+    if (start < pe || start - pe >= ios_jit_mappings[idx].size ||
+        ios_jit_mappings[idx].size - (start - pe) < length ||
+        !pool || pool > UINTPTR_MAX - (start - pe)) goto out;
+    n = length;
+    pool += start - pe;
+    if (pool > UINTPTR_MAX - n) goto out;
+    serial = __atomic_fetch_add( &emitted, 1, __ATOMIC_RELAXED );
+    if (serial >= 64) goto out;
+    actual = 0;
+    got_parent = mach_vm_read_overwrite( mach_task_self(), start, n,
+                                         (mach_vm_address_t)(uintptr_t)a, &actual ) == KERN_SUCCESS && actual == n;
+    actual = 0;
+    got_copy = mach_vm_read_overwrite( mach_task_self(), pool, n,
+                                       (mach_vm_address_t)(uintptr_t)b, &actual ) == KERN_SUCCESS && actual == n;
+    strcpy( parent, "unreadable" );
+    strcpy( copy, "unreadable" );
+    for (i = 0; got_parent && i < n; i++) snprintf( parent + 2 * i, 3, "%02x", a[i] );
+    for (i = 0; got_copy && i < n; i++) snprintf( copy + 2 * i, 3, "%02x", b[i] );
+    dprintf( 2, "[image-patch] #%u tid=%04x image=%p rva=%#lx len=%lu prot=%#x "
+                 "owner=%p caller=%p pe=%s pool=%s %s\n",
+             serial + 1, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+             (void *)pe, (unsigned long)(start - pe), (unsigned long)length, prot, owner, caller,
+             parent, copy, got_parent && got_copy ? (memcmp( a, b, n ) ? "DIFFERENT" : "MATCH") : "UNREADABLE" );
+out:
+    errno = saved_errno;
+}
+/* image-patch-test:end */
 
 /* Translate a PE address to JIT pool address. Returns original if not mapped.
  * Owner-aware: resolves against the calling thread's process. */
@@ -6588,6 +7102,11 @@ struct file_view
 #define VPROT_SYSTEM           0x0200  /* system view (underlying mmap not under our control) */
 #define VPROT_PLACEHOLDER      0x0400
 #define VPROT_FREE_PLACEHOLDER 0x0800
+/* madeira-bcd [x64-image]: a pure-x64 image view in an x64 process that gets no
+ * JIT-pool copy; its code is host DATA that the emulator runs at the PE VA.
+ * Set once by map_image_into_view (MADEIRA_X64_IMAGE_NOCOPY), read by
+ * mprotect_exec. Follows the view through splits like VPROT_ARM64EC. */
+#define VPROT_X64DATA          0x1000
 
 /* Conversion from VPROT_* to Win32 flags */
 static const BYTE VIRTUAL_Win32Flags[16] =
@@ -6824,6 +7343,13 @@ static inline ULONG_PTR ios_usable_va_floor_get(void)
 {
     size_t sz = ios_jit_pool_size_global;
     if (ios_sc_layout_mode == 2) return (ULONG_PTR)0x7100000000ULL;   /* IOS_SC2_FLOOR */
+    /* madeira-bcd pool-low: the RW reservation starts with region C's alias, so the
+     * pool's own alias sits higher than 0x7000000000; the floor is where it ends. */
+    if (ios_jit_low_size_global && sz)
+    {
+        ULONG_PTR end = (ULONG_PTR)ios_jit_rw_base_global + sz;
+        if (end > (ULONG_PTR)0x7000000000ULL + sz && end < (ULONG_PTR)0x7400000000ULL) return end;
+    }
     return (ULONG_PTR)0x7000000000ULL + (ULONG_PTR)(sz ? sz : (896ULL << 20));
 }
 #define ios_usable_va_floor (ios_usable_va_floor_get())
@@ -7319,6 +7845,7 @@ static int ios_jit_pool_intersects( const void *addr, size_t size )
     if (!sz) return 0;
     if (rx && a < rx + sz && e > rx) return 1;
     if (rw && a < rw + sz && e > rw) return 1;
+    if (ios_jit_low_overlaps( (uintptr_t)a, size )) return 1;   /* madeira-bcd pool-low: region C */
     return 0;
 }
 
@@ -7644,7 +8171,8 @@ static void ios_jit_range_tripwire( const char *tag, const void *addr, size_t si
     static volatile int n;
 
     if (!ps || !addr || !size) return;
-    if (!((rx && a < rx + ps && e > rx) || (rw && a < rw + ps && e > rw))) return;
+    if (!((rx && a < rx + ps && e > rx) || (rw && a < rw + ps && e > rw) ||
+          ios_jit_low_overlaps( a, size ))) return;   /* madeira-bcd pool-low: region C too */
     if (__sync_fetch_and_add( &n, 1 ) > 300) return;
     dprintf(2, "[jit-tripwire] %s addr=%p size=0x%lx prot=%d caller=%p (pool rx=%p rw=%p)\n",
             tag, addr, (unsigned long)size, prot, retaddr, (void *)rx, (void *)rw);
@@ -9393,14 +9921,48 @@ static int ios_wow_guard_neighbour_blocked( ULONG_PTR addr, ULONG_PTR len )
     return a + size >= (mach_vm_address_t)addr + len;
 }
 
+/* A combined 4GB+page mapping may be refused even when the two pieces can
+ * be reserved separately. Own the guard first, without replacing any live
+ * mapping, then reserve the exact window. Publish only the complete pair;
+ * a failed window attempt must release only the guard we just acquired.
+ * Return -1 if cleanup failed, so the caller cannot borrow our leaked guard. */
+static int ios_wow_window_try_separate_guard( ULONG_PTR base, ULONG_PTR guard )
+{
+    void *guard_base;
+
+    if (guard > ~(ULONG_PTR)0 - IOS_WOW_WINDOW_SIZE ||
+        base > ~(ULONG_PTR)0 - IOS_WOW_WINDOW_SIZE - guard ||
+        !ios_wow_band_ok( base, IOS_WOW_WINDOW_SIZE + guard )) return 0;
+    guard_base = (void *)(base + IOS_WOW_WINDOW_SIZE);
+    if (anon_mmap_tryfixed( guard_base, guard, PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+        return 0;
+    if (anon_mmap_tryfixed( (void *)base, IOS_WOW_WINDOW_SIZE,
+                            PROT_NONE, MAP_NORESERVE ) == MAP_FAILED)
+    {
+        if (munmap( guard_base, guard ))
+        {
+            dprintf( 2, "[wow-window] B=%p: failed to release own guard page at %p: errno=%d\n",
+                     (void *)base, guard_base, errno );
+            return -1;
+        }
+        return 0;
+    }
+    mmap_add_reserved_area( (void *)base, IOS_WOW_WINDOW_SIZE + guard );
+    dprintf( 2, "[wow-window] B=%p: reserved 4GB + own guard page in separate mappings (+0x%llx)\n",
+             (void *)base, (unsigned long long)guard );
+    return 1;
+}
+
 static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
 {
     ULONG_PTR guard = ios_wow_guard_size();
     struct ios_wow_placeholder *ph;
     struct ios_wow_window *slot;
     char what[256];
+    int separate;
 
     *guard_owned = 0;
+    if (base > ~(ULONG_PTR)0 - IOS_WOW_WINDOW_SIZE - guard) return 0;
     if (!ios_wow_band_ok( base, IOS_WOW_WINDOW_SIZE )) return 0;
 
     /* A slot still owned by a registry entry (live, dead-awaiting-teardown or
@@ -9445,10 +10007,20 @@ static int ios_wow_window_try( ULONG_PTR base, unsigned *guard_owned )
         return 1;
     }
 
+    separate = ios_wow_window_try_separate_guard( base, guard );
+    if (separate < 0) return 0;
+    if (separate)
+    {
+        *guard_owned = 1;
+        return 1;
+    }
+
     /* an exactly-4GB gap: borrow the guard from the neighbour if — and only
      * if — the neighbour is already inaccessible */
     if (!ios_wow_guard_neighbour_blocked( base + IOS_WOW_WINDOW_SIZE, guard ))
     {
+        ios_va_describe_range( (void *)base, IOS_WOW_WINDOW_SIZE, what, sizeof(what) );
+        dprintf( 2, "[wow-window] B=%p: window body after failed reservations (%s)\n", (void *)base, what );
         ios_va_describe_range( (void *)(base + IOS_WOW_WINDOW_SIZE), guard, what, sizeof(what) );
         dprintf( 2, "[wow-window] B=%p REJECTED: 4GB+guard unavailable and the page at "
                     "%p is not an inaccessible neighbour (%s)\n",
@@ -11234,7 +11806,6 @@ void ios_jit_reclaim_process( void *peb )
 
     /* madeira-bcd: its Social Club reservations go when the next helper asks */
     ios_sc_grants_owner_died( peb );
-    ios_jit_alias_cb_forget( peb );   /* madeira-doge ml2100: before its emulator's pool copy is reclaimed */
     if (!peb || !rx_base) return;
 
     /* madeira-bcd: the alias-push callback lives in the emulator of the LAST
@@ -11243,6 +11814,7 @@ void ios_jit_reclaim_process( void *peb )
      * the next image map anywhere would call freed (later reused) code. Drop
      * the callback instead: the push had no live table to land in anyway, and
      * the next emulator to register gets the whole table from its drain. */
+    ios_alias_cb_drop( peb );
     if (peb == ios_jit_alias_pushback_peb && ios_jit_alias_pushback_cb)
     {
         dprintf(2, "[alias-push] madeira-bcd peb=%p exits while its emulator receives the alias pushes "
@@ -11918,10 +12490,19 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
             uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
             uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
             size_t ps = ios_jit_pool_size_global;
-            uintptr_t pool_end = 0;
+            uintptr_t pool_end = 0, pool_base = 0;
+            size_t low = ps ? ios_jit_low_size_global : 0;
 
-            if (ps && rx && a + size > rx && a < rx + ps) pool_end = rx + ps;
-            else if (ps && rw && a + size > rw && a < rw + ps) pool_end = rw + ps;
+            if (ps && rx && a + size > rx && a < rx + ps) { pool_base = rx; pool_end = rx + ps; }
+            else if (ps && rw && a + size > rw && a < rw + ps) { pool_base = rw; pool_end = rw + ps; }
+            /* madeira-bcd pool-low: region C's RX side, and on the RW side the whole
+             * reservation below the pool's alias (C's alias and the PROT_NONE part
+             * after it). The RX side between C and the pool is NOT skipped: the
+             * executable window and the low images live there. */
+            else if (low && a + size > ios_jit_low_rx_global && a < ios_jit_low_rx_global + low)
+            { pool_base = ios_jit_low_rx_global; pool_end = ios_jit_low_rx_global + low; }
+            else if (low && rw > ios_jit_low_rw_global && a + size > ios_jit_low_rw_global && a < rw)
+            { pool_base = ios_jit_low_rw_global; pool_end = rw; }
             if (pool_end)
             {
                 static int skipped;
@@ -11930,7 +12511,6 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
                              start, (void *)pool_end );
                 if (step < 0)
                 {
-                    uintptr_t pool_base = (pool_end == rx + ps) ? rx : rw;
                     if (pool_base < size) break;
                     start = ROUND_ADDR( (char *)(pool_base - size), (size_t)(-step) - 1 );
                 }
@@ -13038,7 +13618,6 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
     if (dead_peb)
     {
         extern void ios_jit_reclaim_process( void *peb );
-        ios_jit_alias_cb_forget( dead_peb );   /* ml2100 */
         ios_jit_reclaim_process( dead_peb );
     }
     ios_jit_purge_window( base, IOS_WOW_WINDOW_SIZE );
@@ -13291,6 +13870,627 @@ static int ios_sc_current_is_helper(void)
     return ios_sc_path_is_helper( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR) );
 }
 
+/* madeira-bcd: [sc-rph] the renderer half of Social Club's pages under
+ * --single-process.
+ *
+ * SocialClubHelper.exe picks its CefApp by process type: no --type= gets the
+ * browser app, --type=renderer the renderer app. Only the renderer app's
+ * GetRenderProcessHandler returns a handler (Rockstar's page bridge: it reads
+ * "rgsc-ipc-channel-name" when a browser is created, logs "Renderer IPC
+ * channel: ..." and connects the page to the launcher); the browser app's
+ * returns NULL. A single-process Chromium asks the BROWSER app for the
+ * renderer's handler, so that half never ran. GTA log 2026-10-04 12:56: the
+ * launcher sent four navigations (two online, two offline file:// pages), each
+ * naming a fresh channel rgsc_ipc_<pid>_channel_1, _2, ...; every page loaded
+ * (load-start / load-end events came back over channel_0), nobody ever opened
+ * those channels, and the launcher gave up "timed out loading both its online
+ * and offline content" (SC_INIT_ERR_WEBSITE_FAILED_LOAD). A renderer process of
+ * its own cannot exist here: layout 2 has room for one Chromium.
+ *
+ * For the one helper build analysed (TimeDateStamp 0x6a86d563, SizeOfImage
+ * 0x244000) every byte this relies on is checked first. Then a 112-byte x64
+ * thunk goes into the zero tail of .text (past SizeOfRawData, cleared by the
+ * mapper above) and the browser app's GetRenderProcessHandler vtable slot
+ * points to it. The thunk builds the helper's own renderer app once (its
+ * operator new and constructor), keeps one reference to it in the zero tail of
+ * .data's last page, and returns that app's handler through the helper's own
+ * getter (which adds the caller's reference):
+ *     push rbx; sub rsp,0x30; mov rbx,rdx
+ *     mov rax,[cache]; test rax,rax; jnz have
+ *     mov ecx,0x60; call new; test rax,rax; jz none
+ *     mov rcx,rax; mov edx,1; call RendererApp::RendererApp
+ *     mov [rsp+0x20],rax; AddRef through the virtual base; mov rax,[rsp+0x20]
+ *     mov [cache],rax
+ *   have: mov rcx,rax; mov rdx,rbx; call App::GetRenderProcessHandler
+ *   out:  mov rax,rbx; add rsp,0x30; pop rbx; ret
+ *   none: mov qword [rbx],0; jmp out
+ * Applied after relocation and before the section protections, so the JIT-pool
+ * copy of .text carries it. Any mismatch: nothing is written and the reason is
+ * logged. env.MADEIRA_SC_RENDER_HANDLER = 0 turns it off; so does
+ * env.MADEIRA_SC_CEF = 0 (no --single-process then).
+ *
+ * The Unix view can still have preferred-base pointers in its vtables. The
+ * JIT-pool copy rebases the existing DIR64 entries, including both patched
+ * vtable slots, so the slots must be written in their current base. Read that
+ * base from a slot instead of assuming it is ptr. New pointers in the unused
+ * .data tail have no DIR64 entries: those must name the mapped view directly
+ * so the normal PE-to-JIT alias translation can resolve them. */
+#define IOS_SCH_IMAGE_BASE  0x140000000ULL /* the helper's preferred base */
+#define IOS_SCH_STAMP       0x6a86d563u
+#define IOS_SCH_SIZE        0x244000u
+#define IOS_SCH_TEXT        0x1000u      /* .text: VirtualSize 0x17f34c, raw 0x17f400 */
+#define IOS_SCH_DATA        0x1cc000u    /* .data: VirtualSize 0x43bc */
+#define IOS_SCH_THUNK       0x180800u
+#define IOS_SCH_CACHE       0x1d0ff8u
+#define IOS_SCH_VT_BROWSER  0x182268u    /* browser app's CefApp vtable */
+#define IOS_SCH_VT_RENDERER 0x182658u    /* renderer app's CefApp vtable */
+#define IOS_SCH_GET_HANDLER 0x51b0u      /* returns this+0x28 as a CefRefPtr */
+#define IOS_SCH_GET_NULL    0x4330u      /* returns a NULL CefRefPtr */
+#define IOS_SCH_SLOT_BROWSER  3          /* CefApp::GetBrowserProcessHandler */
+#define IOS_SCH_SLOT_RENDERER 4          /* CefApp::GetRenderProcessHandler */
+#define IOS_SCH_VT_RPH      0x182688u    /* CefRenderProcessHandler vtable */
+#define IOS_SCH_WEBKIT      0x7e60u      /* OnWebKitInitialized */
+#define IOS_SCH_CURRENT_LOOP 0x173090u   /* this thread's helper MessageLoop */
+#define IOS_SCH_LOOP_CTOR   0x171770u
+#define IOS_SCH_LOOP_WORK   0x172330u    /* DoWork, NOT DeletePendingTasks (0x172020) */
+#define IOS_SCH_LOOP_DELAYED 0x1721c0u   /* DoDelayedWork */
+#define IOS_SCH_LOOP_IDLE   0x1722a0u    /* DoIdleWork */
+#define IOS_SCH_POST_TASK   0x181b08u    /* cef_post_delayed_task import slot */
+#define IOS_SCH_LOOP_INIT   0x180880u
+#define IOS_SCH_LOOP_PUMP   0x1808f0u
+#define IOS_SCH_TASK_ADD    0x1809b0u
+#define IOS_SCH_TASK_RELEASE 0x1809c0u
+#define IOS_SCH_TASK_ONE    0x1809d0u
+#define IOS_SCH_TASK_ANY    0x1809e0u
+#define IOS_SCH_TASK        0x1d0c00u   /* cef_task_t + loop pointer + anchored refcount */
+#define IOS_SCH_RUN_INSTALL 0x180a00u
+#define IOS_SCH_RUN_RESTORE 0x180a80u
+#define IOS_SCH_RUN_RING    0x1d0c40u   /* counter + 16 records (32 bytes each) */
+#define IOS_SCH_RUN_RING_SIZE 520u
+#define IOS_SCH_RENDER_DRAIN_SITE 0x48fa4u /* renderer-only call to drain helper work */
+#define IOS_SCH_RENDER_DRAIN 0x180b70u
+#define IOS_SCH_IPC_CONNECT 0x4ac10u
+#define IOS_SCH_RENDER_CHANNEL_REPLY 0x48593u
+#define IOS_SCH_RENDER_CHANNEL_KEEP  0x48598u
+#define IOS_SCH_RENDER_CHANNEL_THUNK 0x180400u
+#define IOS_SCH_IPC_TRACE   0x180b90u
+#define IOS_SCH_IPC_COUNT   0x1d0e48u /* immediately after the RunState ring */
+#define IOS_SCH_IPC_SPLIT   0x180c90u
+#define IOS_SCH_IPC_CAPTURE 0x180db2u
+#define IOS_SCH_IPC_STORE   0x180dc8u
+#define IOS_SCH_IPC_ROLE    0x180ddfu
+#define IOS_SCH_IPC_GLOBAL_LOOP 0x180dfbu
+#define IOS_SCH_IPC_INITIAL_CONNECT 0x180e0au
+#define IOS_SCH_IPC_DESTROY 0x180e19u
+#define IOS_SCH_IPC_DIRECT  0x180edcu
+#define IOS_SCH_IPC_CONTEXT 0x1d0e50u /* renderer manager + borrowed main command line */
+#define IOS_SCH_UI_CTOR     0xd5040u  /* message 0x20005, four-byte payload */
+#define IOS_SCH_UI_TRACE    0x180f30u
+#define IOS_SCH_UI_COUNT    0x1d0e60u
+#define IOS_SCH_UI_DELEGATE_CALLER 0x320afu
+
+
+/* Source: tests/host/sc-renderer-channels.S. Preserve page channels within
+ * the embedded client's 64-slot capacity; the original reply cleanup still runs. */
+static const unsigned char ios_sch_renderer_channels[25] =
+{
+    0x83,0xb8,0x20,0x02,0x00,0x00,0x40,0x73,0x0b,0x45,0x31,0xc0,0x48,0x89,0xc1,0xe9,
+    0x8b,0x81,0xec,0xff,0xe9,0x93,0x81,0xec,0xff,
+};
+
+static const unsigned char ios_sch_thunk[112] =
+{
+    0x53, 0x48,0x83,0xec,0x30, 0x48,0x89,0xd3,
+    0x48,0x8b,0x05,0xe9,0x07,0x05,0x00, 0x48,0x85,0xc0, 0x75,0x3f,
+    0xb9,0x60,0x00,0x00,0x00, 0xe8,0xea,0xde,0xfb,0xff, 0x48,0x85,0xc0, 0x74,0x44,
+    0x48,0x89,0xc1, 0xba,0x01,0x00,0x00,0x00, 0xe8,0x70,0x61,0xe8,0xff,
+    0x48,0x89,0x44,0x24,0x20, 0x48,0x8b,0x48,0x08, 0x48,0x63,0x49,0x04,
+    0x48,0x8d,0x4c,0x08,0x08, 0x48,0x8b,0x11, 0xff,0x12,
+    0x48,0x8b,0x44,0x24,0x20, 0x48,0x89,0x05,0xa5,0x07,0x05,0x00,
+    0x48,0x89,0xc1, 0x48,0x89,0xda, 0xe8,0x52,0x49,0xe8,0xff,
+    0x48,0x89,0xd8, 0x48,0x83,0xc4,0x30, 0x5b, 0xc3,
+    0x48,0xc7,0x03,0x00,0x00,0x00,0x00, 0xeb,0xee,
+};
+
+/* Chromium creates the in-process renderer thread without the helper's
+ * thread-local MessageLoop. Initialize it before the original WebKit callback;
+ * only a newly created loop gets a CEF TID_RENDERER task. Existing helper loops
+ * keep their own pump. Each task drives DoWork/DoDelayedWork/DoIdleWork with a
+ * scoped RunState and a 32-iteration budget, then yields for at least 10 ms.
+ * Source: tests/host/sc-render-loop.S; the host test assembles and executes it.
+ * The loop and anchored task remain alive until the pseudo-process exits. */
+static const unsigned char ios_sch_loop_thunk[363] =
+{
+    0x53,0x48,0x83,0xec,0x30,0x48,0x89,0xcb,0xc7,0x44,0x24,0x20,0x00,0x00,0x00,0x00,
+    0xe8,0xfb,0x27,0xff,0xff,0x48,0x85,0xc0,0x75,0x28,0xb9,0x60,0x01,0x00,0x00,0xe8,
+    0x64,0xde,0xfb,0xff,0x48,0x85,0xc0,0x74,0x19,0x48,0x89,0xc1,0x31,0xd2,0xe8,0xbd,
+    0x0e,0xff,0xff,0x48,0x89,0x05,0x76,0x03,0x05,0x00,0xc7,0x44,0x24,0x20,0x01,0x00,
+    0x00,0x00,0x48,0x89,0xd9,0xe8,0x96,0x75,0xe8,0xff,0x83,0x7c,0x24,0x20,0x00,0x74,
+    0x18,0xb9,0x06,0x00,0x00,0x00,0x48,0x8d,0x15,0x23,0x03,0x05,0x00,0x41,0xb8,0x0a,
+    0x00,0x00,0x00,0xff,0x15,0x1f,0x12,0x00,0x00,0x48,0x83,0xc4,0x30,0x5b,0xc3,0x90,
+    0x53,0x56,0x48,0x83,0xec,0x58,0x48,0x89,0xcb,0x48,0x8b,0x4b,0x30,0x48,0x85,0xc9,
+    0x0f,0x84,0x94,0x00,0x00,0x00,0x48,0x8b,0x81,0x28,0x01,0x00,0x00,0x48,0x89,0x44,
+    0x24,0x30,0xba,0x01,0x00,0x00,0x00,0x48,0x85,0xc0,0x74,0x04,0x8b,0x10,0xff,0xc2,
+    0x89,0x54,0x24,0x38,0xc7,0x44,0x24,0x3c,0x00,0x00,0x00,0x00,0x48,0xc7,0x44,0x24,
+    0x40,0x00,0x00,0x00,0x00,0x48,0x8d,0x44,0x24,0x38,0x48,0x89,0x81,0x28,0x01,0x00,
+    0x00,0xbe,0x20,0x00,0x00,0x00,0x48,0x8b,0x4b,0x30,0xe8,0xe1,0x19,0xff,0xff,0x88,
+    0x44,0x24,0x28,0x48,0x8b,0x4b,0x30,0x48,0x8d,0x54,0x24,0x20,0xe8,0x5f,0x18,0xff,
+    0xff,0x0a,0x44,0x24,0x28,0x74,0x06,0xff,0xce,0x75,0xdb,0xeb,0x09,0x48,0x8b,0x4b,
+    0x30,0xe8,0x2a,0x19,0xff,0xff,0x48,0x8b,0x4b,0x30,0x48,0x8b,0x44,0x24,0x30,0x48,
+    0x89,0x81,0x28,0x01,0x00,0x00,0xb9,0x06,0x00,0x00,0x00,0x48,0x89,0xda,0x41,0xb8,
+    0x0a,0x00,0x00,0x00,0xff,0x15,0x6e,0x11,0x00,0x00,0x48,0x83,0xc4,0x58,0x5e,0x5b,
+    0xc3,0x66,0x66,0x2e,0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00,0x0f,0x1f,0x40,0x00,
+    0xf0,0xff,0x41,0x38,0xc3,0x66,0x66,0x2e,0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00,
+    0xf0,0xff,0x49,0x38,0x31,0xc0,0xc3,0x66,0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00,
+    0x83,0x79,0x38,0x01,0x0f,0x94,0xc0,0x0f,0xb6,0xc0,0xc3,0x0f,0x1f,0x44,0x00,0x00,
+    0x83,0x79,0x38,0x00,0x0f,0x95,0xc0,0x0f,0xb6,0xc0,0xc3,
+};
+
+/* Record only the two RunState pointer writes in MessagePumpWin::Run.
+ * No printing or allocation on the normal path; dump the bounded ring only
+ * when the matching helper faults. The hooks replay displaced instructions
+ * and preserve flags/volatile registers. This is diagnostic, not a repair. */
+static const unsigned char ios_sch_run_trace[365] =
+{
+    0x48,0x89,0x41,0x40,0x9c,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,
+    0x48,0x83,0xec,0x60,0xf3,0x0f,0x7f,0x04,0x24,0xf3,0x0f,0x7f,0x4c,0x24,0x10,0xf3,
+    0x0f,0x7f,0x54,0x24,0x20,0xf3,0x0f,0x7f,0x5c,0x24,0x30,0xf3,0x0f,0x7f,0x64,0x24,
+    0x40,0xf3,0x0f,0x7f,0x6c,0x24,0x50,0x48,0x89,0xc2,0x41,0xb8,0x01,0x00,0x00,0x00,
+    0xe8,0xcb,0x00,0x00,0x00,0xf3,0x0f,0x6f,0x04,0x24,0xf3,0x0f,0x6f,0x4c,0x24,0x10,
+    0xf3,0x0f,0x6f,0x54,0x24,0x20,0xf3,0x0f,0x6f,0x5c,0x24,0x30,0xf3,0x0f,0x6f,0x64,
+    0x24,0x40,0xf3,0x0f,0x6f,0x6c,0x24,0x50,0x48,0x83,0xc4,0x60,0x41,0x5b,0x41,0x5a,
+    0x41,0x59,0x41,0x58,0x5a,0x59,0x58,0x9d,0x48,0x8b,0x01,0xe9,0xa8,0x36,0xff,0xff,
+    0x48,0x89,0x7b,0x40,0x9c,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,
+    0x48,0x83,0xec,0x60,0xf3,0x0f,0x7f,0x04,0x24,0xf3,0x0f,0x7f,0x4c,0x24,0x10,0xf3,
+    0x0f,0x7f,0x54,0x24,0x20,0xf3,0x0f,0x7f,0x5c,0x24,0x30,0xf3,0x0f,0x7f,0x64,0x24,
+    0x40,0xf3,0x0f,0x7f,0x6c,0x24,0x50,0x48,0x89,0xd9,0x48,0x89,0xfa,0x41,0xb8,0x02,
+    0x00,0x00,0x00,0xe8,0x48,0x00,0x00,0x00,0xf3,0x0f,0x6f,0x04,0x24,0xf3,0x0f,0x6f,
+    0x4c,0x24,0x10,0xf3,0x0f,0x6f,0x54,0x24,0x20,0xf3,0x0f,0x6f,0x5c,0x24,0x30,0xf3,
+    0x0f,0x6f,0x64,0x24,0x40,0xf3,0x0f,0x6f,0x6c,0x24,0x50,0x48,0x83,0xc4,0x60,0x41,
+    0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5a,0x59,0x58,0x9d,0x48,0x8b,0x5c,0x24,0x50,
+    0xe9,0x2f,0x36,0xff,0xff,0x66,0x66,0x2e,0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00,
+    0x53,0x56,0x57,0x48,0x83,0xec,0x20,0x48,0x89,0xcb,0x48,0x89,0xd6,0x44,0x89,0xc7,
+    0xff,0x15,0x82,0x09,0x00,0x00,0x41,0x89,0xc1,0x4c,0x8d,0x15,0x10,0x01,0x05,0x00,
+    0xb8,0x01,0x00,0x00,0x00,0xf0,0x49,0x0f,0xc1,0x02,0x48,0x89,0xc1,0x83,0xe1,0x0f,
+    0xc1,0xe1,0x05,0x4d,0x8d,0x54,0x0a,0x08,0x48,0xff,0xc0,0x49,0xc7,0x02,0x00,0x00,
+    0x00,0x00,0x45,0x89,0x4a,0x08,0x41,0x89,0x7a,0x0c,0x49,0x89,0x5a,0x10,0x49,0x89,
+    0x72,0x18,0x49,0x87,0x02,0x48,0x83,0xc4,0x20,0x5f,0x5e,0x5b,0xc3,
+};
+
+/* In --single-process, OnWebKitInitialized reaches the renderer branch of
+ * the helper's CEF task dispatcher. Its original call to 0x11be60 drains the
+ * browser's global I/O loop (0x1cea00), even while the browser thread runs it.
+ * Use the TLS loop installed by the renderer adapter instead. Only this
+ * renderer call site is redirected; the browser's original drain is intact.
+ * RunUntilIdle still executes the pending work with its normal scoped state.
+ * Source: tests/host/sc-render-drain.S. */
+static const unsigned char ios_sch_render_drain[31] =
+{
+    0x48,0x83,0xec,0x28,0xe8,0x17,0x25,0xff,0xff,0x48,0x85,0xc0,0x74,0x0c,0x48,0x89,
+    0xc1,0x48,0x83,0xc4,0x28,0xe9,0x26,0x1d,0xff,0xff,0x48,0x83,0xc4,0x28,0xc3,
+};
+
+/* Diagnose a separate --single-process assumption: the renderer's channel
+ * response rebinds the process-wide IPC manager. Log its old/new channel and
+ * caller before the original connect; at most eight lines, using the helper's
+ * own logger. This does not replace the manager or change connection results.
+ * Source: tests/host/sc-ipc-rebind.S. */
+static const unsigned char ios_sch_ipc_rebind[256] =
+{
+    0x48,0x89,0x5c,0x24,0x18,0x9c,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,
+    0x53,0x48,0x83,0xec,0x60,0xf3,0x0f,0x7f,0x04,0x24,0xf3,0x0f,0x7f,0x4c,0x24,0x10,
+    0xf3,0x0f,0x7f,0x54,0x24,0x20,0xf3,0x0f,0x7f,0x5c,0x24,0x30,0xf3,0x0f,0x7f,0x64,
+    0x24,0x40,0xf3,0x0f,0x7f,0x6c,0x24,0x50,0x83,0x3d,0x79,0x02,0x05,0x00,0x08,0x73,
+    0x4c,0xb8,0x01,0x00,0x00,0x00,0xf0,0x0f,0xc1,0x05,0x6a,0x02,0x05,0x00,0x83,0xf8,
+    0x08,0x73,0x3a,0x49,0x89,0xc8,0x4c,0x8d,0x49,0x50,0x48,0x83,0x79,0x68,0x07,0x76,
+    0x04,0x4c,0x8b,0x49,0x50,0x48,0x83,0xec,0x48,0x48,0x89,0x54,0x24,0x20,0x48,0x8b,
+    0x84,0x24,0xe8,0x00,0x00,0x00,0x48,0x89,0x44,0x24,0x28,0x48,0x8d,0x15,0x43,0x00,
+    0x00,0x00,0x31,0xc9,0xe8,0x27,0x07,0xf9,0xff,0x48,0x83,0xc4,0x48,0xf3,0x0f,0x6f,
+    0x04,0x24,0xf3,0x0f,0x6f,0x4c,0x24,0x10,0xf3,0x0f,0x6f,0x54,0x24,0x20,0xf3,0x0f,
+    0x6f,0x5c,0x24,0x30,0xf3,0x0f,0x6f,0x64,0x24,0x40,0xf3,0x0f,0x6f,0x6c,0x24,0x50,
+    0x48,0x83,0xc4,0x60,0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5a,0x59,0x58,0x9d,
+    0xe9,0xc0,0x9f,0xec,0xff,0x5b,0x73,0x63,0x2d,0x69,0x70,0x63,0x5d,0x20,0x72,0x65,
+    0x62,0x69,0x6e,0x64,0x20,0x6d,0x61,0x6e,0x61,0x67,0x65,0x72,0x3d,0x25,0x70,0x20,
+    0x6f,0x6c,0x64,0x3d,0x25,0x2e,0x38,0x30,0x6c,0x73,0x20,0x6e,0x65,0x77,0x3d,0x25,
+    0x2e,0x38,0x30,0x6c,0x73,0x20,0x63,0x61,0x6c,0x6c,0x65,0x72,0x3d,0x25,0x70,0x00,
+};
+
+/* A separately constructed renderer manager keeps the browser's channel and
+ * disconnect callback intact. Initialize consumes its retained CefRefPtr;
+ * the renderer uses its own role and waits for its channel response. The
+ * browser's global loop and singleton remain owned by the original manager.
+ * Source: tests/host/sc-ipc-split.S. */
+static const unsigned char ios_sch_ipc_split[661] =
+{
+    0x9c,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x48,0x81,0xec,0x90,0x00,
+    0x00,0x00,0xf3,0x0f,0x7f,0x44,0x24,0x30,0xf3,0x0f,0x7f,0x4c,0x24,0x40,0xf3,0x0f,
+    0x7f,0x54,0x24,0x50,0xf3,0x0f,0x7f,0x5c,0x24,0x60,0xf3,0x0f,0x7f,0x64,0x24,0x70,
+    0xf3,0x0f,0x7f,0xac,0x24,0x80,0x00,0x00,0x00,0xb9,0x06,0x00,0x00,0x00,0xff,0x15,
+    0x24,0x0e,0x00,0x00,0x85,0xc0,0x0f,0x84,0x95,0x00,0x00,0x00,0x48,0x8b,0x05,0x6d,
+    0x01,0x05,0x00,0x48,0x85,0xc0,0x0f,0x85,0x8c,0x00,0x00,0x00,0x48,0x83,0x3d,0x64,
+    0x01,0x05,0x00,0x00,0x74,0x7b,0xb9,0x30,0x1a,0x00,0x00,0xe8,0x08,0xda,0xfb,0xff,
+    0x48,0x85,0xc0,0x74,0x6c,0x48,0x89,0x05,0x44,0x01,0x05,0x00,0x48,0x89,0xc1,0xe8,
+    0xec,0x96,0xec,0xff,0x48,0x8b,0x15,0x3d,0x01,0x05,0x00,0x48,0x89,0x54,0x24,0x20,
+    0x48,0x8b,0x42,0x08,0x48,0x8d,0x4a,0x08,0x48,0x63,0x40,0x04,0x48,0x01,0xc1,0x48,
+    0x8b,0x01,0xff,0x10,0x48,0x8d,0x54,0x24,0x20,0x48,0x8b,0x0d,0x10,0x01,0x05,0x00,
+    0xe8,0x0b,0xad,0xec,0xff,0x0f,0xb6,0xc0,0x89,0x44,0x24,0x20,0x4c,0x8b,0x05,0xfd,
+    0x00,0x05,0x00,0x4c,0x8b,0x0d,0x36,0xce,0x04,0x00,0x48,0x8d,0x15,0x94,0x01,0x00,
+    0x00,0x31,0xc9,0xe8,0xd8,0x05,0xf9,0xff,0x48,0x8b,0x05,0xe1,0x00,0x05,0x00,0xeb,
+    0x07,0x48,0x8b,0x05,0x18,0xce,0x04,0x00,0xf3,0x0f,0x6f,0x44,0x24,0x30,0xf3,0x0f,
+    0x6f,0x4c,0x24,0x40,0xf3,0x0f,0x6f,0x54,0x24,0x50,0xf3,0x0f,0x6f,0x5c,0x24,0x60,
+    0xf3,0x0f,0x6f,0x64,0x24,0x70,0xf3,0x0f,0x6f,0xac,0x24,0x80,0x00,0x00,0x00,0x48,
+    0x81,0xc4,0x90,0x00,0x00,0x00,0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5a,0x59,
+    0x9d,0xc3,0x48,0x89,0x5c,0x24,0x20,0x50,0x48,0x8b,0x02,0x48,0x89,0x05,0x96,0x00,
+    0x05,0x00,0x58,0xe9,0x8d,0xac,0xec,0xff,0x9c,0x48,0x3b,0x1d,0x80,0x00,0x05,0x00,
+    0x74,0x07,0x48,0x89,0x1d,0xb7,0xcd,0x04,0x00,0x9d,0xe9,0xeb,0x97,0xec,0xff,0x9c,
+    0x4c,0x3b,0x35,0x69,0x00,0x05,0x00,0x75,0x05,0xb8,0x01,0x00,0x00,0x00,0x41,0x89,
+    0x86,0xf0,0x00,0x00,0x00,0x9d,0xe9,0xb7,0xac,0xec,0xff,0x4c,0x3b,0x35,0x4e,0x00,
+    0x05,0x00,0x74,0x05,0xe9,0x67,0xad,0xf9,0xff,0xc3,0x48,0x3b,0x0d,0x3f,0x00,0x05,
+    0x00,0x74,0x05,0xe9,0xf8,0x9d,0xec,0xff,0xc3,0x9c,0x48,0x3b,0x3d,0x2f,0x00,0x05,
+    0x00,0x0f,0x84,0xa4,0x00,0x00,0x00,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,
+    0x41,0x53,0x48,0x81,0xec,0x90,0x00,0x00,0x00,0xf3,0x0f,0x7f,0x44,0x24,0x30,0xf3,
+    0x0f,0x7f,0x4c,0x24,0x40,0xf3,0x0f,0x7f,0x54,0x24,0x50,0xf3,0x0f,0x7f,0x5c,0x24,
+    0x60,0xf3,0x0f,0x7f,0x64,0x24,0x70,0xf3,0x0f,0x7f,0xac,0x24,0x80,0x00,0x00,0x00,
+    0x48,0x8b,0x0d,0xe9,0xff,0x04,0x00,0x48,0x85,0xc9,0x74,0x19,0x48,0x89,0x4c,0x24,
+    0x20,0xe8,0x6a,0x98,0xec,0xff,0x48,0x8b,0x4c,0x24,0x20,0xba,0x30,0x1a,0x00,0x00,
+    0xe8,0xbf,0xd8,0xfb,0xff,0xf3,0x0f,0x6f,0x44,0x24,0x30,0xf3,0x0f,0x6f,0x4c,0x24,
+    0x40,0xf3,0x0f,0x6f,0x54,0x24,0x50,0xf3,0x0f,0x6f,0x5c,0x24,0x60,0xf3,0x0f,0x6f,
+    0x64,0x24,0x70,0xf3,0x0f,0x6f,0xac,0x24,0x80,0x00,0x00,0x00,0x48,0x81,0xc4,0x90,
+    0x00,0x00,0x00,0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5a,0x59,0x58,0x9d,0x48,
+    0x89,0x35,0xca,0xcc,0x04,0x00,0xe9,0x55,0x98,0xec,0xff,0x48,0xc7,0x05,0x7a,0xff,
+    0x04,0x00,0x00,0x00,0x00,0x00,0x9d,0xe9,0x44,0x98,0xec,0xff,0x9c,0x50,0x48,0x83,
+    0xec,0x20,0xe8,0xa9,0xa3,0xec,0xff,0x48,0x89,0xc3,0x48,0x83,0xc4,0x20,0x58,0x9d,
+    0xe9,0x7e,0xcb,0xec,0xff,0x5b,0x73,0x63,0x2d,0x69,0x70,0x63,0x5d,0x20,0x72,0x65,
+    0x6e,0x64,0x65,0x72,0x65,0x72,0x20,0x6d,0x61,0x6e,0x61,0x67,0x65,0x72,0x3d,0x25,
+    0x70,0x20,0x62,0x72,0x6f,0x77,0x73,0x65,0x72,0x3d,0x25,0x70,0x20,0x69,0x6e,0x69,
+    0x74,0x3d,0x25,0x75,0x00,
+};
+
+/* Record the source and caller of the early UI termination notification.
+ * For the guarded window delegate call, also record its parent caller and
+ * stored HWND. Other constructor callers do not expose those fields.
+ * Resume the original constructor with its original inputs: no notification
+ * is suppressed and its payload/delivery are unchanged. At most 16 records.
+ * Source: tests/host/sc-ui-close.S. */
+static const unsigned char ios_sch_ui_trace[190] =
+{
+    0x48,0x89,0x5c,0x24,0x10,0x51,0x52,0x48,0x83,0xec,0x38,0x83,0x3d,0x1e,0xff,0x04,
+    0x00,0x10,0x73,0x5f,0xb8,0x01,0x00,0x00,0x00,0xf0,0x0f,0xc1,0x05,0x0f,0xff,0x04,
+    0x00,0x83,0xf8,0x10,0x73,0x4d,0x44,0x8b,0x02,0x49,0x89,0xd1,0x48,0x8b,0x44,0x24,
+    0x48,0x48,0x89,0x44,0x24,0x20,0x45,0x31,0xd2,0x4c,0x89,0x54,0x24,0x28,0x4c,0x89,
+    0x54,0x24,0x30,0x4c,0x8d,0x15,0x35,0x11,0xeb,0xff,0x4c,0x39,0xd0,0x75,0x16,0x48,
+    0x8b,0x44,0x24,0x78,0x48,0x89,0x44,0x24,0x28,0x49,0x8b,0x81,0x88,0x01,0x00,0x00,
+    0x48,0x89,0x44,0x24,0x30,0x48,0x8d,0x15,0x12,0x00,0x00,0x00,0x31,0xc9,0xe8,0x9d,
+    0x03,0xf9,0xff,0x48,0x83,0xc4,0x38,0x5a,0x59,0xe9,0x97,0x40,0xf5,0xff,0x5b,0x73,
+    0x63,0x2d,0x75,0x69,0x5d,0x20,0x6d,0x73,0x67,0x32,0x30,0x30,0x30,0x35,0x20,0x76,
+    0x61,0x6c,0x75,0x65,0x3d,0x25,0x75,0x20,0x73,0x6f,0x75,0x72,0x63,0x65,0x3d,0x25,
+    0x70,0x20,0x63,0x61,0x6c,0x6c,0x65,0x72,0x3d,0x25,0x70,0x20,0x6f,0x72,0x69,0x67,
+    0x69,0x6e,0x3d,0x25,0x70,0x20,0x68,0x77,0x6e,0x64,0x3d,0x25,0x70,0x00,
+};
+
+/* The helper code the thunk and the vtable change rely on (no relocations in
+ * any of these ranges). */
+static const struct { unsigned int rva; unsigned char len; unsigned char bytes[64]; } ios_sch_code[] =
+{
+    { IOS_SCH_GET_HANDLER, 0x3b, { /* App::GetRenderProcessHandler / GetBrowserProcessHandler */
+      0x40,0x53,0x48,0x83,0xec,0x20,0x33,0xc0,0x4c,0x8d,0x41,0x28,0x48,0x85,0xc9,0x48,
+      0x8b,0xda,0x4c,0x0f,0x44,0xc0,0x4c,0x89,0x02,0x4d,0x85,0xc0,0x74,0x14,0x49,0x8b,
+      0x40,0x08,0x49,0x83,0xc0,0x08,0x48,0x63,0x48,0x04,0x49,0x03,0xc8,0x48,0x8b,0x01,
+      0xff,0x10,0x48,0x8b,0xc3,0x48,0x83,0xc4,0x20,0x5b,0xc3 } },
+    { 0x69a0, 0x20, { /* RendererApp::RendererApp(this, most_derived) */
+      0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,0xec,0x20,0x33,
+      0xf6,0x48,0x8b,0xd9,0x85,0xd2,0x74,0x21,0x48,0x8d,0x05,0x11,0xbd,0x17,0x00,0x48 } },
+    { 0x13e708, 0x20, { /* operator new */
+      0x40,0x53,0x48,0x83,0xec,0x20,0x48,0x8b,0xd9,0xeb,0x0f,0x48,0x8b,0xcb,0xe8,0xcd,
+      0xea,0x01,0x00,0x85,0xc0,0x74,0x13,0x48,0x8b,0xcb,0xe8,0xe9,0xd9,0x01,0x00,0x48 } },
+    { IOS_SCH_GET_NULL, 0x0b, { 0x48,0xc7,0x02,0x00,0x00,0x00,0x00,0x48,0x8b,0xc2,0xc3 } },
+    /* app_get_render_process_handler (CefAppCppToC): the C++ call is slot 4 */
+    { 0x7e267, 0x06, { 0x48,0x8b,0xcb,0xff,0x50,0x20 } },
+    { IOS_SCH_CURRENT_LOOP, 0x1f, { /* MessageLoop::current (TLS initialization) */
+      0x48,0x83,0xec,0x28,0x8b,0x05,0xbe,0xd2,0x05,0x00,0x83,0xf8,0x02,0x74,0x50,0x48,
+      0x8d,0x0d,0xb2,0xd2,0x05,0x00,0xe8,0xf5,0x34,0x00,0x00,0x84,0xc0,0x74,0x40 } },
+    { 0x1730ef, 0x10, { /* MessageLoop::current (TLS getter tail) */
+      0x48,0x8b,0x0d,0x6a,0xd2,0x05,0x00,0x48,0x83,0xc4,0x28,0xe9,0x21,0x37,0x00,0x00 } },
+    { 0x176820, 0x09, { /* TLS slot getter */
+      0x8b,0x09,0x48,0xff,0x25,0x2f,0xaa,0x00,0x00 } },
+    { IOS_SCH_LOOP_CTOR, 0x20, { /* MessageLoop constructor */
+      0x48,0x89,0x5c,0x24,0x18,0x56,0x57,0x41,0x56,0x48,0x83,0xec,0x20,0x89,0x51,0x08,
+      0x48,0x8d,0x59,0x10,0x33,0xff,0x48,0x8d,0x05,0x2b,0x0d,0x03,0x00,0x48,0x89,0x01 } },
+    { 0x17190a, 0x22, { /* constructor installs this thread TLS loop */
+      0x48,0x8b,0x0d,0x4f,0xea,0x05,0x00,0x49,0x8b,0xd6,0x48,0x89,0x6c,0x24,0x40,0xe8,
+      0x12,0x4f,0x00,0x00,0x41,0x8b,0x46,0x08,0x83,0xf8,0x01,0x75,0x19,0xb9,0x50,0x00,
+      0x00,0x00 } },
+    { 0x1719b8, 0x19, { /* constructor returns the loop */
+      0x48,0x89,0x3e,0x49,0x8b,0xc6,0x48,0x8b,0x6c,0x24,0x40,0x48,0x8b,0x5c,0x24,0x50,
+      0x48,0x83,0xc4,0x20,0x41,0x5e,0x5f,0x5e,0xc3 } },
+    { IOS_SCH_LOOP_WORK, 0x20, { /* DoWork */
+      0x48,0x89,0x5c,0x24,0x08,0x57,0x48,0x83,0xec,0x40,0x80,0xb9,0xa8,0x00,0x00,0x00,
+      0x00,0x48,0x8b,0xd9,0x0f,0x84,0xd8,0x00,0x00,0x00,0xe8,0xd1,0x03,0x00,0x00,0x48 } },
+    { IOS_SCH_LOOP_DELAYED, 0x20, { /* DoDelayedWork */
+      0x48,0x89,0x5c,0x24,0x10,0x48,0x89,0x6c,0x24,0x18,0x48,0x89,0x74,0x24,0x20,0x57,
+      0x48,0x83,0xec,0x50,0x80,0xb9,0xa8,0x00,0x00,0x00,0x00,0x48,0x8b,0xfa,0x48,0x8b } },
+    { IOS_SCH_LOOP_IDLE, 0x20, { /* DoIdleWork */
+      0x48,0x83,0xec,0x28,0x48,0x8b,0x81,0x28,0x01,0x00,0x00,0x4c,0x8b,0xc1,0x83,0x38,
+      0x01,0x75,0x5f,0x48,0x8b,0x51,0x78,0x48,0x85,0xd2,0x74,0x56,0x4c,0x8b,0x49,0x70 } },
+    { 0x1728b0, 0x40, { /* scoped RunState layout and nesting */
+      0x48,0x83,0xec,0x48,0x48,0x89,0x4c,0x24,0x30,0x48,0x8b,0x81,0x28,0x01,0x00,0x00,
+      0x48,0x89,0x44,0x24,0x38,0x48,0x85,0xc0,0x74,0x0a,0x8b,0x00,0xff,0xc0,0x89,0x44,
+      0x24,0x20,0xeb,0x08,0xc7,0x44,0x24,0x20,0x01,0x00,0x00,0x00,0x48,0x8d,0x44,0x24,
+      0x20,0x48,0x89,0x81,0x28,0x01,0x00,0x00,0x48,0xc7,0x44,0x24,0x28,0x00,0x00,0x00 } },
+    { 0x1728f1, 0x1c, { /* scoped RunState quit flag and restore */
+      0xc6,0x44,0x24,0x24,0x01,0xe8,0x25,0x00,0x00,0x00,0x48,0x8b,0x44,0x24,0x30,0x48,
+      0x8b,0x4c,0x24,0x38,0x48,0x89,0x88,0x28,0x01,0x00,0x00,0x48 } },
+    { 0x174121, 0x07, { /* MessagePumpWin::Run installs its stack RunState */
+      0x48,0x89,0x41,0x40,0x48,0x8b,0x01 } },
+    { 0x17412b, 0x09, { /* Run restores the prior state and caller RBX */
+      0x48,0x89,0x7b,0x40,0x48,0x8b,0x5c,0x24,0x50 } },
+    { 0x48f0f, 0x12, { /* only the CEF TID_RENDERER branch reaches the patched call */
+      0xb9,0x06,0x00,0x00,0x00,0xe8,0xd7,0x0f,0x02,0x00,0x84,0xc0,0x0f,0x85,0x83,0x00,
+      0x00,0x00 } },
+    { IOS_SCH_RENDER_DRAIN_SITE, 0x05, { 0xe8,0xb7,0x2e,0x0d,0x00 } },
+    { 0x11be60, 0x11, { /* original global browser drain remains unchanged */
+      0x48,0x8b,0x0d,0x99,0x2b,0x0b,0x00,0x48,0x85,0xc9,0x0f,0x85,0x40,0x6a,0x05,0x00,
+      0xc3 } },
+    { IOS_SCH_IPC_CONNECT, 0x12, { /* original connect prologue; replay the first instruction */
+      0x48,0x89,0x5c,0x24,0x18,0x48,0x89,0x6c,0x24,0x20,0x56,0x57,0x41,0x54,0x48,0x83,
+      0xec,0x60 } },
+    { 0x4ac5b, 0x13, { /* previous channel std::wstring, inline capacity 7 */
+      0x48,0x83,0x79,0x68,0x07,0x4c,0x8d,0x41,0x50,0x48,0x8b,0x51,0x60,0x76,0x04,0x4c,
+      0x8b,0x41,0x50 } },
+    { IOS_SCH_RENDER_CHANNEL_REPLY, 0x19, { /* renderer's Channel Response -> Connect(name, replace_old) */
+      0xe8,0xf8,0x2c,0x00,0x00,0x44,0x0f,0xb6,0xc3,0x48,0x8b,0xc8,0x48,0x85,0xf6,0x74,
+      0x25,0x48,0x8b,0x16,0xe8,0x64,0x26,0x00,0x00 } },
+    { 0x4add0, 0x3d, { /* Connect removes the previous named channel only when replace_old is true */
+      0x45,0x84,0xe4,0x74,0x38,0x48,0x8b,0x06,0x48,0x8d,0x54,0x24,0x20,0x48,0x83,0x7c,
+      0x24,0x38,0x0f,0x49,0x8b,0xce,0x48,0x0f,0x47,0x54,0x24,0x20,0x48,0x8b,0x58,0x18,
+      0xff,0x50,0x38,0x48,0x83,0x7c,0x24,0x38,0x0f,0x48,0x8d,0x54,0x24,0x20,0x44,0x0f,
+      0xb6,0xc0,0x49,0x8b,0xce,0x48,0x0f,0x47,0x54,0x24,0x20,0xff,0xd3 } },
+    { 0x4abf0, 0xe, { /* embedded IPC client appends a connection and increments its counts */
+      0xb0,0x01,0xff,0x86,0x88,0x00,0x00,0x00,0xff,0x86,0x8c,0x00,0x00,0x00 } },
+    { 0x4af6f, 0x2c, { /* explicit disconnect locates and closes only the named connection */
+      0xe8,0xac,0x02,0x00,0x00,0x48,0x63,0xf8,0x85,0xc0,0x0f,0x88,0x41,0x01,0x00,0x00,
+      0x3b,0xbb,0x88,0x00,0x00,0x00,0x0f,0x8d,0x35,0x01,0x00,0x00,0x4c,0x8b,0x0b,0x44,
+      0x0f,0xb6,0xc6,0x8b,0xd7,0x48,0x8b,0xcb,0x41,0xff,0x51,0x10 } },
+    { 0x111340, 0x19, { /* helper's existing variadic text logger */
+      0x48,0x89,0x54,0x24,0x10,0x4c,0x89,0x44,0x24,0x18,0x4c,0x89,0x4c,0x24,0x20,0x55,
+      0x53,0x56,0x57,0x41,0x54,0x41,0x56,0x41,0x57 } },
+    { 0x4b290, 0x8, { /* original process-wide manager getter */
+      0x48,0x8b,0x05,0xf9,0x28,0x18,0x00,0xc3 } },
+    { 0x4ba50, 0x5, { /* Initialize entry; captures the live main command line */
+      0x48,0x89,0x5c,0x24,0x20 } },
+    { 0x4a5c3, 0x7, { /* constructor singleton store */
+      0x48,0x89,0x1d,0xc6,0x35,0x18,0x00 } },
+    { 0x4baab, 0x7, { /* Initialize role store */
+      0x41,0x89,0x86,0xf0,0x00,0x00,0x00 } },
+    { 0x4d255, 0xe, { /* global browser loop initialization */
+      0xe8,0x16,0xe9,0x0c,0x00,0x48,0x8d,0x05,0xdf,0xc7,0x13,0x00,0x48,0x89 } },
+    { 0x4d2e0, 0x20, { /* initial channel connection from the command line */
+      0x49,0x83,0x7e,0x60,0x00,0x74,0x19,0x49,0x83,0x7e,0x68,0x07,0x49,0x8d,0x56,0x50,
+      0x76,0x03,0x48,0x8b,0x12,0x45,0x33,0xc0,0x49,0x8b,0xce,0xe8,0x10,0xd9,0xff,0xff } },
+    { 0x4a712, 0x11, { /* destructor owned-object load and singleton clear */
+      0x48,0x8b,0x8f,0x28,0x1a,0x00,0x00,0x48,0x89,0x35,0x70,0x34,0x18,0x00,0x48,0x85,
+      0xc9 } },
+    { 0x4a400, 0x2a, { /* manager constructor ABI and initial fields */
+      0x48,0x89,0x5c,0x24,0x10,0x57,0x48,0x83,0xec,0x20,0xc7,0x41,0x03,0x00,0x00,0x00,
+      0x01,0x33,0xff,0x66,0x89,0x39,0x0f,0x57,0xc0,0x66,0x89,0x79,0x07,0x48,0x8b,0xd9,
+      0x40,0x88,0x79,0x09,0x0f,0x11,0x41,0x10,0x48,0x89 } },
+    { 0x4a5b4, 0xf, { /* embedded client construction and final owned-object field */
+      0xe8,0xf7,0xfa,0xff,0xff,0x48,0x8b,0xc3,0x48,0x89,0xbb,0x28,0x1a,0x00,0x00 } },
+    { 0x4d408, 0x1e, { /* Initialize consumes its by-value command-line reference */
+      0x49,0x8b,0x14,0x24,0x48,0x85,0xd2,0x74,0x15,0x48,0x8b,0x42,0x08,0x48,0x83,0xc2,
+      0x08,0x48,0x63,0x48,0x04,0x48,0x03,0xca,0x48,0x8b,0x01,0xff,0x50,0x08 } },
+    { 0x4da6c, 0xc, { /* inlined manager lookup, routed like the getter */
+      0x48,0x8b,0x1d,0x1d,0x01,0x18,0x00,0xb9,0x28,0x00,0x00,0x00 } },
+    { 0x13e708, 0x6, { /* helper allocator */
+      0x40,0x53,0x48,0x83,0xec,0x20 } },
+    { 0x13e744, 0x6, { /* helper sized deallocator */
+      0xe9,0x5f,0x07,0x00,0x00,0xcc } },
+    { IOS_SCH_UI_CTOR, 0x21, { /* constructor inputs; R8/R9 are set before use */
+      0x48,0x89,0x5c,0x24,0x10,0x57,0x48,0x83,0xec,0x20,0x48,0x8b,0xda,0x41,0xb9,0x02,
+      0x00,0x00,0x00,0xba,0xff,0xff,0xff,0x7f,0x41,0xb8,0x05,0x00,0x02,0x00,0x48,0x8b,
+      0xf9 } },
+    { 0x12eb5, 0x5, { /* first message 0x20005 constructor call */
+      0xe8,0x86,0x21,0x0c,0x00 } },
+    { 0x320aa, 0x5, { /* second message 0x20005 constructor call */
+      0xe8,0x91,0x2f,0x0a,0x00 } },
+    { 0x32070, 0xf, { /* delegate frame used to find its parent caller */
+      0x40,0x53,0x48,0x83,0xec,0x20,0x80,0x79,0x0a,0x00,0x48,0x8b,0xd9,0x74,0x43 } },
+    { 0x320a3, 0x7, { /* payload is the window owner's +0x10 field */
+      0x48,0x8d,0x53,0xc0,0x48,0x8b,0xc8 } },
+    { 0x31f9a, 0x7, { /* HWND is at owner+0x198, payload+0x188 */
+      0x48,0x8b,0x83,0x48,0x01,0x00,0x00 } },
+    { IOS_SCH_WEBKIT, 0x20, { /* original OnWebKitInitialized */
+      0x40,0x53,0x55,0x41,0x55,0x41,0x57,0x48,0x81,0xec,0x28,0x01,0x00,0x00,0x4c,0x8b,
+      0xe9,0x33,0xed,0x48,0x83,0xc1,0x10,0x89,0xac,0x24,0x50,0x01,0x00,0x00,0xe8,0x2d } },
+};
+
+/* Why `base` (SocialClubHelper.exe, mapped) cannot take the patch, or NULL when
+ * it can; on success *vtbase is the guest base the CefApp vtables use (ptr when
+ * the directory was applied, else the preferred base), which the thunk pointer
+ * is written in. */
+static const char *ios_sch_mismatch( const char *base, SIZE_T total_size, const IMAGE_NT_HEADERS *nt,
+                                     const IMAGE_SECTION_HEADER *sec, ULONG64 *vtbase )
+{
+    const ULONG64 *vb = (const ULONG64 *)(base + IOS_SCH_VT_BROWSER);
+    const ULONG64 *vr = (const ULONG64 *)(base + IOS_SCH_VT_RENDERER);
+    const ULONG64 *vh = (const ULONG64 *)(base + IOS_SCH_VT_RPH);
+    ULONG64 b = (ULONG64)(ULONG_PTR)base;
+    int i, text = 0, data = 0;
+    size_t k;
+
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return "not a 64-bit x64 image";
+    if (nt->FileHeader.TimeDateStamp != IOS_SCH_STAMP || nt->OptionalHeader.SizeOfImage != IOS_SCH_SIZE ||
+        total_size < IOS_SCH_SIZE) return "another build (TimeDateStamp / SizeOfImage)";
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        if (sec[i].VirtualAddress == IOS_SCH_TEXT && sec[i].Misc.VirtualSize == 0x17f34c &&
+            sec[i].SizeOfRawData == 0x17f400 && (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) text = 1;
+        if (sec[i].VirtualAddress == IOS_SCH_DATA && sec[i].Misc.VirtualSize == 0x43bc &&
+            (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) data = 1;
+    }
+    if (!text || !data) return "section layout differs";
+    for (k = 0; k < sizeof(ios_sch_code) / sizeof(ios_sch_code[0]); k++)
+        if (memcmp( base + ios_sch_code[k].rva, ios_sch_code[k].bytes, ios_sch_code[k].len ))
+            return "code bytes differ";
+    /* The vtables carry guest pointers in one base -- ptr (directory applied)
+     * or the preferred base (ml949 / sub-floor). Read it from one slot and
+     * require the other three consistent, and the base one of the two. */
+    *vtbase = vb[IOS_SCH_SLOT_BROWSER] - IOS_SCH_GET_HANDLER;
+    if (*vtbase != b && *vtbase != IOS_SCH_IMAGE_BASE) return "CefApp vtable base is neither the view nor the preferred base";
+    if (vb[IOS_SCH_SLOT_RENDERER] != *vtbase + IOS_SCH_GET_NULL ||
+        vr[IOS_SCH_SLOT_BROWSER]  != *vtbase + IOS_SCH_GET_NULL ||
+        vr[IOS_SCH_SLOT_RENDERER] != *vtbase + IOS_SCH_GET_HANDLER)
+        return "CefApp vtables differ";
+    if (vh[0] != *vtbase + IOS_SCH_WEBKIT) return "renderer OnWebKitInitialized differs";
+    for (k = 0; k < sizeof(ios_sch_renderer_channels); k++)
+        if (base[IOS_SCH_RENDER_CHANNEL_THUNK + k]) return "renderer channel .text tail not zero";
+    for (k = 0; k < sizeof(ios_sch_thunk); k++)
+        if (base[IOS_SCH_THUNK + k]) return ".text tail not zero";
+    for (k = 0; k < sizeof(ios_sch_loop_thunk); k++)
+        if (base[IOS_SCH_LOOP_INIT + k]) return "renderer loop .text tail not zero";
+    for (k = 0; k < 64; k++)
+        if (base[IOS_SCH_TASK + k]) return "renderer task .data tail not zero";
+    for (k = 0; k < sizeof(ios_sch_run_trace); k++)
+        if (base[IOS_SCH_RUN_INSTALL + k]) return "RunState trace .text tail not zero";
+    for (k = 0; k < IOS_SCH_RUN_RING_SIZE; k++)
+        if (base[IOS_SCH_RUN_RING + k]) return "RunState trace .data tail not zero";
+    for (k = 0; k < sizeof(ios_sch_render_drain); k++)
+        if (base[IOS_SCH_RENDER_DRAIN + k]) return "renderer drain .text tail not zero";
+    for (k = 0; k < sizeof(ios_sch_ipc_rebind); k++)
+        if (base[IOS_SCH_IPC_TRACE + k]) return "IPC trace .text tail not zero";
+    if (*(const unsigned int *)(base + IOS_SCH_IPC_COUNT)) return "IPC trace counter not zero";
+    for (k = 0; k < sizeof(ios_sch_ipc_split); k++)
+        if (base[IOS_SCH_IPC_SPLIT + k]) return "IPC split .text tail not zero";
+    for (k = 0; k < 16; k++)
+        if (base[IOS_SCH_IPC_CONTEXT + k]) return "IPC split context not zero";
+    for (k = 0; k < sizeof(ios_sch_ui_trace); k++)
+        if (base[IOS_SCH_UI_TRACE + k]) return "UI notification trace .text tail not zero";
+    if (*(const unsigned int *)(base + IOS_SCH_UI_COUNT)) return "UI notification trace counter not zero";
+    if (*(const ULONG64 *)(base + IOS_SCH_CACHE)) return ".data tail not zero";
+    return NULL;
+}
+
+static void ios_sc_render_handler_patch( char *base, SIZE_T total_size, const IMAGE_NT_HEADERS *nt,
+                                         const IMAGE_SECTION_HEADER *sec, const UNICODE_STRING *nt_name )
+{
+    static int enabled = -1;
+    const char *why;
+    ULONG64 vtbase = 0;
+    const char *ipc_setting = getenv( "MADEIRA_SC_IPC_SPLIT" );
+    int ipc_split = !(ipc_setting && ipc_setting[0] == '0');
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_SC_RENDER_HANDLER" );
+        enabled = !(e && e[0] == '0') && ios_sc_cef_enabled();
+    }
+    if (!enabled || !nt_name || !nt_name->Buffer ||
+        !ios_sc_path_is_helper( nt_name->Buffer, nt_name->Length / sizeof(WCHAR) )) return;
+    if ((why = ios_sch_mismatch( base, total_size, nt, sec, &vtbase )))
+    {
+        dprintf( 2, "[sc-rph] madeira-bcd: SocialClubHelper.exe at %p not patched: %s -- its pages get no "
+                    "renderer bridge under --single-process (the launcher times out loading them)\n", base, why );
+        return;
+    }
+    /* The thunk bytes go into the view (ptr); the slot carries the guest
+     * pointer in the vtables' base (vtbase), which FEX runs through the alias. */
+    memcpy( base + IOS_SCH_THUNK, ios_sch_thunk, sizeof(ios_sch_thunk) );
+    memcpy( base + IOS_SCH_LOOP_INIT, ios_sch_loop_thunk, sizeof(ios_sch_loop_thunk) );
+    memcpy( base + IOS_SCH_RUN_INSTALL, ios_sch_run_trace, sizeof(ios_sch_run_trace) );
+    memcpy( base + IOS_SCH_RENDER_DRAIN, ios_sch_render_drain, sizeof(ios_sch_render_drain) );
+    memcpy( base + IOS_SCH_IPC_TRACE, ios_sch_ipc_rebind, sizeof(ios_sch_ipc_rebind) );
+    memcpy( base + IOS_SCH_UI_TRACE, ios_sch_ui_trace, sizeof(ios_sch_ui_trace) );
+    {
+        int32_t disp = (int32_t)(IOS_SCH_UI_TRACE - IOS_SCH_UI_CTOR - 5);
+        base[IOS_SCH_UI_CTOR] = (char)0xe9;
+        memcpy( base + IOS_SCH_UI_CTOR + 1, &disp, sizeof(disp) );
+    }
+    {
+        int32_t disp = (int32_t)(IOS_SCH_IPC_TRACE - IOS_SCH_IPC_CONNECT - 5);
+        base[IOS_SCH_IPC_CONNECT] = (char)0xe9;
+        memcpy( base + IOS_SCH_IPC_CONNECT + 1, &disp, sizeof(disp) );
+    }
+    {
+        int32_t disp = (int32_t)(IOS_SCH_RENDER_DRAIN - IOS_SCH_RENDER_DRAIN_SITE - 5);
+        /* Keep CALL so the renderer dispatcher resumes after draining work. */
+        base[IOS_SCH_RENDER_DRAIN_SITE] = (char)0xe8;
+        memcpy( base + IOS_SCH_RENDER_DRAIN_SITE + 1, &disp, sizeof(disp) );
+    }
+    if (ipc_split)
+    {
+        /* Multiple pages share this renderer process. The helper's IPC client
+         * already owns an indexed set of connections; a Channel Response must
+         * add its channel without disconnecting the previous page's channel.
+         * Keep the browser transport, explicit disconnects and window-close
+         * notifications unchanged. The thunk also bounds the client's table;
+         * the following TEST overwrites its flags. */
+        static const struct { unsigned int site, dest, span; unsigned char opcode; } hook[] =
+        {
+            { 0x4b290, IOS_SCH_IPC_SPLIT, 7, 0xe9 },
+            { 0x4ba50, IOS_SCH_IPC_CAPTURE, 5, 0xe9 },
+            { 0x4a5c3, IOS_SCH_IPC_STORE, 7, 0xe9 },
+            { 0x4baab, IOS_SCH_IPC_ROLE, 7, 0xe9 },
+            { 0x4d255, IOS_SCH_IPC_GLOBAL_LOOP, 5, 0xe8 },
+            { 0x4d2fb, IOS_SCH_IPC_INITIAL_CONNECT, 5, 0xe8 },
+            { 0x4a719, IOS_SCH_IPC_DESTROY, 7, 0xe9 },
+            { 0x4da6c, IOS_SCH_IPC_DIRECT, 7, 0xe9 },
+            { IOS_SCH_RENDER_CHANNEL_KEEP, IOS_SCH_RENDER_CHANNEL_THUNK, 7, 0xe9 },
+        };
+        unsigned int k;
+        memcpy( base + IOS_SCH_IPC_SPLIT, ios_sch_ipc_split, sizeof(ios_sch_ipc_split) );
+        memcpy( base + IOS_SCH_RENDER_CHANNEL_THUNK, ios_sch_renderer_channels,
+                sizeof(ios_sch_renderer_channels) );
+        for (k = 0; k < ARRAY_SIZE(hook); k++)
+        {
+            int32_t disp = (int32_t)(hook[k].dest - hook[k].site - 5);
+            base[hook[k].site] = (char)hook[k].opcode;
+            memcpy( base + hook[k].site + 1, &disp, sizeof(disp) );
+            memset( base + hook[k].site + 5, 0x90, hook[k].span - 5 );
+        }
+    }
+    /* Both hooks branch within the image, so no new DIR64 pointer is needed. */
+    {
+        const unsigned int site[2] = { 0x174121, 0x17412b };
+        const unsigned int dest[2] = { IOS_SCH_RUN_INSTALL, IOS_SCH_RUN_RESTORE };
+        const unsigned int span[2] = { 7, 9 };
+        int j;
+        for (j = 0; j < 2; j++)
+        {
+            int32_t disp = (int32_t)(dest[j] - site[j] - 5);
+            base[site[j]] = (char)0xe9;
+            memcpy( base + site[j] + 1, &disp, sizeof(disp) );
+            memset( base + site[j] + 5, 0x90, span[j] - 5 );
+        }
+    }
+
+    /* Unlike the existing vtable slots, these new pointers have no DIR64
+     * entries in the helper. Use the mapped view, not the vtable base: the
+     * pool copy cannot rebase a new preferred-base function pointer.
+     * The CEF task retains one owner reference for the image lifetime. CEF's
+     * queued references can be released at shutdown without freeing the task
+     * or a loop still referenced by the helper's IPC wait thread. */
+    {
+        ULONG64 callback_base = (ULONG64)(ULONG_PTR)base;
+        ULONG64 task[8] = { 0x30, callback_base + IOS_SCH_TASK_ADD, callback_base + IOS_SCH_TASK_RELEASE,
+                            callback_base + IOS_SCH_TASK_ONE, callback_base + IOS_SCH_TASK_ANY,
+                            callback_base + IOS_SCH_LOOP_PUMP, 0, 1 };
+        memcpy( base + IOS_SCH_TASK, task, sizeof(task) );
+    }
+    ((ULONG64 *)(base + IOS_SCH_VT_BROWSER))[IOS_SCH_SLOT_RENDERER] = vtbase + IOS_SCH_THUNK;
+    ((ULONG64 *)(base + IOS_SCH_VT_RPH))[0] = vtbase + IOS_SCH_LOOP_INIT;
+    dprintf( 2, "[sc-rph] madeira-bcd: SocialClubHelper.exe at %p (vtable base 0x%llx): the browser app now hands "
+                "out its renderer app's CefRenderProcessHandler (thunk guest 0x%llx) -- the page bridge runs under "
+                "--single-process; renderer MessageLoop adapter installed (CEF task, callback view base 0x%llx, "
+                "10 ms delay, 32-work budget); bounded I/O RunState trace installed; "
+                "renderer startup drains its own TLS loop; bounded IPC rebind trace installed; "
+                "bounded UI notification trace installed; %s "
+                "(MADEIRA_SC_RENDER_HANDLER=0 turns it off)\n",
+             base, (unsigned long long)vtbase, (unsigned long long)(vtbase + IOS_SCH_THUNK),
+             (unsigned long long)(ULONG_PTR)base,
+             ipc_split ? "separate renderer IPC manager installed; renderer channels retained" : "IPC split disabled" );
+}
+
 /* Does the calling pseudo-process have socialclub.dll mapped? The table is read
  * under the pool lock, the images' export names outside it (the caller holds
  * virtual_mutex, so none of this process's images can be unmapped meanwhile). */
@@ -13532,12 +14732,21 @@ static int ios_sc_layout(void)
     if (ios_sc_layout_mode < 0)
     {
         const char *e = getenv( "MADEIRA_SC_PA_POOLS" ), *rw = getenv( "WINE_IOS_JIT_RW" );
-        const char *sz = getenv( "WINE_IOS_JIT_SIZE" );
+        const char *sz = getenv( "WINE_IOS_JIT_SIZE" ), *rx = getenv( "WINE_IOS_JIT_RX" );
+        const char *low = getenv( "WINE_IOS_JIT_TAIL_REGION" );
         unsigned long long a = rw ? strtoull( rw, NULL, 16 ) : 0, n = sz ? strtoull( sz, NULL, 16 ) : 0;
-        int m = ios_sc_layout_pick( e, a, n );
+        unsigned long long x = rx ? strtoull( rx, NULL, 16 ) : 0;
+        uint64_t lrx = 0, lsz = 0, lo = a, span = n;
+        int m;
+        /* madeira-bcd pool-low: the app's one RW reservation starts with region C's
+         * alias, at 0x7900000000 for layout 2; the pool's own alias lies above it. */
+        if (low && ios_pool_low_parse( low, x, a, n, &lrx, &lsz ))
+            ios_pool_alias_extent( x, a, n, lrx, lsz, &lo, &span );
+        m = ios_sc_layout_pick( e, lo, span );
         if (e && e[0] == '2' && m != 2)
             dprintf( 2, "[sc-cef] env.MADEIRA_SC_PA_POOLS=2 needs the JIT pool's RW alias at 0x%llx (it is at "
-                        "0x%llx, 0x%llx bytes): layout 1\n", IOS_SC2_RW_ALIAS, a, n );
+                        "0x%llx, 0x%llx bytes): layout 1\n", IOS_SC2_RW_ALIAS,
+                     (unsigned long long)lo, (unsigned long long)span );
         ios_sc_layout_mode = m;
     }
     return ios_sc_layout_mode;
@@ -14173,6 +15382,91 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
 #endif
 }
 
+/* madeira-bcd [x64-image] (env MADEIRA_X64_IMAGE_NOCOPY = 1; default off, set
+ * in the game's own file): A PURE-X64 IMAGE IS HOST DATA IN AN X64 PROCESS TOO.
+ *
+ * Every image an x64 pseudo-process loads is copied into the JIT pool, pure
+ * x64 ones included: GTA V Enhanced build 422 (2026-10-07 07:59) carried
+ * 454 MiB of such copies in the 889 MiB span (libcef.dll 239.7, the game exe
+ * 91.3, steamclient64.dll x2 49.5, Launcher.exe 32.1, libGLESv2, socialclub,
+ * tier0, chrome_elf, nvapi64 ...) next to ~450 MiB of hybrid Wine DLL copies,
+ * and the game died at its third steamclient64.dll copy with the span full.
+ *
+ * The emulator never runs x64 code from a pool copy. FEX Core.cpp (ml315,
+ * [pool-rip-fix]) rewrites any guest RIP that lands in a module's pool copy
+ * back to the PE VA and re-enters the dispatcher ("No block is ever created
+ * for the alias address"); the SMC intervals it tracks are PE-space (2341
+ * `Add SMC interval` lines in that log, all at PE VAs); the EC bitmap is
+ * PE-space; the alias table exists for ARM64EC native code, which really
+ * executes from its copy. So a pure-x64 copy is dead weight: the i386
+ * precedent is ml1030 above, where a 32-bit image page keeps VPROT_EXEC in
+ * Wine's tables while the host page is R/W only, and 32-bit programs run.
+ *
+ * Marking: map_image_into_view sets VPROT_X64DATA on the view before the
+ * section protections when the image is machine AMD64, carries no CHPE
+ * metadata (update_arm64ec_ranges did not set VPROT_ARM64EC, and the server
+ * did not call it hybrid), is not a Wine builtin, is not a resource-only map,
+ * and the process is not WoW64. mprotect_exec then drops PROT_EXEC for such a
+ * view exactly as ml1030 does: the eager copy loop makes no copy, set_vprot
+ * still records VPROT_EXEC, and every later PAGE_EXECUTE_* request (the
+ * emulator's SMC trap/untrap through NtProtectVirtualMemory) lands on plain
+ * R or R/W. No alias entry is pushed for the image (IosAliasEntries has 256
+ * slots). Hybrid images, builtins and everything else keep their copy.
+ *
+ * History: upstream's ml457 (2026-08-03) skipped the copy for pure x64 and
+ * steam.exe died within seconds ("garbage target out of vstdlib's .fptable");
+ * ml458 wrote "do not try a third time" without a root cause. That predates
+ * ml710 (loader-safe interval registration), ml1030 and the child-process
+ * alias work, so it is tested again behind this switch, off by default. The
+ * failure to watch for is an exec AV / [iOS-noexec] at the first call into a
+ * module logged by [x64-image]; 0 restores the copies. */
+static int ios_x64_image_nocopy_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_X64_IMAGE_NOCOPY" );
+        cached = (s && s[0] == '1' && !s[1]) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* The request is host-page rounded (16 KB) while SizeOfImage is only 4 KB
+ * aligned, so a last section's request ends up to 12 KB past the view: GTA V
+ * Enhanced build 423 (2026-10-07 09:18), GTA5_Enhanced.exe 0x72d4840000+
+ * 0x5b46000, last section request 0x72d9964000+0xa24000 ends 0x72da388000, 8 KB
+ * past the view. find_view( base, size ) refused it, the ml348 "OUTSIDE nearest
+ * image" path gave the 10 MB section an anonymous-RWX pool alias, its PE VA was
+ * remapped onto blessed pool pages, and the game's TLS callback, which decrypts
+ * that section byte by byte, took one emulated store fault per byte
+ * ([fault-class] stride=1, 2 million hits, 2 MB done in a minute). So look the
+ * view up by its start and accept a tail that stays inside the view's last host
+ * page; views start on 64 KB boundaries, so no other view shares that page. */
+#define IOS_X64_IMAGE_HOST_PAGE 0x4000u
+static int ios_x64_image_view_covers( uintptr_t view_base, size_t view_size, uintptr_t base, size_t size )
+{
+    uintptr_t view_end = view_base + view_size;
+    uintptr_t host_end = (view_end + IOS_X64_IMAGE_HOST_PAGE - 1) & ~(uintptr_t)(IOS_X64_IMAGE_HOST_PAGE - 1);
+
+    if (base < view_base || base >= view_end) return 0;
+    if (base + size < base) return 0;
+    return base + size <= host_end;
+}
+
+static int ios_x64_image_is_host_data( const void *base, size_t size )
+{
+#ifdef WINE_IOS
+    struct file_view *view;
+
+    if (!ios_x64_image_nocopy_enabled()) return 0;
+    if (!(view = find_view( base, 0 ))) return 0;
+    if (!(view->protect & VPROT_X64DATA)) return 0;
+    return ios_x64_image_view_covers( (uintptr_t)view->base, view->size, (uintptr_t)base, size );
+#else
+    return 0;
+#endif
+}
+
 
 /* A guest's anonymous RWX data heap is plain read/write memory to the host.
  *
@@ -14428,6 +15722,25 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
         if (!unix_prot) unix_prot = PROT_READ;
     }
 
+    /* madeira-bcd [x64-image]: see ios_x64_image_is_host_data. Same contract as
+     * ml1030, for a pure-x64 image view in an x64 process: the bit has no host
+     * meaning, the page keeps VPROT_EXEC in Wine's tables, no pool copy. */
+    if ((unix_prot & PROT_EXEC) && ios_x64_image_is_host_data( base, size ))
+    {
+        static unsigned long x64_n;
+        if (++x64_n <= 24 && !ios_in_mach_exc)
+            dprintf( 2, "[x64-image] #%lu %p+0x%lx prot=%c%c%c -- pure-x64 image page, EXEC has no host "
+                        "meaning here (the emulator runs it at the PE VA); applying %c%c- (MADEIRA_X64_IMAGE_NOCOPY)\n",
+                     x64_n, base, (unsigned long)size,
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-',
+                     (unix_prot & PROT_EXEC)  ? 'x' : '-',
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-' );
+        unix_prot &= ~PROT_EXEC;
+        if (!unix_prot) unix_prot = PROT_READ;
+    }
+
     /* madeira-bcd: a resource-only image view (ios_map_resource_view) never runs
      * code, so no exec request made while mapping it may create anything
      * executable -- in particular not the ml348 "OUTSIDE nearest image"
@@ -14627,6 +15940,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         {
                             ios_jit_hole_off = (size_t)h0;
                             ios_jit_hole_end = (size_t)h1;
+                            ios_jit_hole_off_eff = (size_t)h0;
                             ios_jit_hole_end_eff = (size_t)h1;
                             dprintf( 2, "[jit-pool] split pool: RX [%p,%p) + [%p,%p) as one span of 0x%lx; "
                                      "hole [0x%llx,0x%llx) (%llu MB: the main thread's stack) is never "
@@ -14640,25 +15954,42 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                      hole, (unsigned long)jit_pool_size );
                     }
                 }
-                /* madeira-bcd: the big-image slot right above the hole (see
-                 * ios_pool_big_off). Needs the split; a slot that does not fit
-                 * in the run above the hole is ignored. */
+                /* The default big-image slot is above the hole. A game may
+                 * request the lower side; if it cannot leave 256MB for startup
+                 * images, retain the old upper placement instead. */
                 {
-                    /* N MB above the hole of a split pool for one image of 64 MB or more (Social Club's libcef.dll); off by default. */
+                    /* N MB adjacent to a split-pool hole for one image of 64 MB or more (Social Club's libcef.dll); off by default. */
                     const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );
+                    /* 1 puts the existing image slot below the native hole; 0/default keeps it above. */
+                    const char *lower = getenv( "MADEIRA_POOL_BIG_SLOT_BELOW" );
                     if (big && *big && strtoul( big, NULL, 10 ))
                     {
-                        size_t want = (size_t)strtoul( big, NULL, 10 ) << 20;
-                        if (ios_jit_hole_end > ios_jit_hole_off && want >= IOS_POOL_BIG_MIN &&
-                            ios_jit_hole_end + want <= jit_pool_size)
+                        unsigned long mb = strtoul( big, NULL, 10 );
+                        size_t want = mb <= (SIZE_MAX >> 20) ? (size_t)mb << 20 : 0;
+                        int below = lower && !strcmp( lower, "1" );
+                        size_t slot, skip_off, skip_end;
+                        int fits = ios_pool_big_layout( jit_pool_size, ios_jit_hole_off,
+                                                         ios_jit_hole_end, want, below,
+                                                         &slot, &skip_off, &skip_end );
+                        if (!fits && below)
                         {
-                            ios_pool_big_off = ios_jit_hole_end;
+                            dprintf( 2, "[pool-big] lower slot unavailable with 256MB startup room; trying the default upper slot\n" );
+                            below = 0;
+                            fits = ios_pool_big_layout( jit_pool_size, ios_jit_hole_off,
+                                                       ios_jit_hole_end, want, 0,
+                                                       &slot, &skip_off, &skip_end );
+                        }
+                        if (fits)
+                        {
+                            ios_pool_big_off = slot;
                             ios_pool_big_size = want;
-                            ios_jit_hole_end_eff = ios_jit_hole_end + want;
-                            dprintf( 2, "[pool-big] madeira-bcd slot [0x%lx,0x%lx) (%lu MB) above the hole for one "
-                                     "image of %u MB or more; %lu MB above it left for the rest\n",
-                                     (unsigned long)ios_pool_big_off, (unsigned long)ios_jit_hole_end_eff,
-                                     (unsigned long)(want >> 20), IOS_POOL_BIG_MIN >> 20,
+                            ios_jit_hole_off_eff = skip_off;
+                            ios_jit_hole_end_eff = skip_end;
+                            dprintf( 2, "[pool-big] madeira-bcd slot [0x%lx,0x%lx) (%lu MB) %s the hole for one "
+                                     "image of %u MB or more; ordinary runs below=%lu MB above=%lu MB\n",
+                                     (unsigned long)slot, (unsigned long)(slot + want),
+                                     (unsigned long)(want >> 20), below ? "below" : "above", IOS_POOL_BIG_MIN >> 20,
+                                     (unsigned long)(ios_jit_hole_off_eff >> 20),
                                      (unsigned long)((jit_pool_size - ios_jit_hole_end_eff) >> 20) );
                         }
                         else
@@ -14667,6 +15998,68 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                      : want < IOS_POOL_BIG_MIN ? "smaller than 64 MB"
                                      : "larger than the run above the hole" );
                     }
+                }
+                /* 48 to 256 MB of image headroom in the FEX pool-tail budget;
+                 * 48/default keeps the existing policy. Region C is unchanged. */
+                ios_pool_head_reserve = ios_pool_parse_head_reserve( getenv( "MADEIRA_POOL_HEAD_RESERVE_MB" ) );
+                dprintf( 2, "[pool-head] code-buffer budget targets %lu MB of image headroom (region C and recycled buffers unchanged)\n",
+                         (unsigned long)(ios_pool_head_reserve >> 20) );
+                /* madeira-bcd pool-low: region C (see ios_jit_low_rx_global). Taken only
+                 * when its RX side is mapped executable, its RW side read-write, and a
+                 * word written through the RW side reads back through the RX side --
+                 * the proof that its alias really is at the pool's RX->RW distance,
+                 * which FEX's single WriteOffset relies on. */
+                {
+                    const char *low = getenv( "WINE_IOS_JIT_TAIL_REGION" );
+                    uint64_t lrx = 0, lsz = 0;
+                    if (low && *low &&
+                        ios_pool_low_parse( low, (uint64_t)(uintptr_t)jit_rx_base, (uint64_t)(uintptr_t)jit_rw_base,
+                                            jit_pool_size, &lrx, &lsz ))
+                    {
+                        uintptr_t lrw = (uintptr_t)lrx + ((uintptr_t)jit_rw_base - (uintptr_t)jit_rx_base);
+                        mach_vm_address_t qx = (mach_vm_address_t)lrx, qw = (mach_vm_address_t)lrw;
+                        mach_vm_size_t sx = 0, sw = 0;
+                        vm_region_basic_info_data_64_t ix = { 0 }, iw = { 0 };
+                        mach_msg_type_number_t cx = VM_REGION_BASIC_INFO_COUNT_64, cw = VM_REGION_BASIC_INFO_COUNT_64;
+                        mach_port_t ox = MACH_PORT_NULL, ow = MACH_PORT_NULL;
+                        int ok = mach_vm_region( mach_task_self(), &qx, &sx, VM_REGION_BASIC_INFO_64,
+                                                 (vm_region_info_t)&ix, &cx, &ox ) == KERN_SUCCESS &&
+                                 mach_vm_region( mach_task_self(), &qw, &sw, VM_REGION_BASIC_INFO_64,
+                                                 (vm_region_info_t)&iw, &cw, &ow ) == KERN_SUCCESS &&
+                                 qx <= lrx && qw <= lrw &&
+                                 (ix.max_protection & VM_PROT_EXECUTE) &&
+                                 (iw.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE);
+                        if (ok)
+                        {
+                            volatile uint64_t *pw = (volatile uint64_t *)lrw, *px = (volatile uint64_t *)(uintptr_t)lrx;
+                            uint64_t keep = *pw, mark = 0x776f6c2d6c6f6f70ULL ^ (uint64_t)lrx;   /* "pool-low" */
+                            *pw = mark;
+                            ok = *px == mark;
+                            *pw = keep;
+                        }
+                        if (ok)
+                        {
+                            ios_jit_low_rx_global = (uintptr_t)lrx;
+                            ios_jit_low_rw_global = lrw;
+                            __sync_synchronize();
+                            ios_jit_low_size_global = (size_t)lsz;
+                            dprintf( 2, "[pool-low] madeira-bcd region C RX [0x%llx,0x%llx) RW [%p,%p) (%llu MB) at the "
+                                     "pool's RX->RW distance: FEX code buffers are carved here first, the pool "
+                                     "tail takes over when it is full; WoW64 processes keep the tail\n",
+                                     (unsigned long long)lrx, (unsigned long long)(lrx + lsz), (void *)lrw,
+                                     (void *)(lrw + (uintptr_t)lsz), (unsigned long long)(lsz >> 20) );
+                        }
+                        else
+                            dprintf( 2, "[pool-low] madeira-bcd WINE_IOS_JIT_TAIL_REGION=%s ignored: region C is not "
+                                     "mapped as expected (RX max=0x%x at 0x%llx, RW prot=0x%x at 0x%llx) or its RW "
+                                     "alias is not at the pool's distance -- code buffers stay in the pool tail\n",
+                                     low, ix.max_protection, (unsigned long long)qx, iw.protection,
+                                     (unsigned long long)qw );
+                    }
+                    else if (low && *low)
+                        dprintf( 2, "[pool-low] madeira-bcd WINE_IOS_JIT_TAIL_REGION=%s ignored: not a page-aligned "
+                                 "region of 16 MB or more below the pool [%p,+0x%lx) -- code buffers stay in the "
+                                 "pool tail\n", low, jit_rx_base, (unsigned long)jit_pool_size );
                 }
 
                 /* ml91 (task #35): dump the VA map ONCE here, unconditionally.
@@ -15489,6 +16882,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                             (unsigned long)(image_alloc + tramp_prealloc));
                 reload_jit = NULL;
                 offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
+                if (offset == (size_t)-1) offset = ios_pool_low_image_range( alloc_size );
+                if (offset == (size_t)-1 && ios_pool_recycle_code_range( alloc_size ))
+                    offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
             }
             if (!reload_jit && offset != (size_t)-1 && data_delta)
             {
@@ -15499,6 +16895,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
             if (offset == (size_t)-1)
             {
+                ios_pool_failure_census( alloc_size );
                 ERR("iOS JIT: pool exhausted\n");
                 /* Task #25: FAIL the protect instead of silently leaving the
                  * image R-only — the old path returned success and the first
@@ -15533,10 +16930,14 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             /* Record mapping for the entire image */
             ios_jit_add_mapping(image_base, (char *)jit_rx_base + offset, image_size);
 
+            int image_in_low = ios_jit_low_contains( (uintptr_t)jit_rx_base + offset );
+            size_t image_used = image_in_low ? ios_jit_low_reserved : offset + alloc_size;
+            size_t image_budget = image_in_low ? ios_jit_low_size_global : jit_pool_size;
+
             ERR("iOS JIT: copied image %p+0x%lx → pool %p (offset 0x%lx, used 0x%lx/0x%lx)\n",
                 image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
                 (unsigned long)offset,
-                (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
+                (unsigned long)image_used, (unsigned long)image_budget);
             /* ml670: PHASE trigger for the fast sampler. ml668 only sped up
              * once a sample READ >=2800MB, which is unreachable here -- the last
              * observed value was 2481MB and the burst reached jetsam inside one
@@ -15548,11 +16949,11 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 if (mn && (strstr(mn, "d3d11") || strstr(mn, "D3D11")))
                     ios_fast_footprint = 1;
             }
-            dprintf(2, "[jit-pool] image %p+0x%lx (%s) → pool %p used=0x%lx/0x%lx tramp+0x%lx\n",
+            dprintf(2, "[jit-pool] image %p+0x%lx (%s) → pool %p used=0x%lx/0x%lx tramp+0x%lx%s\n",
                     image_base, (unsigned long)image_size,
                     ios_pe_module_name( image_base, image_size ), (char *)jit_rx_base + offset,
-                    (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size,
-                    (unsigned long)tramp_prealloc);
+                    (unsigned long)image_used, (unsigned long)image_budget,
+                    (unsigned long)tramp_prealloc, image_in_low ? " [pool-low] region C" : "");
 
             ios_jit_verify_text_exec( ios_pe_module_name( image_base, image_size ),
                                       (char *)jit_rx_base + offset, image_size );
@@ -18478,6 +19879,7 @@ static int ios_swap_is_fexjit( uintptr_t b, size_t size )
     if (ios_fex_arena_base_unix && b < ios_fex_arena_end_unix && e > ios_fex_arena_base_unix) return 1;
     if (ps && rx && b < rx + ps && e > rx) return 1;
     if (ps && rw && b < rw + ps && e > rw) return 1;
+    if (ios_jit_low_overlaps( b, size )) return 1;   /* madeira-bcd pool-low: region C */
     return 0;
 }
 /* madeira-doge: MADEIRA_SWAP_SMALLMAP=1, as build 79 had it.  A 63 GB map (no
@@ -18998,6 +20400,7 @@ IOS_DC_INLINE int ios_dc_prepare( struct ios_dc_edge *edge, char *base, size_t s
                          (pool_rx >= p && pool_rx - p < host_page_size))) ||
             (pool_rw && ((p >= pool_rw && p - pool_rw < ios_jit_pool_size_global) ||
                          (pool_rw >= p && pool_rw - p < host_page_size)))) return 0;
+        if (ios_jit_low_overlaps( p, host_page_size )) return 0;   /* madeira-bcd pool-low: region C */
     }
     if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
     edge->original = current;
@@ -20376,6 +21779,25 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         ios_lowalloc_note_qualifying_image(
             (unsigned long long)image_info->base,
             (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) ? 1 : 0 );
+    }
+    /* madeira-bcd: [sc-rph], before the protections and the JIT-pool copy. */
+    ios_sc_render_handler_patch( ptr, total_size, nt, sec, nt_name );
+
+    /* madeira-bcd [x64-image]: decided before any protection is set, so both
+     * the section pass and the eager copy loop below see the mark (see
+     * ios_x64_image_is_host_data). update_arm64ec_ranges has run: a hybrid
+     * image carries VPROT_ARM64EC by now. */
+    if (ios_x64_image_nocopy_enabled() && !ios_map_resource_view && !ios_wow_base() &&
+        nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+        nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+        !(view->protect & VPROT_ARM64EC) && !image_info->is_hybrid && !image_info->wine_builtin)
+    {
+        static int x64_images;
+        view->protect |= VPROT_X64DATA;
+        if (x64_images++ < 64)
+            dprintf( 2, "[x64-image] %s %p+0x%lx mapped without a pool copy (pure x64: the emulator runs "
+                        "it at the PE VA; MADEIRA_X64_IMAGE_NOCOPY)\n",
+                     debugstr_us(nt_name), ptr, (unsigned long)total_size );
     }
 #endif
 
@@ -23014,6 +24436,8 @@ void ios_dump_fault_region( void *addr )
     view = find_view( addr, 1 );
     if (rx && a >= rx && a < rx + sz) region = "JIT-POOL-RX (exec, RO)";
     else if (rw && a >= rw && a < rw + sz) region = "JIT-POOL-RW (alias)";
+    else if (ios_jit_low_contains( a )) region = "JIT-POOL-LOW-RX (region C, FEX code)";
+    else if (ios_jit_low_rw_contains( a )) region = "JIT-POOL-LOW-RW (region C alias)";
     dprintf( 2, "[fault-rgn] addr=%p page=%p vprot prev/this/next=%02x/%02x/%02x region=%s\n",
              addr, page, vp_prev, vp, vp_next, region );
     if (view)
@@ -26836,6 +28260,16 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         ios_jit_pool_size_global)
     {
         size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;
+        /* madeira-bcd pool-low: region C (ios_jit_low_rx_global) serves this carve
+         * first when it still has room; the pool's budget cap below only applies to
+         * what goes to the tail. Never for a WoW64 process: its FEX refuses an
+         * executable allocation outside the pool span. */
+        int low_ok = ios_jit_low_size_global && !ios_wow_base();
+        int low_fits = low_ok && alloc_size <= IOS_POOL_LOW_CARVE_MAX &&
+                       alloc_size <= ios_jit_low_size_global &&
+                       ios_jit_low_reserved <= ios_jit_low_size_global - alloc_size;
+        int kept_large_carve = 0, reuse_all_carves = 0;
+        size_t tail_cap = ~(size_t)0;
         /* ml459 (#75): cap a single EC code buffer at 16MB. FEX asks for 32MB
          * once its buffers get hot, but an old generation stays pinned by any
          * thread still referencing it (see [pool-tail] PIN) — and a 32MB
@@ -26870,17 +28304,14 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * 5.5M real compiles (56 % hit rate), 390 buffer rotations, and a
              * quarter of all running CPU samples inside the compiler. The cap is
              * now what the pool can actually afford: up to 128 MB (the branch
-             * range FEX itself limits a buffer to) while HEAD_RESERVE stays free
-             * between the image head and the tail. */
-            enum { TAIL_SMALL = 0x1000000, TAIL_MAX = 0x8000000, HEAD_RESERVE = 48u * 1024 * 1024 };
+             * range FEX itself limits a buffer to) with a headroom target between
+             * the image head and the tail (48MB by default). */
+            enum { TAIL_SMALL = 0x1000000 };
             size_t head_now = jit_pool_offset, tail_now = ios_jit_tail_reserved;
-            /* madeira-bcd split pool: a hole still between head and tail is not room */
-            size_t hole_now = ios_pool_hole_between( ios_jit_pool_size_global, head_now, tail_now,
-                                                     ios_jit_hole_off, ios_jit_hole_end_eff );
-            size_t room = ios_jit_pool_size_global > head_now + tail_now + hole_now + HEAD_RESERVE
-                        ? ios_jit_pool_size_global - head_now - tail_now - hole_now - HEAD_RESERVE : 0;
-            size_t cap = TAIL_SMALL;
-            while (cap < TAIL_MAX && cap * 2 <= room) cap *= 2;
+            /* Neither the native hole nor either placement of the image slot
+             * is available to the tail. Default headroom remains 48MB. */
+            size_t cap = ios_pool_code_cap( ios_jit_pool_size_global, head_now, tail_now,
+                                            ios_jit_hole_off_eff, ios_jit_hole_end_eff, ios_pool_head_reserve );
             /* A retired generation of this size already sitting on the carve
              * free-list costs the pool nothing new: never refuse that. */
             if (alloc_size > cap)
@@ -26888,11 +28319,13 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                 unsigned fi;
                 pthread_mutex_lock( &ios_tail_carve_lock );
                 for (fi = 0; fi < ios_tail_carve_n; fi++)
-                    if (ios_tail_carves[fi].free && ios_tail_carves[fi].size >= alloc_size) { cap = alloc_size; break; }
+                    if (ios_tail_carves[fi].free && ios_tail_carves[fi].size >= alloc_size &&
+                        (low_ok || !ios_tail_carve_in_low( ios_tail_carves[fi].off ))) { cap = alloc_size; break; }
                 pthread_mutex_unlock( &ios_tail_carve_lock );
             }
+            tail_cap = cap;
 
-            if (alloc_size > cap) {
+            if (alloc_size > cap && !low_fits) {
                 static int cap_log_n;
                 if (cap_log_n < 16) {
                     cap_log_n++;
@@ -26902,7 +28335,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                 }
                 return STATUS_NO_MEMORY;
             }
-            if (alloc_size > TAIL_SMALL) {
+            if (alloc_size > TAIL_SMALL && !low_fits) {
                 static int big_log_n;
                 if (big_log_n < 16) {
                     big_log_n++;
@@ -26912,13 +28345,21 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             }
         }
         /* ml438 (#74): serve from the free-list first — see ios_tail_carves. */
+retry_code_carve_reuse:
         {
             unsigned i, best = ~0u;
             pthread_mutex_lock( &ios_tail_carve_lock );
             for (i = 0; i < ios_tail_carve_n; i++)
                 if (ios_tail_carves[i].free && ios_tail_carves[i].size >= alloc_size &&
+                    (low_ok || !ios_tail_carve_in_low( ios_tail_carves[i].off )) &&   /* madeira-bcd pool-low */
                     (best == ~0u || ios_tail_carves[i].size < ios_tail_carves[best].size))
                     best = i;
+            if (best != ~0u && !reuse_all_carves &&
+                ios_pool_preserve_code_carve( ios_tail_carves[best].size, alloc_size, low_fits ))
+            {
+                kept_large_carve = 1;
+                best = ~0u;
+            }
             if (best != ~0u)
             {
                 void *jit_rx = (char *)ios_jit_rx_base_global + ios_tail_carves[best].off;
@@ -26933,11 +28374,72 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                 }
                 *ret = jit_rx;
                 *size_ptr = got;
-                dprintf(2, "[jit-pool] tail REUSE rx=%p size=0x%lx (asked 0x%lx) free_left=%u rev=ml438\n",
-                        jit_rx, (unsigned long)got, (unsigned long)alloc_size, ios_tail_carve_n);
+                dprintf(2, "[jit-pool] tail REUSE rx=%p size=0x%lx (asked 0x%lx) free_left=%u rev=ml438%s\n",
+                        jit_rx, (unsigned long)got, (unsigned long)alloc_size, ios_tail_carve_n,
+                        ios_jit_low_contains( (uintptr_t)jit_rx ) ? " [pool-low] region C" : "");
                 return STATUS_SUCCESS;
             }
             pthread_mutex_unlock( &ios_tail_carve_lock );
+        }
+        /* madeira-bcd pool-low: carve from region C's bottom. The carve goes into
+         * ios_tail_carves with `off` = its (wrapping) distance from the pool's RX
+         * base, so the free, reuse, lookup and census paths treat it like any other
+         * carve, and rw + off is its RW alias (C's alias is at the same distance). */
+        if (low_ok)
+        {
+            size_t loff;
+            if (low_fits && ios_pool_low_take( &ios_jit_low_reserved, ios_jit_low_size_global, alloc_size, &loff ))
+            {
+                void *jit_rx = (void *)(ios_jit_low_rx_global + loff);
+                volatile uint32_t *rw_words = (volatile uint32_t *)(ios_jit_low_rw_global + loff);
+                size_t w, nwords = alloc_size / sizeof(uint32_t);
+
+                for (w = 0; w < nwords; w++) rw_words[w] = 0xd503201fu;   /* NOP-prefill, as for tail carves */
+                pthread_mutex_lock( &ios_tail_carve_lock );
+                if (ios_tail_carve_n < IOS_TAIL_CARVE_MAX)
+                {
+                    ios_tail_carves[ios_tail_carve_n].off = (size_t)((uintptr_t)jit_rx - (uintptr_t)ios_jit_rx_base_global);
+                    ios_tail_carves[ios_tail_carve_n].size = alloc_size;
+                    ios_tail_carves[ios_tail_carve_n].free = 0;
+                    ios_tail_carves[ios_tail_carve_n].freed_at = 0;
+                    ios_tail_carve_n++;
+                }
+                pthread_mutex_unlock( &ios_tail_carve_lock );
+                dprintf(2, "[pool-low] EC_CODE rx=%p size=0x%lx from region C: used 0x%lx/0x%lx (pool tail_resv=0x%lx "
+                        "head_used=0x%lx/0x%lx untouched)\n",
+                        jit_rx, (unsigned long)alloc_size, (unsigned long)(loff + alloc_size),
+                        (unsigned long)ios_jit_low_size_global, (unsigned long)ios_jit_tail_reserved,
+                        (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
+                *ret = jit_rx;
+                *size_ptr = alloc_size;
+                return STATUS_SUCCESS;
+            }
+            /* Another thread may have consumed C after the budget snapshot.
+             * Retry the original freelist policy once, rather than leaking a
+             * new tail carve or refusing an allocation that used to work. */
+            if (kept_large_carve && !reuse_all_carves)
+            {
+                reuse_all_carves = 1;
+                low_fits = 0;
+                goto retry_code_carve_reuse;
+            }
+            if (alloc_size <= IOS_POOL_LOW_CARVE_MAX && ios_jit_low_full_logged < 4)
+            {
+                ios_jit_low_full_logged++;
+                dprintf(2, "[pool-low] region C has 0x%lx of 0x%lx left, not enough for carve 0x%lx: it goes to the "
+                        "pool tail (freed C carves are still reused first)\n",
+                        (unsigned long)(ios_jit_low_size_global - ios_jit_low_reserved),
+                        (unsigned long)ios_jit_low_size_global, (unsigned long)alloc_size);
+            }
+            /* C could not take it after all (another thread got there first):
+             * the tail's budget cap applies, as it would have without C. */
+            if (alloc_size > tail_cap)
+            {
+                dprintf(2, "[jit-pool] tail CAP: refusing 0x%lx (cap 0x%lx, tail_resv=0x%lx, region C full) so FEX "
+                        "halves down [pool-low]\n", (unsigned long)alloc_size, (unsigned long)tail_cap,
+                        (unsigned long)ios_jit_tail_reserved);
+                return STATUS_NO_MEMORY;
+            }
         }
         /* Reserve from the END of the JIT pool to avoid colliding with
          * mprotect_exec's PE-image copies which take from the start.
@@ -26953,8 +28455,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             do
             {
                 cur = ios_jit_tail_reserved;
-                start = ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,
-                                                  ios_jit_hole_off, ios_jit_hole_end_eff );
+            start = ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,
+                                                  ios_jit_hole_off_eff, ios_jit_hole_end_eff );
             } while (!__sync_bool_compare_and_swap( &ios_jit_tail_reserved, cur, start + alloc_size ));
             reserve_offset = start;
             tail_added = start + alloc_size - cur;
@@ -26990,6 +28492,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                         ios_tail_carves[ios_tail_carve_n].off = foff;
                         ios_tail_carves[ios_tail_carve_n].size = alloc_size;
                         ios_tail_carves[ios_tail_carve_n].free = 0;
+                        ios_tail_carves[ios_tail_carve_n].freed_at = 0;
                         ios_tail_carve_n++;
                     }
                     pthread_mutex_unlock( &ios_tail_carve_lock );
@@ -27030,10 +28533,11 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                     pthread_mutex_lock( &ios_tail_carve_lock );
                     for (ci = 0; ci < ios_tail_carve_n; ci++)
                     {
-                        dprintf(2, "[pool-tail] carve[%u] off=0x%lx size=0x%lx %s rev=ml459\n",
+                        dprintf(2, "[pool-tail] carve[%u] off=0x%lx size=0x%lx %s rev=ml459%s\n",
                                 ci, (unsigned long)ios_tail_carves[ci].off,
                                 (unsigned long)ios_tail_carves[ci].size,
-                                ios_tail_carves[ci].free ? "FREE" : "LIVE");
+                                ios_tail_carves[ci].free ? "FREE" : "LIVE",
+                                ios_tail_carve_in_low( ios_tail_carves[ci].off ) ? " [pool-low] region C" : "");
                         if (ios_tail_carves[ci].free) freed += ios_tail_carves[ci].size;
                         else live += ios_tail_carves[ci].size;
                     }
@@ -27092,6 +28596,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                 ios_tail_carves[ios_tail_carve_n].off = pool_tail_off;
                 ios_tail_carves[ios_tail_carve_n].size = alloc_size;
                 ios_tail_carves[ios_tail_carve_n].free = 0;
+                ios_tail_carves[ios_tail_carve_n].freed_at = 0;
                 ios_tail_carve_n++;
             }
             /* madeira-bcd split pool: this carve went below the hole; the span it
@@ -27101,13 +28606,14 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                 ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end_eff;
                 ios_tail_carves[ios_tail_carve_n].size = tail_skipped & ~(size_t)0x3fff;
                 ios_tail_carves[ios_tail_carve_n].free = 1;
+                ios_tail_carves[ios_tail_carve_n].freed_at = 0;   /* never executed, outside region C */
                 ios_tail_carve_n++;
             }
             pthread_mutex_unlock( &ios_tail_carve_lock );
             if (tail_added != alloc_size)
                 dprintf(2, "[jit-pool] split pool: tail carve 0x%lx would overlap the hole [0x%lx,0x%lx) -- "
                         "placed below it at off 0x%lx; 0x%lx above the hole kept as a free carve\n",
-                        (unsigned long)alloc_size, (unsigned long)ios_jit_hole_off,
+                        (unsigned long)alloc_size, (unsigned long)ios_jit_hole_off_eff,
                         (unsigned long)ios_jit_hole_end_eff, (unsigned long)pool_tail_off,
                         (unsigned long)tail_skipped);
             dprintf(2, "[jit-pool] tail EC_CODE rx=%p size=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx\n",
@@ -27703,9 +29209,12 @@ static NTSTATUS ios_na_inner_NtFreeVirtualMemory( HANDLE process, PVOID *addr_pt
     /* ml438 (#74): a MEM_RELEASE of a live tail EC-buffer carve has no wine
      * view — before this rev it error'd (FEXCore ignored it) and the tail
      * space leaked forever. Mark the carve free for reuse and succeed. */
+    /* madeira-bcd pool-low: a carve in region C is released the same way; its
+     * `off` is the same wrapping base - rx it was recorded with. */
     if ((type & MEM_RELEASE) && ios_jit_rx_base_global && ios_jit_pool_size_global &&
-        (char *)base >= (char *)ios_jit_rx_base_global &&
-        (char *)base <  (char *)ios_jit_rx_base_global + ios_jit_pool_size_global)
+        (((char *)base >= (char *)ios_jit_rx_base_global &&
+          (char *)base <  (char *)ios_jit_rx_base_global + ios_jit_pool_size_global) ||
+         ios_jit_low_contains( (uintptr_t)base )))
     {
         unsigned i;
         size_t off = (size_t)((char *)base - (char *)ios_jit_rx_base_global);
@@ -27726,14 +29235,16 @@ static NTSTATUS ios_na_inner_NtFreeVirtualMemory( HANDLE process, PVOID *addr_pt
                 break;
             }
             ios_tail_carves[i].free = 1;
+            ios_tail_carves[i].freed_at = time( NULL );
             carve_size = ios_tail_carves[i].size;
             break;
         }
         pthread_mutex_unlock( &ios_tail_carve_lock );
         if (carve_size)
         {
-            dprintf(2, "[jit-pool] tail FREE rx=%p size=0x%lx -> free-list rev=ml438\n",
-                    (void *)base, (unsigned long)carve_size);
+            dprintf(2, "[jit-pool] tail FREE rx=%p size=0x%lx -> free-list rev=ml438%s\n",
+                    (void *)base, (unsigned long)carve_size,
+                    ios_jit_low_contains( (uintptr_t)base ) ? " [pool-low] region C" : "");
             *addr_ptr = base;
             *size_ptr = carve_size;
             return STATUS_SUCCESS;
@@ -27819,6 +29330,8 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
     DWORD old;
 
 #ifdef WINE_IOS
+    LPVOID ios_patch_requested = addr;
+    SIZE_T ios_patch_length = size;
     /* ml966: a protection change on a low guest allocation applies to the
      * backing. The whole span is bounds-checked, so a request that runs off
      * the end of the allocation is left alone rather than silently clipped. */
@@ -28472,6 +29985,10 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
 #endif
     }
     else *old_prot = PAGE_NOACCESS;
+    /* After the existing IAT sync, observe both copies without touching them. */
+#ifdef WINE_IOS
+    ios_trace_image_patch( ios_patch_requested, ios_patch_length, new_prot, status );
+#endif
     return status;
 }
 

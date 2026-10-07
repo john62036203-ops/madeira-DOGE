@@ -1339,8 +1339,32 @@ void winios_window_visibility(HWND hwnd, int visible) {
     });
 }
 
+/* Parent movement does not give every child its own WindowPosChanged. Update
+ * existing layers only; retain their visibility, surface and Metal layer.
+ * All Wine queries happened on the caller's Wine thread, not this queue. */
+void winios_window_geometry(HWND hwnd, int x, int y, int w, int h,
+                            int cx, int cy, int cw, int ch) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSNumber *key = @((uintptr_t)hwnd);
+        CALayer *l = g_layers[key];
+        if (!l) return;
+        g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
+        if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
+        g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        l.frame = winios_layer_rect(x, y, w, h);
+        winios_apply_contents_rect(key, l);
+        winios_place_metal_layer(key);
+        [CATransaction commit];
+        static unsigned n;
+        if (++n <= 64 || (n % 128) == 0)
+            fprintf(stderr, "[winios] inherited frame hwnd=%p screen=(%d,%d %dx%d)\n", hwnd, x, y, w, h);
+    });
+}
+
 /* Called from win32u's pWindowPosChanged wrapper (wine thread).
- * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, desktop pixels. */
+ * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, screen desktop pixels. */
 void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
                          int cx, int cy, int cw, int ch) {
     /* Here, not in the block below: the census asks win32u about the window,
@@ -1505,7 +1529,8 @@ void winios_dump_srcbits(const void *bits, int w, int h, int stride) {
 }
 
 /* Called from winios_surface_flush (wine thread) with the surface's
- * whole DIB. Copy immediately — `bits` is only valid for this call.
+ * whole DIB and Wine's alpha mask. Copy immediately — `bits` is only valid
+ * for this call. Ordinary GDI remains opaque BGRX; per-pixel alpha is BGRA.
  *
  * ml1028: returns 0 if the snapshot could not be allocated, 1 otherwise.
  *
@@ -1537,7 +1562,7 @@ void winios_dump_srcbits(const void *bits, int w, int h, int stride) {
  * WARNING: the snapshot must OWN its bytes. Wrapping `bits` with no-copy would
  * be cheaper and wrong: it is only valid for the duration of this call. */
 int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
-                           int sw, int sh, int stride, const void *bits) {
+                           int sw, int sh, int stride, const void *bits, unsigned int alpha_mask) {
     if (sw <= 0 || sh <= 0 || !bits) return 1;   /* nothing to paint */
     winios_census_note_present(hwnd);   /* no-op unless the census is on */
     size_t snap_len = (size_t)stride * (size_t)sh;
@@ -1723,6 +1748,36 @@ int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
 
     if (mycnt <= 16 || (mycnt % 200) == 0 ||
         (sw >= 400 && sh >= 400 && mycnt <= 2000)) {
+        /* Observe the actual owned snapshot shown below. A sparse sample of
+         * the first four dirty rectangles separates blank source pixels from
+         * content lost in composition, including small layered error dialogs.
+         * No image bytes or text are dumped, and no pixel is changed. */
+        if (mycnt && mycnt <= 4 && stride >= (int64_t)sw * 4) {
+            int left = MAX(0, dx), top = MAX(0, dy);
+            int right = (int)MIN((int64_t)sw, (int64_t)dx + dw);
+            int bottom = (int)MIN((int64_t)sh, (int64_t)dy + dh);
+            if (right > left && bottom > top) {
+                const uint8_t *src = data.bytes;
+                uint32_t first = ((const uint32_t *)(src + (size_t)top * stride))[left];
+                unsigned samples = 0, different = 0, bright = 0, alpha0 = 0, alpha255 = 0;
+                int xstep = (right - left + 31) / 32, ystep = (bottom - top + 31) / 32;
+                for (int y = top; y < bottom; y += ystep) {
+                    const uint32_t *row = (const uint32_t *)(src + (size_t)y * stride);
+                    for (int x = left; x < right; x += xstep) {
+                        uint32_t px = row[x];
+                        samples++;
+                        different += (px & 0xffffff) != (first & 0xffffff);
+                        bright += (px & 255) > 96 || ((px >> 8) & 255) > 96 || ((px >> 16) & 255) > 96;
+                        alpha0 += (px >> 24) == 0;
+                        alpha255 += (px >> 24) == 255;
+                    }
+                }
+                dprintf(STDERR_FILENO, "[surf-pixels] hwnd=%p #%u rect={%d,%d,%d,%d} "
+                        "samples=%u first=%08x rgb-different=%u bright=%u alpha0=%u alpha255=%u alpha-mask=%08x\n",
+                        hwnd, mycnt, left, top, right, bottom, samples, first, different, bright, alpha0, alpha255,
+                        alpha_mask);
+            }
+        }
         /* ml504: bits pointer + content signature per present.
          *
          * ml503 showed ~200k pixels changing across the WHOLE window while
@@ -1772,12 +1827,17 @@ int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         CALayer *l = winios_layer_for(hwnd, true);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
-        /* GDI 32bpp DIB = BGRX little-endian, no alpha */
+        /* UpdateLayeredWindow marks premultiplied BGRA with alpha_mask.
+         * Ordinary GDI is BGRX: its unused high byte can also be zero, so
+         * only a surface explicitly marked by Wine uses per-pixel alpha. */
+        BOOL pixelAlpha = alpha_mask == 0xff000000u;
         CGImageRef img = CGImageCreate(sw, sh, 8, 32, stride, cs,
-                                       kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+                                       kCGBitmapByteOrder32Little |
+                                       (pixelAlpha ? kCGImageAlphaPremultipliedFirst : kCGImageAlphaNoneSkipFirst),
                                        dp, NULL, false, kCGRenderingIntentDefault);
         if (img) {
             NSNumber *key = @((uintptr_t)hwnd);
+            l.opaque = !pixelAlpha;
             l.contents = (__bridge id)img;
             if (pending) l.hidden = YES;   /* winios_window_frame decides */
             else atomic_fetch_add_explicit(&g_surface_present_count, 1, memory_order_relaxed);

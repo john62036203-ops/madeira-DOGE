@@ -6,6 +6,7 @@
 #undef main
 
 extern void madeira_hidpad_init( void );
+extern void madeira_storage_device_init( void );
 
 /* Our replacement that adds logging */
 int wineserver_main(int argc, char *argv[])
@@ -61,6 +62,7 @@ int wineserver_main(int argc, char *argv[])
         extern int wineserver_ready;
         __atomic_store_n( &wineserver_ready, 1, __ATOMIC_RELEASE );
     }
+    madeira_storage_device_init();
     ws_log("[wineserver] entering main_loop!");
     main_loop();
     ws_log("[wineserver] main_loop returned");

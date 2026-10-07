@@ -36,7 +36,7 @@ WANT="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcr110 msvcrt20 msvcrt40 msvcir
       comctl32_v6
       wbemprox wbemdisp wmiutils
       riched20 riched32 msftedit gdiplus mlang usp10 cabinet sspicli msxml3 msxml6
-      msasn1 wldp hnetcfg msctf xmllite netprofm d2d1
+      msasn1 wldp hnetcfg msctf xmllite netprofm d2d1 wmvcore winegstreamer
       xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9
       x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6 x3daudio1_7
       xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4 xapofx1_5
@@ -71,15 +71,14 @@ if [ "${MADEIRA_XINPUT_RUMBLE_BUILD:-1}" != 0 ]; then
 fi
 [ -n "$todo$XI" ] || { echo "nothing to build"; exit 0; }
 
-# A tree configured before winegstreamer was wanted has no Makefile rule for it.
-if [ -f "$B/Makefile" ] && ! grep -q "dlls/winegstreamer/arm64ec-windows/winegstreamer.dll" "$B/Makefile"; then
-    echo "reconfiguring $B with --enable-winegstreamer"
-    rm -f "$B/Makefile" "$B/config.status"
-fi
-if [ ! -f "$B/Makefile" ]; then
+# The cached tree may have disabled winegstreamer because macOS has no
+# GStreamer headers. Only its real PE frontend is needed here; the iOS unix
+# backend already lives in libntdll_unix.a. Reconfigure that older cache too.
+if [ ! -f "$B/Makefile" ] ||
+   ! grep -q '^dlls/winegstreamer/arm64ec-windows/winegstreamer.dll:' "$B/Makefile"; then
     mkdir -p "$B"
-    ( cd "$B" && "$R/wine/configure" --enable-archs=arm64ec --without-x --disable-tests \
-          --without-freetype --without-gnutls --enable-winegstreamer ${TOOLS:+--with-wine-tools="$TOOLS"} ) > "$B.cfg.log" 2>&1 \
+    ( cd "$B" && "$R/wine/configure" --enable-archs=arm64ec --enable-winegstreamer --without-x --disable-tests \
+          --without-freetype --without-gnutls ${TOOLS:+--with-wine-tools="$TOOLS"} ) > "$B.cfg.log" 2>&1 \
         || { tail -20 "$B.cfg.log"; echo "::error::wine arm64ec configure failed"; exit 1; }
 fi
 # widl looks for imported typelibs (stdole2.tlb) under aarch64-windows, its

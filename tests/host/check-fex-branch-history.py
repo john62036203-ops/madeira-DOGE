@@ -86,6 +86,7 @@ suffix = r'''
 };
 int main(int argc,char** argv) {
   if (argc!=4) return 1;
+  static_assert(offsetof(Frame, State.gregs[FEXCore::X86State::REG_RSP]) == 0x40);
   Frame initial {};
   if (initial.IosGuestBranchHistory.Magic != 0x314744454742444dULL || initial.IosGuestBranchHistory.Serial) return 2;
   if (IosGuestBranchTraceLayout[0] != 0x314744454742444dULL ||

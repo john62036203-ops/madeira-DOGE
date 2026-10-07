@@ -31,7 +31,8 @@ app = (ROOT / "app/Madeira/Winios/Winios.m").read_text()
 callback = function(driver, "static void winios_drv_window_pos_changed(")
 # The remainder is the existing logging, repaint and chained driver hook.
 frame = callback[:callback.index("    /* ml505: z-order")] + "}\n"
-refresh = function(driver, "static void winios_drv_refresh_child_visibility(")
+coordinates = function(driver, "static BOOL winios_drv_screen_rects(")
+refresh = function(driver, "static void winios_drv_refresh_children(")
 predicate = function(wine, "BOOL is_window_visible( HWND hwnd )")
 
 # A late GDI flush or swapchain must not make a new layer visible by default.
@@ -41,6 +42,7 @@ present = function(app, "int winios_surface_present(")
 assert "l.hidden = NO" not in present
 
 harness = r'''
+#define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -53,6 +55,7 @@ typedef int NTSTATUS;
 typedef struct { int left, top, right, bottom; } RECT;
 struct window_rects { RECT window, client, visible; };
 struct window_surface { int unused; };
+enum coords_relative { COORDS_SCREEN, COORDS_PARENT };
 #define TRUE 1
 #define FALSE 0
 #define GWL_STYLE (-16)
@@ -61,6 +64,9 @@ struct window_surface { int unused; };
 #define WS_CHILD 0x40000000u
 #define SWP_SHOWWINDOW 0x40u
 #define SWP_HIDEWINDOW 0x80u
+#define SWP_NOSIZE 0x1u
+#define SWP_NOMOVE 0x2u
+#define SWP_FRAMECHANGED 0x20u
 #define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xc0000023u)
 #define DESKTOP 1
 static DWORD styles[512];
@@ -68,7 +74,13 @@ static HWND parents[512];
 static int child_visible[512], visibility_calls, resize_calls, enum_error;
 static int desktop_mode = 1, game_windows, frame_calls, dialog_calls;
 static struct { HWND hwnd; int x,y,w,h,visible,cx,cy,cw,ch; } last;
+static struct window_rects queried_rects;
 static BOOL IsRectEmpty(const RECT *r) { return r->left >= r->right || r->top >= r->bottom; }
+static void OffsetRect(RECT *r, int x, int y) { r->left += x; r->right += x; r->top += y; r->bottom += y; }
+static UINT get_win_monitor_dpi(HWND hwnd, UINT *raw_dpi) { (void)hwnd; *raw_dpi = 96; return 96; }
+static BOOL get_window_rects(HWND hwnd, enum coords_relative relative, struct window_rects *rects, UINT dpi) {
+    (void)hwnd; (void)relative; assert(dpi == 96); *rects = queried_rects; return TRUE;
+}
 static DWORD get_window_long(HWND w, int index) { assert(index == GWL_STYLE && w < 512); return styles[w]; }
 static HWND get_desktop_window(void) { return DESKTOP; }
 static HWND NtUserGetAncestor(HWND w, UINT kind) { assert(kind == GA_PARENT); return parents[w]; }
@@ -109,6 +121,7 @@ static void capture_visibility(HWND hwnd, int visible) {
     child_visible[hwnd] = visible; visibility_calls++;
 }
 static void (*winios_window_visibility)(HWND,int) = capture_visibility;
+static void (*winios_window_geometry)(HWND,int,int,int,int,int,int,int,int);
 static void winios_note_dialog_thread(HWND hwnd, const RECT *v) { (void)hwnd; (void)v; dialog_calls++; }
 /* PRODUCTION */
 static struct window_rects rects = {
@@ -116,6 +129,7 @@ static struct window_rects rects = {
 };
 static struct window_surface surface;
 static void expect(HWND hwnd, UINT flags, int visible) {
+    queried_rects = rects;
     frame_calls = 0;
     winios_drv_window_pos_changed(hwnd, 0, 0, flags, &rects, &surface);
     assert(frame_calls == 1 && last.hwnd == hwnd && last.visible == visible);
@@ -209,7 +223,7 @@ with tempfile.TemporaryDirectory(prefix="winios-visibility-") as folder:
     old_frame = frame.replace("is_window_visible( hwnd ) && ", "", 1)
     assert old_frame != frame, "the negative control must remove the visibility gate"
     for label, block in (("current", frame), ("rect-only", old_frame)):
-        source.write_text(harness.replace("/* PRODUCTION */", predicate + "\n" + refresh + "\n" + block))
+        source.write_text(harness.replace("/* PRODUCTION */", predicate + "\n" + coordinates + "\n" + refresh + "\n" + block))
         subprocess.run([compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
                         "-Wno-unused-parameter", "-g", "-fsanitize=address,undefined",
                         str(source), "-o", str(binary)], check=True)

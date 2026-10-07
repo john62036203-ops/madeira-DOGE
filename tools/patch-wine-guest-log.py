@@ -11,8 +11,9 @@ in the session log. This restores it, applied to the wine checkout before
 
 NtWriteFile, after a successful write to a regular file and before the fd is
 closed, hands the bytes to ios_guest_log_mirror(): it returns at once for a
-spent budget, short writes and anything with control bytes (binary data);
-otherwise it splits the text into lines, keeps the ones that matter and, only
+spent budget, short writes and binary data. UTF-16 LE/BE writes are decoded
+before the control-byte check (a BOM may have been written separately);
+it splits the text into lines, keeps the ones that matter and, only
 then, asks the fd's path (F_GETPATH) -- only *.log and output_log.txt count.
 Guest I/O results are never changed.
 
@@ -73,6 +74,75 @@ static int ios_guest_log_keep( const char *line, size_t len )
     return 0;
 }
 
+/* A BOM can be its own NtWriteFile call. Without one, require several ASCII
+ * code units with the correct zero-byte layout before considering UTF-16.
+ * Validate the whole bounded input, including text beyond the output limit;
+ * do not reinterpret arbitrary NUL-containing writes as text. No fd state is
+ * cached, so descriptor reuse and different writers cannot mix encodings. */
+static int ios_guest_log_utf16( const unsigned char *src, unsigned int n,
+                              int clipped, char *dst, unsigned int capacity )
+{
+    unsigned int i, start = 0, ascii_le = 0, ascii_be = 0, written = 0;
+    int endian = 0, full = 0;
+
+    if (n < 2 || (n & 1)) return -1;
+    if (src[0] == 0xff && src[1] == 0xfe) { endian = 1; start = 2; }
+    else if (src[0] == 0xfe && src[1] == 0xff) { endian = 2; start = 2; }
+    else
+    {
+        for (i = 0; i < n; i += 2)
+        {
+            unsigned int a = src[i], b = src[i + 1];
+            if (!b && ((a >= 32 && a <= 126) || a == '\n' || a == '\r' || a == '\t')) ascii_le++;
+            if (!a && ((b >= 32 && b <= 126) || b == '\n' || b == '\r' || b == '\t')) ascii_be++;
+        }
+        if (ascii_le >= 4 && ascii_le >= (n / 2) - (n / 2) / 4) endian = 1;
+        else if (ascii_be >= 4 && ascii_be >= (n / 2) - (n / 2) / 4) endian = 2;
+        else return -1;
+    }
+    for (i = start; i < n; i += 2)
+    {
+        unsigned int c = endian == 1 ? src[i] | (src[i + 1] << 8) : (src[i] << 8) | src[i + 1];
+        unsigned int bytes;
+        if ((c < 32 && c != '\n' && c != '\r' && c != '\t') || (c >= 127 && c <= 159)) return -1;
+        if (c >= 0xd800 && c <= 0xdbff)
+        {
+            unsigned int low;
+            if (i + 3 >= n)
+            {
+                if (clipped) break; /* bounded prefix ended between a surrogate pair */
+                return -1;
+            }
+            low = endian == 1 ? src[i + 2] | (src[i + 3] << 8) : (src[i + 2] << 8) | src[i + 3];
+            if (low < 0xdc00 || low > 0xdfff) return -1;
+            c = 0x10000 + ((c - 0xd800) << 10) + low - 0xdc00;
+            i += 2;
+        }
+        else if (c >= 0xdc00 && c <= 0xdfff) return -1;
+        if (c == 0xfffe || c == 0xffff) return -1;
+        bytes = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+        if (full || bytes > capacity - written) { full = 1; continue; }
+        if (bytes == 1) dst[written++] = c;
+        else
+        {
+            if (bytes == 2) dst[written++] = 0xc0 | (c >> 6);
+            else if (bytes == 3)
+            {
+                dst[written++] = 0xe0 | (c >> 12);
+                dst[written++] = 0x80 | ((c >> 6) & 0x3f);
+            }
+            else
+            {
+                dst[written++] = 0xf0 | (c >> 18);
+                dst[written++] = 0x80 | ((c >> 12) & 0x3f);
+                dst[written++] = 0x80 | ((c >> 6) & 0x3f);
+            }
+            dst[written++] = 0x80 | (c & 0x3f);
+        }
+    }
+    return written;
+}
+
 static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int length )
 {
     static int mode = -1;                 /* 0 off, 1 keyword lines, 2 every line */
@@ -82,6 +152,7 @@ static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int lengt
     unsigned int i, n, start, serial;
     int saved_errno = errno, have_path = 0, m = __atomic_load_n( &mode, __ATOMIC_RELAXED );
     char path[PATH_MAX];
+    char decoded[4096];
 
     if (m < 0)
     {
@@ -105,13 +176,25 @@ static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int lengt
     if (__atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= __atomic_load_n( &limit, __ATOMIC_RELAXED )) goto out;
 
     n = length < 4096 ? length : 4096;
+    {
+        int wide = n >= 2 && ((text[0] == 0xff && text[1] == 0xfe) ||
+                              (text[0] == 0xfe && text[1] == 0xff));
+        for (i = 0; !wide && i < n; i++) if (!text[i]) wide = 1;
+        if (wide)
+        {
+            int count = ios_guest_log_utf16( text, n, length > n, decoded, sizeof(decoded) );
+            if (count < 0) goto out;
+            n = count;
+            text = (const unsigned char *)decoded;
+        }
+    }
     for (i = 0; i < n; i++)
         if (text[i] < 32 && text[i] != '\n' && text[i] != '\r' && text[i] != '\t') goto out;   /* binary */
 
     for (start = 0; start < n; start = i + 1)
     {
         unsigned long long hash = 14695981039346656037ULL;
-        unsigned int len, j;
+        unsigned int len, shown, j;
 
         for (i = start; i < n && text[i] != '\n'; i++) ;
         len = i - start;
@@ -150,8 +233,12 @@ static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int lengt
         if (__atomic_exchange_n( &previous_hash, hash, __ATOMIC_RELAXED ) == hash) continue;
         serial = __atomic_fetch_add( &emitted, 1, __ATOMIC_RELAXED );
         if (serial >= __atomic_load_n( &limit, __ATOMIC_RELAXED )) break;
+        shown = len > 300 ? 300 : len;
+        /* Keep a truncated UTF-8 line valid, including decoded UTF-16. */
+        if (shown < len)
+            while (shown && (text[start + shown] & 0xc0) == 0x80) shown--;
         dprintf( 2, "[guest-log] #%u tid=%04x %.*s%s\n", serial + 1, (unsigned int)GetCurrentThreadId(),
-                 (int)(len > 300 ? 300 : len), (const char *)text + start, len > 300 ? " [truncated]" : "" );
+                 (int)shown, (const char *)text + start, shown < len ? " [truncated]" : "" );
     }
 out:
     errno = saved_errno;
