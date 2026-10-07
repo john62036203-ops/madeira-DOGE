@@ -245,7 +245,10 @@ void winios_dump_window_tree(void)
         dprintf( 2, "[winios-tree] BuildHwndList failed 0x%x\n", (unsigned)status );
         return;
     }
-    dprintf( 2, "[winios-tree] ---- %u top-level windows ----\n", (unsigned)(size ? size - 1 : 0) );
+    /* madeira-doge: which window Windows calls foreground (a game that only takes
+     * input while it is the foreground window ignores pad, keys and mouse otherwise) */
+    dprintf( 2, "[winios-tree] ---- %u top-level windows ---- foreground=%p\n", (unsigned)(size ? size - 1 : 0),
+             NtUserGetForegroundWindow() );
     for (i = 0; i + 1 < size && i < ARRAY_SIZE(list); i++)
     {
         HWND hwnd = list[i];
