@@ -49,19 +49,35 @@ static void madeira_file_trace( const char *what, unsigned int status, const UNI
         const char *e = getenv( "MADEIRA_FILE_TRACE" ), *l = getenv( "MADEIRA_FILE_TRACE_LIMIT" );
         limit = l ? atoi( l ) : 4000;
         if (limit <= 0 || limit > 100000) limit = 4000;
-        on = e && e[0] == '1';
+        on = e && e[0] == '1' ? 1 : e && e[0] == '2' ? 2 : 0;   /* madeira-doge: 2 = the loader's DLL misses too */
         if (on) dprintf( 2, "[file-trace] madeira-bcd on: every guest open / attribute query, %d lines (MADEIRA_FILE_TRACE)\n", limit );
     }
-    if (!on || n >= limit) return;
     if (nt && nt->Buffer) { w = nt->Buffer; wl = nt->Length / sizeof(WCHAR); }
     else if (attr && attr->ObjectName && attr->ObjectName->Buffer)
     { w = attr->ObjectName->Buffer; wl = attr->ObjectName->Length / sizeof(WCHAR); }
     if (w) while (k < wl && k < sizeof(nb) - 1) { nb[k] = (w[k] < 32 || w[k] > 126) ? '?' : (char)w[k]; k++; }
     nb[k] = 0;
+    /* madeira-doge [file-watch]: always on, capped. Monster Hunter Rise (build 157,
+     * log 2026-10-07 12:16) ends on a delay-load of steam_api64.dll that the loader
+     * reports as not found, and nothing says where it looked. */
+    {
+        static volatile int watched;
+        unsigned int j;
+        for (j = 0; j + 9 <= k; j++)
+            if ((nb[j] | 0x20) == 's' && (nb[j+1] | 0x20) == 't' && (nb[j+2] | 0x20) == 'e' && (nb[j+3] | 0x20) == 'a' &&
+                (nb[j+4] | 0x20) == 'm' && nb[j+5] == '_' && (nb[j+6] | 0x20) == 'a' && (nb[j+7] | 0x20) == 'p' &&
+                (nb[j+8] | 0x20) == 'i')
+            {
+                if (__atomic_add_fetch( &watched, 1, __ATOMIC_RELAXED ) <= 60)
+                    dprintf( 2, "[file-watch] %s status=0x%08x disp=%u access=0x%08x name=%s\n", what, status, disp, access, nb );
+                break;
+            }
+    }
+    if (!on || n >= limit) return;
     /* Madeira's own shader cache (madeira_d3d12's .msc files) is not the game's I/O and
      * used most of the budget in the first GTA trace (log 2026-10-02 13:21:28). */
     if (strstr( nb, "\\Madeira\\ShaderCache" )) return;
-    if (status == 0xc0000034 && k > 4)
+    if (on < 2 && status == 0xc0000034 && k > 4)
     {
         const char *x = nb + k - 4;
         if ((x[0] == '.') && (x[1] | 0x20) == 'd' && (x[2] | 0x20) == 'l' && (x[3] | 0x20) == 'l') return;
