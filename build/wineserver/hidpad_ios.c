@@ -489,6 +489,15 @@ static void hidpad_file_ioctl( struct fd *fd, ioctl_code_t code, struct async *a
     unsigned char report[64];
     unsigned int len;
 
+    {
+        /* madeira-doge: which requests a game makes after opening the pad (Sora no
+         * Kiseki the 1st opens it twice and never reads a report) */
+        static unsigned int seen;
+        if (seen++ < 40)
+            fprintf( stderr, "[hid-pad] madeira-doge ioctl #%u code=%#x in=%u out-room=%u\n", seen,
+                     (unsigned)code, (unsigned)in_size, (unsigned)get_reply_max_size() );
+    }
+
     switch (code)
     {
     case IOCTL_HID_GET_COLLECTION_INFORMATION:

@@ -499,6 +499,10 @@ jobs:
         continue-on-error: true
         run: bash build/wineserver/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/wineserver.log"; exit ${PIPESTATUS[0]}
 
+      # [rawinput]: which Raw Input devices a game registers and asks about.
+      - name: Patch wine to log Raw Input use
+        run: python3 tools/patch-wine-rawinput-log.py
+
       - name: Build win32u-unix
         # Keep going so one run reports every broken stage (and caches FEX and
         # LLVM). "Verify all linked archives exist" still fails the job before
