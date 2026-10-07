@@ -2031,6 +2031,31 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
         ERR_(seh)("Unhandled exception code %x flags %x addr %p\n",
                   rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress );
 
+    /* madeira-doge [delay-load]: a failed delay-load (0xc06d007e module not
+     * found, 0xc06d007f procedure not found) carries a DelayLoadInfo naming
+     * what was missing; print it. Monster Hunter Rise (build 159, log
+     * 2026-10-07 13:40) ended on 0xc06d007f right after loading a
+     * steam_api64.dll and nothing said which export it wanted. */
+    if ((rec->ExceptionCode == 0xc06d007e || rec->ExceptionCode == 0xc06d007f) && rec->NumberParameters >= 1)
+    {
+        struct { unsigned int cb; unsigned int pad; ULONG64 pidd, ppfn, dll; unsigned int by_name, pad2; ULONG64 proc; } dli;
+        char dll[80] = "?", proc[160] = "?";
+
+        memset( &dli, 0, sizeof(dli) );
+        if (virtual_uninterrupted_read_memory( (void *)rec->ExceptionInformation[0], &dli, sizeof(dli) ) == sizeof(dli))
+        {
+            SIZE_T n;
+            if (dli.dll && (n = virtual_uninterrupted_read_memory( (void *)(ULONG_PTR)dli.dll, dll, sizeof(dll) - 1 ))) dll[n] = 0;
+            if (dli.by_name)
+            {
+                if (dli.proc && (n = virtual_uninterrupted_read_memory( (void *)(ULONG_PTR)dli.proc, proc, sizeof(proc) - 1 ))) proc[n] = 0;
+            }
+            else snprintf( proc, sizeof(proc), "ordinal %u", (unsigned)dli.proc );
+        }
+        dprintf( 2, "[delay-load] madeira-doge %s: dll=%s import=%s\n",
+                 rec->ExceptionCode == 0xc06d007e ? "module not found" : "procedure not found", dll, proc );
+    }
+
     NtTerminateProcess( NtCurrentProcess(), rec->ExceptionCode );
     return STATUS_SUCCESS;
 }
