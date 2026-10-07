@@ -90,6 +90,23 @@ mkdir -p "$B/dlls/stdole2.tlb" && ln -sfn arm64ec-windows "$B/dlls/stdole2.tlb/a
 python3 "$R/tools/patch-wine-msvcrt-datasync.py" "$R/wine/dlls/msvcrt/main.c"
 # d2d1: DC render targets without IDXGISurface1 (DXMT), see the script.
 case " $todo " in *" d2d1 "*) python3 "$R/tools/patch-wine-d2d1-dc-readback.py" "$R/wine/dlls/d2d1/dc_render_target.c" ;; esac
+# madeira-doge: the second exception. mfreadwrite is rebuilt with
+# tools/patch-wine-mf-reader-allocator.py (a source reader whose D3D sample
+# allocator cannot be set up returns system-memory samples; Monster Hunter
+# Rise read an error 500 times a second for ever). Its delay import of mf.dll
+# becomes a plain import for the reason given below. A failed build keeps the
+# shipped copy. MADEIRA_MF_READER_BUILD=0 skips it.
+MFR=0
+if [ "${MADEIRA_MF_READER_BUILD:-1}" != 0 ] && [ -f "$R/wine/dlls/mfreadwrite/reader.c" ] && shipped mf; then
+    if python3 "$R/tools/patch-wine-mf-reader-allocator.py" "$R/wine/dlls/mfreadwrite/reader.c"; then
+        MFR=1
+        sed -i.bak -e '/^DELAYIMPORTS[[:space:]]*=/d' -e 's/^\(IMPORTS[[:space:]]*=.*\)$/\1 mf/' "$R/wine/dlls/mfreadwrite/Makefile.in" && rm -f "$R/wine/dlls/mfreadwrite/Makefile.in.bak"
+        rm -f "$B/dlls/mfreadwrite/arm64ec-windows/mfreadwrite.dll" "$B/dlls/mfreadwrite"/arm64ec-windows/*.o
+        targets="$targets dlls/mfreadwrite/arm64ec-windows/mfreadwrite.dll"
+    else
+        echo "::warning::mfreadwrite allocator patch did not apply; shipped mfreadwrite.dll kept"
+    fi
+fi
 xi_patched=0
 if [ -n "$XI" ]; then
     python3 "$R/tools/patch-wine-xinput-vibration.py" "$R/wine/dlls/xinput1_3/main.c" && xi_patched=1
@@ -119,6 +136,27 @@ for d in $todo; do
 done
 make -C "$B" -k -j"$JOBS" $targets > "$B.build.log" 2>&1
 git -C "$R/wine" checkout -- dlls/msvcrt/main.c dlls/xinput1_3/main.c dlls/d2d1/dc_render_target.c
+git -C "$R/wine" checkout -- dlls/mfreadwrite/reader.c dlls/mfreadwrite/Makefile.in
+if [ "$MFR" = 1 ]; then
+    f="$B/dlls/mfreadwrite/arm64ec-windows/mfreadwrite.dll"
+    if [ -f "$f" ]; then
+        cp "$f" "$SHIP/mfreadwrite.dll.tmp"
+        "$MINGW/llvm-strip" "$SHIP/mfreadwrite.dll.tmp"
+        python3 - "$SHIP/mfreadwrite.dll.tmp" <<'PY'
+import struct, sys
+p = sys.argv[1]; d = open(p, 'rb').read()
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+target = struct.unpack_from('<I', d, pe + 24 + 56)[0] + 0x10000
+if len(d) < target:
+    open(p, 'ab').write(b'\0' * (target - len(d)))
+PY
+        mv "$SHIP/mfreadwrite.dll.tmp" "$SHIP/mfreadwrite.dll"
+        echo "::notice::mfreadwrite with the allocator fallback: shipped DLL replaced"
+    else
+        echo "::warning::mfreadwrite did not build; shipped copy kept"
+        grep -m 10 "mfreadwrite.*error\|error.*mfreadwrite" "$B.build.log"
+    fi
+fi
 for d in $undelayed; do git -C "$R/wine" checkout -- "dlls/$d/Makefile.in"; done
 [ -n "$undelayed" ] && echo "::notice::delay imports linked as plain imports:$undelayed"
 xi_built=0; xi_failed=""
