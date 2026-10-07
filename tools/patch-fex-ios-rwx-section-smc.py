@@ -14,6 +14,8 @@ and writable now get FEX's existing per-instruction validator (the one
 FEX_SMCCHECKS=full applies everywhere), so a changed byte is noticed before it
 runs. Ordinary .text is untouched. Opt-in per game: env.MADEIRA_FEX_RWX_SMC = 1
 (a game whose hot code sits in such a section would pay for it every frame).
+The validator stays on for MADEIRA_FEX_RWX_SMC_SECONDS (default 45, 0 = always)
+after the first such section is mapped: see the comment at IosRwxDeadlineMs.
 
 Fork-local build patch (tools/build-xtajit64.sh); not a contribution to FEX.
 Usage: patch-fex-ios-rwx-section-smc.py FEX
@@ -41,6 +43,8 @@ patch("FEXCore/Source/Interface/Core/Frontend.cpp",
 """,
 """/* madeira-doge: writable code sections (tools/patch-fex-ios-rwx-section-smc.py).
  * Filled by the Windows invalidation tracker at image map; read by the decoder. */
+#include <atomic>
+#include <chrono>
 namespace FEXCore {
 std::atomic<uint64_t> IosRwxSection[32][2] {};
 std::atomic<uint32_t> IosRwxSectionCount {};
@@ -54,8 +58,36 @@ void IosRwxSectionAdd(uint64_t Start, uint64_t End) {
   IosRwxSection[N][1].store(End, std::memory_order_relaxed);
   IosRwxSectionCount.store(N + 1, std::memory_order_release);
 }
+/* The validator only has to run while the program is still writing its own
+ * code. Monster Hunter Rise declares its whole 98 MB code section writable:
+ * every block got the validator, the translator emitted so much code that the
+ * 64-128 MB code buffer filled about once a second (468 rotations and 1.04
+ * million compiles in 9 minutes, 75-90% of the CPU inside the translator), and
+ * the game ran at 1 FPS from its loading screen on -- while every write to code
+ * in that log fell between seconds 13.6 and 16 of the process. So the validator
+ * is applied for a limited time after the first such section is seen
+ * (MADEIRA_FEX_RWX_SMC_SECONDS, default 45; 0 = for as long as the process runs). */
+std::atomic<int64_t> IosRwxDeadlineMs {0};   /* 0: no section yet; -1: no limit */
+static int64_t IosRwxNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void IosRwxSectionLimit(uint32_t Seconds) {
+  int64_t Expected = 0;
+  const int64_t Deadline = Seconds ? IosRwxNowMs() + int64_t(Seconds) * 1000 : -1;
+  IosRwxDeadlineMs.compare_exchange_strong(Expected, Deadline);
+}
 static bool IosRwxSectionHas(uint64_t Address) {
   const uint32_t N = IosRwxSectionCount.load(std::memory_order_acquire);
+  if (!N) return false;
+  const int64_t Deadline = IosRwxDeadlineMs.load(std::memory_order_relaxed);
+  if (Deadline > 0 && IosRwxNowMs() > Deadline) {
+    static std::atomic<uint32_t> MadRwxOver {};
+    if (MadRwxOver.fetch_add(1) == 0) {
+      LogMan::Msg::EFmt("[smc-rwx] time limit reached: blocks in writable code sections are compiled without the validator from now on "
+                        "(MADEIRA_FEX_RWX_SMC_SECONDS = 0 keeps it)");
+    }
+    return false;
+  }
   for (uint32_t i = 0; i < N && i < 32; i++) {
     if (Address >= IosRwxSection[i][0].load(std::memory_order_relaxed) &&
         Address < IosRwxSection[i][1].load(std::memory_order_relaxed)) return true;
@@ -98,6 +130,11 @@ patch("Source/Windows/Common/InvalidationTracker.cpp",
             LogMan::Msg::EFmt("[smc-rwx] {} section {:X}-{:X} is executable and writable: validated before each instruction",
                               Name, SectionBase, SectionBase + Section->Misc.VirtualSize);
             FEXCore::IosRwxSectionAdd(SectionBase, SectionBase + Section->Misc.VirtualSize);
+            {
+              const char* Sec = getenv("MADEIRA_FEX_RWX_SMC_SECONDS"); /* how long the validator stays on; 0 = always */
+              int V = Sec ? atoi(Sec) : 45;
+              FEXCore::IosRwxSectionLimit(V < 0 ? 0 : static_cast<uint32_t>(V));
+            }
           }
         }
       }
@@ -107,7 +144,7 @@ patch("Source/Windows/Common/InvalidationTracker.cpp",
 patch("Source/Windows/Common/InvalidationTracker.cpp",
 """namespace FEX::Windows {
 """,
-"""namespace FEXCore { void IosRwxSectionAdd(uint64_t Start, uint64_t End); } /* madeira-doge: writable code sections decl */
+"""namespace FEXCore { void IosRwxSectionAdd(uint64_t Start, uint64_t End); void IosRwxSectionLimit(uint32_t Seconds); } /* madeira-doge: writable code sections decl */
 
 namespace FEX::Windows {
 """)
