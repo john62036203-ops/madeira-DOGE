@@ -659,7 +659,7 @@ final class MetalBackedView: UIView {
                 if !twoFingerMoved && now - twoFingerStartTime < 0.40
                     && !InputSettings.shared.relative {   // ml643: see touchesBegan
                     postPointer(F_RDOWN)
-                    postPointer(F_RUP)
+                    releaseClickLater(F_RUP)
                 }
                 twoFingerActive = false
             }
@@ -683,7 +683,18 @@ final class MetalBackedView: UIView {
         if !movedBeyondSlop && now - touchStartTime < 0.5 && !InputSettings.shared.relative {
             fputs("[trackpad] ended: click\n", stderr)
             postPointer(F_LDOWN)
-            postPointer(F_LUP)
+            releaseClickLater(F_LUP)
+        }
+    }
+
+    /// madeira-doge: a tap's button stays down for 100 ms. Down and up posted
+    /// together reach a game that samples the button once a frame (Raw Input
+    /// or GetAsyncKeyState) as "never pressed": Sora no Kiseki the 1st took a
+    /// tap only now and then (builds 152-157, 2026-10-07; it registers Raw
+    /// Input for mouse and keyboard). 100 ms covers a frame down to 10 fps.
+    private func releaseClickLater(_ up: UInt32) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.postPointer(up)
         }
     }
 
