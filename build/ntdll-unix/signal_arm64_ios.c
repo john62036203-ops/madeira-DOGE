@@ -5118,6 +5118,39 @@ skip_reclaim_band: ;
                                     dprintf( STDERR_FILENO, "[rsp-trunc]   guest stack: %llx %llx %llx %llx\n",
                                              (unsigned long long)stk[0], (unsigned long long)stk[1],
                                              (unsigned long long)stk[2], (unsigned long long)stk[3] );
+                                /* madeira-doge: the saved rip can be stale (it is the last block the
+                                 * emulator entered through a return); the call that led here is the
+                                 * one whose return address is on top of the stack (build 162: rip said
+                                 * a vtable call, the stack said another site). Print that call, and
+                                 * for `call [rip+disp32]` the slot it read and what the slot holds. */
+                                if (stk[0] > 0x10000 && (stk[0] >> 40) == 0)
+                                {
+                                    unsigned char cb[8];
+                                    g = 0;
+                                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(stk[0] - 8),
+                                            sizeof(cb), (mach_vm_address_t)cb, &g ) == KERN_SUCCESS && g == sizeof(cb))
+                                    {
+                                        dprintf( STDERR_FILENO,
+                                                 "[rsp-trunc]   call before stack top %llx: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                                 (unsigned long long)stk[0],
+                                                 cb[0],cb[1],cb[2],cb[3],cb[4],cb[5],cb[6],cb[7] );
+                                        if (cb[2] == 0xff && cb[3] == 0x15)
+                                        {
+                                            int32_t disp = (int32_t)((uint32_t)cb[4] | ((uint32_t)cb[5] << 8) |
+                                                                     ((uint32_t)cb[6] << 16) | ((uint32_t)cb[7] << 24));
+                                            uint64_t slot = stk[0] + (int64_t)disp, val = 0;
+                                            g = 0;
+                                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)slot, 8,
+                                                    (mach_vm_address_t)&val, &g ) == KERN_SUCCESS && g == 8)
+                                                dprintf( STDERR_FILENO,
+                                                         "[rsp-trunc]   it is call [rip%+d]: slot %llx holds %llx\n",
+                                                         (int)disp, (unsigned long long)slot, (unsigned long long)val );
+                                            else
+                                                dprintf( STDERR_FILENO, "[rsp-trunc]   it is call [rip%+d]: slot %llx unreadable\n",
+                                                         (int)disp, (unsigned long long)slot );
+                                        }
+                                    }
+                                }
                             }
 
                             /* iOS-Madeira ml333: is the guest code we EXECUTE the guest code that was
