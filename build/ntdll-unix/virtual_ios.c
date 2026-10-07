@@ -2170,8 +2170,10 @@ static int ios_hook_island_release( uintptr_t hint, size_t size );
  * reported the hook as failed; nothing in the log says which step refused). */
 static volatile int ios_na_trace_left;
 static volatile unsigned ios_na_trace_tid;
+static void * volatile ios_na_hook_peb;   /* the pseudo-process that was granted a hook page */
 static void ios_na_trace_arm( void )
 {
+    ios_na_hook_peb = ios_jit_current_peb();
     ios_na_trace_tid = NtCurrentTeb() ? (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread : 0;
     ios_na_trace_left = 160;
 }
@@ -30540,7 +30542,102 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
 NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *buffer,
                                       SIZE_T size, SIZE_T *bytes_written )
 {
-    NTSTATUS st = ios_na_inner_NtWriteVirtualMemory( process, addr, buffer, size, bytes_written );
+    NTSTATUS st;
+
+    /* madeira-doge self-write: WriteProcessMemory on the caller's own process
+     * into executable memory it allocated itself. The server cannot write any
+     * process's memory on iOS (ACCESS_DENIED), and such a page is read+execute
+     * at its guest address anyway; ordinary guest stores to it are redirected
+     * to the page's writable alias by the fault handler. Do the same here.
+     * Monster Hunter Rise (build 155, log 2026-10-07 11:22) got the page it
+     * asked for next to ntdll, queried it, then failed on
+     * NtWriteVirtualMemory(self, page+8, 5 bytes) -> c0000022 and reported
+     * 'Error at hooking API'. Only the current-process pseudo handle and only
+     * a range that lies wholly in one such allocation; everything else goes to
+     * the server as before. env MADEIRA_SELF_WPM=0 turns it off. */
+    if (process == NtCurrentProcess() && addr && size && size <= 0x100000)
+    {
+        static int on = -1;
+        uintptr_t rw, rw_last;
+
+        if (on < 0)
+        {
+            const char *e = getenv( "MADEIRA_SELF_WPM" );
+            on = !(e && e[0] == '0');
+        }
+        if (on && (rw = ios_jit_anon_alias_lookup( (uintptr_t)addr )) &&
+            (rw_last = ios_jit_anon_alias_lookup( (uintptr_t)addr + size - 1 )) == rw + size - 1)
+        {
+            static unsigned n;
+            if (!virtual_check_buffer_for_read( buffer, size ))
+            {
+                if (bytes_written) *bytes_written = 0;
+                return STATUS_PARTIAL_COPY;
+            }
+            memcpy( (void *)rw, buffer, size );
+            if (bytes_written) *bytes_written = size;
+            if (n < 16)
+            {
+                n++;
+                dprintf( 2, "[self-wpm] #%u wrote %p+0x%lx through its writable alias %p\n",
+                         n, addr, (unsigned long)size, (void *)rw );
+            }
+            if (ios_na_trace_on())
+                dprintf( 2, "[near-trace] Write %p+0x%lx -> 00000000 (self, alias)\n", addr, (unsigned long)size );
+            return STATUS_SUCCESS;
+        }
+    }
+
+    /* The same caller's other self-writes (the patch it then puts on the
+     * function itself, in an image page): only in a process that was granted a
+     * hook page, so nothing else changes (the server's ACCESS_DENIED is what
+     * every other caller has always seen). Write in place; if the page is
+     * read-only on the host, lift that for the copy and put it back. */
+    if (process == NtCurrentProcess() && addr && size && size <= 0x1000 &&
+        ios_na_hook_peb && ios_na_hook_peb == ios_jit_current_peb() &&
+        virtual_check_buffer_for_read( buffer, size ))
+    {
+        static unsigned n;
+        const char *how = NULL;
+        kern_return_t kr = mach_vm_write( mach_task_self(), (mach_vm_address_t)(uintptr_t)addr,
+                                          (vm_offset_t)buffer, (mach_msg_type_number_t)size );
+        if (kr == KERN_SUCCESS) how = "in place";
+        else
+        {
+            mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)addr;
+            mach_vm_size_t rs = 0;
+            vm_region_basic_info_data_64_t ri;
+            mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t ro = MACH_PORT_NULL;
+            mach_vm_address_t lo = (mach_vm_address_t)(uintptr_t)addr & ~(mach_vm_address_t)host_page_mask;
+            mach_vm_size_t len = (((mach_vm_address_t)(uintptr_t)addr + size + host_page_mask) &
+                                  ~(mach_vm_address_t)host_page_mask) - lo;
+
+            if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS &&
+                ra <= lo && !(ri.protection & VM_PROT_EXECUTE) &&
+                mach_vm_protect( mach_task_self(), lo, len, FALSE,
+                                 VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY ) == KERN_SUCCESS)
+            {
+                memcpy( addr, buffer, size );
+                mach_vm_protect( mach_task_self(), lo, len, FALSE, ri.protection );
+                how = "host protection lifted for the copy";
+            }
+        }
+        if (n < 24)
+        {
+            n++;
+            dprintf( 2, "[self-wpm] #%u %p+0x%lx: %s (kr=%d)\n", n, addr, (unsigned long)size,
+                     how ? how : "not written here, asking the server", (int)kr );
+        }
+        if (how)
+        {
+            if (bytes_written) *bytes_written = size;
+            return STATUS_SUCCESS;
+        }
+    }
+
+    st = ios_na_inner_NtWriteVirtualMemory( process, addr, buffer, size, bytes_written );
     if (ios_na_trace_on())
         dprintf( 2, "[near-trace] Write %p+0x%lx -> %08x\n", addr, (unsigned long)size, (unsigned)st );
     return st;
