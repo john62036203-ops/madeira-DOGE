@@ -2355,7 +2355,13 @@ static NTSTATUS wgp_create( void *args )
     if (!(parser->core = mav_create( params->output_compressed )))
     {
         free( parser );
+        dprintf( 2, "[wg-parser] madeira-doge create: no core\n" );
         return E_OUTOFMEMORY;
+    }
+    {   /* madeira-doge: MHR's opening video failed with 0x8007000e and no line said where */
+        static unsigned int creates;
+        if (__sync_fetch_and_add( &creates, 1 ) < 16)
+            dprintf( 2, "[wg-parser] madeira-doge create #%u ok (output_compressed=%d)\n", creates, (int)params->output_compressed );
     }
     parser->magic = MADEIRA_WG_PARSER_MAGIC;
     for (i = 0; i < MAV_MAX_STREAMS; i++)
@@ -2385,8 +2391,19 @@ static NTSTATUS wgp_connect( wg_parser_t handle, UINT64 file_size )
 {
     struct wgp_parser *parser = get_wgp_parser( handle );
 
-    if (!parser) return STATUS_INVALID_HANDLE;
-    return wgp_status( mav_connect( parser->core, file_size ) );
+    if (!parser)
+    {
+        dprintf( 2, "[wg-parser] madeira-doge connect: bad handle %#llx\n", (unsigned long long)handle );
+        return STATUS_INVALID_HANDLE;
+    }
+    {
+        static unsigned int connects;
+        int status = mav_connect( parser->core, file_size );
+        if (__sync_fetch_and_add( &connects, 1 ) < 16)
+            dprintf( 2, "[wg-parser] madeira-doge connect #%u: %llu bytes -> status %d (0 = ok)\n",
+                     connects, (unsigned long long)file_size, status );
+        return wgp_status( status );
+    }
 }
 
 static NTSTATUS wgp_connect64( void *args )

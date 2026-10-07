@@ -1063,13 +1063,13 @@ static int mav_connect_locked( struct mav_parser *p )
     unsigned int i;
     int err, status, is_mp3;
 
-    if (!(avio_buf = av_malloc( MAV_AVIO_BUFFER ))) return MAV_E_NOMEM;
+    if (!(avio_buf = av_malloc( MAV_AVIO_BUFFER ))) return mav_refuse( p, MAV_E_NOMEM, "no memory for the I/O buffer" );
     if (!(p->avio = avio_alloc_context( avio_buf, MAV_AVIO_BUFFER, 0, p, mav_avio_read, NULL, mav_avio_seek )))
     {
         av_free( avio_buf );
-        return MAV_E_NOMEM;
+        return mav_refuse( p, MAV_E_NOMEM, "avio_alloc_context failed" );
     }
-    if (!(p->fmt = avformat_alloc_context())) return MAV_E_NOMEM;
+    if (!(p->fmt = avformat_alloc_context())) return mav_refuse( p, MAV_E_NOMEM, "avformat_alloc_context failed" );
     p->fmt->pb = p->avio;
     p->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
     p->fmt->probesize = MAV_PROBESIZE;
