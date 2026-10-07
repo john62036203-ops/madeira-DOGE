@@ -2403,9 +2403,29 @@ C_ASSERT( sizeof(struct winios_gamepad) == 20 );
 ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
 {
     struct winios_gamepad pad;
+    /* madeira-doge [xi-query]: does the game read the pad at all, and does a
+     * press reach it? (Sora no Kiseki the 1st demo, build 152: runs, but the
+     * touch pad does nothing; nothing in the log said whether XInput was
+     * read.) First calls, a line every 4096 reads, and slot 0's button
+     * changes (capped). */
+    static unsigned xi_n, xi_miss, xi_chg;
+    static unsigned short xi_last;
+    unsigned n = __atomic_add_fetch( &xi_n, 1, __ATOMIC_RELAXED );
+    int connected;
 
     if (!buffer || index >= 4) return 0;
-    if (!winios_gamepad_get_state( index, &pad )) return 0;
+    connected = winios_gamepad_get_state( index, &pad );
+    if (!connected && !index) __atomic_add_fetch( &xi_miss, 1, __ATOMIC_RELAXED );
+    if (n <= 4 || !(n & 4095))
+        dprintf( 2, "[xi-query] #%u slot=%u op=%u connected=%d buttons=%04x (slot 0 not connected on %u reads)\n",
+                 n, index, op, connected, connected ? (unsigned)pad.buttons : 0, xi_miss );
+    if (connected && !index && !op && pad.buttons != xi_last && xi_chg < 60)
+    {
+        xi_chg++;
+        dprintf( 2, "[xi-query] slot 0 buttons %04x -> %04x (read #%u)\n", (unsigned)xi_last, (unsigned)pad.buttons, n );
+        xi_last = pad.buttons;
+    }
+    if (!connected) return 0;
 
     switch (op)
     {

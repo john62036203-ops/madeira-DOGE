@@ -12,6 +12,8 @@ root = Path(__file__).resolve().parents[2]
 driver = (root / 'build/win32u-unix/driver_ios.c').read_text()
 query = driver[driver.index('/* ml1920: same-task controller snapshots'):]
 types = r'''
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
 #include <stdint.h>
 #include <assert.h>
 #include <pthread.h>
