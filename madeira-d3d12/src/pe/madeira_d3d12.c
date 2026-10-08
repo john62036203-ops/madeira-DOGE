@@ -910,6 +910,7 @@ struct mad_pso {
     int gs_emu;                                     /* ml927: a geometry-shader pipeline through the converter's mesh emulation;
                                                      * 2 = a DXIL hull+domain pipeline through its tessellation emulation */
     obj_handle_t si_lib, gs_lib;                    /* stage-in library, geometry (mesh) library; gs_emu 2: gs_lib is the DOMAIN library */
+    int vs_obj_only;                                /* madeira-doge: vs_fn is the vertex LIBRARY (object variant only); never a plain vertex function */
     obj_handle_t hs_lib;                            /* gs_emu 2: the hull library (hull function + tessellator) */
     struct { UINT out_prim, patches_per_tg, threads_per_patch, input_cps, mesh_prims; float max_factor; } dt;   /* gs_emu 2: IRRuntimeTessellationPipelineConfig */
     UINT gs_vertex_size, gs_max_prims;              /* IRRuntimeGeometryPipelineConfig */
@@ -12101,6 +12102,11 @@ struct mad_convert_opts {
      * GS, gs_bc the VS). */
     UINT gs_stage, gs_strip;
     const void *gs_bc; SIZE_T gs_bc_len;
+    /* madeira-doge: geometry emulation of a DXIL VS. The converter may emit only the
+     * object variant ("<name>.dxil_irconverter_object_shader", specialised by winemetal
+     * when the pipeline is built), so a missing plain function is not a failure: the
+     * library is returned (one reference) and *obj_only_out is set. */
+    int *obj_only_out;
 };
 static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_rootsig *rs,
                                       const void *dxil, SIZE_T dxil_len, const char *entry,
@@ -12974,6 +12980,17 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
      * name reflection reported, never by the D3D-side name. */
     fn = MTLLibrary_newFunction(lib, name);
     InterlockedExchangeAdd64(&g_pt_lib, mad_qpc() - lib_t0); InterlockedIncrement(&g_pn_lib);
+    if (!fn && o && o->obj_only_out) {   /* madeira-doge: P3R's MainForGS / PositionOnlyMainForGS (one-pass point-light shadows) */
+        static LONG said;
+        if (InterlockedIncrement(&said) <= 8)
+            d3d12_log("[madeira-d3d12] %s: no plain function '%s'; using the library's object variant for geometry emulation\n", tag, name);
+        *o->obj_only_out = 1;
+        if (o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);
+        NSObject_retain(lib);   /* one reference returned, one in *lib_out (released separately) */
+        *lib_out = lib;
+        free(buf);
+        return lib;
+    }
     if (!fn) {
         d3d12_log("[madeira-d3d12] %s: converted library has no function '%s'\n", tag, name);
         NSObject_release(lib);
@@ -13675,6 +13692,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             mad_build_input_layout(desc, p, L);
             memset(&ov, 0, sizeof ov); ov.gs_emulation = 1; ov.topology = (UINT)desc->PrimitiveTopologyType; ov.layout = L->n ? L : NULL;
             ov.lib2_out = &p->si_lib; ov.vs_output_size = &p->gs_vertex_size; ov.name_out = p->vs_name; ov.name_cap = sizeof p->vs_name;
+            ov.obj_only_out = &p->vs_obj_only;   /* madeira-doge */
             p->vs_fn = mad_convert_stage_opts(d, rs, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, NULL, &p->vs_lib, "VS(gs)",
                                               vsin, 32, &nvsin, NULL, locs, &nl, &ov);
             if (p->vs_fn) mad_apply_reflected_layout(p, rs, locs, nl, "VS");
@@ -13698,6 +13716,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
                 if (p->gs_lib) { NSObject_release(p->gs_lib); p->gs_lib = 0; }
                 if (p->vs_fn) { NSObject_release(p->vs_fn); p->vs_fn = 0; }
                 if (p->vs_lib) { NSObject_release(p->vs_lib); p->vs_lib = 0; }
+                p->vs_obj_only = 0;
                 nvsin = 0; nl = 0;
             } }
         }
@@ -14074,7 +14093,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
      * pipeline the game cannot create is a material it never draws. Only a
      * patch-list draw can use such a pipeline, and those go through the mesh
      * pipelines below. */
-    if (!p->gs_emu && !p->has_tess) {
+    if (!p->gs_emu && !p->has_tess && !p->vs_obj_only) {   /* madeira-doge: an object-only vertex library has no plain pipeline */
         if (mad_pso_lazy_on() && !(desc->GS.pShaderBytecode && desc->GS.BytecodeLength)) {
             /* madeira-bcd: descriptors kept, built by mad_pso_realize */
             p->lazy = 1; p->rp = rp; p->has_vd = has_vd; if (has_vd) p->vd = vd;
