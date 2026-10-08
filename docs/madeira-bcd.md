@@ -317,6 +317,16 @@ the update pack, the game's options and starts the per-game session log.
   how particle systems kill a particle, becomes NaN, which Metal discards like
   D3D instead of rasterising a sliver). Non-zero biases are logged
   (`sampler with MipLODBias`, `static sampler sN with MipLODBias`).
+- D3D11 GPU fault attribution (`tools/patch-dxmt-d3d11-fault-info.py`):
+  DXMT's own queue (D3D11/D3D10/D3D9) makes its command buffers through
+  `madeira_ctl` op 8 too, and a failed one logs
+  `GPU fault encoders at frame N: code C (...): [FAULTED] R3 1920x1080; ...`
+  next to `Device error at frame N`. From the first fault on, its render,
+  compute and blit encoders are labelled `R<i> <w>x<h>`, `C<i>` and `B<i>`
+  (position in the command buffer). Only `[affected]`/`[unknown]` entries and
+  a victim code (Devil May Cry 5 on build 174 lost frames 2321-2324 as
+  `kIOGPUCommandBufferCallbackErrorInnocentVictim`) mean the work that caused
+  the GPU recovery was outside this queue. `gpu-fault-info = 0` turns it off.
 - GPU fault attribution (`mad_fault_*`, `tools/patch-dxmt-gpu-fault-info.py`):
   batch command buffers are created with
   `MTLCommandBufferErrorOptionEncoderExecutionStatus` (winemetal

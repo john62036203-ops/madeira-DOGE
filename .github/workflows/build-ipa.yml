@@ -894,6 +894,11 @@ jobs:
       - name: Patch DXMT with GPU fault attribution
         run: python3 tools/patch-dxmt-gpu-fault-info.py
 
+      # The same for DXMT's own D3D11/D3D10/D3D9 queue: op 8 command buffers,
+      # the faulted encoders of a failed one, labels after the first fault.
+      - name: Patch DXMT D3D11 queue with GPU fault attribution
+        run: python3 tools/patch-dxmt-d3d11-fault-info.py
+
       - name: Patch DXMT buffer->texture blits with a depth/stencil aspect
         run: python3 tools/patch-dxmt-b2t-aspect.py
 
