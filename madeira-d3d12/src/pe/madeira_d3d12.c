@@ -444,6 +444,12 @@ static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n
 static volatile LONG64 g_reserved_live_bytes; static volatile LONG g_reserved_live_n;   /* madeira-bcd: d3d12-tiled-resources */
 static int mad_upload_swap_on(void);
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
+/* madeira-doge: what ml1057 leaves out. P3R's graphics ledger reached 2.0 GB while ml1057
+ * summed 0.97 GB; the game had created 112 DEFAULT heaps (1080 MB) whose Metal placement
+ * heaps are charged in full and were counted nowhere, and shader-visible descriptor heaps
+ * keep their Metal buffer after release (heap_Release). Live, peak and released bytes. */
+static volatile LONG64 g_aheap_bytes, g_aheap_peak, g_aheap_freed; static volatile LONG g_aheap_n, g_aheap_made;
+static volatile LONG64 g_dheap_bytes, g_dheap_kept_bytes; static volatile LONG g_dheap_n, g_dheap_kept;
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
 static void mad_resident(struct mad_device *d, obj_handle_t h) {
@@ -714,6 +720,13 @@ static void mad_acct_report(void) {
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
     d3d12_log("[madeira-d3d12] ml1060 shader libraries created: %ld, %lld MB of metallib (one per pipeline STAGE, never shared "
               "between pipelines)\n", g_lib_count, (long long)(g_lib_bytes >> 20));
+    d3d12_log("[madeira-d3d12] madeira-doge app heaps (Metal placement heaps, NOT in ml1057): %ld live, %lld MB (peak %lld MB), "
+              "%ld created, %lld MB released by the game, %u released awaiting GPU; shader-visible descriptor heaps: %ld live %lld MB, "
+              "%ld released but kept %lld MB; ml1057 + these = %lld MB\n",
+              g_aheap_n, (long long)(g_aheap_bytes >> 20), (long long)(g_aheap_peak >> 20), g_aheap_made,
+              (long long)(g_aheap_freed >> 20), g_hp_dev ? g_hp_dev->nmhret : 0u, g_dheap_n, (long long)(g_dheap_bytes >> 20),
+              g_dheap_kept, (long long)(g_dheap_kept_bytes >> 20),
+              (long long)((tot + g_aheap_bytes + g_dheap_bytes + g_dheap_kept_bytes) >> 20));
 }
 static void mad_smpdesc_put(UINT64 id, UINT filter, UINT au, UINT av, UINT aw, UINT aniso, UINT cmp, UINT border,
                             float minlod, float maxlod, float bias) {   /* madeira-bcd: see g_smpdesc */
@@ -10587,6 +10600,9 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
                       (unsigned long long)h->desc.SizeInBytes >> 10);   /* ml895 */
         if (h->mtl) {   /* ml1145: every placed resource held a reference, so none is left; ml1148: but the GPU may still hold them */
             struct mad_device *hd = h->device; int queued = 0;
+            InterlockedExchangeAdd64(&g_aheap_bytes, -(LONG64)h->desc.SizeInBytes);   /* madeira-doge */
+            InterlockedExchangeAdd64(&g_aheap_freed, (LONG64)h->desc.SizeInBytes);
+            InterlockedDecrement(&g_aheap_n);
             EnterCriticalSection(&hd->heap_lock);
             if (mad_grow((void **)&hd->mhret, &hd->mhret_cap, hd->nmhret + 1, sizeof *hd->mhret)) {
                 hd->mhret[hd->nmhret].heap = h->mtl; hd->mhret[hd->nmhret].serial = (UINT64)hd->gpu_serial; hd->mhret[hd->nmhret].mem = NULL; hd->nmhret++; queued = 1;
@@ -10638,7 +10654,12 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
         if (backing < 0) { backing = (int)mad_cfg_int_pe("heap-backing", 1); d3d12_log("[madeira-d3d12] ml1145 heap-backing = %d (DEFAULT heaps %s)\n", backing, backing ? "are Metal placement heaps; placed resources alias" : "are descriptions only"); }
         if (backing && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {
             h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, desc->SizeInBytes, WMTResourceStorageModePrivate);
-            if (h->mtl) mad_resident(hd, h->mtl);
+            if (h->mtl) {
+                LONG64 now = InterlockedExchangeAdd64(&g_aheap_bytes, (LONG64)desc->SizeInBytes) + (LONG64)desc->SizeInBytes;   /* madeira-doge */
+                if (now > g_aheap_peak) g_aheap_peak = now;
+                InterlockedIncrement(&g_aheap_n); InterlockedIncrement(&g_aheap_made);
+                mad_resident(hd, h->mtl);
+            }
             if (said_b++ < 32) d3d12_log("[madeira-d3d12] ml1145 heap %llu KB flags %#x %s\n", (unsigned long long)(desc->SizeInBytes >> 10),
                                          (unsigned)desc->Flags, h->mtl ? "backed by a Metal placement heap" : "COULD NOT be backed; its resources stand alone");
         }
@@ -10715,6 +10736,11 @@ static ULONG STDMETHODCALLTYPE heap_Release(ID3D12DescriptorHeap *T) {
          * storage has no such reader. */
         free(h->slots);
         if (!h->buffer) free(h->cpu);
+        else {   /* madeira-doge: counted as kept */
+            LONG64 len = (LONG64)sizeof(struct mad_descriptor) * (h->desc.NumDescriptors ? h->desc.NumDescriptors : 1);
+            InterlockedDecrement(&g_dheap_n); InterlockedExchangeAdd64(&g_dheap_bytes, -len);
+            InterlockedIncrement(&g_dheap_kept); InterlockedExchangeAdd64(&g_dheap_kept_bytes, len);
+        }
         free(h);
     }
     return (ULONG)r;
@@ -11599,6 +11625,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(ID3D12Device *This,
         h->cpu = (struct mad_descriptor *)bi.memory.ptr;
         h->gpu_address = bi.gpu_address;
         if (h->cpu) memset(h->cpu, 0, (size_t)bi.length);
+        InterlockedIncrement(&g_dheap_n); InterlockedExchangeAdd64(&g_dheap_bytes, (LONG64)bi.length);   /* madeira-doge */
         if (g_sd_state < 0) mad_sync_diag_load();   /* madeira-bcd: desc-guard watches shader-visible heaps */
         if (g_sd_state > 0 && g_desc_guard) mad_dg_register(h);
     }
