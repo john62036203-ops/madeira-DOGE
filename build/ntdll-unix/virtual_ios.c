@@ -25860,7 +25860,7 @@ static struct file_view *ios_vpark_take( size_t size, unsigned int vprot )
  * A write racing the drop is only a lost prediction.
  *
  * Commits of that exact shape are remembered here; the monitor thread sweeps each
- * one a few seconds later (after the scrub), under virtual_mutex, and only drops
+ * one about a second later (after the scrub), under virtual_mutex, and only drops
  * pages that are resident and still all zero. FEX is not changed.
  * madeira.cfg callret-trim = 0 turns it off. */
 #define IOS_CRT_MAX 512
@@ -25958,10 +25958,10 @@ static void ios_callret_trim_sweep( void )
     if (!on || !ios_crt_n) return;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
-    for (i = 0; i < ios_crt_n && did < 16; )
+    for (i = 0; i < ios_crt_n && did < 64; )   /* 180: 16 per cycle left ~50 pending and they were compressed first */
     {
         unsigned long long kept = 0, cold = 0, d;
-        if (now - ios_crt[i].t_ns < 3000000000ull) { i++; continue; }
+        if (now - ios_crt[i].t_ns < 1000000000ull) { i++; continue; }
         d = ios_crt_trim_one( ios_crt[i].base, &kept, &cold );
         if (d || kept || cold) ios_crt_swept++; else ios_crt_skipped++;
         ios_crt_dropped += d; ios_crt_kept += kept; ios_crt_cold += cold;
