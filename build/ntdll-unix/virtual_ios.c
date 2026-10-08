@@ -918,6 +918,7 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 extern unsigned long long ios_last_footprint_mb;
 extern int ios_fast_footprint;
 
+static void ios_callret_trim_sweep( void );   /* madeira-doge: defined before allocate_virtual_memory */
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
@@ -1114,6 +1115,7 @@ static void *ios_pool_warmer_thread( void *arg )
                 extern void ios_pump_sample(void);
                 ios_pump_sample();
             }
+            ios_callret_trim_sweep();   /* madeira-doge: see ios_crt_note_commit */
             {
                 task_vm_info_data_t vmi;
                 mach_msg_type_number_t vmi_cnt = TASK_VM_INFO_COUNT;
@@ -25841,6 +25843,144 @@ static struct file_view *ios_vpark_take( size_t size, unsigned int vprot )
  *
  * NtAllocateVirtualMemory[Ex] implementation.
  */
+/* madeira-doge: FEX's per-thread call-ret stacks cost footprint they do not use.
+ *
+ * Every emulated thread gets a 16 MB FEXMem_CallRetStacks commit (CallRetStack.h:
+ * a reservation of 16 MB + two 4 KB guards, then MEM_COMMIT of the 16 MB at +4 KB),
+ * and FEX zero-scrubs all of it at thread start. On iOS that touch makes every page
+ * resident, so P3R's and MH Rise's walks show these ranges 11-15 MB dirty each,
+ * mostly compressed, all of it charged against the jetsam limit -- with dozens of
+ * threads that is several hundred MB of zeros.
+ *
+ * The stack is only a return-address PREDICTOR: an all-zero entry fails the
+ * compare and falls back to the lookup, which is always right (FEX's own comment
+ * at ResetCallRetStack, and the ARM64EC dispatcher's ldp/cbnz). So a page that is
+ * still all zero can be handed back -- the same anon_mmap_fixed that FEX's reset
+ * already triggers through decommit_pages -- and comes back zero-filled on demand.
+ * A write racing the drop is only a lost prediction.
+ *
+ * Commits of that exact shape are remembered here; the monitor thread sweeps each
+ * one a few seconds later (after the scrub), under virtual_mutex, and only drops
+ * pages that are resident and still all zero. FEX is not changed.
+ * madeira.cfg callret-trim = 0 turns it off. */
+#define IOS_CRT_MAX 512
+/* 16 MB + 2 x 4 KB, which the view may carry rounded up to the 16 KB host page */
+#define IOS_CRT_VIEW_OK(v) ((v)->size == 0x1002000 || (v)->size == 0x1004000)
+static struct { char *base; unsigned long long t_ns; } ios_crt[IOS_CRT_MAX];
+static unsigned ios_crt_n;
+static unsigned long long ios_crt_dropped, ios_crt_kept, ios_crt_cold;
+static unsigned ios_crt_swept, ios_crt_skipped, ios_crt_lost;
+
+static unsigned long long ios_crt_now_ns( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+/* virtual_mutex held */
+static void ios_crt_note_commit( struct file_view *view, void *base, size_t size, ULONG protect )
+{
+    unsigned i;
+    if (!view || size != 0x1000000 || protect != PAGE_READWRITE) return;
+    if (!IOS_CRT_VIEW_OK( view ) || (char *)base != (char *)view->base + 0x1000) return;
+    for (i = 0; i < ios_crt_n; i++)
+        if (ios_crt[i].base == base) { ios_crt[i].t_ns = ios_crt_now_ns(); return; }
+    if (ios_crt_n >= IOS_CRT_MAX) { ios_crt_lost++; return; }
+    ios_crt[ios_crt_n].base = base;
+    ios_crt[ios_crt_n].t_ns = ios_crt_now_ns();
+    ios_crt_n++;
+}
+
+static int ios_crt_page_zero( const char *p, size_t len )
+{
+    const uint64_t *q = (const uint64_t *)p, *e = (const uint64_t *)(p + len);
+    uint64_t acc = 0;
+    for (; q < e; q += 8)
+    {
+        acc |= q[0] | q[1] | q[2] | q[3] | q[4] | q[5] | q[6] | q[7];
+        if (acc) return 0;
+    }
+    return 1;
+}
+
+/* virtual_mutex held. Returns bytes dropped. */
+static unsigned long long ios_crt_trim_one( char *base, unsigned long long *kept, unsigned long long *cold )
+{
+    struct file_view *view = find_view( base, 0x1000000 );
+    size_t ps = host_page_size, n, i, run = 0;
+    char *lo, *hi;
+    unsigned long long dropped = 0;
+    static char vec[0x1000000 / 0x4000 + 1];
+
+    lo = (char *)(((uintptr_t)base + host_page_mask) & ~(uintptr_t)host_page_mask);
+    hi = (char *)(((uintptr_t)base + 0x1000000) & ~(uintptr_t)host_page_mask);
+    if (!view || !IOS_CRT_VIEW_OK( view ) || base != (char *)view->base + 0x1000) return 0;
+    if (!(get_page_vprot( base ) & VPROT_COMMITTED) || (get_page_vprot( base ) & VPROT_GUARD)) return 0;
+    if (ios_jit_pool_intersects( base, 0x1000000 ) || ios_swap_overlaps( base, 0x1000000 )) return 0;
+    if (hi <= lo || !ps) return 0;
+    n = (hi - lo) / ps;
+    if (n > sizeof(vec) || mincore( lo, hi - lo, vec )) return 0;
+    for (i = 0; i <= n; i++)
+    {
+        int zero = 0;
+        if (i < n)
+        {
+            if (!(vec[i] & MINCORE_INCORE)) *cold += ps;
+            else if (ios_crt_page_zero( lo + i * ps, ps )) zero = 1;
+            else *kept += ps;
+        }
+        if (zero) { run++; continue; }
+        if (run)
+        {
+            char *r = lo + (i - run) * ps;
+            if (anon_mmap_fixed( r, run * ps, PROT_READ | PROT_WRITE, 0 ) != MAP_FAILED) dropped += run * ps;
+            run = 0;
+        }
+    }
+    return dropped;
+}
+
+static void ios_callret_trim_sweep( void )
+{
+    static int on = -1;
+    unsigned long long now = ios_crt_now_ns(), got = 0;
+    unsigned i, did = 0;
+    sigset_t sigset;
+
+    if (on < 0)
+    {
+        char v[16];
+        on = !(madeira_cfg_get( "callret-trim", v, sizeof v ) && v[0] == '0');
+        dprintf( 2, "[callret-trim] madeira-doge: %s (madeira.cfg callret-trim = 0 turns it off)\n",
+                 on ? "zero pages of FEX call-ret stacks are handed back after thread start" : "OFF" );
+    }
+    if (!on || !ios_crt_n) return;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    for (i = 0; i < ios_crt_n && did < 16; )
+    {
+        unsigned long long kept = 0, cold = 0, d;
+        if (now - ios_crt[i].t_ns < 3000000000ull) { i++; continue; }
+        d = ios_crt_trim_one( ios_crt[i].base, &kept, &cold );
+        if (d || kept || cold) ios_crt_swept++; else ios_crt_skipped++;
+        ios_crt_dropped += d; ios_crt_kept += kept; ios_crt_cold += cold;
+        got += d; did++;
+        ios_crt[i] = ios_crt[--ios_crt_n];
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+
+    if (did)
+    {
+        static unsigned said;
+        if (said++ < 12 || !(said % 32))
+            dprintf( 2, "[callret-trim] madeira-doge: %u stacks swept now, %llu MB handed back; total %llu MB over %u stacks "
+                        "(in use %llu MB, already compressed %llu MB, %u not trimmable, %u pending, %u untracked)\n",
+                     did, got >> 20, ios_crt_dropped >> 20, ios_crt_swept, ios_crt_kept >> 20, ios_crt_cold >> 20,
+                     ios_crt_skipped, ios_crt_n, ios_crt_lost );
+    }
+}
+
 static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect,
                                          ULONG_PTR limit_low, ULONG_PTR limit_high,
                                          ULONG_PTR align, ULONG attributes )
@@ -26056,6 +26196,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         }
         /* ml293 (task #52): PA-arena recommit must read back as zero. */
         if (!status && !fast_commit) ios_verify_commit_zero( base, size, protect, was_committed );
+        if (!status) ios_crt_note_commit( view, base, size, protect );   /* madeira-doge: callret-trim */
     }
 
     if (!status && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE))
