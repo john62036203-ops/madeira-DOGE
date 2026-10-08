@@ -1296,8 +1296,15 @@ static void *ios_pool_warmer_thread( void *arg )
              * 300 ms is not repeated (env.MADEIRA_PHYS_MAP = 1 keeps it). */
             static int phys_walk_off;
             struct timespec phys_t0;
+            /* madeira-doge: walk again at every new 512 MB of footprint from 3 GB up, even
+             * after the 300 ms cut-off. MH Rise (build 176) went from 2.4 GB after loading
+             * to the 6 GB jetsam limit in ~90 s of play, and the only walk was at load time,
+             * so nothing named what grew. A few 0.4 s stalls per run is the price. */
+            static unsigned long long phys_next_mb = 3072;
+            int phys_milestone = ios_last_footprint_mb >= phys_next_mb;
+            if (phys_milestone) phys_next_mb = (ios_last_footprint_mb / 512 + 1) * 512;
             clock_gettime( CLOCK_MONOTONIC, &phys_t0 );
-            if (!phys_walk_off && (cycle == 2 || (cycle % 5) == 0))
+            if (phys_milestone || (!phys_walk_off && (cycle == 2 || (cycle % 5) == 0)))
             {
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];
@@ -1456,8 +1463,33 @@ static void *ios_pool_warmer_thread( void *arg )
                     raddr += rsize;
                     if (++regions > 200000) { dprintf(2, "[phys-map] TRUNCATED at %u regions\n", regions); break; }
                 }
-                dprintf(2, "[phys-map] rev=ml359 cycle=%u regions=%u total_dirty=%llu MB\n",
-                        cycle, regions, total_dirty >> 20);
+                dprintf(2, "[phys-map] rev=ml359 cycle=%u regions=%u total_dirty=%llu MB%s\n",
+                        cycle, regions, total_dirty >> 20,
+                        phys_milestone ? " (footprint milestone)" : "");
+                {   /* madeira-doge: what changed since the previous walk, per tag and per band */
+                    static unsigned long long prev_tag[256], prev_band[B_MAX], prev_fp;
+                    static int have_prev;
+                    if (have_prev)
+                    {
+                        dprintf(2, "[phys-delta] madeira-doge footprint %llu -> %llu MB; dirty+swapped change (MB):",
+                                prev_fp, ios_last_footprint_mb);
+                        for (ti = 0; ti < 256; ti++)
+                        {
+                            long long dm = ((long long)dirty_by_tag[ti] - (long long)prev_tag[ti]) >> 20;
+                            if (dm >= 16 || dm <= -16) dprintf(2, " tag%u=%+lld", ti, dm);
+                        }
+                        for (ti = 0; ti < B_MAX; ti++)
+                        {
+                            long long dm = ((long long)band_dirty[ti] - (long long)prev_band[ti]) >> 20;
+                            if (dm >= 16 || dm <= -16) dprintf(2, " band:%s=%+lld", band_name[ti], dm);
+                        }
+                        dprintf(2, "\n");
+                    }
+                    memcpy( prev_tag, dirty_by_tag, sizeof prev_tag );
+                    memcpy( prev_band, band_dirty, sizeof prev_band );
+                    prev_fp = ios_last_footprint_mb;
+                    have_prev = 1;
+                }
                 for (ti = 0; ti < 12; ti++)
                 {
                     if (!top[ti].dirty) continue;
