@@ -13241,6 +13241,20 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 rec = vrec;
                 ERR("BUS->AV: unreadable target addr=%p pc=%p rw=%d rev=ml420\n",
                     siginfo->si_addr, pc, (int)vrec.ExceptionInformation[0]);
+                /* madeira-doge: a syscall probing a caller's buffer (virtual_check_buffer_for_read's
+                 * __TRY) gets SIGBUS, not SIGSEGV, when the page is mapped with prot 0. segv_handler
+                 * hands that to handle_syscall_fault; this path dispatched it to the guest with the
+                 * host pc as the exception address. MH Rise Sunbreak Demo (build 176) probes such
+                 * addresses on purpose; one landed in a prot-0 IOAccelerator region and the game's
+                 * __GSHandlerCheck fast-failed (c0000409). Return the AV status from the syscall,
+                 * as Windows and the SIGSEGV path do. */
+                if (handle_syscall_fault( bus_ctx, &rec ))
+                {
+                    ERR("[bus-syscall] addr=%p pc=%p: fault inside a syscall, returned to its __TRY / caller\n",
+                        siginfo->si_addr, pc);
+                    ios_fixup_x18_for_return( bus_ctx );
+                    return;
+                }
                 /* ml1043: this path printed neither registers nor a caller. A fault
                  * at FEX's rpfree+0x38 -- page->heap holding garbage -- could not be
                  * attributed: the pointer being freed (x0) and who freed it (lr and
