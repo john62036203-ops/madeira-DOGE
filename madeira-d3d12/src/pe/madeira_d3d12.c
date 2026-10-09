@@ -16404,7 +16404,11 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         struct madeira_ctl_args a;
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
         memset(&a, 0, sizeof a); a.op = 0; MadeiraCtl(&a);
-        if (a.ret) { g_capture_left += a.ret; d3d12_log("[capture] %u frame(s) requested at present #%llu\n", a.ret, (unsigned long long)s->presents); }
+        if (a.ret) {   /* madeira-doge: capture-frames = N (2..8) turns one CAP tap into N consecutive frames, to diff a good frame against a flickering one */
+            long long nf = mad_cfg_int_pe("capture-frames", 1);
+            if (nf >= 2 && nf <= 8 && a.ret == 1) a.ret = (unsigned)nf;
+            g_capture_left += a.ret; d3d12_log("[capture] %u frame(s) requested at present #%llu\n", a.ret, (unsigned long long)s->presents);
+        }
         {   /* ml1136: live fence-chain switch from the overlay; lists already running keep their mode */
             int want;
             memset(&a, 0, sizeof a); a.op = 6; MadeiraCtl(&a);
