@@ -277,6 +277,13 @@ static int mad_name_in_list(const char *list, const char *name) {
     }
     return 0;
 }
+/* madeira-doge: capture-ps entries written vs:<name> match the vertex shader, for a pixel shader shared by dozens of draws */
+static int mad_vs_in_list(const char *list, const char *name) {
+    char buf[200];
+    if (!name || !name[0] || strlen(name) > sizeof buf - 4) return 0;
+    snprintf(buf, sizeof buf, "vs:%s", name);
+    return mad_name_in_list(list, buf);
+}
 static LONG g_barrier_renc_closed, g_stencil_srv, g_barrier_seen;
 struct mad_obj {
     void *vtbl;
@@ -5813,7 +5820,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
     if (g_skip_ps_state && mad_skip_ps_match(e->pso)) { MAD_SKIP(e); return; }   /* madeira-bcd: diagnostic, off unless skip-ps is set */
     g_dump_tables = 0;
-    if (g_capture_on && g_capture_ps[0] && mad_name_in_list(g_capture_ps, e->pso->ps_name) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots; madeira-bcd: exact names (a substring match let ps_SetColor eat the shots meant for ps_SetColor_MultiLight) */
+    if (g_capture_on && g_capture_ps[0] && (mad_name_in_list(g_capture_ps, e->pso->ps_name) || mad_vs_in_list(g_capture_ps, e->pso->vs_name)) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots; madeira-bcd: exact names (a substring match let ps_SetColor eat the shots meant for ps_SetColor_MultiLight) */
         g_capture_ps_shots++;
         mad_capture_draw_inputs(e, c);
         if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
@@ -7234,8 +7241,8 @@ static void mad_capture_log_op(const struct mad_cmd *c) {
                  c->u.clear.rgba[3], c->u.clear.v.level, c->u.clear.v.slice); break;
     case MC_CLEAR_DS: r = c->u.clear.res;
         snprintf(extra, sizeof extra, "clear DS flags %u depth %g stencil %u", c->u.clear.flags, c->u.clear.depth, c->u.clear.stencil); break;
-    case MC_COPY_BB: r = c->u.bb.dst; snprintf(extra, sizeof extra, "copy buffer +%llu len %llu -> +%llu", (unsigned long long)c->u.bb.soff,
-                                               (unsigned long long)c->u.bb.len, (unsigned long long)c->u.bb.doff); break;
+    case MC_COPY_BB: r = c->u.bb.dst; snprintf(extra, sizeof extra, "copy buffer r#%u +%llu len %llu -> +%llu", c->u.bb.src ? c->u.bb.src->serial : 0,
+                                               (unsigned long long)c->u.bb.soff, (unsigned long long)c->u.bb.len, (unsigned long long)c->u.bb.doff); break;
     case MC_COPY_B2T: r = c->u.bt.tex; snprintf(extra, sizeof extra, "copy buffer -> texture mip %u slice %u %ux%u at %u,%u", c->u.bt.level, c->u.bt.slice,
                                                 c->u.bt.w, c->u.bt.h, c->u.bt.x, c->u.bt.y); break;
     case MC_COPY_T2T: r = c->u.tt.dst; snprintf(extra, sizeof extra, "copy texture r#%u plane %u -> mip %u slice %u plane %u %ux%u at %u,%u",
