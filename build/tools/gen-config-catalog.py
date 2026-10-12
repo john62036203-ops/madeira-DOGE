@@ -43,6 +43,14 @@ INT_READERS = {"madeira_cfg_int", "mad_cfg_int_pe"}
 # Titles, kinds and fixed choices for options with a dedicated Settings row.
 # "choices" are (value, label); the empty value means "remove the key".
 OVERLAY = {
+    "static-cbv": {"category": "Direct3D 12", "title": "Constant buffers as the draw was recorded",
+                "kind": "int", "default": "0",
+                "note": "Default off: the GPU reads every descriptor of a table when it runs. 1: a descriptor table's "
+                        "single constant-buffer ranges are read when each draw or dispatch is recorded, as NVIDIA's "
+                        "driver and vkd3d-proton do; a game that rewrites one after recording the draw no longer makes "
+                        "that draw use another object's constants. Ranges marked VOLATILE stay as before. 2: VOLATILE "
+                        "ones too (vkd3d-proton's force_static_cbv). 3: only count the rewrites ([static-cbv] lines). "
+                        "Read once per game start."},
     "env.MADEIRA_PIN_GRAPHICS_DLLS": {"category": "Memory & JIT pool", "title": "Keep graphics DLLs loaded",
                 "kind": "bool", "default": "0",
                 "note": "Default off. On a D3D12 device/probe call, pins already loaded D3D12, DXGI and Wine Metal "
