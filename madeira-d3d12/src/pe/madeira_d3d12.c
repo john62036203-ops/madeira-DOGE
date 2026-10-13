@@ -16830,14 +16830,22 @@ static HRESULT STDMETHODCALLTYPE swap_GetDesc(IDXGISwapChain4 *T, DXGI_SWAP_CHAI
  * client area (1914x1048), so only the top-left part reached the screen. With
  * the switch, a resize to a size smaller than the client area makes buffers of
  * the client area's size; GetDesc, GetDesc1 and GetSourceSize keep reporting
- * the size the application asked for. */
+ * the size the application asked for. GetClientRect is looked up, not
+ * imported: importing user32 into d3d12.dll stalled Madeira Dock's Steam
+ * client at start (build 186). */
 static void mad_swap_fit_client(struct mad_swapchain *s) {
     static int on = -1;
+    static BOOL (WINAPI *get_client_rect)(HWND, RECT *);
     RECT rc;
     UINT cw, ch;
     if (on < 0) on = mad_cfg_int_pe("swap-fit-client", 0) ? 1 : 0;
     s->app_w = s->app_h = 0;
-    if (!on || !s->hwnd || !GetClientRect(s->hwnd, &rc)) return;
+    if (!on || !s->hwnd) return;
+    if (!get_client_rect) {
+        HMODULE u32 = GetModuleHandleW(L"user32.dll");
+        if (u32) get_client_rect = (BOOL (WINAPI *)(HWND, RECT *))(void *)GetProcAddress(u32, "GetClientRect");
+    }
+    if (!get_client_rect || !get_client_rect(s->hwnd, &rc)) return;
     cw = (UINT)(rc.right - rc.left); ch = (UINT)(rc.bottom - rc.top);
     if (cw > 16384 || ch > 16384 || cw < s->desc.Width || ch < s->desc.Height || (cw == s->desc.Width && ch == s->desc.Height)) return;
     d3d12_log("[madeira-d3d12] swap-fit-client: the application asked for %ux%u, buffers take the window's client area %ux%u\n",
