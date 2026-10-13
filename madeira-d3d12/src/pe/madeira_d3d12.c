@@ -16384,6 +16384,7 @@ struct mad_swapchain {
     /* MetalFX spatial upscaling of the presented image (madeira.cfg metalfx-upscale) */
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
+    UINT app_w, app_h;   /* madeira-doge: swap-fit-client -- the size the application asked for, reported back unchanged (0 = not fitted) */
 };
 static IDXGISwapChain4Vtbl g_swap_vtbl;
 
@@ -16809,7 +16810,7 @@ static HRESULT STDMETHODCALLTYPE swap_GetDesc(IDXGISwapChain4 *T, DXGI_SWAP_CHAI
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     if (!d) return E_INVALIDARG;
     memset(d, 0, sizeof *d);
-    d->BufferDesc.Width = s->desc.Width; d->BufferDesc.Height = s->desc.Height;
+    d->BufferDesc.Width = s->app_w ? s->app_w : s->desc.Width; d->BufferDesc.Height = s->app_h ? s->app_h : s->desc.Height;
     d->BufferDesc.Format = s->desc.Format;
     d->BufferDesc.RefreshRate = s->fs.RefreshRate;
     d->BufferDesc.ScanlineOrdering = s->fs.ScanlineOrdering;
@@ -16823,9 +16824,31 @@ static HRESULT STDMETHODCALLTYPE swap_GetDesc(IDXGISwapChain4 *T, DXGI_SWAP_CHAI
     d->Flags = s->desc.Flags;
     return S_OK;
 }
+/* madeira-doge: madeira.cfg swap-fit-client = 1 (default 0). Monster Hunter Rise
+ * in a window larger than Madeira's desktop resizes its buffers to the desktop
+ * (1408x648) but still draws its final pass with a viewport of the window's
+ * client area (1914x1048), so only the top-left part reached the screen. With
+ * the switch, a resize to a size smaller than the client area makes buffers of
+ * the client area's size; GetDesc, GetDesc1 and GetSourceSize keep reporting
+ * the size the application asked for. */
+static void mad_swap_fit_client(struct mad_swapchain *s) {
+    static int on = -1;
+    RECT rc;
+    UINT cw, ch;
+    if (on < 0) on = mad_cfg_int_pe("swap-fit-client", 0) ? 1 : 0;
+    s->app_w = s->app_h = 0;
+    if (!on || !s->hwnd || !GetClientRect(s->hwnd, &rc)) return;
+    cw = (UINT)(rc.right - rc.left); ch = (UINT)(rc.bottom - rc.top);
+    if (cw > 16384 || ch > 16384 || cw < s->desc.Width || ch < s->desc.Height || (cw == s->desc.Width && ch == s->desc.Height)) return;
+    d3d12_log("[madeira-d3d12] swap-fit-client: the application asked for %ux%u, buffers take the window's client area %ux%u\n",
+              s->desc.Width, s->desc.Height, cw, ch);
+    s->app_w = s->desc.Width; s->app_h = s->desc.Height;
+    s->desc.Width = cw; s->desc.Height = ch;
+}
 static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     UINT i;
+    if (s->app_w) { s->desc.Width = s->app_w; s->desc.Height = s->app_h; }   /* w or h of 0 keeps the size the application last asked for */
     if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1120: no list may still reference the old buffers */
     for (i = 0; i < s->nbuf; i++)
         if (s->buffers[i] && s->buffers[i]->refs > 1)
@@ -16836,6 +16859,7 @@ static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT cou
     if (h) s->desc.Height = h;
     if (fmt != DXGI_FORMAT_UNKNOWN) s->desc.Format = fmt;
     s->desc.Flags = flags;
+    mad_swap_fit_client(s);
     return mad_swap_make_buffers(s);
 }
 static HRESULT STDMETHODCALLTYPE swap_ResizeTarget(IDXGISwapChain4 *T, const DXGI_MODE_DESC *m) { (void)T; (void)m; return S_OK; }
@@ -16866,9 +16890,11 @@ static HRESULT STDMETHODCALLTYPE swap_GetLastPresentCount(IDXGISwapChain4 *T, UI
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE swap_GetDesc1(IDXGISwapChain4 *T, DXGI_SWAP_CHAIN_DESC1 *d) {
+    struct mad_swapchain *s = (struct mad_swapchain *)T;
     if (!d) return E_INVALIDARG;
-    *d = ((struct mad_swapchain *)T)->desc;
-    d->BufferCount = ((struct mad_swapchain *)T)->nbuf;
+    *d = s->desc;
+    if (s->app_w) { d->Width = s->app_w; d->Height = s->app_h; }   /* swap-fit-client */
+    d->BufferCount = s->nbuf;
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE swap_GetFullscreenDesc(IDXGISwapChain4 *T, DXGI_SWAP_CHAIN_FULLSCREEN_DESC *d) {
@@ -16892,7 +16918,7 @@ static HRESULT STDMETHODCALLTYPE swap_GetRotation(IDXGISwapChain4 *T, DXGI_MODE_
 static HRESULT STDMETHODCALLTYPE swap_SetSourceSize(IDXGISwapChain4 *T, UINT w, UINT h) { (void)T; (void)w; (void)h; return S_OK; }
 static HRESULT STDMETHODCALLTYPE swap_GetSourceSize(IDXGISwapChain4 *T, UINT *w, UINT *h) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
-    if (w) *w = s->desc.Width; if (h) *h = s->desc.Height; return S_OK;
+    if (w) *w = s->app_w ? s->app_w : s->desc.Width; if (h) *h = s->app_h ? s->app_h : s->desc.Height; return S_OK;   /* swap-fit-client */
 }
 static HRESULT STDMETHODCALLTYPE swap_SetMaximumFrameLatency(IDXGISwapChain4 *T, UINT n) { ((struct mad_swapchain *)T)->max_latency = n ? n : 1; return S_OK; }
 static HRESULT STDMETHODCALLTYPE swap_GetMaximumFrameLatency(IDXGISwapChain4 *T, UINT *n) { if (!n) return E_INVALIDARG; *n = ((struct mad_swapchain *)T)->max_latency; return S_OK; }
