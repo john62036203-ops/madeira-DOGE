@@ -79,10 +79,20 @@ final class DepotDownloader {
     func install(_ app: SteamAppInfo, steamApps: URL,
                  ownedDepots: @escaping () async -> Set<UInt32>? = { nil },
                  progress report: @escaping (SteamDownloadProgress) -> Void) async throws -> URL {
-        let depots = app.installDepots()
+        var depots = app.installDepots()
         guard !depots.isEmpty else { throw SteamError.depotNotFound(app.appID) }
         // Before the key requests, so a refused depot still has its selection logged.
         SteamLog.event("[steam-depot] selection app=\(app.appID) build=\(app.buildID) \(app.depotSelectionSummary())")
+        // DLC content the account owns ships in its own depots; the base
+        // selection leaves every DLC depot out, so the game never saw it.
+        var dlcOf: [UInt32: UInt32] = [:]
+        if app.depots.contains(where: { $0.dlcAppID != nil }), let owned = await ownedDepots(), !owned.isEmpty {
+            let dlc = app.ownedDLCDepots(owned: owned)
+            for d in dlc { dlcOf[d.depotID] = d.dlcAppID }
+            depots += dlc
+            let all = app.depots.filter { $0.dlcAppID != nil }.map { String($0.depotID) }
+            SteamLog.event("[steam-dlc] app=\(app.appID) dlc-depots=\(all.joined(separator: ",")) owned=\(dlc.map { "\($0.depotID)<\($0.dlcAppID!)" }.joined(separator: ","))")
+        }
 
         let folderName = SteamInstallFiles.safeFolderName(app.installDir.isEmpty ? "app_\(app.appID)" : app.installDir)
         let installURL = steamApps.appendingPathComponent("common", isDirectory: true)
@@ -114,6 +124,10 @@ final class DepotDownloader {
             let key: Data
             do {
                 key = try await depotKey(depotID: depot.depotID, appID: app.appID)
+            } catch SteamError.depotKeyNotFound(let refused) where dlcOf[refused] != nil {
+                // An owned DLC depot Steam still refuses is left out; the base game installs.
+                licenseSkipped.append(refused)
+                continue
             } catch SteamError.depotKeyNotFound(let refused) {
                 // A depot Steam refuses AND the account's licenses do not
                 // include is content this account does not own (another
@@ -208,7 +222,8 @@ final class DepotDownloader {
         report(state)
         let installed = plans.map { plan in
             AppManifestWriter.InstalledDepot(depotID: Int(plan.depotID), manifestGID: plan.manifestGID,
-                                             size: Int64(plan.manifest.totalUncompressedSize))
+                                             size: Int64(plan.manifest.totalUncompressedSize),
+                                             dlcAppID: dlcOf[plan.depotID].map { Int($0) })
         }
         // Depots taken from another app are that app's content. Valve's client
         // refuses a launch until the owner app has its own record, so both

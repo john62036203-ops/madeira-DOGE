@@ -175,6 +175,21 @@ struct SteamAppInfo {
         return preferred
     }
 
+    /// DLC depots the account's licenses include (`owned`, the package
+    /// `depotids`), with the same OS, architecture, language and manifest rules
+    /// as the base install. Valve still decides access: each depot key is asked
+    /// for as usual and a refused one is left out.
+    func ownedDLCDepots(owned: Set<UInt32>, os: String = "windows", arch: String = "64",
+                        language: String = "english") -> [DepotInfo] {
+        let baseArch = installDepots(os: os, arch: arch, language: language).contains { $0.osarch == "32" } ? "32" : arch
+        return depots.filter { d in
+            d.dlcAppID != nil && owned.contains(d.depotID) && d.supports(os: os) && !d.isSharedInstall &&
+            d.publicManifestID != nil && !d.lowViolence &&
+            (d.osarch.isEmpty || d.osarch == baseArch) &&
+            (d.language.isEmpty || d.language.caseInsensitiveCompare(language) == .orderedSame)
+        }.sorted { $0.depotID < $1.depotID }
+    }
+
     /// Every depot with why it was or was not selected, for the install log
     /// ("sel", or the first failing rule). IDs and flags only.
     func depotSelectionSummary(os: String = "windows", arch: String = "64",
