@@ -1,0 +1,114 @@
+diff --git a/src/launch.c b/src/launch.c
+index 339f3d8..5aca96d 100644
+--- a/src/launch.c
++++ b/src/launch.c
+@@ -194,6 +194,20 @@ int sh_launch(HMODULE module, void *engine, void *client_user,
+     HKEY active = NULL, machine = NULL;
+     int result = 42;
+     struct saved_value values[3] = {0};
++    /* Madeira: the launch option the user chose (MADEIRA_STEAM_HOST_LAUNCH_OPTION,
++     * a key of the app's config/launch list). Unset keeps Steam's first entry.
++     * Valve's client still decides whether the account may start that entry.
++     * An unreadable value never falls back to another entry: result 50.
++     */
++    wchar_t option_text[8] = {0};
++    DWORD option_length = GetEnvironmentVariableW(L"MADEIRA_STEAM_HOST_LAUNCH_OPTION", option_text, 8);
++    uint32_t option = 0;
++    if (option_length >= 8 || !sh_parse_launch_option(option_length ? option_text : NULL, &option)) {
++        o->event("launch-option-invalid", 1);
++        result = 50;
++        goto done;
++    }
++    o->event("launch-option", (int32_t)option);
+     /* ml1990: the public app sets MADEIRA_STEAM_HOST_CEG=1 only for an app
+      * whose depot manifests flag CustomExecutable files, and records them in
+      * the manifest's CheckGuid block. Failure never launches the game.
+@@ -230,7 +244,7 @@ int sh_launch(HMODULE module, void *engine, void *client_user,
+     o->event("launch-client-discovery-published", 1);
+     SetConsoleCtrlHandler(on_control, TRUE);
+     uint64_t gameid = appid;
+-    uint64_t call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, 0, 0, "");
++    uint64_t call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, option, 0, "");
+     o->event("launch-request-submitted", call != 0);
+     if (!call) { result = 43; goto done; }
+     uint64_t begin = o->now_ms(), stopped_at = 0;
+@@ -356,7 +370,7 @@ int sh_launch(HMODULE module, void *engine, void *client_user,
+         }
+         if (retry_at && !seen_running && o->now_ms() >= retry_at) {
+             retry_at = 0;
+-            call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, 0, 0, "");
++            call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, option, 0, "");
+             ++retries;
+             if (retries <= 3 || retries % 60 == 0) o->event("launch-update-retry", (int32_t)retries);
+             if (!call) { result = 43; goto done; }
+diff --git a/src/validation.c b/src/validation.c
+index cf6acfe..b014316 100644
+--- a/src/validation.c
++++ b/src/validation.c
+@@ -196,3 +196,18 @@ const char *sh_install_scm_word(int32_t outcome)
+     default: return "failed";
+     }
+ }
++
++bool sh_parse_launch_option(const wchar_t *text, uint32_t *option)
++{
++    if (!option) return false;
++    uint32_t value = 0;
++    if (text) {
++        for (size_t i = 0; text[i]; ++i) {
++            if (i >= 4 || text[i] < L'0' || text[i] > L'9') return false;
++            value = value * 10 + (uint32_t)(text[i] - L'0');
++        }
++        if (value > SH_LAUNCH_OPTION_MAX) return false;
++    }
++    *option = value;
++    return true;
++}
+diff --git a/src/validation.h b/src/validation.h
+index 1305934..03fa50a 100644
+--- a/src/validation.h
++++ b/src/validation.h
+@@ -6,6 +6,7 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stddef.h>
++#include <wchar.h>
+ bool sh_subscription_list_contains(const uint32_t *apps, int32_t count,
+                                    size_t capacity, uint32_t requested);
+ bool sh_decode_launch_result(const void *payload, size_t size, uint64_t expected_game,
+@@ -15,6 +16,12 @@ bool sh_launch_error_waits_for_content(int32_t error);
+ uint32_t sh_launch_retry_delay_ms(unsigned attempt);
+ bool sh_launch_error_waits_for_config(int32_t error);
+ bool sh_launch_error_waits_for_session(int32_t error);
++/* Madeira: the Steam launch option to start (a config/launch key of the app's
++ * info, for example a DLC's own entry). NULL or empty means 0, Steam's first
++ * entry, as before. Decimal digits only, at most SH_LAUNCH_OPTION_MAX.
++ */
++#define SH_LAUNCH_OPTION_MAX 1023u
++bool sh_parse_launch_option(const wchar_t *text, uint32_t *option);
+ 
+ /* ml1990: Valve custom-executable (CEG) preparation. Callback 1020025 is
+  * posted once per per-file job: int32 EResult, uint32 AppID (8 bytes).
+diff --git a/tests/test-validation.c b/tests/test-validation.c
+index d22d177..657bcac 100644
+--- a/tests/test-validation.c
++++ b/tests/test-validation.c
+@@ -8,6 +8,18 @@
+ int main(void)
+ {
+     uint32_t apps[] = {17, 29, 44, 0};
++    uint32_t option = 99;
++    assert(sh_parse_launch_option(NULL, &option) && option == 0);
++    assert(sh_parse_launch_option(L"", &option) && option == 0);
++    assert(sh_parse_launch_option(L"3", &option) && option == 3);
++    assert(sh_parse_launch_option(L"1023", &option) && option == 1023);
++    option = 7;
++    assert(!sh_parse_launch_option(L"1024", &option) && option == 7);
++    assert(!sh_parse_launch_option(L"12345", &option));
++    assert(!sh_parse_launch_option(L"-1", &option));
++    assert(!sh_parse_launch_option(L" 1", &option));
++    assert(!sh_parse_launch_option(L"1a", &option));
++    assert(!sh_parse_launch_option(L"1", NULL));
+     assert(sh_subscription_list_contains(apps, 3, 4, 29));
+     assert(!sh_subscription_list_contains(apps, 3, 4, 30));
+     assert(!sh_subscription_list_contains(NULL, 3, 4, 29));

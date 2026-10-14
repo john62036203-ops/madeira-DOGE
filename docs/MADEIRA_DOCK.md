@@ -84,8 +84,45 @@ library session. The sheet has:
    A game starts at "Run at next start"; a start that runs its programs
    turns it to "Skip".
 
-Tap a game. Dock is started with Steam's default launch option only; custom
-arguments are not supported.
+Tap a game. Dock is started with Steam's first launch option; custom
+arguments are not supported. The library's Steam sheet can choose another
+launch option (see "Launch options" below).
+
+## Launch options
+
+A game's Steam app info lists its launch options (`config/launch/<n>`); a DLC
+often adds its own entry, marked by `config/ownsdlc`. When the library's Steam
+sheet finds more than one Windows entry for a game, it offers **Launch
+option**; entries that need a DLC are marked "(DLC)".
+
+- **Source.** `SteamAppInfo` (`app/Madeira/SteamKeyValues.swift`) reads
+  Valve's binary app info cache, `C:\Program Files (x86)\Steam\appcache\appinfo.vdf`
+  (versions 27 to 29), for that one App ID, off the main thread. Entries for
+  another system (`oslist`) or a beta branch (`betakey`) and keys above 1023
+  are left out. Valve's client writes the cache; a game it has not loaded yet
+  has no choice and starts as before. Nothing is written.
+- **Launch.** Play hands the chosen key to `ContentView.startDock`, which
+  takes it once (`MadeiraDock.takeLaunchOption`) and sets
+  `MADEIRA_STEAM_HOST_LAUNCH_OPTION` for that start only; key 0 (Steam's first
+  entry) leaves it unset, so every other start is unchanged. Dock passes it as
+  `LaunchApp`'s launch-option argument, which was always 0 before. Valve's
+  client still checks the licence: a DLC entry starts only for an account that
+  owns the DLC, with its content installed.
+- **Dock change.** The host side is `patches/madeira-dock-launch-option.patch`
+  against the pinned `research/madeira-dock`; `build/madeira-dock/build.sh`
+  applies `patches/madeira-dock-*.patch` to a copy before building (the
+  submodule stays untouched) and names them in `dock-notices.txt`. A value
+  that is not 0 to 1023 fails closed with result 50 (`launch-option-invalid`);
+  the report has `launch-option=<n>`.
+- **Unverified on device.** The launch-option argument's meaning (the
+  `config/launch` key) comes from the interface's public descriptions; no
+  device or native run has checked a non-zero option yet.
+- **Not included.** Dock still installs nothing: a DLC's content must already
+  be in the game's folder (installed by Steam's desktop client and copied with
+  the game's app manifest).
+
+Log lines: `[steam-games] app=<id> launch-options=<count>`, `[steam-games]
+play app=<id> option=<n>` and `[dock-launch] app=<id> option=<n>`.
 
 ## How a launch works
 

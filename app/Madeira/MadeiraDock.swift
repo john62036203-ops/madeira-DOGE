@@ -207,6 +207,7 @@ enum MadeiraDock {
                 return "Madeira Dock could not initialize the Steam session (code 30). Export the log to identify the failed check."
             }
             if result == 35 { return "Steam did not confirm a license for this game on the signed-in account." }
+            if result == 50 { return "Madeira Dock could not read the chosen launch option. Choose it again and start the game." }
             if result == 37 {
                 if fields["session-native-handoff-app-mismatch"] == "1" {
                     return "Madeira Dock received a sign-in transfer for a different launch. Close the session and try again."
@@ -272,6 +273,7 @@ enum MadeiraDock {
         "session-authenticated-online", "session-requested-app-listed", "session-auth-test-result",
         "launch-client-error", "launch-update-wait", "launch-update-retry", "launch-update-ready",
         "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
+        "launch-option", "launch-option-invalid",
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
         "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
         "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-stop", "ceg-scm-stopped",
@@ -362,7 +364,7 @@ enum MadeiraDock {
     }
 
     /// The host's environment for one launch.
-    static func configure(_ game: DockGame) {
+    static func configure(_ game: DockGame, launchOption option: UInt32 = 0) {
         for key in ["MADEIRA_STEAM_HOST_PROBE", "MADEIRA_STEAM_HOST_SESSION", "MADEIRA_STEAM_HOST_LOGIN", "MADEIRA_STEAM_HOST_LAUNCH"] {
             setenv(key, "1", 1)
         }
@@ -370,6 +372,11 @@ enum MadeiraDock {
         setenv("MADEIRA_STEAM_HOST_CLIENT_DIR", SteamRuntimeFiles.windowsRoot, 1)
         setenv("MADEIRA_STEAM_HOST_EXPECTED_INSTALL", game.windowsInstallPath, 1)
         setenv("MADEIRA_STEAM_HOST_LOG", "C:\\madeira-dock.txt", 1)
+        // The launch option the library's Steam sheet chose for this game (an app info
+        // config/launch key, for example a DLC's own entry). Unset starts Steam's first
+        // entry, as before; Valve's client still checks the licence for the entry.
+        if option != 0 { setenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION", String(option), 1) } else { unsetenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION") }
+        SteamLog.event("[dock-launch] app=\(game.id) option=\(option)")
         // The install record lists per-user executables: Dock asks Valve's client to prepare
         // them before it launches. env.MADEIRA_DOCK_CEG = 0 never asks.
         if game.customExecutables && SteamSignIn.flag("MADEIRA_DOCK_CEG", default: true) {
@@ -398,6 +405,18 @@ enum MadeiraDock {
     static func launchArguments(width: Int, height: Int, installers: String? = nil) -> String {
         guard let installers else { return "/desktop=madeira,\(width)x\(height) \(executable)" }
         return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(executable)"
+    }
+
+    /// The launch option chosen for the next start of one game. ContentView.startDock
+    /// takes (and clears) it first, so any other start uses Steam's first entry.
+    nonisolated(unsafe) private static var launchOptionRequest: (appID: Int, option: UInt32)?
+    static func requestLaunchOption(_ option: UInt32, appID: Int) {
+        launchOptionRequest = option <= SteamAppInfo.maxOption ? (appID, option) : nil
+    }
+    static func takeLaunchOption(appID: Int) -> UInt32 {
+        defer { launchOptionRequest = nil }
+        guard let request = launchOptionRequest, request.appID == appID else { return 0 }
+        return request.option
     }
 
     /// Set on the main actor right before a Dock launch; read (and cleared) once by the
