@@ -50,11 +50,17 @@ final class ProMotionIntent {
     /// while it runs.
     static var has40Cap: Bool { madeira_dxmt_has_40_cap() != 0 && panelMaxFPS >= 120 }
 
+    /// Whether the 20 FPS cap (vsync mode 5) is offered: DXMT must have it
+    /// (madeira_dxmt_has_20_cap) and the display pacing hook. 50 ms is three
+    /// refreshes at 60 Hz and six at 120 Hz, so any panel takes it.
+    static var has20Cap: Bool { has30Cap && madeira_dxmt_has_20_cap() != 0 }
+
     /// The pacing mode a saved FPS limit runs as: 30 and 40 run as 60 when
     /// they are not offered.
     static func supportedMode(_ mode: Int) -> Int32 {
         if mode == 3 && !has30Cap { return 1 }
         if mode == 4 && !has40Cap { return 1 }
+        if mode == 5 && !has20Cap { return 1 }
         return Int32(mode)
     }
 
@@ -84,7 +90,7 @@ final class ProMotionIntent {
 
     /// The intent that belongs to a given pacing mode (0 = none). See the type comment.
     static func maxHz(for mode: Int32) -> Int {
-        if mode == 3 { return holdMaximum ? min(60, panelMaxFPS) : 0 }   // 30 cap
+        if mode == 3 || mode == 5 { return holdMaximum ? min(60, panelMaxFPS) : 0 }   // 30 and 20 caps
         if mode == 1 { return holdMaximum ? panelMaxFPS : 0 }            // 60 cap
         return panelMaxFPS                                                // MAX, RAW, 40 cap
     }
@@ -304,7 +310,8 @@ struct FPSOverlay: View {
         case 1: return 0    // 60 -> MAX
         case 0: return 2    // MAX -> RAW
         case 2: return ProMotionIntent.has30Cap ? 3 : ProMotionIntent.has40Cap ? 4 : 1   // RAW -> 30, 40 or 60
-        case 3: return ProMotionIntent.has40Cap ? 4 : 1   // 30 -> 40 (when offered) or 60
+        case 3: return ProMotionIntent.has20Cap ? 5 : ProMotionIntent.has40Cap ? 4 : 1   // 30 -> 20, 40 or 60
+        case 5: return ProMotionIntent.has40Cap ? 4 : 1   // 20 -> 40 (when offered) or 60
         default: return 1   // 40 -> 60
         }
     }
@@ -374,6 +381,7 @@ struct FPSOverlay: View {
         case 1: return "60"
         case 3: return "30"
         case 4: return "40"
+        case 5: return "20"
         case 0: return "MAX(\(UIScreen.main.maximumFramesPerSecond))"
         default: return "RAW"
         }
@@ -384,7 +392,7 @@ struct FPSOverlay: View {
     private var pillColor: Color {
         switch vsyncMode {
         case 1, 4: return .cyan
-        case 3: return .indigo
+        case 3, 5: return .indigo
         case 0: return .pink
         default: return .orange
         }

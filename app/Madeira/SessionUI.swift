@@ -61,8 +61,10 @@ enum DisplayFit: String, CaseIterable, Identifiable {
 
 /// DXMT's pacing modes (g_madeira_vsync_mode). 1/0/2 are upstream's (the FPS
 /// pill cycles through them); 3 and 4 are added in CI by
-/// tools/patch-dxmt-frame-limits.py. Listed in the order the panel shows them.
+/// tools/patch-dxmt-frame-limits.py; 5 (20 FPS) by tools/patch-dxmt-frame-20.py.
+/// Listed in the order the panel shows them.
 enum FrameLimit: Int32, CaseIterable, Identifiable {
+    case locked20 = 5
     case locked30 = 3
     case locked40 = 4
     case locked60 = 1
@@ -73,6 +75,7 @@ enum FrameLimit: Int32, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
+        case .locked20: return "20 FPS"
         case .locked30: return "30 FPS"
         case .locked40: return "40 FPS"
         case .locked60: return "60 FPS"
@@ -87,12 +90,14 @@ enum FrameLimit: Int32, CaseIterable, Identifiable {
     /// refreshes at 120 Hz but rounds to 33 ms at 60 Hz, so it needs the
     /// ProMotion rate held, as do the display-max and raw modes.
     static func wantsHighRefresh(_ mode: Int32) -> Bool {
-        mode != FrameLimit.locked60.rawValue && mode != FrameLimit.locked30.rawValue
+        mode != FrameLimit.locked60.rawValue && mode != FrameLimit.locked30.rawValue &&
+            mode != FrameLimit.locked20.rawValue
     }
 
     static func apply(_ limit: FrameLimit) {
-        madeira_set_vsync_locked(Int32(limit.rawValue))
-        ProMotionIntent.apply(mode: limit.rawValue)
+        let mode = ProMotionIntent.supportedMode(Int(limit.rawValue))
+        madeira_set_vsync_locked(mode)
+        ProMotionIntent.apply(mode: mode)
     }
 }
 

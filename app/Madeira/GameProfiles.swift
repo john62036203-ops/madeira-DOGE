@@ -101,7 +101,7 @@ struct GameProfile {
     static let metalFXChoices: [(String, String)] = [("", "Off"), ("1.5", "1.5×"), ("2", "2×")]
 
     /// Frame limit the session starts with (the Session panel still changes it).
-    static let fpsChoices: [(String, String)] = [("", "Default (60)"), ("30", "30 FPS"), ("40", "40 FPS"),
+    static let fpsChoices: [(String, String)] = [("", "Default (60)"), ("20", "20 FPS"), ("30", "30 FPS"), ("40", "40 FPS"),
                                                   ("60", "60 FPS"), ("max", "Display max"), ("raw", "Unlimited")]
 
     /// The D3D12 runtime's cap on low-detail tessellation (dxil-tess-max-factor).
@@ -127,6 +127,7 @@ struct GameProfile {
 
     var frameLimit: FrameLimit? {
         switch get("fps-limit") {
+        case "20": return .locked20
         case "30": return .locked30
         case "40": return .locked40
         case "60": return .locked60

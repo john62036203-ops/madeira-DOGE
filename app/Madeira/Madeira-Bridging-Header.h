@@ -59,6 +59,7 @@ int madeira_dxmt_has_display_pacing(void);
 // 1 when DXMT has the 40 FPS cap (vsync mode 4). Defined by DXMT; IOSDisplayShim.m
 // carries a weak fallback that returns 0, so the app links against a DXMT without it.
 int madeira_dxmt_has_40_cap(void);
+int madeira_dxmt_has_20_cap(void);
 
 /* ml526: startup phase timeline (Winios.m) */
 void winios_phase(const char *name);

@@ -124,6 +124,11 @@ __attribute__((weak)) int madeira_dxmt_has_40_cap(void) {
     return 0;
 }
 
+// The same for the 20 FPS cap (vsync mode 5, tools/patch-dxmt-frame-20.py).
+__attribute__((weak)) int madeira_dxmt_has_20_cap(void) {
+    return 0;
+}
+
 // --- macdrv_* implementations ---
 
 // DXMT only dereferences client_cocoa_view (passing it straight back to

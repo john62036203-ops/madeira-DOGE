@@ -182,7 +182,7 @@ struct LibraryEntry: Codable, Identifiable {
     var resolution = ResolutionChoices.defaultValue
     /// How the monitor is scaled to the screen (DisplayMode raw value; nil = Fit).
     var display: String?
-    /// FPS limit: 1 = 60, 3 = 30, 4 = 40, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
+    /// FPS limit: 1 = 60, 3 = 30, 4 = 40, 5 = 20, 0 = display maximum, 2 = uncapped (madeira_set_vsync_locked).
     var fpsMode = 1
     /// FEX's X87ReducedPrecision for this game. Off by default, as in FEX; only
     /// an explicit choice exports FEX_X87REDUCEDPRECISION=1.
@@ -449,7 +449,7 @@ struct LibraryEntry: Codable, Identifiable {
     func validate() throws {
         let size = resolution.split(separator: "x").compactMap { Int($0) }
         guard size.count == 2, (320...4096).contains(size[0]), (240...4096).contains(size[1]),
-              (0...4).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0"),
+              (0...5).contains(fpsMode), !arguments.contains("\0"), !windowsPath.contains("\0"),
               !launchArguments.contains("\0"), !launchWindowsPath.contains("\0"),
               launchWindowsPath.utf8.count < 1024, (steamWorkingWindowsPath?.utf8.count ?? 0) < 512 else {
             throw LibraryError.message("The saved launch profile contains invalid display or argument values.")
@@ -3658,6 +3658,8 @@ struct FPSChoice: View {
     var body: some View {
         HStack { Text("FPS limit"); Spacer(); Picker("FPS limit", selection: $mode) {
             // 30 needs DXMT's 30 FPS cap (ProMotionIntent.has30Cap); a saved 30 stays selectable.
+            // 20 needs DXMT's 20 FPS cap (ProMotionIntent.has20Cap); a saved 20 stays selectable.
+            if ProMotionIntent.has20Cap || mode == 5 { Text("20 FPS").tag(5) }
             if ProMotionIntent.has30Cap || mode == 3 { Text("30 FPS").tag(3) }
             // 40 needs DXMT's 40 FPS cap and a 120 Hz panel (ProMotionIntent.has40Cap).
             if ProMotionIntent.has40Cap || mode == 4 { Text("40 FPS").tag(4) }
