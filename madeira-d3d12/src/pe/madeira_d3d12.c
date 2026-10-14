@@ -13084,6 +13084,7 @@ static struct {
     UINT64 *pend; SIZE_T npend, pcap;  /* keys added since */
     SRWLOCK klk, ser;
     volatile LONG writing; DWORD last; LONG written;
+    HANDLE wake;                       /* the one writer thread waits on this */
 } g_parch = { -1 };
 #define MAD_PARCH_MAX 24000
 #define MAD_PARCH_MAGIC 0x3148435241444d4dull   /* "MMDARCH1" */
@@ -13112,6 +13113,7 @@ static void mad_parch_put(UINT64 k) {   /* g_parch.klk held exclusively */
     for (i = (SIZE_T)(k & (g_parch.cap - 1)); g_parch.set[i]; i = (i + 1) & (g_parch.cap - 1));
     g_parch.set[i] = k; g_parch.n++;
 }
+static DWORD WINAPI mad_parch_writer(void *arg);
 static int mad_parch_init(obj_handle_t device) {
     static SRWLOCK lk = SRWLOCK_INIT;
     if (g_parch.state >= 0) return g_parch.state;
@@ -13187,6 +13189,11 @@ static int mad_parch_init(obj_handle_t device) {
                            load ? "using" : "starting", g_parch.warch, (unsigned long long)nkeys,
                            (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
             g_parch.last = GetTickCount();
+            if (on && (g_parch.wake = CreateEventW(NULL, FALSE, FALSE, NULL))) {
+                HANDLE t = CreateThread(NULL, 0, mad_parch_writer, NULL, 0, NULL);
+                if (t) CloseHandle(t); else { CloseHandle(g_parch.wake); g_parch.wake = NULL; }
+            }
+            if (on && !g_parch.wake) d3d12_log("[madeira-d3d12] pso-archive: no writer thread; the archive is read but not written\n");
         }
         if (!on && mad_cfg_int_pe("pso-archive", 0)) d3d12_log("[madeira-d3d12] pso-archive: off (%s)\n", why);
         g_parch.state = on;
@@ -13209,7 +13216,11 @@ static UINT64 mad_parch_key(const struct mad_pso *p, const struct WMTRenderPipel
     return h ? h : 1;
 }
 /* Fills rp's archive fields. Returns 1 when the caller must call
- * mad_parch_done after building (the archive's shared lock is then held). */
+ * mad_parch_done after building: the archive's lock is then held shared, by
+ * lookups as well as additions. Build 190 let lookups run without it, and Metal
+ * crashed inside serializeToURL while other threads were building pipelines
+ * that looked up in the same archive (Onimusha, 2026-10-14 18:16 and 18:23:
+ * "write FAILED" after a fault in the framework, then the game froze). */
 static int mad_parch_prepare(const struct mad_pso *p, struct WMTRenderPipelineInfo *rp, UINT64 *key, int *add) {
     int known;
     *key = 0; *add = 0;
@@ -13223,16 +13234,13 @@ static int mad_parch_prepare(const struct mad_pso *p, struct WMTRenderPipelineIn
     known = mad_parch_has(*key) || g_parch.n + g_parch.npend >= MAD_PARCH_MAX;
     if (!known) { SIZE_T i; for (i = 0; i < g_parch.npend; i++) if (g_parch.pend[i] == *key) { known = 1; break; } }
     ReleaseSRWLockShared(&g_parch.klk);
-    if (known) return 0;
-    *add = 1;
-    rp->binary_archive_for_serialization = g_parch.arch;
-    AcquireSRWLockShared(&g_parch.ser);
+    if (!known) { *add = 1; rp->binary_archive_for_serialization = g_parch.arch; }
+    AcquireSRWLockShared(&g_parch.ser);   /* no write while any build uses the archive */
     return 1;
 }
-static DWORD WINAPI mad_parch_write(void *arg) {
+static void mad_parch_write_once(void) {
     obj_handle_t err = 0; SIZE_T i, n0 = 0, n1 = 0; int ok = 0;
-    (void)arg;
-    AcquireSRWLockExclusive(&g_parch.ser);   /* no build is adding to the archive now */
+    AcquireSRWLockExclusive(&g_parch.ser);   /* no build is using the archive now, for lookup or addition */
     DeleteFileW(g_parch.wtmp);
     g_parch.serialize(g_parch.arch, g_parch.utmp, &err);
     if (err) mad_log_nserror("pipeline archive (write)", err);
@@ -13260,12 +13268,17 @@ static DWORD WINAPI mad_parch_write(void *arg) {
                   (unsigned long)n1, (unsigned long)n0);
     g_parch.last = GetTickCount();
     InterlockedExchange(&g_parch.writing, 0);
+}
+/* One writer thread for the session: build 190 started a new thread for every
+ * write, and each new thread gets the emulator's per-thread state. */
+static DWORD WINAPI mad_parch_writer(void *arg) {
+    (void)arg;
+    for (;;) { WaitForSingleObject(g_parch.wake, INFINITE); mad_parch_write_once(); }
     return 0;
 }
 static void mad_parch_done(UINT64 key, int add, int ok) {
     SIZE_T np = 0;
-    if (!add) return;
-    if (ok) {
+    if (add && ok) {
         AcquireSRWLockExclusive(&g_parch.klk);
         if (g_parch.npend == g_parch.pcap) {
             SIZE_T nc = g_parch.pcap ? g_parch.pcap * 2 : 256;
@@ -13280,8 +13293,8 @@ static void mad_parch_done(UINT64 key, int add, int ok) {
     if (np) {
         DWORD age = GetTickCount() - g_parch.last;
         if (((np >= 16 && age >= 60000) || age >= 180000) && !InterlockedCompareExchange(&g_parch.writing, 1, 0)) {
-            HANDLE t = CreateThread(NULL, 0, mad_parch_write, NULL, 0, NULL);
-            if (t) CloseHandle(t); else InterlockedExchange(&g_parch.writing, 0);
+            if (g_parch.wake) SetEvent(g_parch.wake);
+            else InterlockedExchange(&g_parch.writing, 0);
         }
     }
 }
