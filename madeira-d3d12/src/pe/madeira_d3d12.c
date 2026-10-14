@@ -898,11 +898,15 @@ struct mad_rootsig {
 struct mad_deflib;   /* madeira-doge: pso-lazy-libs, a converted library not yet given to Metal */
 static int mad_deflib_take(struct mad_deflib *e, obj_handle_t device, obj_handle_t *lib, obj_handle_t *fn);
 static void mad_deflib_unref(struct mad_deflib *e);
+struct mad_pso;   /* madeira-doge: pso-archive, see mad_parch_prepare */
+static int mad_parch_prepare(const struct mad_pso *p, struct WMTRenderPipelineInfo *rp, UINT64 *key, int *add);
+static void mad_parch_done(UINT64 key, int add, int ok);
 struct mad_pso {
     ID3D12PipelineStateVtbl *vtbl; LONG refs; const IID *iid; const char *name;
     obj_handle_t rps;          /* Metal render pipeline state */
     obj_handle_t vs_lib, ps_lib, vs_fn, ps_fn;
     struct mad_deflib *vs_def, *ps_def;   /* madeira-doge: pso-lazy-libs; vs_fn/ps_fn are made from these at the first draw */
+    UINT64 vs_k[2], ps_k[2];              /* madeira-doge: pso-archive, the stages' library keys (pso-share-libs hash); 0 = unknown */
     int uses_depth, uses_stencil;
     UINT8 dbg_denable, dbg_dfunc, dbg_dwrite, dbg_wmask[8], dbg_senable, dbg_sfunc, dbg_srmask, dbg_swmask;   /* ml903/ml904: census only */
     obj_handle_t dsso;                              /* per-pipeline depth-stencil state */
@@ -4688,8 +4692,13 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
             ReleaseSRWLockExclusive(&p->rlock);
             return 0;
         }
-        p->rps = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
-                           : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
+        {   /* madeira-doge: pso-archive -- looked up in (and maybe added to) the persistent pipeline archive */
+            struct WMTRenderPipelineInfo rpx = p->rp; UINT64 pk = 0; int padd = 0;
+            int held = mad_parch_prepare(p, &rpx, &pk, &padd);
+            p->rps = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &rpx, &p->vd, &err)
+                               : MTLDevice_newRenderPipelineState(p->device_handle, &rpx, &err);
+            if (held) mad_parch_done(pk, padd, p->rps != 0);
+        }
         if (err) mad_log_nserror(p->vs_name, err);
         InterlockedExchangeAdd64(&g_pt_realize, mad_qpc() - t0); InterlockedIncrement(&g_pn_realize);
         if (p->rps) {
@@ -12339,6 +12348,7 @@ struct mad_convert_opts {
      * yet, the converted bytes are kept (shared, counted) in *defer_out instead
      * of being given to Metal; the call returns 0 with *defer_out set. */
     struct mad_deflib **defer_out;
+    UINT64 *share_key_out;   /* madeira-doge: pso-archive, receives the library's two-word key */
 };
 static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_rootsig *rs,
                                       const void *dxil, SIZE_T dxil_len, const char *entry,
@@ -13048,6 +13058,234 @@ static int mad_deflib_take(struct mad_deflib *e, obj_handle_t device, obj_handle
     return ok;
 }
 
+/* madeira-doge: PERSISTENT PIPELINE ARCHIVE (madeira.cfg pso-archive = 1,
+ * default 0; needs pso-lazy and the shader cache). Metal compiles a pipeline
+ * into GPU code when it is built, and pso-lazy builds it at its first draw on
+ * the submitting path: Onimusha: Way of the Sword spent 51 s on 269 such
+ * builds in its first session (about 190 ms each) and still 9-13 s on ~370 in
+ * later ones, each one a hitch the first time an effect appears. An
+ * MTLBinaryArchive keeps the compiled pipelines in a file
+ * (ShaderCache\<identity>\pipelines.metalar) that Metal looks pipelines up in
+ * before compiling. Every lazy build looks there; one whose key (its
+ * descriptor, vertex layout and both stages' library keys) is not in the
+ * index next to the archive is also added, and the archive and index are
+ * written in the background (to .tmp, then renamed) at most once a minute. A
+ * file Metal refuses, or one written on another OS version, starts over. The
+ * archive's new entries stay in memory until written, which costs some RAM in
+ * a session that builds many new pipelines. */
+static struct {
+    int state;                         /* -1 not tried, 0 off, 1 on */
+    obj_handle_t arch;                 /* the archive; lookups pass &arch */
+    void (*serialize)(obj_handle_t, const char *, obj_handle_t *);
+    char uarch[MAX_PATH * 3], utmp[MAX_PATH * 3];
+    WCHAR warch[MAX_PATH], wtmp[MAX_PATH], widx[MAX_PATH], widxtmp[MAX_PATH];
+    UINT64 os[3];
+    UINT64 *set; SIZE_T cap, n;        /* keys in the written archive (open addressing, 0 = empty) */
+    UINT64 *pend; SIZE_T npend, pcap;  /* keys added since */
+    SRWLOCK klk, ser;
+    volatile LONG writing; DWORD last; LONG written;
+} g_parch = { -1 };
+#define MAD_PARCH_MAX 24000
+#define MAD_PARCH_MAGIC 0x3148435241444d4dull   /* "MMDARCH1" */
+static int mad_parch_has(UINT64 k) {
+    SIZE_T i;
+    if (!g_parch.cap) return 0;
+    for (i = (SIZE_T)(k & (g_parch.cap - 1));; i = (i + 1) & (g_parch.cap - 1)) {
+        if (!g_parch.set[i]) return 0;
+        if (g_parch.set[i] == k) return 1;
+    }
+}
+static void mad_parch_put(UINT64 k) {   /* g_parch.klk held exclusively */
+    SIZE_T i;
+    if (!k || mad_parch_has(k)) return;
+    if ((g_parch.n + 1) * 10 >= g_parch.cap * 7) {
+        SIZE_T ncap = g_parch.cap ? g_parch.cap * 2 : 8192, oc = g_parch.cap, j;
+        UINT64 *nw = calloc(ncap, sizeof *nw), *old = g_parch.set;
+        if (!nw) return;
+        g_parch.set = nw; g_parch.cap = ncap;
+        for (j = 0; j < oc; j++) if (old[j]) {
+            for (i = (SIZE_T)(old[j] & (ncap - 1)); nw[i]; i = (i + 1) & (ncap - 1));
+            nw[i] = old[j];
+        }
+        free(old);
+    }
+    for (i = (SIZE_T)(k & (g_parch.cap - 1)); g_parch.set[i]; i = (i + 1) & (g_parch.cap - 1));
+    g_parch.set[i] = k; g_parch.n++;
+}
+static int mad_parch_init(obj_handle_t device) {
+    static SRWLOCK lk = SRWLOCK_INIT;
+    if (g_parch.state >= 0) return g_parch.state;
+    AcquireSRWLockExclusive(&lk);
+    if (g_parch.state < 0) {
+        int on = 0; const char *why = "madeira.cfg pso-archive = 0";
+        obj_handle_t (*newarch)(obj_handle_t, const char *, obj_handle_t *) = NULL;
+        void (*osver)(uint64_t *, uint64_t *, uint64_t *) = NULL;
+        char *(CDECL *unixname)(const WCHAR *) = NULL;
+        HMODULE wm = GetModuleHandleW(L"winemetal.dll"), k32 = GetModuleHandleW(L"kernel32.dll");
+        InitializeSRWLock(&g_parch.klk); InitializeSRWLock(&g_parch.ser);
+        if (mad_cfg_int_pe("pso-archive", 0)) {   /* madeira-doge: 1 keeps Metal's compiled pipelines in ShaderCache\\<identity>\\pipelines.metalar across launches (needs pso-lazy) */
+            if (wm) {
+                newarch = (void *)GetProcAddress(wm, "MTLDevice_newBinaryArchive");
+                g_parch.serialize = (void *)GetProcAddress(wm, "MTLBinaryArchive_serialize");
+                osver = (void *)GetProcAddress(wm, "WMTGetOSVersion");
+            }
+            if (k32) unixname = (void *)GetProcAddress(k32, "wine_get_unix_file_name");
+            if (!mad_pso_lazy_on()) why = "pso-lazy is off";
+            else if (!newarch || !g_parch.serialize || !osver) why = "winemetal has no binary archive calls";
+            else if (!unixname) why = "no wine_get_unix_file_name";
+            else if (!mad_sc_init()) why = "the shader cache is off";
+            else {
+                char *ud = unixname(g_sc_dir);
+                why = "the cache folder has no host path";
+                if (ud) {
+                    snprintf(g_parch.uarch, sizeof g_parch.uarch, "%s/pipelines.metalar", ud);
+                    snprintf(g_parch.utmp, sizeof g_parch.utmp, "%s/pipelines.metalar.tmp", ud);
+                    HeapFree(GetProcessHeap(), 0, ud);
+                    _snwprintf(g_parch.warch, MAX_PATH, L"%ls\\pipelines.metalar", g_sc_dir);
+                    _snwprintf(g_parch.wtmp, MAX_PATH, L"%ls\\pipelines.metalar.tmp", g_sc_dir);
+                    _snwprintf(g_parch.widx, MAX_PATH, L"%ls\\pipelines.idx", g_sc_dir);
+                    _snwprintf(g_parch.widxtmp, MAX_PATH, L"%ls\\pipelines.idx.tmp", g_sc_dir);
+                    on = 1;
+                }
+            }
+        }
+        if (on) {
+            obj_handle_t err = 0; HANDLE f; DWORD got = 0; UINT64 hdr[5] = {0}, nkeys = 0; int load = 0;
+            uint64_t a = 0, b = 0, c = 0;
+            osver(&a, &b, &c); g_parch.os[0] = a; g_parch.os[1] = b; g_parch.os[2] = c;
+            f = CreateFileW(g_parch.widx, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if (f != INVALID_HANDLE_VALUE) {
+                if (ReadFile(f, hdr, sizeof hdr, &got, NULL) && got == sizeof hdr && hdr[0] == MAD_PARCH_MAGIC &&
+                    hdr[1] == a && hdr[2] == b && hdr[3] == c && hdr[4] <= MAD_PARCH_MAX &&
+                    GetFileAttributesW(g_parch.warch) != INVALID_FILE_ATTRIBUTES) {
+                    UINT64 *keys = hdr[4] ? malloc((SIZE_T)hdr[4] * sizeof *keys) : NULL;
+                    if (!hdr[4] || (keys && ReadFile(f, keys, (DWORD)(hdr[4] * sizeof *keys), &got, NULL) && got == hdr[4] * sizeof *keys)) {
+                        SIZE_T i;
+                        for (i = 0; i < hdr[4]; i++) mad_parch_put(keys[i]);
+                        nkeys = hdr[4]; load = 1;
+                    }
+                    free(keys);
+                }
+                CloseHandle(f);
+            }
+            if (load) {
+                g_parch.arch = newarch(device, g_parch.uarch, &err);
+                if (!g_parch.arch || err) {
+                    if (err) mad_log_nserror("pipeline archive (load)", err);
+                    if (g_parch.arch) NSObject_release(g_parch.arch);
+                    g_parch.arch = 0; err = 0; load = 0;
+                    free(g_parch.set); g_parch.set = NULL; g_parch.cap = g_parch.n = 0; nkeys = 0;
+                }
+            }
+            if (!load) {
+                DeleteFileW(g_parch.warch); DeleteFileW(g_parch.widx);
+                g_parch.arch = newarch(device, NULL, &err);
+                if (err) mad_log_nserror("pipeline archive (new)", err);
+            }
+            if (!g_parch.arch) { on = 0; why = "Metal made no archive"; }
+            else d3d12_log("[madeira-d3d12] pso-archive: %s %ls, %llu pipelines in it (iOS %llu.%llu.%llu)\n",
+                           load ? "using" : "starting", g_parch.warch, (unsigned long long)nkeys,
+                           (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
+            g_parch.last = GetTickCount();
+        }
+        if (!on && mad_cfg_int_pe("pso-archive", 0)) d3d12_log("[madeira-d3d12] pso-archive: off (%s)\n", why);
+        g_parch.state = on;
+    }
+    ReleaseSRWLockExclusive(&lk);
+    return g_parch.state;
+}
+static UINT64 mad_parch_key(const struct mad_pso *p, const struct WMTRenderPipelineInfo *rp) {
+    struct WMTRenderPipelineInfo r = *rp;
+    const unsigned char *c; SIZE_T i;
+    UINT64 h = 0xcbf29ce484222325ull, ks[4];
+    r.vertex_function = 0; r.fragment_function = 0; r.binary_archive_for_serialization = 0;
+    memset(&r.binary_archives_for_lookup, 0, sizeof r.binary_archives_for_lookup);
+    r.num_binary_archives_for_lookup = 0; r.fail_on_binary_archive_miss = 0;
+    for (c = (const unsigned char *)&r, i = 0; i < sizeof r; i++) h = (h ^ c[i]) * 0x100000001b3ull;
+    if (p->has_vd) for (c = (const unsigned char *)&p->vd, i = 0; i < sizeof p->vd; i++) h = (h ^ c[i]) * 0x100000001b3ull;
+    ks[0] = p->vs_k[0]; ks[1] = p->vs_k[1]; ks[2] = p->ps_k[0]; ks[3] = p->ps_k[1];
+    for (c = (const unsigned char *)ks, i = 0; i < sizeof ks; i++) h = (h ^ c[i]) * 0x100000001b3ull;
+    h ^= h >> 29; h *= 0xbf58476d1ce4e5b9ull; h ^= h >> 32;
+    return h ? h : 1;
+}
+/* Fills rp's archive fields. Returns 1 when the caller must call
+ * mad_parch_done after building (the archive's shared lock is then held). */
+static int mad_parch_prepare(const struct mad_pso *p, struct WMTRenderPipelineInfo *rp, UINT64 *key, int *add) {
+    int known;
+    *key = 0; *add = 0;
+    if (!p->vs_k[0] && !p->vs_k[1]) return 0;
+    if (p->rp.fragment_function && !p->ps_k[0] && !p->ps_k[1]) return 0;
+    if (mad_parch_init(p->device_handle) != 1) return 0;
+    *key = mad_parch_key(p, rp);
+    rp->binary_archives_for_lookup.ptr = &g_parch.arch;
+    rp->num_binary_archives_for_lookup = 1;
+    AcquireSRWLockShared(&g_parch.klk);
+    known = mad_parch_has(*key) || g_parch.n + g_parch.npend >= MAD_PARCH_MAX;
+    if (!known) { SIZE_T i; for (i = 0; i < g_parch.npend; i++) if (g_parch.pend[i] == *key) { known = 1; break; } }
+    ReleaseSRWLockShared(&g_parch.klk);
+    if (known) return 0;
+    *add = 1;
+    rp->binary_archive_for_serialization = g_parch.arch;
+    AcquireSRWLockShared(&g_parch.ser);
+    return 1;
+}
+static DWORD WINAPI mad_parch_write(void *arg) {
+    obj_handle_t err = 0; SIZE_T i, n0 = 0, n1 = 0; int ok = 0;
+    (void)arg;
+    AcquireSRWLockExclusive(&g_parch.ser);   /* no build is adding to the archive now */
+    DeleteFileW(g_parch.wtmp);
+    g_parch.serialize(g_parch.arch, g_parch.utmp, &err);
+    if (err) mad_log_nserror("pipeline archive (write)", err);
+    else if (MoveFileExW(g_parch.wtmp, g_parch.warch, MOVEFILE_REPLACE_EXISTING)) {
+        HANDLE f;
+        AcquireSRWLockExclusive(&g_parch.klk);
+        n0 = g_parch.npend;
+        for (i = 0; i < g_parch.npend; i++) mad_parch_put(g_parch.pend[i]);
+        g_parch.npend = 0;
+        n1 = g_parch.n;
+        f = CreateFileW(g_parch.widxtmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            UINT64 hdr[5] = { MAD_PARCH_MAGIC, g_parch.os[0], g_parch.os[1], g_parch.os[2], g_parch.n };
+            DWORD put = 0; ok = WriteFile(f, hdr, sizeof hdr, &put, NULL) && put == sizeof hdr;
+            for (i = 0; ok && i < g_parch.cap; i++)
+                if (g_parch.set[i]) ok = WriteFile(f, &g_parch.set[i], sizeof g_parch.set[i], &put, NULL) && put == sizeof g_parch.set[i];
+            CloseHandle(f);
+            ok = ok && MoveFileExW(g_parch.widxtmp, g_parch.widx, MOVEFILE_REPLACE_EXISTING);
+        }
+        ReleaseSRWLockExclusive(&g_parch.klk);
+    }
+    ReleaseSRWLockExclusive(&g_parch.ser);
+    if (InterlockedIncrement(&g_parch.written) <= 12 || !ok)
+        d3d12_log("[madeira-d3d12] pso-archive: %s, %lu pipelines (+%lu)\n", ok ? "written" : "write FAILED",
+                  (unsigned long)n1, (unsigned long)n0);
+    g_parch.last = GetTickCount();
+    InterlockedExchange(&g_parch.writing, 0);
+    return 0;
+}
+static void mad_parch_done(UINT64 key, int add, int ok) {
+    SIZE_T np = 0;
+    if (!add) return;
+    if (ok) {
+        AcquireSRWLockExclusive(&g_parch.klk);
+        if (g_parch.npend == g_parch.pcap) {
+            SIZE_T nc = g_parch.pcap ? g_parch.pcap * 2 : 256;
+            UINT64 *nw = realloc(g_parch.pend, nc * sizeof *nw);
+            if (nw) { g_parch.pend = nw; g_parch.pcap = nc; }
+        }
+        if (g_parch.npend < g_parch.pcap) g_parch.pend[g_parch.npend++] = key;
+        np = g_parch.npend;
+        ReleaseSRWLockExclusive(&g_parch.klk);
+    }
+    ReleaseSRWLockShared(&g_parch.ser);   /* taken in mad_parch_prepare */
+    if (np) {
+        DWORD age = GetTickCount() - g_parch.last;
+        if (((np >= 16 && age >= 60000) || age >= 180000) && !InterlockedCompareExchange(&g_parch.writing, 1, 0)) {
+            HANDLE t = CreateThread(NULL, 0, mad_parch_write, NULL, 0, NULL);
+            if (t) CloseHandle(t); else InterlockedExchange(&g_parch.writing, 0);
+        }
+    }
+}
+
 /* ml1990: the inputs of one conversion request, shared by the first call and
  * any retry so the two can never disagree about what is being converted. */
 static void mad_fill_convert_inputs(struct madeira_ir_convert_args *a, struct mad_rootsig *rs,
@@ -13272,6 +13510,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     obj_handle_t fn = 0, err = 0, lib = 0;
     UINT64 share_k0, share_k1;
     mad_libshare_key(buf, (SIZE_T)a.ret_len, name, &share_k0, &share_k1);
+    if (o && o->share_key_out) { o->share_key_out[0] = share_k0; o->share_key_out[1] = share_k1; }   /* madeira-doge: pso-archive */
     /* Not for a DXIL tessellation conversion (lib_only): its result is the library
      * itself, and a shared entry would hand back the function instead. */
     if (!(o && o->lib_only) && mad_libshare_find(share_k0, share_k1, &lib, &fn)) {   /* an identical library already exists */
@@ -14075,6 +14314,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         ov2.air = &air_vs;
         ov2.name_out = vsentry; ov2.name_cap = sizeof vsentry; vsentry[0] = 0;
         if (defer_libs) ov2.defer_out = &p->vs_def;   /* madeira-doge */
+        ov2.share_key_out = p->vs_k;                  /* madeira-doge: pso-archive */
         p->vs_fn = mad_convert_stage_opts(d, rs, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, NULL, &p->vs_lib, "VS",
                                      vsin, 32, &nvsin, NULL, locs, &nl, &ov2);
         free(LV);
@@ -14159,6 +14399,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             }
             nl = 0;
             if (defer_libs) op.defer_out = &p->ps_def;   /* madeira-doge */
+            op.share_key_out = p->ps_k;                  /* madeira-doge: pso-archive */
             p->ps_fn = mad_convert_stage_opts(d, rs, desc->PS.pShaderBytecode, desc->PS.BytecodeLength, NULL, &p->ps_lib, "PS",
                                               NULL, 0, NULL, NULL, locs, &nl, &op);
             {   /* madeira-doge: madeira.cfg capture-ps also writes the named pixel shaders' bytecode to the
