@@ -895,10 +895,14 @@ struct mad_rootsig {
     UINT16 scbv_off[MAD_ROOT_PARAM_MAX][8], scbv_ext[MAD_ROOT_PARAM_MAX];
 };
 #define MAD_SCBV_MAX_EXT 64u
+struct mad_deflib;   /* madeira-doge: pso-lazy-libs, a converted library not yet given to Metal */
+static int mad_deflib_take(struct mad_deflib *e, obj_handle_t device, obj_handle_t *lib, obj_handle_t *fn);
+static void mad_deflib_unref(struct mad_deflib *e);
 struct mad_pso {
     ID3D12PipelineStateVtbl *vtbl; LONG refs; const IID *iid; const char *name;
     obj_handle_t rps;          /* Metal render pipeline state */
     obj_handle_t vs_lib, ps_lib, vs_fn, ps_fn;
+    struct mad_deflib *vs_def, *ps_def;   /* madeira-doge: pso-lazy-libs; vs_fn/ps_fn are made from these at the first draw */
     int uses_depth, uses_stencil;
     UINT8 dbg_denable, dbg_dfunc, dbg_dwrite, dbg_wmask[8], dbg_senable, dbg_sfunc, dbg_srmask, dbg_swmask;   /* ml903/ml904: census only */
     obj_handle_t dsso;                              /* per-pipeline depth-stencil state */
@@ -4673,6 +4677,17 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
     if (!p->rps && p->lazy) {
         obj_handle_t err = 0;
         LONG64 t0 = mad_qpc();   /* madeira-bcd */
+        /* madeira-doge: pso-lazy-libs -- the stages' libraries are made now */
+        if (p->vs_def && !p->vs_fn && mad_deflib_take(p->vs_def, p->device_handle, &p->vs_lib, &p->vs_fn)) p->rp.vertex_function = p->vs_fn;
+        if (p->ps_def && !p->ps_fn && mad_deflib_take(p->ps_def, p->device_handle, &p->ps_lib, &p->ps_fn)) p->rp.fragment_function = p->ps_fn;
+        if ((p->vs_def && !p->vs_fn) || (p->ps_def && !p->ps_fn)) {
+            LONG n = InterlockedIncrement(&g_pso_lazy_failed);
+            p->lazy = 0;   /* draws with it are skipped from now on */
+            if (n <= 8) d3d12_log("[madeira-d3d12] pso-lazy-libs: a shader library failed at first draw (vs '%s', ps '%s'); its draws are skipped\n",
+                                  p->vs_name, p->ps_name);
+            ReleaseSRWLockExclusive(&p->rlock);
+            return 0;
+        }
         p->rps = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
                            : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
         if (err) mad_log_nserror(p->vs_name, err);
@@ -11021,6 +11036,7 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
         if (p->ps_fn) NSObject_release(p->ps_fn);
         if (p->vs_lib) NSObject_release(p->vs_lib);
         if (p->ps_lib) NSObject_release(p->ps_lib);
+        mad_deflib_unref(p->vs_def); mad_deflib_unref(p->ps_def);   /* madeira-doge: pso-lazy-libs */
         if (p->si_lib) NSObject_release(p->si_lib);   /* ml927 */
         if (p->gs_lib) NSObject_release(p->gs_lib);
         if (p->hs_lib) NSObject_release(p->hs_lib);   /* DXIL tessellation */
@@ -12319,6 +12335,10 @@ struct mad_convert_opts {
      * when the pipeline is built), so a missing plain function is not a failure: the
      * library is returned (one reference) and *obj_only_out is set. */
     int *obj_only_out;
+    /* madeira-doge: pso-lazy-libs. When set and no identical MTLLibrary exists
+     * yet, the converted bytes are kept (shared, counted) in *defer_out instead
+     * of being given to Metal; the call returns 0 with *defer_out set. */
+    struct mad_deflib **defer_out;
 };
 static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_rootsig *rs,
                                       const void *dxil, SIZE_T dxil_len, const char *entry,
@@ -12933,6 +12953,101 @@ static void mad_libshare_add(UINT64 k0, UINT64 k1, obj_handle_t lib, obj_handle_
     ReleaseSRWLockExclusive(&g_libshare_lock);
 }
 
+/* madeira-doge: pso-lazy-libs, one distinct converted library (see mad_pso_lazy_libs_on). */
+struct mad_deflib {
+    UINT64 k0, k1; LONG refs; struct mad_deflib *next;
+    unsigned char *bytes; SIZE_T len;   /* freed once the library exists */
+    obj_handle_t lib, fn;               /* one reference each, held by the entry */
+    char name[MADEIRA_IR_ENTRY_MAX];
+};
+#define MAD_DEFLIB_BUCKETS 4096
+static struct mad_deflib *g_deflib[MAD_DEFLIB_BUCKETS];
+static SRWLOCK g_deflib_lock = SRWLOCK_INIT;
+static LONG g_deflib_n, g_deflib_made; static LONG64 g_deflib_bytes;
+/* madeira-doge: LAZY SHADER LIBRARIES (madeira.cfg pso-lazy-libs = 1, default
+ * 0). Pipelines are already built at their first draw (pso-lazy), but every
+ * stage's MTLLibrary was still made at creation: Monster Hunter Rise created
+ * 39,308 graphics pipelines and 6,545 libraries (109 MB of metallib held by
+ * Metal) and drew with about 210 pipelines in the first minutes. With this on,
+ * a plain pipeline's converted bytes are kept in this table (one entry per
+ * distinct library, shared and counted like pso-share-libs) in the game's own
+ * memory, and the MTLLibrary and MTLFunction are made by mad_pso_realize. The
+ * conversion itself still runs at creation: its reflection (vertex inputs,
+ * resource locations, names) is part of the pipeline. Geometry, tessellation
+ * and compute pipelines are unchanged. */
+static int mad_pso_lazy_libs_on(void) {
+    static int on = -1;
+    if (on < 0) { on = (mad_pso_lazy_on() && mad_cfg_int_pe("pso-lazy-libs", 0)) ? 1 : 0;
+                  d3d12_log("[madeira-d3d12] shader libraries of plain pipelines are made %s (madeira.cfg pso-lazy-libs)\n",
+                            on ? "at their first draw" : "at creation"); }
+    return on;
+}
+/* Takes buf (malloc'd, len bytes) when a new entry is made; otherwise frees it. */
+static struct mad_deflib *mad_deflib_get(UINT64 k0, UINT64 k1, unsigned char *buf, SIZE_T len, const char *name) {
+    struct mad_deflib *e, **head = &g_deflib[k0 & (MAD_DEFLIB_BUCKETS - 1)];
+    AcquireSRWLockExclusive(&g_deflib_lock);
+    for (e = *head; e; e = e->next) if (e->k0 == k0 && e->k1 == k1) break;
+    if (e) { e->refs++; ReleaseSRWLockExclusive(&g_deflib_lock); free(buf); return e; }
+    e = calloc(1, sizeof *e);
+    if (e) {
+        unsigned char *b = realloc(buf, len ? len : 1);
+        e->k0 = k0; e->k1 = k1; e->refs = 1; e->bytes = b ? b : buf; e->len = len;
+        snprintf(e->name, sizeof e->name, "%s", name);
+        e->next = *head; *head = e;
+        g_deflib_n++; g_deflib_bytes += (LONG64)len;
+    } else free(buf);
+    ReleaseSRWLockExclusive(&g_deflib_lock);
+    return e;
+}
+static void mad_deflib_unref(struct mad_deflib *e) {
+    struct mad_deflib **pp;
+    if (!e) return;
+    AcquireSRWLockExclusive(&g_deflib_lock);
+    if (--e->refs > 0) { ReleaseSRWLockExclusive(&g_deflib_lock); return; }
+    for (pp = &g_deflib[e->k0 & (MAD_DEFLIB_BUCKETS - 1)]; *pp; pp = &(*pp)->next)
+        if (*pp == e) { *pp = e->next; break; }
+    g_deflib_n--;
+    if (e->bytes) g_deflib_bytes -= (LONG64)e->len;
+    ReleaseSRWLockExclusive(&g_deflib_lock);
+    if (e->fn) NSObject_release(e->fn);
+    if (e->lib) NSObject_release(e->lib);
+    free(e->bytes);
+    free(e);
+}
+/* The entry's library and function, made on first use; one reference of each
+ * for the caller. 0 when Metal refused them (the entry stays refused). */
+static int mad_deflib_take(struct mad_deflib *e, obj_handle_t device, obj_handle_t *lib, obj_handle_t *fn) {
+    int ok = 0;
+    if (!e) return 0;
+    AcquireSRWLockExclusive(&g_deflib_lock);
+    if (!e->lib && e->bytes) {
+        obj_handle_t l = 0, f = 0, err = 0, dd;
+        if (mad_libshare_find(e->k0, e->k1, &l, &f)) { e->lib = l; e->fn = f; }   /* made meanwhile by an eager pipeline */
+        else if ((dd = DispatchData_alloc_init((uint64_t)(uintptr_t)e->bytes, (uint64_t)e->len))) {
+            l = MTLDevice_newLibrary(device, dd, &err);
+            NSObject_release(dd);
+            if (err) mad_log_nserror("library (pso-lazy-libs)", err);
+            if (l) {
+                InterlockedExchangeAdd64(&g_lib_bytes, (LONG64)e->len); InterlockedIncrement(&g_lib_count);   /* ml1060 */
+                f = MTLLibrary_newFunction(l, e->name);
+                if (f) { e->lib = l; e->fn = f; mad_libshare_add(e->k0, e->k1, l, f); }
+                else { d3d12_log("[madeira-d3d12] pso-lazy-libs: library has no function '%s'\n", e->name); NSObject_release(l); }
+            }
+        }
+        g_deflib_bytes -= (LONG64)e->len;
+        free(e->bytes); e->bytes = NULL;   /* made or refused: the bytes are not needed again */
+        if (e->lib) {
+            LONG n = ++g_deflib_made;
+            if (n == 1 || (n % 250) == 0)
+                d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld libraries made at first draw; %ld distinct kept, %lld KB not yet given to Metal\n",
+                          n, g_deflib_n, (long long)(g_deflib_bytes >> 10));
+        }
+    }
+    if (e->lib && e->fn) { NSObject_retain(e->lib); NSObject_retain(e->fn); *lib = e->lib; *fn = e->fn; ok = 1; }
+    ReleaseSRWLockExclusive(&g_deflib_lock);
+    return ok;
+}
+
 /* ml1990: the inputs of one conversion request, shared by the first call and
  * any retry so the two can never disagree about what is being converted. */
 static void mad_fill_convert_inputs(struct madeira_ir_convert_args *a, struct mad_rootsig *rs,
@@ -13165,6 +13280,16 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         *lib_out = lib;
         free(buf);
         return fn;
+    }
+    if (o && o->defer_out && !o->lib_only && !o->obj_only_out && mad_pso_lazy_libs_on()) {   /* madeira-doge: pso-lazy-libs */
+        static LONG said;
+        snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
+        if (o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);
+        *o->defer_out = mad_deflib_get(share_k0, share_k1, buf, (SIZE_T)a.ret_len, name);   /* takes buf */
+        if (*o->defer_out && InterlockedIncrement(&said) <= 4)
+            d3d12_log("[madeira-d3d12] %s converted, library deferred to the first draw: %u bytes of metallib, entry '%s'\n",
+                      tag, (unsigned)a.ret_len, name);
+        return 0;
     }
     LONG64 lib_t0 = mad_qpc();   /* madeira-bcd: timed, with the function lookup below */
     obj_handle_t dd = DispatchData_alloc_init((uint64_t)(uintptr_t)buf, (uint64_t)a.ret_len);
@@ -13868,10 +13993,12 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     struct WMTDepthStencilInfo dsi;
     struct madeira_ir_vs_input vsin[32];
     unsigned nvsin = 0, i;
-    int has_vd = 0, is_depth;
+    int has_vd = 0, is_depth, defer_libs;
     static unsigned said_inputs, said_pso;
     HRESULT hr;
     if (!desc || !out) return E_INVALIDARG;
+    /* madeira-doge: pso-lazy-libs -- only a plain pipeline, which pso-lazy builds at its first draw */
+    defer_libs = !desc->GS.pShaderBytecode && !desc->HS.pShaderBytecode && !desc->DS.pShaderBytecode && mad_pso_lazy_libs_on();
     if (!desc->VS.pShaderBytecode) { d3d12_log("[madeira-d3d12] pipeline has no vertex shader\n"); return E_INVALIDARG; }
     if (desc->GS.pShaderBytecode || desc->HS.pShaderBytecode || desc->DS.pShaderBytecode) {   /* ml926: stages this runtime cannot run yet */
         static unsigned said; if (said++ < 12)
@@ -13947,10 +14074,11 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         ov2.layout = LV->n ? LV : NULL;
         ov2.air = &air_vs;
         ov2.name_out = vsentry; ov2.name_cap = sizeof vsentry; vsentry[0] = 0;
+        if (defer_libs) ov2.defer_out = &p->vs_def;   /* madeira-doge */
         p->vs_fn = mad_convert_stage_opts(d, rs, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, NULL, &p->vs_lib, "VS",
                                      vsin, 32, &nvsin, NULL, locs, &nl, &ov2);
         free(LV);
-        if (p->vs_fn) {
+        if (p->vs_fn || p->vs_def) {
             snprintf(p->vs_name, sizeof p->vs_name, "%s", vsentry[0] ? vsentry : g_last_entry);
             p->backend = air_vs.backend;
             if (air_vs.backend == MADEIRA_IR_BACKEND_AIRCONV) {   /* ml1011 */
@@ -14030,6 +14158,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
                 }
             }
             nl = 0;
+            if (defer_libs) op.defer_out = &p->ps_def;   /* madeira-doge */
             p->ps_fn = mad_convert_stage_opts(d, rs, desc->PS.pShaderBytecode, desc->PS.BytecodeLength, NULL, &p->ps_lib, "PS",
                                               NULL, 0, NULL, NULL, locs, &nl, &op);
             {   /* madeira-doge: madeira.cfg capture-ps also writes the named pixel shaders' bytecode to the
@@ -14058,7 +14187,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
                     d3d12_log("[madeira-d3d12] ps-dump '%s': end\n", p->ps_name);
                 }
             }
-            if (p->ps_fn) {
+            if (p->ps_fn || p->ps_def) {
                 if (air_ps.backend == MADEIRA_IR_BACKEND_AIRCONV) {   /* ml1011 */
                     p->ps_cb_bind = air_ps.cb_bind; p->ps_arg_bind = air_ps.arg_bind;
                     p->ps_arg_qwords = air_ps.arg_qwords; p->ps_nair = 0;
@@ -14096,7 +14225,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         mad_dxil_dump_one("gs", en, desc->GS.pShaderBytecode, desc->GS.BytecodeLength);
         mad_dxil_dump_one("ps", en, desc->PS.pShaderBytecode, desc->PS.BytecodeLength);
     }
-    if (!p->vs_fn || (desc->PS.pShaderBytecode && !p->ps_fn)) { pso_Release((ID3D12PipelineState *)p); return E_FAIL; }
+    if (!(p->vs_fn || p->vs_def) || (desc->PS.pShaderBytecode && !(p->ps_fn || p->ps_def))) { pso_Release((ID3D12PipelineState *)p); return E_FAIL; }
 
     /* Input layout -> vertex descriptor, through the attribute indices the
      * converted vertex shader reports. Element offsets follow D3D's append
@@ -14398,7 +14527,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         said_pso++;
         d3d12_log("[madeira-d3d12] pipeline: %u targets (fmt %u), depth fmt %u, %u input elements%s, %s\n",
                   desc->NumRenderTargets, (unsigned)desc->RTVFormats[0], (unsigned)desc->DSVFormat,
-                  desc->InputLayout.NumElements, has_vd ? " (vertex descriptor)" : "", p->ps_fn ? "VS+PS" : "VS only");
+                  desc->InputLayout.NumElements, has_vd ? " (vertex descriptor)" : "", (p->ps_fn || p->ps_def) ? "VS+PS" : "VS only");
     }
     hr = pso_QI((ID3D12PipelineState *)p, riid, out);
     pso_Release((ID3D12PipelineState *)p);
