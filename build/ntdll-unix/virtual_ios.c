@@ -30501,6 +30501,10 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
                     uintptr_t pool_offset = (uintptr_t)ios_jit_mappings[idx].jit_base
                                           - (uintptr_t)ios_jit_rx_base_global;
                     char *jit_rw_dest = (char *)ios_jit_rw_base_global + pool_offset + off;
+                    /* madeira-doge: madeira.cfg x64-fast -- a pure x64 module's import
+                     * slots for the placed entries now call the x64 stubs (x64fast_ios.h).
+                     * Before the copy below, so the pool copy gets the same slots. */
+                    x64f_redirect_iat( (unsigned char *)pe_start, pe_end - pe_start, off, size );
                     /* iOS-Madeira ml1199: words the pointer translation below must leave alone.
                      *
                      * That translation rewrites every 8-byte word whose value lies inside ANY

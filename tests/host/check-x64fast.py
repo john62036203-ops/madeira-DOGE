@@ -52,7 +52,7 @@ r = subprocess.run([os.path.join(tmp, "patch")] + [os.path.join(tmp, f) for f in
 print(r.stdout.rstrip())
 ok = r.returncode == 0 and "PASS" in r.stdout
 bad += not ok
-print("ok  " if ok else "FAIL", "installer patches the shipped DLLs and keeps every original target")
+print("ok  " if ok else "FAIL", "installer places stubs in the shipped DLLs, leaves every entry as is, and redirects only pure x64 import slots")
 
 run("gcc", "-O2", "-pthread", "-o", os.path.join(tmp, "stress"), os.path.join(D, "stress.c"), os.path.join(tmp, "stubs.o"))
 for threads, spin in ((1, 0), (4, 0), (4, 200), (8, 50)):

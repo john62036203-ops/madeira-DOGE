@@ -9,12 +9,18 @@
  * "fast-forward sequence", or a `jmp [rip+slot]` forwarder in kernel32);
  * ARM64EC callers bind through the redirection metadata and never run it.
  *
- * madeira.cfg x64-fast = 1 rewrites those x64 entries to jump to x64 stubs
- * placed in the unused tail of the module's .hexpthk section. A stub does
- * what Wine's C code does on the common path (same TEB/critical-section
- * fields) and otherwise runs the original entry (copied after the stub), so
- * contention, waits and unusual indices still go to Wine. The stubs' source
- * and a native x86-64 stress test are in tests/host/x64fast/.
+ * madeira.cfg x64-fast = 1 places x64 stubs in the unused tail of the
+ * module's .hexpthk section and, when the loader restores the protection of
+ * a pure x64 module's import table (the IAT sync), points that module's
+ * slots for these entries at the stubs. The entries themselves are NOT
+ * changed: ARM64EC code that calls them through a pointer (arm64x_check_call
+ * reads the entry bytes; ucrtbase does this for FlsGetValue) must still see
+ * the fast-forward sequence -- build 193 rewrote the entries and dockhost
+ * died at ucrtbase+0x90fe4 calling address 0. A stub does what Wine's C code
+ * does on the common path (same TEB/critical-section fields) and otherwise
+ * runs the original entry (copied after the stub), so contention, waits and
+ * unusual indices still go to Wine. The stubs' source and a native x86-64
+ * stress test are in tests/host/x64fast/.
  * x64-fast-spin = N: an x64 enter spins up to N times on a section another
  * thread holds before taking Wine's waiting path (0 = Wine's own behaviour).
  * Nothing here runs unless x64-fast = 1. */
@@ -99,6 +105,18 @@ static const struct { const char *module, *name; int kind; } x64f_targets[] =
 
 static int x64f_mode = -1, x64f_spin;
 
+/* entry -> stub pairs of every placed module copy (each pseudo-process maps its own) */
+#define X64F_MAX_PAIRS 512
+static struct { uintptr_t entry, stub; } x64f_pairs[X64F_MAX_PAIRS];
+static int x64f_npairs;
+
+static uintptr_t x64f_stub_for( uintptr_t entry )
+{
+    int i, n = __atomic_load_n( &x64f_npairs, __ATOMIC_ACQUIRE );
+    for (i = 0; i < n; i++) if (x64f_pairs[i].entry == entry) return x64f_pairs[i].stub;
+    return 0;
+}
+
 static int x64f_enabled( void )
 {
     if (x64f_mode < 0)
@@ -174,15 +192,13 @@ static int x64f_slack( const unsigned char *img, size_t size, unsigned int *lo, 
 
 static const unsigned char x64f_ffs[10] = { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9 };
 
-/* Writes len bytes at rva into the mapped image and its JIT-pool copy (the
- * same two writes as MADEIRA_PATCH_RVA). Returns 0 when the image write failed. */
-static int x64f_poke( unsigned char *img, unsigned char *pool_rw, unsigned char *pool_rx,
-                      unsigned int rva, const unsigned char *bytes, unsigned int len )
+/* Writes len bytes at rva into the mapped image. Returns 0 when that failed. */
+static int x64f_poke_image( unsigned char *img, unsigned int rva, const unsigned char *bytes, unsigned int len )
 {
     char *p = (char *)img + rva;
     char *pg = (char *)((uintptr_t)p & ~(uintptr_t)host_page_mask);
     size_t pgsz = ROUND_SIZE( p, len, host_page_mask );
-    int restore = PROT_READ, ok = 0;
+    int restore = PROT_READ;
     mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)pg;
     mach_vm_size_t rs = 0;
     vm_region_basic_info_data_64_t ri;
@@ -199,8 +215,17 @@ static int x64f_poke( unsigned char *img, unsigned char *pool_rw, unsigned char 
     {
         memcpy( p, bytes, len );
         mprotect( pg, pgsz, restore );
-        ok = 1;
+        return 1;
     }
+    return 0;
+}
+
+/* Writes len bytes at rva into the mapped image and its JIT-pool copy (the
+ * same two writes as MADEIRA_PATCH_RVA). Returns 0 when the image write failed. */
+static int x64f_poke( unsigned char *img, unsigned char *pool_rw, unsigned char *pool_rx,
+                      unsigned int rva, const unsigned char *bytes, unsigned int len )
+{
+    int ok = x64f_poke_image( img, rva, bytes, len );
     memcpy( pool_rw + rva, bytes, len );
     sys_icache_invalidate( pool_rx + rva, len );
     return ok;
@@ -210,7 +235,7 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
                               unsigned char *pool_rx, const char *mn )
 {
     unsigned char blob[0x1000];
-    unsigned int lo, hi, used = 0, i, n = 0, want = 0, img_ok = 1;
+    unsigned int lo, hi, used = 0, i, n = 0, want = 0;
     struct { unsigned int entry, stub; } done[16];
 
     if (!mn || !x64f_enabled()) return;
@@ -222,7 +247,7 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
         unsigned int e;
         if (strcasecmp( mn, x64f_targets[i].module )) continue;
         e = x64f_export( img, size, x64f_targets[i].name );
-        if (e && x64f_in( size, e, 1 ) && img[e] == 0xe9) return;   /* this image is already done */
+        if (e && x64f_stub_for( (uintptr_t)img + e )) return;   /* this image is already done */
     }
     if (!x64f_slack( img, size, &lo, &hi ))
     {
@@ -274,7 +299,7 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
         used += need;
     }
     if (!n) return;
-    /* stubs first, entries last: an entry never points at an unwritten stub */
+    /* Stubs only: the entries stay as they are (see the top of this file). */
     if (!x64f_poke( img, pool_rw, pool_rx, lo, blob, used ))
     {
         dprintf( 2, "[x64-fast] %s: could not write the stubs into the image, left alone\n", mn );
@@ -282,11 +307,50 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
     }
     for (i = 0; i < n; i++)
     {
-        unsigned char jmp[5] = { 0xe9 };
-        int rel = (int)(done[i].stub - (done[i].entry + 5));
-        memcpy( jmp + 1, &rel, 4 );
-        img_ok &= x64f_poke( img, pool_rw, pool_rx, done[i].entry, jmp, 5 );
+        int k = __atomic_load_n( &x64f_npairs, __ATOMIC_ACQUIRE );
+        if (k >= X64F_MAX_PAIRS) break;
+        x64f_pairs[k].entry = (uintptr_t)img + done[i].entry;
+        x64f_pairs[k].stub = (uintptr_t)img + done[i].stub;
+        __atomic_store_n( &x64f_npairs, k + 1, __ATOMIC_RELEASE );
     }
-    dprintf( 2, "[x64-fast] %s: %u of %u x64 entries now run x64 stubs (stubs at +0x%x, %u bytes, spin %d)%s\n",
-             mn, n, want, lo, used, x64f_spin, img_ok ? "" : " -- an IMAGE write FAILED" );
+    dprintf( 2, "[x64-fast] %s @%p: %u of %u x64 stubs placed (+0x%x, %u bytes, spin %d); x64 modules' import slots are pointed at them\n",
+             mn, img, n, want, lo, used, x64f_spin );
+}
+
+/* A pure x64 image (no .hexpthk): point its import slots that hold a placed
+ * entry at the stub. Called from the IAT sync with the region whose
+ * protection was just restored, before the region is copied to the pool. */
+static void x64f_redirect_iat( unsigned char *img, size_t size, size_t off, size_t len )
+{
+    unsigned int pe, iat, iat_size, sec, i, hits = 0, fails = 0;
+    unsigned short nsec, opt;
+    size_t a, b;
+
+    if (!x64f_mode || !__atomic_load_n( &x64f_npairs, __ATOMIC_ACQUIRE )) return;
+    if (size < 0x200 || img[0] != 'M' || img[1] != 'Z') return;
+    pe = *(const unsigned int *)(img + 0x3c);
+    if (!x64f_in( size, pe, 24 + 112 + 8 * 13 ) || memcmp( img + pe, "PE\0\0", 4 ) ||
+        *(const unsigned short *)(img + pe + 4) != 0x8664 ||
+        *(const unsigned short *)(img + pe + 24) != 0x20b) return;
+    nsec = *(const unsigned short *)(img + pe + 6);
+    opt = *(const unsigned short *)(img + pe + 20);
+    sec = pe + 24 + opt;
+    if (!x64f_in( size, sec, nsec * 40u )) return;
+    for (i = 0; i < nsec; i++)
+        if (!memcmp( img + sec + 40 * i, ".hexpthk", 8 )) return;   /* hybrid: EC callers bind via metadata */
+    iat = *(const unsigned int *)(img + pe + 24 + 112 + 8 * 12);
+    iat_size = *(const unsigned int *)(img + pe + 24 + 112 + 8 * 12 + 4);
+    if (!iat || !x64f_in( size, iat, iat_size )) return;
+    a = iat > off ? iat : off;
+    b = (size_t)iat + iat_size < off + len ? (size_t)iat + iat_size : off + len;
+    for (a = (a + 7) & ~(size_t)7; a + 8 <= b; a += 8)
+    {
+        uintptr_t stub = x64f_stub_for( *(const uintptr_t *)(img + a) );
+        if (!stub) continue;
+        if (x64f_poke_image( img, (unsigned int)a, (const unsigned char *)&stub, 8 )) hits++;
+        else fails++;
+    }
+    if (hits || fails)
+        dprintf( 2, "[x64-fast] x64 image %p: %u import slot(s) now call x64 stubs%s\n", img, hits,
+                 fails ? " (some image writes FAILED)" : "" );
 }

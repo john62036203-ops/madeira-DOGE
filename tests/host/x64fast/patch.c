@@ -20,10 +20,10 @@ typedef struct { int protection; } vm_region_basic_info_data_64_t; typedef void 
 #define VM_PROT_WRITE 2
 #define VM_PROT_COPY 0x10
 static int mach_task_self(void) { return 0; }
-static int mach_vm_region(int t, mach_vm_address_t *a, mach_vm_size_t *s, int f, vm_region_info_t i, mach_msg_type_number_t *c, mach_port_t *o) { ((vm_region_basic_info_data_64_t *)i)->protection = 5; return 0; }
+static int mach_vm_region(int t, mach_vm_address_t *a, mach_vm_size_t *s, int f, vm_region_info_t i, mach_msg_type_number_t *c, mach_port_t *o) { ((vm_region_basic_info_data_64_t *)i)->protection = 3;   /* test buffers stay read-write */ return 0; }
 static int vm_protect(int t, vm_address_t a, size_t s, int m, int p) { return 1; }
 static void sys_icache_invalidate(void *p, size_t n) {}
-static int dprintf_(int fd, const char *f, ...);
+
 #include <stdarg.h>
 static int dprintf_(int fd, const char *f, ...) { va_list a; va_start(a, f); vprintf(f, a); va_end(a); return 0; }
 #define dprintf dprintf_
@@ -46,9 +46,21 @@ static unsigned char *map_pe(const char *path, size_t *size)
     }
     *size = soi; return img;
 }
+/* A minimal pure x64 PE (headers + one IAT) holding the given slot values. */
+static unsigned char *fake_x64(uint64_t *slots, int n, size_t *size)
+{
+    unsigned char *img = calloc(1, 0x3000); unsigned pe = 0x80;
+    img[0] = 'M'; img[1] = 'Z'; *(unsigned *)(img + 0x3c) = pe; memcpy(img + pe, "PE\0\0", 4);
+    *(unsigned short *)(img + pe + 4) = 0x8664; *(unsigned short *)(img + pe + 6) = 1;
+    *(unsigned short *)(img + pe + 20) = 0xf0; *(unsigned short *)(img + pe + 24) = 0x20b;
+    *(unsigned *)(img + pe + 24 + 112 + 8 * 12) = 0x2000; *(unsigned *)(img + pe + 24 + 112 + 8 * 12 + 4) = n * 8;
+    memcpy(img + pe + 24 + 0xf0, ".rdata\0\0", 8);
+    memcpy(img + 0x2000, slots, n * 8); *size = 0x3000; return img;
+}
+
 int main(int argc, char **argv)
 {
-    int bad = 0;
+    int bad = 0; uint64_t slots[64]; int ns = 0;
     for (int a = 1; a < argc; a++) {
         size_t size; unsigned char *img = map_pe(argv[a], &size);
         unsigned char *orig = malloc(size); memcpy(orig, img, size);
@@ -60,8 +72,11 @@ int main(int argc, char **argv)
             if (strcasecmp(mn, x64f_targets[i].module)) continue;
             unsigned e = x64f_export(orig, size, x64f_targets[i].name);
             if (!e) { printf("  %-28s forwarder/absent\n", x64f_targets[i].name); continue; }
-            if (img[e] != 0xe9) { printf("  %-28s NOT patched\n", x64f_targets[i].name); bad++; continue; }
-            unsigned stub = e + 5 + *(int *)(img + e + 1);
+            if (memcmp(img + e, orig + e, 16)) { printf("  %-28s ENTRY CHANGED\n", x64f_targets[i].name); bad++; }
+            uintptr_t sa = x64f_stub_for((uintptr_t)img + e);
+            if (!sa) { printf("  %-28s not registered\n", x64f_targets[i].name); bad++; continue; }
+            unsigned stub = (unsigned)(sa - (uintptr_t)img);
+            slots[ns++] = (uintptr_t)img + e;
             int k = x64f_targets[i].kind; unsigned len = x64f_stub[k].len;
             if (memcmp(img + stub, x64f_stub[k].code, k == X64F_ENTER ? X64F_SPIN_AT : len)) { printf("  stub mismatch\n"); bad++; }
             if (k == X64F_ENTER && *(int *)(img + stub + X64F_SPIN_AT) != cfg_spin) { printf("  spin not set\n"); bad++; }
@@ -75,12 +90,27 @@ int main(int argc, char **argv)
                 snprintf(buf, sizeof buf, "fallback -> 0x%x (original 0x%x) %s", got, want, got == want ? "ok" : "WRONG"); res = buf;
                 if (got != want) bad++;
             }
-            printf("  %-28s entry 0x%x -> stub 0x%x, %s\n", x64f_targets[i].name, e, stub, res);
+            printf("  %-28s entry 0x%x unchanged, stub 0x%x, %s\n", x64f_targets[i].name, e, stub, res);
         }
-        /* nothing else changed */
-        size_t diff = 0; for (size_t j = 0; j < size; j++) if (img[j] != orig[j]) diff++;
-        printf("  %zu bytes changed\n", diff);
+        size_t diff = 0, outside = 0; unsigned lo, hi; x64f_slack(orig, size, &lo, &hi);
+        for (size_t j = 0; j < size; j++) if (img[j] != orig[j]) { diff++; if (j < lo || j >= hi) outside++; }
+        printf("  %zu bytes changed, %zu outside the .hexpthk tail\n", diff, outside);
+        if (outside) bad++;
+        int before = x64f_npairs;
         x64f_patch_image(img, size, pool, pool, mn);   /* second run must be a no-op */
+        if (x64f_npairs != before) { printf("  second run registered again\n"); bad++; }
     }
+    /* a pure x64 module importing every entry, plus two unrelated slots */
+    slots[ns++] = 0x1234; slots[ns++] = 0;
+    size_t fsz; unsigned char *fx = fake_x64(slots, ns, &fsz);
+    x64f_redirect_iat(fx, fsz, 0x2000, 0x1000);
+    for (int i = 0; i < ns; i++) {
+        uint64_t v = *(uint64_t *)(fx + 0x2000 + 8 * i), want = x64f_stub_for(slots[i]) ? x64f_stub_for(slots[i]) : slots[i];
+        if (v != want) { printf("  slot %d = 0x%llx, want 0x%llx\n", i, (unsigned long long)v, (unsigned long long)want); bad++; }
+    }
+    /* a hybrid module (.hexpthk) is left alone */
+    size_t hsz; unsigned char *hx = fake_x64(slots, ns, &hsz); memcpy(hx + 0x80 + 24 + 0xf0, ".hexpthk", 8);
+    x64f_redirect_iat(hx, hsz, 0x2000, 0x1000);
+    if (memcmp(hx + 0x2000, slots, ns * 8)) { printf("  hybrid module was redirected\n"); bad++; }
     printf(bad ? "FAIL %d\n" : "PASS\n", bad); return !!bad;
 }
