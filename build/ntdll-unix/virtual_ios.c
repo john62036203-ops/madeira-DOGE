@@ -16002,6 +16002,8 @@ static int ios_hexval( char c )
     return -1;
 }
 
+#include "x64fast_ios.h"   /* madeira-doge: madeira.cfg x64-fast */
+
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
 #ifdef WINE_IOS
@@ -17529,6 +17531,11 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                              mn, n, user_shared_data, img_ok );
                 }
             }
+
+            /* madeira-doge: madeira.cfg x64-fast = 1 -- x64 fast paths for hot
+             * ntdll/kernelbase/kernel32 imports (x64fast_ios.h). */
+            x64f_patch_image( (unsigned char *)image_base, image_size, (unsigned char *)jit_rw_base + offset,
+                              (unsigned char *)jit_rx_base + offset, ios_pe_module_name( image_base, image_size ) );
 
             /* task #34 [share-probe]: DEFAULT-OFF (set MADEIRA_SHARE_PROBE=1).
              * ml79: running it inline here (pre-detach, on explorer's boot
