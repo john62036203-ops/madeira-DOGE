@@ -2062,6 +2062,15 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     status = STATUS_SUCCESS;
 
 done:
+#ifdef WINE_IOS
+    /* Sekiro (2026-10-14): Steam's CreateProcess failed (launch error 29)
+     * with no trace, because the game cfg's WINEDEBUG=-all silences the ERRs
+     * above. Name the refused image and status regardless of WINEDEBUG. */
+    if (status)
+        dprintf( 2, "[spawn-fail] %s status=0x%08x machine=%04x pe-machine=%04x charact=%04x flags=%02x hybrid=%u\n",
+                 debugstr_us( &path ), status, machine, pe_info.machine, pe_info.image_charact,
+                 pe_info.image_flags, pe_info.is_hybrid );
+#endif
     if (file_handle) NtClose( file_handle );
     if (process_info) NtClose( process_info );
     if (process_handle) NtClose( process_handle );
