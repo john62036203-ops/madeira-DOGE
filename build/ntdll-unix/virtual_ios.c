@@ -27883,6 +27883,34 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                 else ios_na_trace_arm();
             }
 
+            /* The same walk can end in a free hole below the island when one
+             * happens to sit above that ntdll (Monster Hunter Rise, build 187,
+             * 2026-10-13 23:33: page 0xfb5ee0000 for a function at
+             * 0xfb5d75a00). The page is fine; what failed was the patch on the
+             * function itself, because the in-place self-write in
+             * NtWriteVirtualMemory is only allowed once a hook page was
+             * granted, and that was only noted on the island path. Note it
+             * too when an exact request of the same shape succeeds after a
+             * run of refusals. */
+            if (jumbo_hint && jumbo_size && jumbo_size <= 0x10000 && !zero_bits &&
+                (type & ~MEM_TOP_DOWN) == (MEM_COMMIT | MEM_RESERVE) &&
+                protect == PAGE_EXECUTE_READWRITE)
+            {
+                static unsigned walk_refused;
+                if (st == STATUS_CONFLICTING_ADDRESSES)
+                    __atomic_fetch_add( &walk_refused, 1, __ATOMIC_RELAXED );
+                else if (!st)
+                {
+                    unsigned before = __atomic_exchange_n( &walk_refused, 0, __ATOMIC_RELAXED );
+                    if (before >= 16 && ios_na_hook_peb != ios_jit_current_peb())
+                    {
+                        dprintf( 2, "[near-alloc] exact %p+0x%lx granted at %p outside the island after %u refusals: "
+                                 "treated as a hook page\n", jumbo_hint, (unsigned long)jumbo_size, *ret, before );
+                        ios_na_trace_arm();
+                    }
+                }
+            }
+
             /* ml373 census: name what still lands in the guest band once the
              * valve has had its say. The [window] histogram gives sizes but no
              * owner, so a single wrong guess about WHO reserves the 8.4GB costs a
