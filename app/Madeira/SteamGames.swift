@@ -11,6 +11,9 @@ import SwiftUI
 // Steam files. Play starts the game through Madeira Dock's launch path
 // (ContentView.startDock), so Valve's own client signs in, checks the licence
 // and starts it. No program names are involved: a game is its App ID.
+// A game whose Steam app info lists more than one Windows launch option (DLC
+// often adds its own) gets a choice; Dock passes the chosen key to Valve's
+// LaunchApp, and Valve's client still checks the licence for that entry.
 // Log tag: [steam-games] (App IDs and counts only).
 
 // MARK: - Rules (Foundation only; build/host-tests/check-onboarding.py compiles this part)
@@ -34,6 +37,26 @@ enum SteamGamesRules {
         if !client { return "Madeira Dock needs Valve's client components. Download them in Settings › Steam › Madeira Dock." }
         if !signedIn { return "Sign in to Steam in Settings › Steam to play." }
         return nil
+    }
+
+    /// Valve's client's app info cache in the prefix (read only).
+    static func appInfoCache(drive: URL) -> URL {
+        drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot + "/appcache/appinfo.vdf")
+    }
+
+    /// The launch choice is offered only when there is something to choose.
+    static func showsLaunchOptions(_ options: [SteamLaunchOption]) -> Bool { options.count > 1 }
+
+    /// The entry Play starts before anything is chosen: Steam's first entry (0), as
+    /// every Dock start did before, unless the choice is offered without it.
+    static func defaultLaunchOption(_ options: [SteamLaunchOption]) -> UInt32 {
+        guard showsLaunchOptions(options), !options.contains(where: { $0.id == 0 }) else { return 0 }
+        return options[0].id
+    }
+
+    /// An entry's name in the choice; entries that need a DLC say so.
+    static func title(_ option: SteamLaunchOption) -> String {
+        option.dlc.isEmpty ? option.title : option.title + " (DLC)"
     }
 
     /// Steam's public store artwork for an App ID (no account data).
@@ -159,6 +182,8 @@ struct SteamGameDetail: View {
     @ObservedObject private var dock = MadeiraDockModel.shared
     @ObservedObject private var signIn = SteamSignInModel.shared
     @Environment(\.dismiss) private var dismiss
+    @State private var launchOptions: [SteamLaunchOption] = []
+    @State private var launchOption: UInt32 = 0
 
     var body: some View {
         let blocker = SteamGamesRules.blocker(installed: game.installed, client: dock.clientInstalled, signedIn: signIn.signedIn)
@@ -171,10 +196,14 @@ struct SteamGameDetail: View {
                         VStack(alignment: .leading, spacing: 12) {
                             Text(game.name).font(.title2.bold())
                             Button {
-                                LogStore.shared.log("[steam-games] play app=\(game.id)")
+                                let option = SteamGamesRules.showsLaunchOptions(launchOptions) ? launchOption : 0
+                                LogStore.shared.log("[steam-games] play app=\(game.id) option=\(option)")
                                 dismiss()
                                 // Let the sheet finish dismissing before the session takes over.
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { startDock(game, dock.compactPool) }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                                    MadeiraDock.requestLaunchOption(option, appID: game.id)
+                                    startDock(game, dock.compactPool)
+                                }
                             } label: {
                                 HStack(spacing: 10) { Image(systemName: "play.fill"); Text("Play").fontWeight(.semibold) }
                                     .frame(minWidth: 100, minHeight: 30)
@@ -183,6 +212,17 @@ struct SteamGameDetail: View {
                         }
                     }.padding(.vertical, 12)
                     if let blocker { Text(blocker).font(.footnote).foregroundStyle(.orange) }
+                }
+                if SteamGamesRules.showsLaunchOptions(launchOptions) {
+                    Section {
+                        Picker("Start", selection: $launchOption) {
+                            ForEach(launchOptions) { option in Text(SteamGamesRules.title(option)).tag(option.id) }
+                        }
+                    } header: {
+                        Text("Launch option")
+                    } footer: {
+                        Text("Steam's launch options for this game, including the ones its DLC adds. A DLC entry starts only when the signed-in account owns that DLC and its content is installed; Valve's client decides.")
+                    }
                 }
                 Section {
                     Toggle("Smaller JIT pool (512 MB) for this launch", isOn: $dock.compactPool)
@@ -200,6 +240,14 @@ struct SteamGameDetail: View {
             .navigationTitle("Steam").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
             .onAppear { dock.refresh(); signIn.refresh() }
+            .task(id: game.id) {
+                // Valve's client keeps the app info cache; a game it has not loaded yet has no choice.
+                let appID = game.id, cache = SteamGamesRules.appInfoCache(drive: MadeiraDock.drive)
+                let found = await Task.detached(priority: .utility) { SteamAppInfo.launchOptions(appID: appID, cache: cache) }.value
+                launchOptions = found
+                launchOption = SteamGamesRules.defaultLaunchOption(found)
+                LogStore.shared.log("[steam-games] app=\(appID) launch-options=\(found.count)")
+            }
         }
     }
 }

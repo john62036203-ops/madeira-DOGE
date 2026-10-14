@@ -3273,6 +3273,7 @@ struct ContentView: View {
     /// show in the library, and the session gets the full-screen game view.
     private func startDock(_ game: DockGame, compactPool: Bool) {
         let inLibrary = library.enabled
+        let launchOption = MadeiraDock.takeLaunchOption(appID: game.id)
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             if inLibrary { library.error = "Enable JIT before playing." }
@@ -3301,7 +3302,7 @@ struct ContentView: View {
             if inLibrary { library.error = error.localizedDescription }
             return
         }
-        MadeiraDock.configure(game)
+        MadeiraDock.configure(game, launchOption: launchOption)
         // The game's one-time installs (its Steam install script) run first, in the same
         // session. No session runs yet, so the registry files can be read and written.
         DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)

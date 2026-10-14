@@ -166,8 +166,11 @@ section. Artwork comes from Steam's public store CDN by App ID. A game opens a
 sheet with **Play**, which goes through Dock's launch path with Dock's
 per-launch pool toggle, as a library session. Play is offered only for a game
 Steam marks fully installed, with Valve's client components present and a
-Steam sign-in. The section reads install records only; it never writes Steam
-files. Controller focus does not reach it yet.
+Steam sign-in. A game with more than one Windows launch option in Valve's app
+info cache (DLC often adds one) gets a **Launch option** choice on that sheet
+(`docs/MADEIRA_DOCK.md`, "Launch options"). The section reads install records
+and that cache only; it never writes Steam files. Controller focus does not
+reach it yet.
 
 Log tags: `[onboarding]` (`shown reason=… steps=…`, `step=…`, `done`,
 `skipped`) and `[steam-games]` (counts and App IDs). No account name, token or
@@ -227,4 +230,5 @@ without Dock, the done key, the `MADEIRA_ONBOARDING` switch, and the wiring
 their public pieces).
 `build/host-tests/check-steam-games.py` covers the library's Steam section: Dock's
 discovery on a synthetic drive_c laid out as Steam writes it, the section,
-search, Play and artwork rules, and that Play uses only Dock's launch path.
+search, Play and artwork rules, the launch options read from a synthetic app
+info cache (versions 27 to 29), and that Play uses only Dock's launch path.

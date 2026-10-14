@@ -60,6 +60,13 @@ for line in games.splitlines():
         require(re.search(r'\\\((game\.name|name|account|token|signIn|path|folder|status|error)', line) is None,
                 f'no account data, name or path in "{line.strip()[:70]}"')
 require(re.search(r'\bView\b|SwiftUI', rules.replace('// MARK: - Rules', '')) is None, 'the rules are Foundation-only')
+detail = games[games.index('struct SteamGameDetail: View'):]
+require('MadeiraDock.requestLaunchOption(option, appID: game.id)\n                                    startDock(game, dock.compactPool)' in detail,
+        'Play hands the chosen launch option to Dock right before its start')
+require('SteamAppInfo.launchOptions(appID: appID, cache: cache)' in detail and 'Task.detached' in detail,
+        "launch options come from Valve's app info cache, read off the main thread")
+require("ForEach(launchOptions)" in detail and 'SteamGamesRules.showsLaunchOptions(launchOptions)' in detail,
+        'the sheet offers the launch choice')
 
 # ------------------------------------------------------------------ compiled
 head = dock[dock.index('enum DockPerformancePolicy {'):dock.index('enum MadeiraDock {')]
@@ -92,6 +99,70 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
     "\"AppState\"\n{\n\t\"appid\"\t\t\"\(appID)\"\n\t\"Universe\"\t\t\"1\"\n\t\"name\"\t\t\"\(name)\"\n\t\"StateFlags\"\t\t\"\(flags)\"\n" +
     "\t\"installdir\"\t\t\"\(folder)\"\n\t\"buildid\"\t\t\"100\"\n}\n"
 }
+
+// A synthetic appinfo.vdf as Valve's client writes it (binary KeyValues;
+// version 29 names keys through a string table at the end of the file).
+func le32(_ value: UInt32) -> [UInt8] { (0..<4).map { UInt8((value >> UInt32(8 * $0)) & 0xff) } }
+func cstr(_ text: String) -> [UInt8] { Array(text.utf8) + [0] }
+final class Keys {
+    var table: [String]?
+    init(indexed: Bool) { table = indexed ? [] : nil }
+    func key(_ name: String) -> [UInt8] {
+        guard var list = table else { return cstr(name) }
+        if let index = list.firstIndex(of: name) { return le32(UInt32(index)) }
+        list.append(name); table = list
+        return le32(UInt32(list.count - 1))
+    }
+}
+indirect enum KV { case text(String, String), int(String, UInt32), table(String, [KV]) }
+func encode(_ items: [KV], _ keys: Keys) -> [UInt8] {
+    var out: [UInt8] = []
+    for item in items {
+        switch item {
+        case .text(let name, let value): out += [UInt8(1)] + keys.key(name) + cstr(value)
+        case .int(let name, let value): out += [UInt8(2)] + keys.key(name) + le32(value)
+        case .table(let name, let children): out += [UInt8(0)] + keys.key(name) + encode(children, keys)
+        }
+    }
+    return out + [UInt8(8)]
+}
+func appinfo(version: UInt8, apps: [(UInt32, [KV])]) -> Data {
+    let keys = Keys(indexed: version >= 0x29)
+    var body: [UInt8] = []
+    for (id, items) in apps {
+        var entry = le32(2) + le32(1_700_000_000) + [UInt8](repeating: 0, count: 8) + [UInt8](repeating: 0xaa, count: 20) + le32(7)
+        if version >= 0x28 { entry += [UInt8](repeating: 0xbb, count: 20) }
+        entry += encode([.table("appinfo", items)], keys)
+        body += le32(id) + le32(UInt32(entry.count)) + entry
+    }
+    body += le32(0)
+    var header: [UInt8] = [version, 0x44, 0x56, 0x07] + le32(1)
+    guard let table = keys.table else { return Data(header + body) }
+    let offset = UInt32(header.count + 8 + body.count)
+    header += le32(offset) + le32(0)
+    var strings = le32(UInt32(table.count))
+    for name in table { strings += cstr(name) }
+    return Data(header + body + strings)
+}
+func launchEntry(_ key: String, _ items: [KV]) -> KV { .table(key, items) }
+let fixtureLaunch: [KV] = [
+    .int("appid", 4242),
+    .table("common", [.text("name", "Fixture Game"), .text("type", "game")]),
+    .table("config", [
+        .text("installdir", "Fixture Game"),
+        .table("launch", [
+            launchEntry("0", [.text("executable", "game.bin"), .text("description", "Play"), .table("config", [.text("oslist", "windows")])]),
+            launchEntry("1", [.text("executable", "x.bin"), .text("description", "Play the expansion"), .text("type", "option1"),
+                              .table("config", [.text("oslist", "linux,windows"), .text("ownsdlc", "5001, 5002")])]),
+            launchEntry("2", [.text("executable", "m.bin"), .text("description", "Other system"), .table("config", [.text("oslist", "macos")])]),
+            launchEntry("3", [.text("executable", "b.bin"), .text("description", "Beta"), .table("config", [.text("BetaKey", "public_beta")])]),
+            launchEntry("4", [.text("executable", "e.bin"), .table("description_loc", [.text("english", "Editor")])]),
+            launchEntry("5", [.text("executable", "n.bin")]),
+            launchEntry("9999", [.text("executable", "big.bin"), .text("description", "Out of range")]),
+        ]),
+    ]),
+]
+let otherApp: [KV] = [.int("appid", 77), .table("config", [.table("launch", [launchEntry("0", [.text("description", "Other app")])])])]
 
 @main struct Checks {
     static func main() throws {
@@ -131,6 +202,40 @@ func record(_ appID: Int, _ name: String, _ folder: String, flags: Int) -> Strin
         require(cover?.scheme == "https" && cover?.host == "cdn.cloudflare.steamstatic.com" && cover?.path.contains("/4242/") == true,
                 "artwork from Steam's public store CDN by App ID")
         require(R.cover(0) == nil, "no artwork URL for an invalid App ID")
+        // Launch options from Valve's app info cache.
+        for version: UInt8 in [0x27, 0x28, 0x29] {
+            let data = appinfo(version: version, apps: [(77, otherApp), (4242, fixtureLaunch)])
+            let options = SteamAppInfo.app(4242, in: data).map { SteamAppInfo.launchOptions($0) } ?? []
+            require(options.map(\.id) == [0, 1, 4, 5], "v\(String(version, radix: 16)): Windows entries in key order, other systems, betas and out-of-range keys left out: \(options.map(\.id))")
+            require(options.first { $0.id == 1 }?.dlc == [5001, 5002] && options.first { $0.id == 0 }?.dlc == [],
+                    "v\(String(version, radix: 16)): a DLC entry lists the DLC it needs")
+            require(options.first { $0.id == 4 }?.title == "Editor" && options.first { $0.id == 5 }?.title == "Launch option 5",
+                    "v\(String(version, radix: 16)): localized description, else a numbered title")
+            require(SteamAppInfo.app(77, in: data).map { SteamAppInfo.launchOptions($0) }?.map(\.title) == ["Other app"], "v\(String(version, radix: 16)): each app is read on its own")
+            require(SteamAppInfo.app(4343, in: data) == nil, "v\(String(version, radix: 16)): an app the cache does not list has no entry")
+            for cut in [12, data.count / 2, data.count - 3] {
+                _ = SteamAppInfo.app(4242, in: data.prefix(cut))
+            }
+        }
+        let v28 = appinfo(version: 0x28, apps: [(4242, fixtureLaunch)])
+        require(SteamAppInfo.app(4242, in: v28.prefix(v28.count - 10)) == nil, "a truncated cache is not read")
+        var foreign = v28; foreign[0] = 0x30
+        require(SteamAppInfo.app(4242, in: foreign) == nil, "an unknown cache version is not read")
+        require(SteamAppInfo.app(0, in: v28) == nil && SteamAppInfo.app(-1, in: v28) == nil, "invalid App IDs are refused")
+        let cache = R.appInfoCache(drive: drive)
+        require(cache.path.hasSuffix("/Program Files (x86)/Steam/appcache/appinfo.vdf"), "the client's own app info cache in the prefix")
+        require(SteamAppInfo.launchOptions(appID: 4242, cache: cache).isEmpty, "no cache yet: no choice")
+        try fm.createDirectory(at: cache.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try appinfo(version: 0x29, apps: [(4242, fixtureLaunch)]).write(to: cache)
+        let options = SteamAppInfo.launchOptions(appID: 4242, cache: cache)
+        require(options.count == 4, "launch options read from the cache file")
+        require(R.showsLaunchOptions(options) && !R.showsLaunchOptions(Array(options.prefix(1))) && !R.showsLaunchOptions([]),
+                "the choice is offered only with more than one entry")
+        require(R.defaultLaunchOption(options) == 0 && R.defaultLaunchOption(Array(options.dropFirst())) == 1 &&
+                R.defaultLaunchOption(Array(options.suffix(1))) == 0 && R.defaultLaunchOption([]) == 0,
+                "Steam's first entry by default; the first offered entry when 0 is not offered; 0 when nothing is offered")
+        require(R.title(options[1]) == "Play the expansion (DLC)" && R.title(options[0]) == "Play", "DLC entries say so")
+
         if failures > 0 { print("FAILURES: \(failures)"); exit(1) }
         print("PASS: all Steam games Swift checks")
     }

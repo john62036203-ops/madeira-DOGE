@@ -26,25 +26,39 @@ OUT="$REPO_ROOT/app/Madeira/arm64ec-windows"
 [ -f "$SRC/src/main.c" ] || { echo "research/madeira-dock is missing: git submodule update --init research/madeira-dock" >&2; exit 1; }
 [ -x "$CC" ] || { echo "missing cross compiler: $CC (set LLVM_MINGW)" >&2; exit 1; }
 
-if [ "${1:-}" = "--check" ]; then
-    (cd "$SRC" && bash tools/check.sh)
-fi
-
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# Madeira's own Dock changes (patches/madeira-dock-*.patch, for example the
+# launch option) are applied to a copy; the submodule itself stays untouched.
+DOCK="$TMP/dock"
+mkdir -p "$DOCK"
+cp -R "$SRC/src" "$SRC/tests" "$SRC/tools" "$DOCK/"
+PATCHES=""
+for patch_file in "$REPO_ROOT"/patches/madeira-dock-*.patch; do
+    [ -f "$patch_file" ] || continue
+    patch -d "$DOCK" -p1 --forward --batch --quiet < "$patch_file" ||
+        { echo "could not apply $(basename "$patch_file") to research/madeira-dock" >&2; exit 1; }
+    PATCHES="$PATCHES $(basename "$patch_file")"
+done
+
+if [ "${1:-}" = "--check" ]; then
+    (cd "$DOCK" && bash tools/check.sh)
+fi
 
 # Same flags as Dock's own tools/build.sh: warnings are errors, the runtime is
 # linked statically (its notices go into dock-notices.txt) and symbols are
 # stripped. -Wl,--no-insert-timestamp keeps the output reproducible.
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror -Wno-cast-function-type \
     -static -Wl,--strip-all -Wl,--no-insert-timestamp \
-    -o "$TMP/dockhost.exe" "$SRC"/src/*.c -ladvapi32
+    -o "$TMP/dockhost.exe" "$DOCK"/src/*.c -ladvapi32
 
 section() { printf '\n\n==== %s ====\n\n' "$1"; }
 {
     cat "$SRC/LICENSE"
     printf '\nCorresponding source: https://github.com/125hz/madeira-dock (commit %s)\n' \
         "$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+    [ -z "$PATCHES" ] || printf 'With these patches from Madeira'"'"'s patches/ folder:%s\n' "$PATCHES"
     section 'LICENSE-EXCEPTION.md (Madeira Converter Exception)'
     cat "$SRC/LICENSE-EXCEPTION.md"
     section 'COPYING (GNU General Public License, version 3)'
