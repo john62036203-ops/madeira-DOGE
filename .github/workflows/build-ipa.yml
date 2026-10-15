@@ -1139,6 +1139,12 @@ jobs:
       - name: Patch airconv strong compare-exchange
         run: python3 tools/patch-airconv-cas-retry.py
 
+      # Sekiro's GPU restarts name only innocent victims among DXMT's main-queue
+      # buffers. MADEIRA_GPU_CAUSE=1 logs every failed command buffer of the
+      # process (cause or victim, queue, GPU times). Native only.
+      - name: Patch winemetal GPU restart cause log
+        run: python3 tools/patch-winemetal-gpu-cause.py
+
       # WoW64's 32-bit Windows farm (app/Madeira/i386-windows), which upstream
       # builds from the pinned wine and DXMT (build/wine-i386) and does not
       # commit. Cached per wine/DXMT revision; a failure only leaves 32-bit
