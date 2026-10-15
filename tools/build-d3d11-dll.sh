@@ -175,6 +175,9 @@ cp "$D/src/dxmt/dxmt_dynamic.cpp" "$OUT/tree/src/dxmt/"
 python3 "$R/tools/patch-dxmt-dyn-trim-switch.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-dyn-trim-switch.py did not apply"
 # madeira-doge: byte-budget keep and no per-allocate queue walk (DXMT_DYN_POOL=0 = off)
 python3 "$R/tools/patch-dxmt-dyn-pool.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-dyn-pool.py did not apply"
+# madeira-doge: GPU hang attribution (MADEIRA_GPU_FAULT=1), on copies of two more dxmt sources
+cp "$D/src/dxmt/dxmt_command_queue.cpp" "$D/src/dxmt/dxmt_context.cpp" "$OUT/tree/src/dxmt/"
+python3 "$R/tools/patch-dxmt-gpu-fault-d3d11.py" "$OUT/tree/src" || fail "tools/patch-dxmt-gpu-fault-d3d11.py did not apply"
 grep -q "madeira-bcd: context state swap" "$OUT/tree/src/d3d11/d3d11_context_impl.cpp" || fail "the swap patch left d3d11_context_impl.cpp unchanged"
 
 # DXMT's meson.build: compiler_args, the project defines, buildtype=release
@@ -273,6 +276,8 @@ for s in "${PARSER_SRC[@]}"; do
     o="$OUT/obj/parser_$s.o"; job "$D" "$P/$s.cpp" "$o" parser; PARSER_OBJ+=("$o")
 done
 job "$D" "$OUT/tree/src/dxmt/dxmt_dynamic.cpp" "$OUT/obj/dxmt_dynamic_mad.o" dxmt
+job "$D" "$OUT/tree/src/dxmt/dxmt_command_queue.cpp" "$OUT/obj/dxmt_command_queue_mad.o" dxmt
+job "$D" "$OUT/tree/src/dxmt/dxmt_context.cpp" "$OUT/obj/dxmt_context_mad.o" dxmt
 for s in "${D3D11_SRC[@]}"; do
     o="$OUT/plain/obj/$(obj_name "$s").o"; job "$D" "$D/src/$s.cpp" "$o" d3d11; PLAIN_OBJ+=("$o")
     o="$OUT/obj/$(obj_name "$s").o"; job "$OUT/tree" "$OUT/tree/src/$s.cpp" "$o" d3d11; PATCHED_OBJ+=("$o")
@@ -299,8 +304,10 @@ link_dll() {  # link_dll <output> <objects...>
         2>> "$OUT/build.err" || { grep -m 20 "error" "$OUT/build.err"; fail "linking $(basename "$out") failed"; }
 }
 link_dll "$OUT/plain/d3d11.dll" "${PLAIN_OBJ[@]}"
-link_dll "$OUT/d3d11.dll" "${PATCHED_OBJ[@]}" "$OUT/obj/dxmt_dynamic_mad.o"
+link_dll "$OUT/d3d11.dll" "${PATCHED_OBJ[@]}" "$OUT/obj/dxmt_dynamic_mad.o" \
+    "$OUT/obj/dxmt_command_queue_mad.o" "$OUT/obj/dxmt_context_mad.o"
 LC_ALL=C grep -aqF "DXMT_DYN_TRIM" "$OUT/d3d11.dll" || fail "the DXMT_DYN_TRIM switch is not in the result"
+LC_ALL=C grep -aqF "MADEIRA_GPU_FAULT" "$OUT/d3d11.dll" || fail "the MADEIRA_GPU_FAULT switch is not in the result"
 
 # The new DLL must export exactly what upstream's does, and import from the
 # same DLLs (DXGI.DLL, winemetal.dll, the system and UCRT ones).
