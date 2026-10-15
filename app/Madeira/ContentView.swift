@@ -1589,10 +1589,11 @@ struct ContentView: View {
                     for: UIDevice.orientationDidChangeNotification)) { _ in
                     TouchControlsHost.attach()
                 }
-            if session.showPerformance {
+            if session.showPerformance || session.showThermal {
                 HStack(spacing: 6) {
-                    FPSOverlay()
+                    if session.showPerformance { FPSOverlay() }
                     Spacer()
+                    if session.showThermal { ThermalBadge() }
                 }
                 .padding(.horizontal, 10)
                 .padding(.top, 6)
@@ -1652,6 +1653,12 @@ struct ContentView: View {
                 // the window-level surface covers anything drawn over the
                 // game area itself, so it cannot ride on the game view.
                 HStack(spacing: 0) {
+                    // madeira-doge: the thermal badge rides in the left bar.
+                    VStack {
+                        if session.showThermal { ThermalBadge(compact: true) }
+                        Spacer()
+                    }
+                    .frame(width: barW)
                     Spacer(minLength: 0)
                     VStack {
                         if pendingLaunch == nil || session.showPerformance {

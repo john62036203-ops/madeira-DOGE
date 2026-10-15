@@ -31,6 +31,15 @@ final class GameSession: ObservableObject {
     }
 
     private static let performanceKey = "madeira.session.performanceOverlay"
+
+    /// madeira-doge: the thermal badge (ThermalBadge), on its own switch so it can
+    /// stay on screen without the rest of the performance readout. Off by default.
+    @Published var showThermal: Bool =
+        UserDefaults.standard.object(forKey: GameSession.thermalKey) as? Bool ?? false {
+        didSet { UserDefaults.standard.set(showThermal, forKey: Self.thermalKey) }
+    }
+
+    private static let thermalKey = "madeira.session.thermalBadge"
 }
 
 /// How the guest display sits on the screen. MetalBackedView.gameRect()
@@ -154,6 +163,7 @@ struct SessionPanelView: View {
                     }
                     .onChange(of: fit) { _, value in DisplayFit.current = value }
                     Toggle("Performance overlay", isOn: $session.showPerformance)
+                    Toggle("Thermal status", isOn: $session.showThermal)
                 } header: {
                     Text("Display")
                 }

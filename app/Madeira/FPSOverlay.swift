@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import QuartzCore
 import os
+import Combine
 
 /// Frame-rate intent for the ProMotion panel. CAMetalLayer presents alone
 /// don't express one: iOS parks the display at 60Hz and only promotes on
@@ -103,6 +104,67 @@ final class ProMotionIntent {
     }
 
     @objc private func tick(_ sender: CADisplayLink) {}
+}
+
+/// madeira-doge: the phone's thermal state on its own (Session panel > Thermal
+/// status). iOS gives apps only this level (ProcessInfo.thermalState), not a
+/// temperature; the badge adds how long the phone has been at it, since clocks
+/// drop from Serious on and a long Fair is where a sustained frame rate settles.
+struct ThermalBadge: View {
+    var compact: Bool = false
+    @State private var state = ProcessInfo.processInfo.thermalState
+    @State private var since = Date()
+    @State private var now = Date()
+    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    static func describe(_ s: ProcessInfo.ThermalState) -> (String, Color) {
+        switch s {
+        case .nominal: return ("Normal", .green)
+        case .fair: return ("Warm", .yellow)
+        case .serious: return ("Hot", .orange)
+        case .critical: return ("Critical", .red)
+        @unknown default: return ("?", .secondary)
+        }
+    }
+
+    private var duration: String {
+        let s = max(0, Int(now.timeIntervalSince(since)))
+        return s >= 60 ? "\(s / 60)m\(String(format: "%02d", s % 60))s" : "\(s)s"
+    }
+
+    var body: some View {
+        let (label, color) = Self.describe(state)
+        Group {
+            if compact {
+                VStack(spacing: 2) {
+                    Circle().fill(color).frame(width: 8, height: 8)
+                    Text(label).foregroundColor(color)
+                    Text(duration).foregroundColor(.secondary)
+                }
+                .padding(6)
+            } else {
+                HStack(spacing: 6) {
+                    Circle().fill(color).frame(width: 8, height: 8)
+                    Text("Thermal:").foregroundColor(.secondary)
+                    Text(label).foregroundColor(color)
+                    Text(duration).foregroundColor(.secondary)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+            }
+        }
+        .font(.system(.caption, design: .monospaced))
+        .background(Color.black.opacity(0.55))
+        .cornerRadius(6)
+        .onReceive(tick) { date in
+            now = date
+            let current = ProcessInfo.processInfo.thermalState
+            if current != state {
+                state = current
+                since = date
+            }
+        }
+    }
 }
 
 /// Small overlay shown over the Metal render view. Reads DXMT's present
