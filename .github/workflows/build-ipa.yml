@@ -1133,6 +1133,12 @@ jobs:
       - name: Patch winemetal GPU trace and render-pass experiment
         run: python3 tools/patch-winemetal-gpu-trace.py
 
+      # Sekiro's GPU restarts: D3D's compare-exchange is strong, airconv used
+      # Metal's weak one on typed UAV textures, and a spurious failure reads as
+      # success. Retry that case (MADEIRA_CAS_RETRY=0 = off). Native only.
+      - name: Patch airconv strong compare-exchange
+        run: python3 tools/patch-airconv-cas-retry.py
+
       # WoW64's 32-bit Windows farm (app/Madeira/i386-windows), which upstream
       # builds from the pinned wine and DXMT (build/wine-i386) and does not
       # commit. Cached per wine/DXMT revision; a failure only leaves 32-bit
