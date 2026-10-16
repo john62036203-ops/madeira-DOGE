@@ -5416,7 +5416,7 @@ skip_reclaim_band: ;
                                         for (k = 0; k < sizeof(map) / sizeof(map[0]) && n < (int)sizeof(line) - 40; k++)
                                             n += snprintf( line + n, sizeof(line) - n, " %s=%llx", map[k].n,
                                                            (unsigned long long)(map[k].x == 29 ? state.__fp : state.__x[map[k].x]) );
-                                        dprintf( STDERR_FILENO, "[guest-regs-live] rsp=%llx%s\n", (unsigned long long)state.__sp, line );
+                                        dprintf( STDERR_FILENO, "[guest-regs-live] rsp=%llx%s (FEX keeps rsp in x23; the block start above is the synced rip)\n", (unsigned long long)state.__x[23], line );
                                         for (k = 0; k < sizeof(map) / sizeof(map[0]); k++)
                                         {
                                             uint64_t v = map[k].x == 29 ? state.__fp : state.__x[map[k].x], vt = 0, slot = 0;

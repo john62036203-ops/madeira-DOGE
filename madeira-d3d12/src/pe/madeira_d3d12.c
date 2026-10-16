@@ -17814,6 +17814,21 @@ HRESULT WINAPI D3D12SerializeVersionedRootSignature(
     return mad_serialize_any(desc, blob, err);
 }
 
+/* madeira-doge: where each interface table sits in this image, once, so a guest
+ * fault that names an object of ours by its vtable address (signal_arm64_ios.c
+ * [guest-obj], printed as an offset into madeira_d3d12.dll) can be named. */
+static void mad_log_vtable_rvas(void) {
+    static LONG said;
+    if (InterlockedExchange(&said, 1)) return;
+#define MAD_RVA(v) (unsigned long)((const char *)&(v) - (const char *)&__ImageBase)
+    d3d12_log("[madeira-d3d12] madeira-doge vtable RVAs: device=%#lx queue=%#lx alloc=%#lx list=%#lx fence=%#lx cmdsig=%#lx qheap=%#lx "
+              "resource=%#lx memheap=%#lx rootsig=%#lx pso=%#lx descheap=%#lx swapchain=%#lx\n",
+              MAD_RVA(g_device_vtbl), MAD_RVA(g_queue_vtbl), MAD_RVA(g_alloc_vtbl), MAD_RVA(g_list_vtbl), MAD_RVA(g_fence_vtbl),
+              MAD_RVA(g_cmdsig_vtbl), MAD_RVA(g_qheap_vtbl), MAD_RVA(g_res_vtbl), MAD_RVA(g_memheap_vtbl), MAD_RVA(g_rootsig_vtbl),
+              MAD_RVA(g_pso_vtbl), MAD_RVA(g_heap_vtbl), MAD_RVA(g_swap_vtbl));
+#undef MAD_RVA
+}
+
 HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL min_level,
                                                        REFIID riid, void **device) {
     /* A NULL out-pointer is the documented capability probe: answer it without
@@ -17824,6 +17839,7 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL min_level,
         mad_pin_graphics_dlls();
         return (min_level <= D3D_FEATURE_LEVEL_12_0) ? S_FALSE : E_INVALIDARG;
     }
+    mad_log_vtable_rvas();
     return MadeiraD3D12CreateDevice(adapter, min_level, riid, device);
 }
 
