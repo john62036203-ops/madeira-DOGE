@@ -433,6 +433,77 @@ final class SteamOwnedLibrary: ObservableObject {
         }
     }
 
+    // MARK: Achievements and trading cards (SteamAchievements.swift)
+
+    /// The game's achievements with this account's unlock times, and the
+    /// account's trading cards for it, over the app's own connection. Read-only;
+    /// each part reports its own failure.
+    func fetchGameExtras(_ appID: Int) async -> SteamGameExtras {
+        var extras = SteamGameExtras()
+        guard Self.enabled, signedIn, !inSession, appID > 0, appID <= Int(UInt32.max) else {
+            let why = inSession ? "Close the running game first." : "Sign in to Steam first."
+            extras.achievementsProblem = why
+            extras.cardsProblem = why
+            return extras
+        }
+        let language = SteamLanguage.current
+        var statsResult = 0
+        do {
+            try await session.ensureConnected()
+            var request = ProtobufEncoder()
+            request.writeFixed64(fieldNumber: 1, value: UInt64(appID))        // game_id
+            request.writeInt32Always(fieldNumber: 3, value: -1)                // schema_local_version: send the schema
+            request.writeFixed64(fieldNumber: 4, value: session.steamID)       // steam_id_for_user
+            let reply = try await session.sendAndWait(eMsg: .clientGetUserStats, body: request.data,
+                                                      responseEMsg: .clientGetUserStatsResponse, timeout: 20)
+            let stats = try SteamAchievementsParser.userStats(reply.body)
+            statsResult = stats.eresult
+            var names = ProtobufEncoder()
+            names.writeUInt32(fieldNumber: 1, value: UInt32(appID))
+            names.writeString(fieldNumber: 2, value: language)
+            var game: [String: SteamAchievementsParser.GameAchievement] = [:]
+            if let data = try? await session.callServiceMethod(method: .getGameAchievements, body: names.data, timeout: 20) {
+                game = (try? SteamAchievementsParser.gameAchievements(data)) ?? [:]
+            }
+            // A game without stats answers Fail (2) and has no achievement list.
+            if stats.eresult == 1 || !game.isEmpty {
+                extras.achievements = SteamAchievementsParser.merge(appID: appID, stats: stats, game: game, language: language)
+            } else if stats.eresult != 2 {
+                extras.achievementsProblem = "Steam could not read this game's achievements (code \(stats.eresult))."
+            }
+        } catch {
+            extras.achievementsProblem = "Could not load achievements: \(SteamSignIn.message(error))"
+        }
+        do {
+            var all = SteamAchievementsParser.Inventory()
+            var start: UInt64 = 0
+            for _ in 0..<10 {
+                var request = ProtobufEncoder()
+                request.writeFixed64(fieldNumber: 1, value: session.steamID)   // steamid
+                request.writeUInt32(fieldNumber: 2, value: 753)                // Steam
+                request.writeUInt64(fieldNumber: 3, value: 6)                  // community items
+                request.writeBool(fieldNumber: 4, value: true)                 // get_descriptions
+                request.writeString(fieldNumber: 5, value: language)
+                if start != 0 { request.writeUInt64(fieldNumber: 8, value: start) }
+                request.writeInt32(fieldNumber: 9, value: 2000)                // count
+                let page = try SteamAchievementsParser.inventory(
+                    try await session.callServiceMethod(method: .econGetInventory, body: request.data, timeout: 30))
+                all.assets += page.assets
+                all.descriptions += page.descriptions
+                guard page.more, page.lastAssetID != 0, page.lastAssetID != start else { break }
+                start = page.lastAssetID
+            }
+            extras.cards = SteamAchievementsParser.cards(all, appID: appID)
+        } catch {
+            extras.cardsProblem = "Could not read your Steam inventory: \(SteamSignIn.message(error))"
+        }
+        let unlocked = extras.achievements.filter(\.unlocked).count
+        SteamLog.event("[steam-achievements] app=\(appID) stats=\(statsResult) unlocked=\(unlocked)/\(extras.achievements.count) "
+                       + "cards=\(extras.cards.reduce(0) { $0 + $1.count }) kinds=\(extras.cards.count)"
+                       + (extras.achievementsProblem != nil ? " achievements-failed" : "") + (extras.cardsProblem != nil ? " cards-failed" : ""))
+        return extras
+    }
+
     // MARK: Steam Cloud (docs/STEAM_CLOUD.md)
 
     /// Steam Cloud is on unless Settings › Steam Cloud saves turns it off, kept in

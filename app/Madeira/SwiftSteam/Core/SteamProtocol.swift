@@ -42,6 +42,8 @@ enum EMsg: UInt32 {
     case clientGetDepotDecryptionKeyResponse = 5439
     /// Adds a free-to-play game (or a free package) to the account, as the
     /// store's "Play Game" / "Add to Library" does for a free title.
+    case clientGetUserStats = 818
+    case clientGetUserStatsResponse = 819
     case clientRequestFreeLicense = 5572
     case clientRequestFreeLicenseResponse = 5573
     case serviceMethod = 146
@@ -58,6 +60,8 @@ enum SteamServiceMethod: String {
     case getCDNAuthToken = "ContentServerDirectory.GetCDNAuthToken#1"
     /// The account's own playtime and last-played times.
     case getOwnedGames = "Player.GetOwnedGames#1"
+    case getGameAchievements = "Player.GetGameAchievements#1"
+    case econGetInventory = "Econ.GetInventoryItemsWithDescriptions#1"
     /// The account's Steam Cloud file list for one app.
     case cloudGetAppFileChangelist = "Cloud.GetAppFileChangelist#1"
     /// Where one cloud file can be downloaded from.
