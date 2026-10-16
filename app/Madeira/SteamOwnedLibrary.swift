@@ -734,10 +734,14 @@ final class SteamOwnedLibrary: ObservableObject {
         var request = ProtobufEncoder()
         request.writeUInt32(fieldNumber: 1, value: UInt32(appID))    // appid
         request.writeString(fieldNumber: 2, value: entry.path)       // filename
-        let info = try SteamCloudDownloadInfo.parse(
-            try await session.callServiceMethod(method: .cloudClientFileDownload, body: request.data, timeout: 20))
-        if info.url == nil || info.encrypted {
-            SteamLog.event("[steam-cloud] app=\(appID) no address for file=\(entry.path) host=\(info.host.isEmpty ? "-" : info.host) path=\(info.path.isEmpty ? 0 : 1) size=\(info.fileSize)/\(info.rawSize) list-size=\(entry.cloudSize) encrypted=\(info.encrypted ? 1 : 0)")
+        request.writeUInt32(fieldNumber: 3, value: 1)                // realm: Steam global (as the Steam client sends it)
+        let (body, eresult) = try await session.callServiceMethodWithResult(method: .cloudClientFileDownload, body: request.data, timeout: 20)
+        let info = try SteamCloudDownloadInfo.parse(body)
+        if info.url == nil || info.encrypted || (eresult != 1 && eresult != 0) {
+            SteamLog.event("[steam-cloud] app=\(appID) no address for file=\(entry.path) eresult=\(eresult) body=\(body.count)B host=\(info.host.isEmpty ? "-" : info.host) path=\(info.path.isEmpty ? 0 : 1) size=\(info.fileSize)/\(info.rawSize) list-size=\(entry.cloudSize) encrypted=\(info.encrypted ? 1 : 0)")
+        }
+        if info.url == nil, eresult != 1, eresult != 0 {
+            throw SteamFileError.invalid("Steam refused the download of \(SteamCloudPaths.split(entry.path).rest) (Steam error \(eresult)).")
         }
         return try await SteamCloudTransfer.fetch(info, expectedSHA: entry.cloudSHA)
     }

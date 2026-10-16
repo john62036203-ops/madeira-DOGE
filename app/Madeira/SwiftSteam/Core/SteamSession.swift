@@ -544,6 +544,16 @@ class SteamSession {
         body: Data,
         timeout: TimeInterval = 10
     ) async throws -> Data {
+        try await callServiceMethodWithResult(method: method, body: body, timeout: timeout).body
+    }
+
+    /// The same call, also giving the response header's EResult (1 = OK): a
+    /// refused call comes back with an empty body and only this says why.
+    func callServiceMethodWithResult(
+        method: SteamServiceMethod,
+        body: Data,
+        timeout: TimeInterval = 10
+    ) async throws -> (body: Data, eresult: Int32) {
         resetIdleTimer()
         let jobID = nextJobID()
 
@@ -583,7 +593,7 @@ class SteamSession {
         if response.header.eresult != 1 {
             SteamLog.trace("\(method.rawValue) header eresult=\(response.header.eresult)")
         }
-        return response.body
+        return (response.body, Int32(truncatingIfNeeded: response.header.eresult))
     }
 
     /// Send a message without waiting for response
