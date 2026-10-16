@@ -2944,6 +2944,15 @@ static void ios_guest_branch_history_dump( const void *frame, uint64_t fault_rip
     }
 }
 
+/* madeira-doge: the same dump from the Mach exception thread, at an unhandled
+ * guest fault (signal_arm64_ios.c, with env.MADEIRA_FEX_BRANCH_HISTORY = 1):
+ * a game that shows its own crash dialog never terminates, so the termination
+ * path above never prints it (Monster Hunter Wilds demo, build 207). */
+void ios_guest_branch_history_report( const void *frame, uint64_t fault_rip, void *owner )
+{
+    ios_guest_branch_history_dump( frame, fault_rip, owner );
+}
+
 /* madeira-doge: the newest executed exit was a call through an import slot
  * (FF 15 / FF 25 disp32) that reached address 0 (MHR Sunbreak demo: a
  * D3D12CreateDevice-shaped call). Show the slot, its neighbours and the module

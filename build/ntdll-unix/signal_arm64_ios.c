@@ -5383,6 +5383,27 @@ skip_reclaim_band: ;
                                      "[rsp-trunc] x28=%p guest_rip=%p rsp=%p rsp_hi32=%s\n",
                                      (void *)st28, (void *)cs[0], (void *)rsp,
                                      (rsp >> 32) ? "set (64-bit)" : "ZERO (looks truncated)" );
+                            {   /* madeira-doge: the guest registers and the executed exits, at the fault */
+                                const char *bh = getenv( "MADEIRA_FEX_BRANCH_HISTORY" );
+                                uint64_t gr[16];
+                                mach_vm_size_t gg = 0;
+                                if (bh && bh[0] == '1' && rsp_n <= 2)
+                                {
+                                    extern void ios_guest_branch_history_report( const void *, uint64_t, void * );
+                                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(st28 + 0x20), sizeof(gr),
+                                                                (mach_vm_address_t)gr, &gg ) == KERN_SUCCESS && gg == sizeof(gr))
+                                        dprintf( STDERR_FILENO,
+                                                 "[guest-regs] rax=%llx rcx=%llx rdx=%llx rbx=%llx rsp=%llx rbp=%llx rsi=%llx rdi=%llx "
+                                                 "r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+                                                 (unsigned long long)gr[0], (unsigned long long)gr[1], (unsigned long long)gr[2],
+                                                 (unsigned long long)gr[3], (unsigned long long)gr[4], (unsigned long long)gr[5],
+                                                 (unsigned long long)gr[6], (unsigned long long)gr[7], (unsigned long long)gr[8],
+                                                 (unsigned long long)gr[9], (unsigned long long)gr[10], (unsigned long long)gr[11],
+                                                 (unsigned long long)gr[12], (unsigned long long)gr[13], (unsigned long long)gr[14],
+                                                 (unsigned long long)gr[15] );
+                                    ios_guest_branch_history_report( (const void *)st28, cs[0], ios_jit_current_peb() );
+                                }
+                            }
                             g = 0;
                             if (cs[0] && mach_vm_read_overwrite( mach_task_self(),
                                     (mach_vm_address_t)cs[0], sizeof(code),
