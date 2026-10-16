@@ -4156,6 +4156,31 @@ static void *ios_mach_exception_thread( void *arg )
                                         (unsigned long long)rw_addr, cas_width);
                         }
                     }
+                    /* madeira-doge: the same CAS family into an aliased page OUTSIDE the
+                     * pool -- a guest's own RWX memory that lives behind an anon JIT
+                     * alias. Monster Hunter Wilds' demo (build 206, 2026-10-16) ran
+                     * CASAL X8, X0, [X7] (0xc8e8fce0) on such a page at 0x14c7059a8:
+                     * the alias resolved, the store was left undone ([store-undecoded]),
+                     * and the game died a little later reading through a null pointer.
+                     * Only an aligned access whose address is Xn itself (CAS has no
+                     * offset) and whose RW alias is already known; the CAS is a real
+                     * atomic on the shared pages, as for the pool case above. */
+                    if (!emulated && !in_jit && rw_addr &&
+                        (insn & 0xbfa07c00u) == 0x88a07c00u)
+                    {
+                        unsigned cas_width = (insn & 0x40000000u) ? 8 : 4;
+                        int cas_rn = (insn >> 5) & 31;
+                        uint64_t cas_ea = cas_rn == 31 ? state.__sp : state.__x[cas_rn];
+                        int ok = !(fault_addr & (cas_width - 1)) && (uint64_t)fault_addr == cas_ea &&
+                                 ios_mach_emulate_cas(insn, rw_addr, state.__x);
+                        static unsigned cas_anon_logs;
+                        if (ok) emulated = 1;
+                        if (cas_anon_logs++ < 16)
+                            dprintf(STDERR_FILENO,
+                                    "[mach-cas] madeira-doge anon alias insn=%08x pc=%llx addr=%llx rw=%llx width=%u %s\n",
+                                    insn, (unsigned long long)fault_pc, (unsigned long long)fault_addr,
+                                    (unsigned long long)rw_addr, cas_width, ok ? "emulated" : "REFUSED (unaligned, offset or register)");
+                    }
                     /* ml350 DISCRIMINATOR: alias EXISTS but the instruction is not
                      * in this decode list — every such miss previously cost a full
                      * run to name (ml349's STRB-reg took one). Print the insn so
