@@ -5463,6 +5463,44 @@ skip_reclaim_band: ;
                                     }
                                 }
                             }
+                            /* madeira-doge: MADEIRA_DUMP_AT=addr[:len][,addr[:len]...] dumps guest memory
+                             * chosen by hand. The faulting instruction can be far past the block start
+                             * (MH Wilds: block 0x1498045a3, fault 0x149808412), and a fixed-base image
+                             * keeps its addresses from run to run. Up to 4 ranges, 16..4096 bytes each. */
+                            {
+                                const char *da = getenv( "MADEIRA_DUMP_AT" );
+                                int ranges = 0;
+                                while (da && *da && ranges < 4)
+                                {
+                                    char *end = NULL;
+                                    unsigned long long a = strtoull( da, &end, 16 ), len = 256;
+                                    if (end == da) break;
+                                    if (*end == ':') len = strtoull( end + 1, &end, 0 );
+                                    if (len < 16) len = 16;
+                                    if (len > 4096) len = 4096;
+                                    len = (len + 31) & ~31ull;
+                                    ranges++;
+                                    {
+                                        unsigned long long off;
+                                        for (off = 0; off < len; off += 32)
+                                        {
+                                            unsigned char row[32];
+                                            mach_vm_size_t gr2 = 0;
+                                            char hx[32 * 3 + 1]; int n = 0, c;
+                                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(a + off), sizeof(row),
+                                                    (mach_vm_address_t)row, &gr2 ) != KERN_SUCCESS || gr2 != sizeof(row))
+                                            {
+                                                dprintf( STDERR_FILENO, "[dump-at] %llx: UNREADABLE\n", a + off );
+                                                break;
+                                            }
+                                            for (c = 0; c < 32; c++) n += snprintf( hx + n, sizeof(hx) - n, "%02x ", row[c] );
+                                            dprintf( STDERR_FILENO, "[dump-at] %llx: %s\n", a + off, hx );
+                                        }
+                                    }
+                                    while (*end && *end != ',') end++;
+                                    da = *end ? end + 1 : end;
+                                }
+                            }
                             /* madeira-doge: the instruction BEFORE rip (the call that got here)
                              * and the top of the guest stack. Monster Hunter Rise (build 159, log
                              * 2026-10-07 14:03) ends on a branch to address 0 with rip just past a
