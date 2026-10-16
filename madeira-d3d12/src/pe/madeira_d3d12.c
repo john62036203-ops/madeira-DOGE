@@ -8805,7 +8805,9 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         u[8] = 1000000;   /* MaxViewDescriptorHeapSize */
         return S_OK;
     }
-    case 49: case 50: case 52:
+    /* 51 (BYTECODE_BYPASS_HASH_SUPPORTED) and 54 (TIGHT_ALIGNMENT, 1.716 SDKs): the Monster Hunter Wilds demo asks for 54 and
+     * crashed on a null read while setting up rendering soon after it was refused; answer "not supported" like the others. */
+    case 49: case 50: case 51: case 52: case 54:
         if (size < 4) return E_INVALIDARG;
         memset(data, 0, size);
         return S_OK;
