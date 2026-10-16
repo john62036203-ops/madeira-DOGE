@@ -9205,9 +9205,23 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
     return ret;
 }
 
+/* madeira-doge: env.MADEIRA_D3D12_RESTRACE = 1 logs what each ID3D12Resource
+ * method answered (first 3000 calls), to find the answer a game did not expect
+ * (Monster Hunter Wilds demo stops right after handing one of our resources to
+ * its own code, build 211). */
+static int mad_restrace(void) {
+    static int on = -1;
+    if (on < 0) { char v[4]; on = GetEnvironmentVariableA("MADEIRA_D3D12_RESTRACE", v, sizeof v) == 1 && v[0] == '1'; }
+    if (!on) return 0;
+    { static LONG n; return InterlockedIncrement(&n) <= 3000; }
+}
+
 static D3D12_RESOURCE_DESC1 * STDMETHODCALLTYPE res_GetDesc1(ID3D12Resource2 *This, D3D12_RESOURCE_DESC1 *ret) {
     memset(ret, 0, sizeof *ret);
     memcpy(ret, &((struct mad_resource *)This)->desc, sizeof(D3D12_RESOURCE_DESC));   /* DESC is a prefix of DESC1 */
+    if (mad_restrace())
+        d3d12_log("[restrace] %p GetDesc1 dim %u %llux%u fmt %u flags %#x\n", This, (unsigned)ret->Dimension,
+                  (unsigned long long)ret->Width, (unsigned)ret->Height, (unsigned)ret->Format, (unsigned)ret->Flags);
     return ret;
 }
 static HRESULT STDMETHODCALLTYPE res_GetHeapProperties(ID3D12Resource *This, D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS *flags) {
@@ -9218,10 +9232,14 @@ static HRESULT STDMETHODCALLTYPE res_GetHeapProperties(ID3D12Resource *This, D3D
         props->CreationNodeMask = 1; props->VisibleNodeMask = 1;
     }
     if (flags) *flags = D3D12_HEAP_FLAG_NONE;
+    if (mad_restrace()) d3d12_log("[restrace] %p GetHeapProperties type %u\n", This, props ? (unsigned)props->Type : 0u);
     return S_OK;
 }
 static D3D12_RESOURCE_DESC * STDMETHODCALLTYPE res_GetDesc(ID3D12Resource *This, D3D12_RESOURCE_DESC *ret) {
     *ret = ((struct mad_resource *)This)->desc;
+    if (mad_restrace())
+        d3d12_log("[restrace] %p GetDesc dim %u %llux%u fmt %u flags %#x\n", This, (unsigned)ret->Dimension,
+                  (unsigned long long)ret->Width, (unsigned)ret->Height, (unsigned)ret->Format, (unsigned)ret->Flags);
     return ret;
 }
 
@@ -10215,7 +10233,13 @@ static HRESULT STDMETHODCALLTYPE res_QI(ID3D12Resource *This, REFIID riid, void 
         *out = This;
         return S_OK;
     }
-    return mad_qi((struct mad_obj *)This, riid, out, 1);
+    {
+        HRESULT hr = mad_qi((struct mad_obj *)This, riid, out, 1);
+        if (mad_restrace() && riid)
+            d3d12_log("[restrace] %p QueryInterface {%08lx-%04x-%04x-...} -> %#lx\n", This, (unsigned long)riid->Data1,
+                      (unsigned)riid->Data2, (unsigned)riid->Data3, (unsigned long)hr);
+        return hr;
+    }
 }
 static ULONG STDMETHODCALLTYPE res_AddRef(ID3D12Resource *This) { return mad_addref((struct mad_obj *)This); }
 static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
@@ -10297,10 +10321,12 @@ static HRESULT STDMETHODCALLTYPE res_Map(ID3D12Resource *This, UINT sub,
                       r->texture ? "TEXTURE" : "buffer", sub, r->name ? r->name : "?",
                       (unsigned)r->width, (unsigned)r->height);
         if (data) *data = NULL;
+        if (mad_restrace()) d3d12_log("[restrace] %p Map sub %u -> E_INVALIDARG, NULL\n", This, sub);
         return E_INVALIDARG;
     }
     InterlockedIncrement(&r->mapped);
     if (data) *data = r->cpu;
+    if (mad_restrace()) d3d12_log("[restrace] %p Map sub %u -> %p\n", This, sub, r->cpu);
     return S_OK;
 }
 static void STDMETHODCALLTYPE res_Unmap(ID3D12Resource *This, UINT sub, const D3D12_RANGE *written) {
@@ -10312,6 +10338,7 @@ static D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE res_GetGPUVirtualAddress(ID3D
     struct mad_resource *r = (struct mad_resource *)This;
     /* Deliberately the backend's own address. The design warns against putting
      * synthetic guest addresses where the GPU will dereference them. */
+    if (mad_restrace()) d3d12_log("[restrace] %p GetGPUVirtualAddress -> %#llx\n", This, (unsigned long long)r->gpu_address);
     return (D3D12_GPU_VIRTUAL_ADDRESS)r->gpu_address;
 }
 
@@ -16331,7 +16358,32 @@ static HRESULT mad_child_get_device(struct mad_device *d, REFIID riid, void **ou
     return d->vtbl->QueryInterface((ID3D12Device10 *)d, riid, out);
 }
 static HRESULT STDMETHODCALLTYPE res_GetDevice(ID3D12Resource2 *This, REFIID riid, void **out) {
-    return mad_child_get_device(((struct mad_resource *)This)->owner, riid, out);
+    HRESULT hr = mad_child_get_device(((struct mad_resource *)This)->owner, riid, out);
+    if (mad_restrace()) d3d12_log("[restrace] %p GetDevice -> %#lx %p\n", This, (unsigned long)hr, out ? *out : NULL);
+    return hr;
+}
+/* madeira-doge: the private-data trio, traced (MADEIRA_D3D12_RESTRACE); same storage as the stubs. */
+static HRESULT STDMETHODCALLTYPE res_GetPrivateData(ID3D12Resource2 *This, REFGUID g, UINT *n, void *d) {
+    UINT asked = n ? *n : 0;
+    HRESULT hr = mad_pd_get(This, g, n, d);
+    if (mad_restrace() && g)
+        d3d12_log("[restrace] %p GetPrivateData {%08lx-%04x-%04x-...} size %u->%u -> %#lx\n", This, (unsigned long)g->Data1,
+                  (unsigned)g->Data2, (unsigned)g->Data3, asked, n ? *n : 0, (unsigned long)hr);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE res_SetPrivateData(ID3D12Resource2 *This, REFGUID g, UINT n, const void *d) {
+    HRESULT hr = mad_pd_set(This, g, n, d);
+    if (mad_restrace() && g)
+        d3d12_log("[restrace] %p SetPrivateData {%08lx-%04x-%04x-...} size %u -> %#lx\n", This, (unsigned long)g->Data1,
+                  (unsigned)g->Data2, (unsigned)g->Data3, n, (unsigned long)hr);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE res_SetPrivateDataInterface(ID3D12Resource2 *This, REFGUID g, const IUnknown *i) {
+    HRESULT hr = mad_pd_set_iface(This, g, i);
+    if (mad_restrace() && g)
+        d3d12_log("[restrace] %p SetPrivateDataInterface {%08lx-%04x-%04x-...} %p -> %#lx\n", This, (unsigned long)g->Data1,
+                  (unsigned)g->Data2, (unsigned)g->Data3, i, (unsigned long)hr);
+    return hr;
 }
 static HRESULT STDMETHODCALLTYPE list_GetDevice(ID3D12GraphicsCommandList *This, REFIID riid, void **out) {
     return mad_child_get_device(((struct mad_list *)This)->device, riid, out);
@@ -16521,6 +16573,9 @@ static void build_vtables(void) {
     g_res_vtbl.GetGPUVirtualAddress = (void *)res_GetGPUVirtualAddress;
     g_res_vtbl.GetDesc = (void *)res_GetDesc;
     g_res_vtbl.GetHeapProperties = (void *)res_GetHeapProperties;
+    g_res_vtbl.GetPrivateData = res_GetPrivateData;                     /* madeira-doge: traced */
+    g_res_vtbl.SetPrivateData = res_SetPrivateData;
+    g_res_vtbl.SetPrivateDataInterface = res_SetPrivateDataInterface;
 
     madeira_fill_ID3D12GraphicsCommandList7(&g_list_vtbl);
     g_list_vtbl.GetDevice = (void *)list_GetDevice;
