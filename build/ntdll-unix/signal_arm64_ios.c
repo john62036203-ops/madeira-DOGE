@@ -5463,38 +5463,97 @@ skip_reclaim_band: ;
                                     }
                                 }
                             }
-                            /* madeira-doge: MADEIRA_DUMP_AT=addr[:len][,addr[:len]...] dumps guest memory
+                            /* madeira-doge: MADEIRA_DUMP_AT=[*...]addr[+off][:len][,...] dumps guest memory
                              * chosen by hand. The faulting instruction can be far past the block start
                              * (MH Wilds: block 0x1498045a3, fault 0x149808412), and a fixed-base image
-                             * keeps its addresses from run to run. Up to 4 ranges, 16..4096 bytes each. */
+                             * keeps its addresses from run to run. Each leading '*' reads the pointer
+                             * stored at the address first (a per-class static such as a type-info
+                             * pointer), '+off' is added after the last read, and a dereferenced range
+                             * also shows 0x40 bytes behind each pointer-like qword in its first 0x40
+                             * (name strings). Up to 8 ranges, 16..65536 bytes each, hex and ASCII. */
                             {
                                 const char *da = getenv( "MADEIRA_DUMP_AT" );
                                 int ranges = 0;
-                                while (da && *da && ranges < 4)
+                                while (da && *da && ranges < 8)
                                 {
                                     char *end = NULL;
-                                    unsigned long long a = strtoull( da, &end, 16 ), len = 256;
+                                    int derefs = 0, bad = 0;
+                                    unsigned long long a, len = 256, plus = 0;
+                                    while (*da == '*') { derefs++; da++; }
+                                    a = strtoull( da, &end, 16 );
                                     if (end == da) break;
+                                    if (*end == '+') plus = strtoull( end + 1, &end, 16 );
                                     if (*end == ':') len = strtoull( end + 1, &end, 0 );
                                     if (len < 16) len = 16;
-                                    if (len > 4096) len = 4096;
+                                    if (len > 65536) len = 65536;
                                     len = (len + 31) & ~31ull;
                                     ranges++;
                                     {
-                                        unsigned long long off;
+                                        int d;
+                                        for (d = 0; d < derefs; d++)
+                                        {
+                                            unsigned long long v = 0;
+                                            mach_vm_size_t gd = 0;
+                                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)a, 8,
+                                                    (mach_vm_address_t)&v, &gd ) != KERN_SUCCESS || gd != 8)
+                                            {
+                                                dprintf( STDERR_FILENO, "[dump-at] *%llx: UNREADABLE\n", a );
+                                                bad = 1;
+                                                break;
+                                            }
+                                            dprintf( STDERR_FILENO, "[dump-at] *%llx = %llx\n", a, v );
+                                            a = v;
+                                        }
+                                    }
+                                    if (!bad)
+                                    {
+                                        unsigned long long off, ptrs[8];
+                                        int nptr = 0;
+                                        a += plus;
                                         for (off = 0; off < len; off += 32)
                                         {
                                             unsigned char row[32];
                                             mach_vm_size_t gr2 = 0;
-                                            char hx[32 * 3 + 1]; int n = 0, c;
+                                            char hx[32 * 3 + 1], as[33]; int n = 0, c;
                                             if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(a + off), sizeof(row),
                                                     (mach_vm_address_t)row, &gr2 ) != KERN_SUCCESS || gr2 != sizeof(row))
                                             {
                                                 dprintf( STDERR_FILENO, "[dump-at] %llx: UNREADABLE\n", a + off );
                                                 break;
                                             }
-                                            for (c = 0; c < 32; c++) n += snprintf( hx + n, sizeof(hx) - n, "%02x ", row[c] );
-                                            dprintf( STDERR_FILENO, "[dump-at] %llx: %s\n", a + off, hx );
+                                            for (c = 0; c < 32; c++)
+                                            {
+                                                n += snprintf( hx + n, sizeof(hx) - n, "%02x ", row[c] );
+                                                as[c] = (row[c] >= 32 && row[c] < 127) ? (char)row[c] : '.';
+                                            }
+                                            as[32] = 0;
+                                            dprintf( STDERR_FILENO, "[dump-at] %llx: %s |%s|\n", a + off, hx, as );
+                                            if (derefs && off < 0x40)
+                                                for (c = 0; c < 32 && nptr < 8; c += 8)
+                                                {
+                                                    unsigned long long q;
+                                                    memcpy( &q, row + c, 8 );
+                                                    if (q >= 0x10000 && q < 0x800000000000ull) ptrs[nptr++] = q;
+                                                }
+                                        }
+                                        {   /* behind each pointer-like qword: 0x40 bytes, for name strings */
+                                            int k;
+                                            for (k = 0; k < nptr; k++)
+                                            {
+                                                unsigned char row[64];
+                                                mach_vm_size_t gr3 = 0;
+                                                char hx[64 * 3 + 1], as[65]; int n = 0, c;
+                                                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)ptrs[k], sizeof(row),
+                                                        (mach_vm_address_t)row, &gr3 ) != KERN_SUCCESS || gr3 != sizeof(row))
+                                                    continue;
+                                                for (c = 0; c < 64; c++)
+                                                {
+                                                    n += snprintf( hx + n, sizeof(hx) - n, "%02x ", row[c] );
+                                                    as[c] = (row[c] >= 32 && row[c] < 127) ? (char)row[c] : '.';
+                                                }
+                                                as[64] = 0;
+                                                dprintf( STDERR_FILENO, "[dump-at-ptr] %llx: %s |%s|\n", ptrs[k], hx, as );
+                                            }
                                         }
                                     }
                                     while (*end && *end != ',') end++;

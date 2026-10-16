@@ -8815,7 +8815,12 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         UINT *u = data;
         if (size < 16) return E_INVALIDARG;
         memset(data, 0, size);
-        u[1] = 10;        /* D3D12_EXECUTE_INDIRECT_TIER_1_0; work graphs not supported */
+        /* D3D12_FEATURE_DATA_D3D12_OPTIONS21 = { ExecuteIndirectTier, WorkGraphsTier,
+         * SampleCmpGradientAndBiasSupported, ExtendedCommandInfoSupported }. The
+         * tier 1.0 belongs in u[0]: u[1] = 10 claimed WORK_GRAPHS_TIER_1_0, which
+         * this runtime has no CreateStateObject / DispatchGraph for. */
+        u[0] = 10;        /* D3D12_EXECUTE_INDIRECT_TIER_1_0 (the baseline every device has) */
+        u[1] = 0;         /* D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED */
         return S_OK;
     }
     default: {
