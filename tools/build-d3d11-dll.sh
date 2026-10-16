@@ -173,6 +173,7 @@ python3 "$R/tools/patch-dxmt-context-state-swap.py" "$OUT/tree/src/d3d11" || fai
 mkdir -p "$OUT/tree/src/dxmt"
 cp "$D/src/dxmt/dxmt_dynamic.cpp" "$OUT/tree/src/dxmt/"
 python3 "$R/tools/patch-dxmt-dyn-trim-switch.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-dyn-trim-switch.py did not apply"
+python3 "$R/tools/patch-dxmt-dyn-front-walk.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-dyn-front-walk.py did not apply"
 grep -q "madeira-bcd: context state swap" "$OUT/tree/src/d3d11/d3d11_context_impl.cpp" || fail "the swap patch left d3d11_context_impl.cpp unchanged"
 
 # DXMT's meson.build: compiler_args, the project defines, buildtype=release
