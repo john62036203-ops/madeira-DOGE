@@ -727,11 +727,18 @@ final class SteamOwnedLibrary: ObservableObject {
     /// One cloud file's bytes, checked against the SHA-1 of the comparison:
     /// a file that changed in the cloud since then throws.
     private func cloudFile(_ appID: Int, _ entry: SteamCloudEntry) async throws -> Data {
+        // An empty file in the cloud has nothing to fetch, and Steam gives no
+        // address for one: its bytes are known.
+        let empty = Data(Insecure.SHA1.hash(data: Data()))
+        if entry.cloudSize == 0, entry.cloudSHA.isEmpty || entry.cloudSHA == empty { return Data() }
         var request = ProtobufEncoder()
         request.writeUInt32(fieldNumber: 1, value: UInt32(appID))    // appid
         request.writeString(fieldNumber: 2, value: entry.path)       // filename
         let info = try SteamCloudDownloadInfo.parse(
             try await session.callServiceMethod(method: .cloudClientFileDownload, body: request.data, timeout: 20))
+        if info.url == nil || info.encrypted {
+            SteamLog.event("[steam-cloud] app=\(appID) no address for file=\(entry.path) host=\(info.host.isEmpty ? "-" : info.host) path=\(info.path.isEmpty ? 0 : 1) size=\(info.fileSize)/\(info.rawSize) list-size=\(entry.cloudSize) encrypted=\(info.encrypted ? 1 : 0)")
+        }
         return try await SteamCloudTransfer.fetch(info, expectedSHA: entry.cloudSHA)
     }
 
