@@ -5402,6 +5402,33 @@ skip_reclaim_band: ;
                                                  (unsigned long long)gr[12], (unsigned long long)gr[13], (unsigned long long)gr[14],
                                                  (unsigned long long)gr[15] );
                                     ios_guest_branch_history_report( (const void *)st28, cs[0], ios_jit_current_peb() );
+                                    {   /* madeira-doge: the guest registers as they are NOW (the
+                                         * ARM64EC mapping FEX keeps them in; the frame above holds
+                                         * the last synced copy), and for each callee-saved one that
+                                         * looks like an object: its vtable and vtable slot 17
+                                         * (+0x88), the slot the Wilds fault had just called. */
+                                        static const struct { const char *n; int x; } map[] = {
+                                            {"rax",8},{"rcx",0},{"rdx",1},{"rbx",27},{"rbp",29},{"rsi",25},{"rdi",26},
+                                            {"r8",2},{"r9",3},{"r10",4},{"r11",5},{"r12",19},{"r13",20},{"r14",21},{"r15",22} };
+                                        char line[512];
+                                        int n = 0;
+                                        unsigned k;
+                                        for (k = 0; k < sizeof(map) / sizeof(map[0]) && n < (int)sizeof(line) - 40; k++)
+                                            n += snprintf( line + n, sizeof(line) - n, " %s=%llx", map[k].n,
+                                                           (unsigned long long)(map[k].x == 29 ? state.__fp : state.__x[map[k].x]) );
+                                        dprintf( STDERR_FILENO, "[guest-regs-live] rsp=%llx%s\n", (unsigned long long)state.__sp, line );
+                                        for (k = 0; k < sizeof(map) / sizeof(map[0]); k++)
+                                        {
+                                            uint64_t v = map[k].x == 29 ? state.__fp : state.__x[map[k].x], vt = 0, slot = 0;
+                                            mach_vm_size_t g1 = 0, g2 = 0;
+                                            if (v < 0x100000000ull || (v & 7)) continue;
+                                            if (mach_vm_read_overwrite( mach_task_self(), v, 8, (mach_vm_address_t)&vt, &g1 ) != KERN_SUCCESS || g1 != 8) continue;
+                                            if (vt < 0x100000000ull || (vt & 7)) continue;
+                                            if (mach_vm_read_overwrite( mach_task_self(), vt + 0x88, 8, (mach_vm_address_t)&slot, &g2 ) != KERN_SUCCESS || g2 != 8) continue;
+                                            dprintf( STDERR_FILENO, "[guest-obj] %s=%llx vtable=%llx slot17=%llx\n", map[k].n,
+                                                     (unsigned long long)v, (unsigned long long)vt, (unsigned long long)slot );
+                                        }
+                                    }
                                 }
                             }
                             g = 0;
