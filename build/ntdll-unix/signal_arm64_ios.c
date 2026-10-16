@@ -5443,6 +5443,26 @@ skip_reclaim_band: ;
                                          code[8],code[9],code[10],code[11],code[12],code[13],code[14],code[15] );
                             else
                                 dprintf( STDERR_FILENO, "[rsp-trunc]   x86 @rip UNREADABLE\n" );
+                            /* madeira-doge: a wider window of the code that was running. rip is the
+                             * block START (FEX syncs it per block), so the faulting instruction is
+                             * somewhere after it; 16 bytes rarely reach it (MH Wilds, build 212).
+                             * 32 bytes before and 224 after, read from the running process. */
+                            {
+                                unsigned char win[256];
+                                mach_vm_size_t gw = 0;
+                                if (cs[0] > 32 && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(cs[0] - 32),
+                                        sizeof(win), (mach_vm_address_t)win, &gw ) == KERN_SUCCESS && gw == sizeof(win))
+                                {
+                                    int r, c;
+                                    for (r = 0; r < 8; r++)
+                                    {
+                                        char hx[32 * 3 + 1]; int n = 0;
+                                        for (c = 0; c < 32; c++) n += snprintf( hx + n, sizeof(hx) - n, "%02x ", win[r * 32 + c] );
+                                        dprintf( STDERR_FILENO, "[code-win] %llx: %s\n",
+                                                 (unsigned long long)(cs[0] - 32 + r * 32), hx );
+                                    }
+                                }
+                            }
                             /* madeira-doge: the instruction BEFORE rip (the call that got here)
                              * and the top of the guest stack. Monster Hunter Rise (build 159, log
                              * 2026-10-07 14:03) ends on a branch to address 0 with rip just past a
@@ -5481,6 +5501,22 @@ skip_reclaim_band: ;
                                                  "[rsp-trunc]   call before stack top %llx: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                                                  (unsigned long long)stk[0],
                                                  cb[0],cb[1],cb[2],cb[3],cb[4],cb[5],cb[6],cb[7] );
+                                        {   /* madeira-doge: the caller around that return address, 128 before / 32 after */
+                                            unsigned char cw[160];
+                                            mach_vm_size_t gc = 0;
+                                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(stk[0] - 128),
+                                                    sizeof(cw), (mach_vm_address_t)cw, &gc ) == KERN_SUCCESS && gc == sizeof(cw))
+                                            {
+                                                int r, c;
+                                                for (r = 0; r < 5; r++)
+                                                {
+                                                    char hx[32 * 3 + 1]; int n = 0;
+                                                    for (c = 0; c < 32; c++) n += snprintf( hx + n, sizeof(hx) - n, "%02x ", cw[r * 32 + c] );
+                                                    dprintf( STDERR_FILENO, "[caller-win] %llx: %s\n",
+                                                             (unsigned long long)(stk[0] - 128 + r * 32), hx );
+                                                }
+                                            }
+                                        }
                                         if (cb[2] == 0xff && cb[3] == 0x15)
                                         {
                                             int32_t disp = (int32_t)((uint32_t)cb[4] | ((uint32_t)cb[5] << 8) |
