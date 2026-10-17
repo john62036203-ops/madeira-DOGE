@@ -1371,6 +1371,18 @@ static void *ios_pool_warmer_thread( void *arg )
                                                 (vm_region_recurse_info_t)&info, &icnt ) != KERN_SUCCESS)
                         break;
                     if (info.is_submap) { rdepth++; continue; }
+                    /* madeira-doge: on iOS 27's 512 GB map nothing sits at the top of
+                     * the first 64 GB, so the run from the last low region up to 64 GB
+                     * is free too; count it once (iOS 26's 63 GB map had a region at
+                     * its top, which made that gap count by itself). */
+                    if (raddr >= 0x1000000000ULL && hole_prev_end && hole_prev_end < 0x1000000000ULL)
+                    {
+                        unsigned long long gap = 0x1000000000ULL - hole_prev_end;
+                        hole_total += gap;
+                        if (gap > hole_max) hole_max = gap;
+                        if (gap >= 0x20000) { hole_count++; if (!hole_first_ok) { hole_first_ok = hole_prev_end; hole_first_ok_size = gap; } }
+                        hole_prev_end = 0x1000000000ULL;
+                    }
                     if (raddr < 0x1000000000ULL && raddr > hole_prev_end && hole_prev_end)
                     {
                         unsigned long long gap = raddr - hole_prev_end;

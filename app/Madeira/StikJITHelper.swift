@@ -495,7 +495,22 @@ enum StikJITHelper {
                         vm_region_64(mach_task_self_, &addr, &rsize, VM_REGION_BASIC_INFO_64, $0, &cnt, &obj)
                     }
                 }
-                if kr != KERN_SUCCESS { break }
+                if kr != KERN_SUCCESS {
+                    // madeira-doge (iOS 27): KERN_INVALID_ADDRESS here means NOTHING is
+                    // mapped from `addr` to the top of the task map, so the rest of the
+                    // range is one free run. iOS 26's 63 GB map always had a region at
+                    // its top, so the walk never ended this way; iOS 27's 512 GB map has
+                    // nothing above the dyld shared region at the pool request (the FEX
+                    // arena and the guest band come later), and `break` dropped the only
+                    // hole that fits -- "no hole fits a 1152MB pool -- SHRINKING to 288MB"
+                    // on every launch (log 2026-10-18 00:48).
+                    if vm_address_t(guestLo) > prevEnd && vm_address_t(guestLo) - prevEnd >= 64 << 20 {
+                        holes.append((prevEnd, vm_address_t(guestLo) - prevEnd))
+                        LogStore.shared.log(String(format: "ml1036: madeira-doge: the region walk ended at 0x%lx (kr=%d, nothing mapped above); the rest up to 0x%lx is free",
+                                                   Int(prevEnd), kr, guestLo))
+                    }
+                    break
+                }
                 let start = min(addr, vm_address_t(guestLo))
                 if start > prevEnd && start - prevEnd >= 64 << 20 { holes.append((prevEnd, start - prevEnd)) }
                 prevEnd = max(prevEnd, addr + vm_address_t(rsize))
@@ -504,6 +519,29 @@ enum StikJITHelper {
             let desc = holes.map { String(format: "0x%lx+%luMB", Int($0.base), Int($0.size >> 20)) }.joined(separator: " ")
             LogStore.shared.log("ml1036: free holes >=64MB in [0x119000000,0x7000000000) with the window held: "
                 + (desc.isEmpty ? "NONE" : desc))
+            // madeira-doge: what sits above the executable window, so a shrunken pool
+            // can be explained from the log (regions >= 64 MB, with their VM tag).
+            do {
+                var a = vm_address_t(exeWinBase + exeWinSize), shown = 0, lines: [String] = []
+                while a < vm_address_t(guestLo) && shown < 24 {
+                    var rsize: vm_size_t = 0
+                    var ext = vm_region_extended_info_data_t()
+                    var cnt = mach_msg_type_number_t(MemoryLayout<vm_region_extended_info_data_t>.size / MemoryLayout<Int32>.size)
+                    var obj: mach_port_t = 0
+                    let kr = withUnsafeMutablePointer(to: &ext) {
+                        $0.withMemoryRebound(to: Int32.self, capacity: Int(cnt)) {
+                            vm_region_64(mach_task_self_, &a, &rsize, VM_REGION_EXTENDED_INFO, $0, &cnt, &obj)
+                        }
+                    }
+                    if kr != KERN_SUCCESS || a >= vm_address_t(guestLo) { break }
+                    if rsize >= 64 << 20 {
+                        lines.append(String(format: "0x%lx+%luMB tag%u prot%d share%d", Int(a), Int(rsize >> 20), ext.user_tag, Int(ext.protection), Int(ext.share_mode)))
+                        shown += 1
+                    }
+                    a += vm_address_t(rsize)
+                }
+                LogStore.shared.log("ml1036: madeira-doge regions >=64MB above the window: " + (lines.isEmpty ? "none" : lines.joined(separator: " ")))
+            }
             let largest = holes.map { $0.size }.max() ?? 0
             // madeira-bcd pool-pair (pool-split only): two runs ABOVE the window, split
             // only by the main thread's stack, can beat the largest single run when that
