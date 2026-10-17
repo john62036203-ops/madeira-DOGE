@@ -5560,6 +5560,74 @@ skip_reclaim_band: ;
                                     da = *end ? end + 1 : end;
                                 }
                             }
+                            /* madeira-doge: MADEIRA_SCAN_DISP=138[,1b8...] with MADEIRA_SCAN_RANGE=start:len
+                             * (hex) scans that guest code range, at the fault, for x86 instructions that
+                             * address [reg+disp32] with one of those displacements: byte/dword stores
+                             * (88, 89, C6, C7), the 80/81/83 arithmetic group (or/and/cmp) and 0F B6/B7
+                             * loads. The game's own writers of a flag at a known offset are found that
+                             * way although the executable's code is encrypted on disk. 128 hits, with
+                             * 16 bytes before and 24 after. */
+                            {
+                                const char *sd = getenv( "MADEIRA_SCAN_DISP" ), *sr = getenv( "MADEIRA_SCAN_RANGE" );
+                                if (sd && *sd && sr && *sr)
+                                {
+                                    static unsigned char buf[65536 + 64];
+                                    unsigned int disps[8]; int nd = 0, hits = 0;
+                                    char *e = NULL;
+                                    unsigned long long start = strtoull( sr, &e, 16 ), total = 0, pos;
+                                    if (*e == ':') total = strtoull( e + 1, &e, 16 );
+                                    while (*sd && nd < 8)
+                                    {
+                                        char *e2;
+                                        unsigned long long d = strtoull( sd, &e2, 16 );
+                                        if (e2 == sd) break;
+                                        disps[nd++] = (unsigned int)d;
+                                        sd = (*e2 == ',') ? e2 + 1 : e2;
+                                    }
+                                    dprintf( STDERR_FILENO, "[scan-disp] range %llx+%llx disps=%d\n", start, total, nd );
+                                    for (pos = 0; pos + 64 < total && hits < 128; pos += 65536)
+                                    {
+                                        unsigned long long want = total - pos < sizeof(buf) ? total - pos : sizeof(buf);
+                                        mach_vm_size_t got = 0;
+                                        unsigned long long i, n;
+                                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(start + pos), want,
+                                                (mach_vm_address_t)buf, &got ) != KERN_SUCCESS || got < 16) continue;
+                                        n = got > 65536 ? 65536 : got - 8;
+                                        for (i = 0; i < n && hits < 128; i++)
+                                        {
+                                            unsigned char op = buf[i], modrm; unsigned long long m; int two = 0, k, hit = 0;
+                                            unsigned int disp;
+                                            if (op == 0x0f) { if (i + 1 >= got || (buf[i+1] != 0xb6 && buf[i+1] != 0xb7)) continue; two = 1; }
+                                            else if (op != 0x88 && op != 0x89 && op != 0xc6 && op != 0xc7 &&
+                                                     op != 0x80 && op != 0x81 && op != 0x83 && op != 0x8a && op != 0x8b) continue;
+                                            m = i + 1 + two;
+                                            if (m + 5 > got) continue;
+                                            modrm = buf[m];
+                                            if ((modrm & 0xc0) != 0x80) continue;          /* mod=10: [reg+disp32] */
+                                            if ((modrm & 7) == 4) m++;                      /* SIB */
+                                            if (m + 5 > got) continue;
+                                            disp = (unsigned int)buf[m+1] | ((unsigned int)buf[m+2] << 8) |
+                                                   ((unsigned int)buf[m+3] << 16) | ((unsigned int)buf[m+4] << 24);
+                                            for (k = 0; k < nd; k++) if (disp == disps[k]) hit = 1;
+                                            if (!hit) continue;
+                                            {
+                                                char hx[40 * 3 + 1]; int c, nn = 0;
+                                                long long b0 = (long long)i - 16;
+                                                for (c = 0; c < 40; c++)
+                                                {
+                                                    long long at = b0 + c;
+                                                    if (at < 0 || (unsigned long long)at >= got) nn += snprintf( hx + nn, sizeof(hx) - nn, "?? " );
+                                                    else nn += snprintf( hx + nn, sizeof(hx) - nn, "%02x ", buf[at] );
+                                                }
+                                                dprintf( STDERR_FILENO, "[scan-disp] %llx op=%02x%s disp=%x: %s\n",
+                                                         start + pos + i, op, two ? "(0f)" : "", disp, hx );
+                                                hits++;
+                                            }
+                                        }
+                                    }
+                                    dprintf( STDERR_FILENO, "[scan-disp] done, %d hit(s)\n", hits );
+                                }
+                            }
                             /* madeira-doge: the instruction BEFORE rip (the call that got here)
                              * and the top of the guest stack. Monster Hunter Rise (build 159, log
                              * 2026-10-07 14:03) ends on a branch to address 0 with rip just past a
