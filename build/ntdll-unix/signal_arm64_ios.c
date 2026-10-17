@@ -2528,7 +2528,14 @@ static void *ios_mach_exception_thread( void *arg )
                         {
                         /* unsigned-offset immediate loads, base x18 */
                         case 0xf9400000: /* LDR Xt */
-                            if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
+                            /* willfaust/Madeira 10c7781: the x18 patcher's "via x18" trampoline
+                             * (mrs x18 / and / ldr x18,[x18,#slot] / insn) preempted before its
+                             * ldr: that ldr reads the TSD slot holding the TEB, so x18 gets the
+                             * TEB itself, not the TEB field at the slot's offset. */
+                            if (rt == 18 && rn == 18 && ios_teb_tls_slot_offset &&
+                                fault_addr == (uintptr_t)ios_teb_tls_slot_offset)
+                                state.__x[18] = thread_teb;
+                            else if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
                             emulated = 1; break;
                         case 0xb9400000: /* LDR Wt (zero-extend) */
                             if (rt != 31) state.__x[rt] = *(uint32_t *)ea;
@@ -2538,6 +2545,26 @@ static void *ios_mach_exception_thread( void *arg )
                             emulated = 1; break;
                         case 0x79400000: /* LDRH Wt */
                             if (rt != 31) state.__x[rt] = *(uint16_t *)ea;
+                            emulated = 1; break;
+                        /* madeira-doge (iOS 27.0.1, log 2026-10-18 01:09): the signed
+                         * unsigned-offset loads were missing. steamwebhelper.exe's WoW64
+                         * thread died on `ldrsw x8, [x18, #0x180c]` (b9980e48) with x18
+                         * zeroed -- "[x18-emul3] UNRECOGNIZED" -- and took MH World's
+                         * session with it. Same ea as the loads above; sign-extend. */
+                        case 0xb9800000: /* LDRSW Xt */
+                            if (rt != 31) state.__x[rt] = (uint64_t)(int64_t)*(int32_t *)ea;
+                            emulated = 1; break;
+                        case 0x39800000: /* LDRSB Xt */
+                            if (rt != 31) state.__x[rt] = (uint64_t)(int64_t)*(int8_t *)ea;
+                            emulated = 1; break;
+                        case 0x39c00000: /* LDRSB Wt */
+                            if (rt != 31) state.__x[rt] = (uint32_t)(int32_t)*(int8_t *)ea;
+                            emulated = 1; break;
+                        case 0x79800000: /* LDRSH Xt */
+                            if (rt != 31) state.__x[rt] = (uint64_t)(int64_t)*(int16_t *)ea;
+                            emulated = 1; break;
+                        case 0x79c00000: /* LDRSH Wt */
+                            if (rt != 31) state.__x[rt] = (uint32_t)(int32_t)*(int16_t *)ea;
                             emulated = 1; break;
                         /* unsigned-offset immediate stores, base x18 */
                         case 0xf9000000: /* STR Xt */
