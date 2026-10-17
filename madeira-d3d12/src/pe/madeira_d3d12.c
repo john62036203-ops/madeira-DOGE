@@ -457,6 +457,7 @@ static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml106
  * keep their Metal buffer after release (heap_Release). Live, peak and released bytes. */
 static volatile LONG64 g_aheap_bytes, g_aheap_peak, g_aheap_freed; static volatile LONG g_aheap_n, g_aheap_made;
 static volatile LONG64 g_dheap_bytes, g_dheap_kept_bytes; static volatile LONG g_dheap_n, g_dheap_kept;
+static volatile LONG g_lheap_n; static volatile LONG64 g_lheap_bytes;   /* madeira-doge: heaps whose Metal backing is still deferred */
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
 static void mad_resident(struct mad_device *d, obj_handle_t h) {
@@ -727,10 +728,10 @@ static void mad_acct_report(void) {
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
     d3d12_log("[madeira-d3d12] ml1060 shader libraries created: %ld, %lld MB of metallib (one per pipeline STAGE, never shared "
               "between pipelines)\n", g_lib_count, (long long)(g_lib_bytes >> 20));
-    d3d12_log("[madeira-d3d12] madeira-doge app heaps (Metal placement heaps, NOT in ml1057): %ld live, %lld MB (peak %lld MB), "
+    d3d12_log("[madeira-d3d12] madeira-doge app heaps (Metal placement heaps, NOT in ml1057): %ld live, %lld MB (peak %lld MB), %ld unbacked %lld MB (heap-lazy), "
               "%ld created, %lld MB released by the game, %u released awaiting GPU; shader-visible descriptor heaps: %ld live %lld MB, "
               "%ld released but kept %lld MB; ml1057 + these = %lld MB\n",
-              g_aheap_n, (long long)(g_aheap_bytes >> 20), (long long)(g_aheap_peak >> 20), g_aheap_made,
+              g_aheap_n, (long long)(g_aheap_bytes >> 20), (long long)(g_aheap_peak >> 20), g_lheap_n, (long long)(g_lheap_bytes >> 20), g_aheap_made,
               (long long)(g_aheap_freed >> 20), g_hp_dev ? g_hp_dev->nmhret : 0u, g_dheap_n, (long long)(g_dheap_bytes >> 20),
               g_dheap_kept, (long long)(g_dheap_kept_bytes >> 20),
               (long long)((tot + g_aheap_bytes + g_dheap_bytes + g_dheap_kept_bytes) >> 20));
@@ -10474,9 +10475,41 @@ struct mad_memheap {
     struct mad_device *device;
     D3D12_HEAP_DESC desc;
     obj_handle_t mtl;   /* ml1145: the Metal placement heap, or 0 */
+    int lazy;           /* madeira-doge heap-lazy: backing deferred to the first placement; 0 once tried */
     SRWLOCK pl_lock; struct mad_resource **pl; unsigned npl, pl_cap; unsigned serial;   /* madeira-bcd: what is placed in it */
 };
 static LONG g_res_serial, g_heap_serial;
+/* madeira-doge: madeira.cfg heap-lazy = 1 (default). A DEFAULT heap gets its
+ * Metal placement heap at its FIRST placed resource, not at CreateHeap. A Metal
+ * heap is charged to the footprint in full the moment it exists, and RE Engine
+ * (MH Wilds demo) creates dozens of 16 MB pool heaps up front that it fills
+ * only as the pools are used, so the ones nothing is placed in cost nothing.
+ * Placements are unchanged: a backed heap is the full size the application
+ * asked for, so resources alias exactly as before. heap-lazy = 0 restores
+ * backing at CreateHeap. */
+static void mad_memheap_back(struct mad_memheap *h) {
+    struct mad_device *hd = h->device;
+    static unsigned said;
+    if (!h->lazy) return;
+    EnterCriticalSection(&hd->heap_lock);
+    if (h->lazy) {
+        h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, h->desc.SizeInBytes, WMTResourceStorageModePrivate);
+        h->lazy = 0;
+        InterlockedDecrement(&g_lheap_n); InterlockedExchangeAdd64(&g_lheap_bytes, -(LONG64)h->desc.SizeInBytes);
+        if (h->mtl) {
+            LONG64 now = InterlockedExchangeAdd64(&g_aheap_bytes, (LONG64)h->desc.SizeInBytes) + (LONG64)h->desc.SizeInBytes;
+            if (now > g_aheap_peak) g_aheap_peak = now;
+            InterlockedIncrement(&g_aheap_n); InterlockedIncrement(&g_aheap_made);
+            mad_resident(hd, h->mtl);
+        }
+        if (said++ < 32 || !h->mtl)
+            d3d12_log("[madeira-d3d12] heap-lazy: heap%u %llu KB flags %#x %s at its first placement (%ld heaps, %lld MB still unbacked)\n",
+                      h->serial, (unsigned long long)(h->desc.SizeInBytes >> 10), (unsigned)h->desc.Flags,
+                      h->mtl ? "backed by a Metal placement heap" : "COULD NOT be backed; its resources stand alone",
+                      (long)g_lheap_n, (long long)(g_lheap_bytes >> 20));
+    }
+    LeaveCriticalSection(&hd->heap_lock);
+}
 /* madeira-bcd: placed-resource registry per heap, for the alias report. */
 static void mad_pl_add(struct mad_memheap *h, struct mad_resource *r) {
     AcquireSRWLockExclusive(&h->pl_lock);
@@ -10660,6 +10693,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                               (unsigned)ti.width, (unsigned)ti.height, (unsigned)ti.mipmap_level_count, (long)n, (long long)(saved >> 20));
             }
         }
+        if (ph && ph->lazy) mad_memheap_back(ph);   /* madeira-doge heap-lazy */
         if (ph && ph->mtl) {   /* ml1145: inside the application's heap, at its offset */
             UINT64 psz = 0, pal = 0;
             MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
@@ -10725,6 +10759,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * memory must be page aligned in both pointer and length). */
         info.options = heap_type == D3D12_HEAP_TYPE_DEFAULT ? WMTResourceStorageModePrivate : WMTResourceStorageModeShared;
         info.memory.ptr = NULL;
+        if (ph && ph->lazy && heap_type == D3D12_HEAP_TYPE_DEFAULT) mad_memheap_back(ph);   /* madeira-doge heap-lazy */
         if (ph && ph->mtl && heap_type == D3D12_HEAP_TYPE_DEFAULT) {   /* ml1145: inside the application's heap */
             UINT64 psz = 0, pal = 0;
             MTLDevice_heapBufferSizeAndAlign(d->mtl_device, info.length, info.options, &psz, &pal);
@@ -10854,6 +10889,7 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
         if (h->desc.Alignment == 4194304 && (h->desc.Flags & 0x1000) && said++ < 200)
             d3d12_log("[transient] list#%u heap %p DESTROYED (%llu KB)\n", g_list_seq, (void *)h,
                       (unsigned long long)h->desc.SizeInBytes >> 10);   /* ml895 */
+        if (h->lazy) { InterlockedDecrement(&g_lheap_n); InterlockedExchangeAdd64(&g_lheap_bytes, -(LONG64)h->desc.SizeInBytes); }   /* madeira-doge: never backed */
         if (h->mtl) {   /* ml1145: every placed resource held a reference, so none is left; ml1148: but the GPU may still hold them */
             struct mad_device *hd = h->device; int queued = 0;
             InterlockedExchangeAdd64(&g_aheap_bytes, -(LONG64)h->desc.SizeInBytes);   /* madeira-doge */
@@ -10905,10 +10941,17 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
     h->device = (struct mad_device *)This;
     h->desc = *desc;
     {   /* ml1145 */
-        static int backing = -1; static unsigned said_b;
+        static int backing = -1, lazy = -1; static unsigned said_b;
         struct mad_device *hd = (struct mad_device *)This;
         if (backing < 0) { backing = (int)mad_cfg_int_pe("heap-backing", 1); d3d12_log("[madeira-d3d12] ml1145 heap-backing = %d (DEFAULT heaps %s)\n", backing, backing ? "are Metal placement heaps; placed resources alias" : "are descriptions only"); }
-        if (backing && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {
+        if (lazy < 0) { lazy = (int)mad_cfg_int_pe("heap-lazy", 1); d3d12_log("[madeira-d3d12] heap-lazy = %d (DEFAULT heaps are backed %s)\n", lazy, lazy ? "at their first placement" : "at CreateHeap"); }
+        if (backing && lazy && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {   /* madeira-doge */
+            static unsigned said_l;
+            h->lazy = 1;
+            InterlockedIncrement(&g_lheap_n); InterlockedExchangeAdd64(&g_lheap_bytes, (LONG64)desc->SizeInBytes);
+            if (said_l++ < 32) d3d12_log("[madeira-d3d12] heap-lazy: heap%u %llu KB flags %#x will be backed at its first placement (%ld heaps, %lld MB unbacked)\n",
+                                         h->serial, (unsigned long long)(desc->SizeInBytes >> 10), (unsigned)desc->Flags, (long)g_lheap_n, (long long)(g_lheap_bytes >> 20));
+        } else if (backing && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {
             h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, desc->SizeInBytes, WMTResourceStorageModePrivate);
             if (h->mtl) {
                 LONG64 now = InterlockedExchangeAdd64(&g_aheap_bytes, (LONG64)desc->SizeInBytes) + (LONG64)desc->SizeInBytes;   /* madeira-doge */
