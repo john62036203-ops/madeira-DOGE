@@ -10944,7 +10944,9 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
         static int backing = -1, lazy = -1; static unsigned said_b;
         struct mad_device *hd = (struct mad_device *)This;
         if (backing < 0) { backing = (int)mad_cfg_int_pe("heap-backing", 1); d3d12_log("[madeira-d3d12] ml1145 heap-backing = %d (DEFAULT heaps %s)\n", backing, backing ? "are Metal placement heaps; placed resources alias" : "are descriptions only"); }
-        if (lazy < 0) { lazy = (int)mad_cfg_int_pe("heap-lazy", 1); d3d12_log("[madeira-d3d12] heap-lazy = %d (DEFAULT heaps are backed %s)\n", lazy, lazy ? "at their first placement" : "at CreateHeap"); }
+        if (lazy < 0) {   /* madeira-doge: 1 (default) backs a DEFAULT heap with its Metal placement heap at its first placed resource, so heaps nothing is placed in cost no memory; 0 backs every heap at CreateHeap */
+            lazy = (int)mad_cfg_int_pe("heap-lazy", 1); d3d12_log("[madeira-d3d12] heap-lazy = %d (DEFAULT heaps are backed %s)\n", lazy, lazy ? "at their first placement" : "at CreateHeap");
+        }
         if (backing && lazy && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {   /* madeira-doge */
             static unsigned said_l;
             h->lazy = 1;
