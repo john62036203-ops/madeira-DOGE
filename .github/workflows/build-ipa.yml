@@ -410,12 +410,11 @@ jobs:
         continue-on-error: true
         run: |
           rc=0
-          for t in check-srv-doorbell check-srv-fd-reply check-srv-direct check-srv-eco-follow check-clip-dedupe; do
-            if ! python3 tests/host/$t.py > $t.out 2>&1; then
-              rc=1
-              echo "::error title=$t::$(tail -c 900 $t.out | tr '\n' ' ' | tr -d '%')"
-            fi
-          done
+          python3 tests/host/check-srv-doorbell.py > check-srv-doorbell.out 2>&1 || { rc=1; echo "::error title=check-srv-doorbell::$(tail -c 900 check-srv-doorbell.out | tr '\n' ' ' | tr -d '%')"; }
+          python3 tests/host/check-srv-fd-reply.py > check-srv-fd-reply.out 2>&1 || { rc=1; echo "::error title=check-srv-fd-reply::$(tail -c 900 check-srv-fd-reply.out | tr '\n' ' ' | tr -d '%')"; }
+          python3 tests/host/check-srv-direct.py > check-srv-direct.out 2>&1 || { rc=1; echo "::error title=check-srv-direct::$(tail -c 900 check-srv-direct.out | tr '\n' ' ' | tr -d '%')"; }
+          python3 tests/host/check-srv-eco-follow.py > check-srv-eco-follow.out 2>&1 || { rc=1; echo "::error title=check-srv-eco-follow::$(tail -c 900 check-srv-eco-follow.out | tr '\n' ' ' | tr -d '%')"; }
+          python3 tests/host/check-clip-dedupe.py > check-clip-dedupe.out 2>&1 || { rc=1; echo "::error title=check-clip-dedupe::$(tail -c 900 check-clip-dedupe.out | tr '\n' ' ' | tr -d '%')"; }
           exit $rc
 
       - name: Check paired IPA and OTA publication contracts
