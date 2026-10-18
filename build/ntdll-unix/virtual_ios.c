@@ -22723,8 +22723,13 @@ static void ios_pool_image_finish( struct file_view *view, IMAGE_NT_HEADERS *nt,
     if (!pi || !alias) return;
     tramp_room = pi->alloc > image_alloc ? pi->alloc - image_alloc : 0;
 
-    /* code sections: remembered for mprotect_exec; the last one is "the .text"
-     * for the x18 patcher, as the copy path records it */
+    ios_jit_add_mapping( base, base, size );                 /* identity: no copy, no FEX alias */
+
+    /* code sections: remembered for mprotect_exec and recorded on the mapping;
+     * the LARGEST is "the .text" the x18 patcher walks. An ARM64EC DLL has two
+     * (.text and the small .hexpthk); build 229 (2026-10-18 13:51) patched the
+     * last one, .hexpthk, left kernelbase's 1656 x18 loads alone, and the Dock
+     * died on `ldr [x18,#0x1490]` with x18 = 0 (addr=0x1490, 34 images in). */
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
         size_t vsize = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
@@ -22736,12 +22741,13 @@ static void ios_pool_image_finish( struct file_view *view, IMAGE_NT_HEADERS *nt,
             pi->exec_hi[pi->exec_n] = (uintptr_t)base + sec[i].VirtualAddress + ssize;
             pi->exec_n++;
         }
-        text_off = sec[i].VirtualAddress;
-        text_sz = vsize;
+        ios_jit_set_text_section( base, sec[i].VirtualAddress, vsize );   /* keeps the largest */
+        if (vsize > text_sz)
+        {
+            text_off = sec[i].VirtualAddress;
+            text_sz = vsize;
+        }
     }
-
-    ios_jit_add_mapping( base, base, size );                 /* identity: no copy, no FEX alias */
-    if (text_sz) ios_jit_set_text_section( base, text_off, text_sz );
 
     /* x18 -> trampolines behind the image, inside the range taken with it */
     if (text_sz)
