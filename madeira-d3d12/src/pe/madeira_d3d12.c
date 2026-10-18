@@ -2230,6 +2230,7 @@ done:
     InterlockedExchangeAdd64(cls, b);
 }
 static volatile LONG g_fault_diag;   /* madeira-bcd: GPU fault attribution, below */
+static volatile LONG64 g_fault_last_present;   /* madeira-doge: gpu-fault-settle -- present count at the last GPU fault */
 static void mad_fault_label_render(struct mad_exec *e);
 static void exec_end(struct mad_exec *e) {
     struct mad_resource *crt[8]; struct mad_resource *cdepth = NULL; struct mad_rtvp crtp[8], cdp; unsigned cn = 0, cseq = 0, cdraws = 0;   /* ml1098 */
@@ -3494,6 +3495,7 @@ static void mad_fault_report(obj_handle_t cb) {
             d3d12_log("[madeira-d3d12] GPU fault while fence-chain 0 (no fences) is in effect: expected, nothing marked or skipped\n");
         return;
     }
+    g_fault_last_present = g_presents_now;   /* madeira-doge: gpu-fault-settle */
     if (!InterlockedExchange(&g_fault_diag, 1)) {
         g_enc_labels = 1;
         d3d12_log("[madeira-d3d12] GPU fault: labelling every encoder and running one pipeline per compute encoder from now on\n");
@@ -6152,10 +6154,8 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         MAD_SKIP(e);
         return;
     }
-    if (g_fault_diag) {   /* madeira-bcd: GPU fault attribution */
-        if (mad_fault_skip_pso(e->pso)) { MAD_SKIP(e); return; }
-        mad_fault_note(e, e->pso);
-    }
+    if (mad_fault_skip_pso(e->pso)) { MAD_SKIP(e); return; }   /* madeira-doge: skips outlive the diagnostics (gpu-fault-settle) */
+    if (g_fault_diag) mad_fault_note(e, e->pso);   /* madeira-bcd: GPU fault attribution */
     gsemu = e->pso->gs_emu;
     if (e->pso->nu10 && !exec_u10_prepare(e, u10buf)) { MAD_SKIP(e); return; }   /* madeira-doge: before the render encoder opens */
     if (gsemu && (c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT) && !(gsemu == 2 && e->tind_buf)) {
@@ -7468,8 +7468,8 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
             }
         }
     }
+    if (mad_fault_skip_pso(e->cpso)) { MAD_SKIP(e); return; }   /* madeira-doge: skips outlive the diagnostics (gpu-fault-settle) */
     if (g_fault_diag) {   /* madeira-bcd: GPU fault attribution -- one pipeline per compute encoder */
-        if (mad_fault_skip_pso(e->cpso)) { MAD_SKIP(e); return; }
         if (e->cenc && e->cenc_pso != e->cpso) exec_end(e);
     }
     if (!e->cenc) {
@@ -10833,8 +10833,31 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
  * real chain and small ones (tex-mip-drop-min, default 512 on the long side) are
  * left alone. */
 static volatile LONG g_mip_drop_n; static volatile LONG64 g_mip_drop_saved;
+/* madeira-doge: why textures keep their mips (build 254, MH Wilds: fewer than 250 of
+ * 8000+ sampled textures were reduced at tex-mip-drop = 3). Counted per reason, with
+ * the approximate size, and logged every 500 textures as [mip-drop-why]. */
+enum { MDW_KIND, MDW_FLAGS, MDW_MSAA3D, MDW_FORMAT, MDW_MIPS, MDW_SMALL, MDW_ALIGN, MDW_DROPPED, MDW_N };
+static volatile LONG g_mdw_n[MDW_N]; static volatile LONG64 g_mdw_b[MDW_N]; static volatile LONG g_mdw_total;
+static UINT mad_mip_drop_why(const D3D12_RESOURCE_DESC *desc, int why, UINT k) {
+    static const char *nm[MDW_N] = { "not-2D/not-default-heap", "RT/DS/UAV", "MSAA/3D", "uncompressed", "few-mips", "small", "odd-size", "dropped" };
+    UINT bytes = 0, block = 0; LONG64 b; LONG t; int i;
+    mad_format_info(desc->Format, &bytes, &block);
+    if (block == 4) b = (LONG64)(desc->Width / 4) * (desc->Height / 4) * bytes;
+    else b = (LONG64)desc->Width * desc->Height * (bytes ? bytes : 4);
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) b *= desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
+    if (desc->MipLevels != 1) b = b * 4 / 3;
+    InterlockedIncrement(&g_mdw_n[why]); InterlockedExchangeAdd64(&g_mdw_b[why], b);
+    t = InterlockedIncrement(&g_mdw_total);
+    if (t <= 3 || !(t % 500)) {
+        char line[640]; int o = 0;
+        for (i = 0; i < MDW_N; i++)
+            o += snprintf(line + o, sizeof line - o, " %s=%ld/%lldMB", nm[i], (long)g_mdw_n[i], (long long)(g_mdw_b[i] >> 20));
+        d3d12_log("[mip-drop-why] %ld textures:%s\n", (long)t, line);
+    }
+    return k;
+}
 static UINT mad_mip_drop_for(const D3D12_RESOURCE_DESC *desc, D3D12_HEAP_TYPE heap_type, const struct WMTTextureInfo *ti) {
-    static int k = -1, min_side = 512; UINT bytes = 0, block = 0, mips, w, h, lng, sht;
+    static int k = -1, min_side = 512; UINT bytes = 0, block = 0, mips, w, h, lng, sht, kk;
     if (k < 0) {
         int v = (int)mad_cfg_int_pe("tex-mip-drop", 0), m = (int)mad_cfg_int_pe("tex-mip-drop-min", 512);
         if (v < 0) v = 0; if (v > 3) v = 3; if (m < 64) m = 64;
@@ -10843,17 +10866,23 @@ static UINT mad_mip_drop_for(const D3D12_RESOURCE_DESC *desc, D3D12_HEAP_TYPE he
                   v ? "read-only block-compressed textures lose their largest mips" : "off: every texture keeps all of its mips", m);
     }
     if (!k) return 0;
-    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || heap_type != D3D12_HEAP_TYPE_DEFAULT) return 0;
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || heap_type != D3D12_HEAP_TYPE_DEFAULT) return mad_mip_drop_why(desc, MDW_KIND, 0);
     if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
-                       D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) return 0;
-    if (ti->sample_count > 1 || ti->type == WMTTextureType3D) return 0;
+                       D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) return mad_mip_drop_why(desc, MDW_FLAGS, 0);
+    if (ti->sample_count > 1 || ti->type == WMTTextureType3D) return mad_mip_drop_why(desc, MDW_MSAA3D, 0);
     mad_format_info(desc->Format, &bytes, &block);
-    if (block != 4) return 0;
+    if (block != 4) return mad_mip_drop_why(desc, MDW_FORMAT, 0);
     mips = desc->MipLevels; w = (UINT)desc->Width; h = desc->Height;
     lng = w > h ? w : h; sht = w > h ? h : w;
-    if (mips < (UINT)k + 3 || lng < (UINT)min_side) return 0;
-    if ((w & ((4u << k) - 1)) || (h & ((4u << k) - 1)) || (sht >> k) < 4) return 0;
-    return (UINT)k;
+    if (lng < (UINT)min_side) return mad_mip_drop_why(desc, MDW_SMALL, 0);
+    /* madeira-doge: a texture that cannot lose k mips loses as many as it can (k-1 .. 1)
+     * instead of none -- a short chain or a size not divisible by 4 << k used to keep
+     * the whole texture. */
+    for (kk = (UINT)k; kk >= 1; kk--)
+        if (mips >= kk + 3 && !(w & ((4u << kk) - 1)) && !(h & ((4u << kk) - 1)) && (sht >> kk) >= 4)
+            return mad_mip_drop_why(desc, MDW_DROPPED, kk);
+    if (mips < 4) return mad_mip_drop_why(desc, MDW_MIPS, 0);
+    return mad_mip_drop_why(desc, MDW_ALIGN, 0);
 }
 /* The application's mip level of a texture -> Metal's, or 0 when that mip was dropped. */
 static int mad_mip_live(const struct mad_resource *r, UINT *level) {
@@ -17682,6 +17711,22 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
             memset(&a, 0, sizeof a); a.op = 6; MadeiraCtl(&a);
             want = (int)a.ret;
             g_presents_now = (LONG64)s->presents;   /* madeira-bcd: mad_f0_quiet */
+            {   /* madeira-doge: madeira.cfg gpu-fault-settle = N presents (default 150; 0 = keep the
+                 * diagnostics for the whole run). The attribution mode (one pipeline per compute
+                 * encoder, labels on every encoder) multiplied MH Wilds' encoders and fence waits by
+                 * ten after one hang (build 254, 2026-10-19: 83 -> 900 fence waits a frame, then
+                 * 0.2 fps). Once the culprit is marked and N presents pass with no new fault, the
+                 * diagnostics end; the marked pipelines stay skipped, and a new fault turns them
+                 * back on. */
+                static int settle = -1;
+                if (settle < 0) { long long v = mad_cfg_int_pe("gpu-fault-settle", 150); settle = v < 0 ? 0 : (int)v; }
+                if (settle && g_fault_diag && g_fault_nbad && g_presents_now - g_fault_last_present > settle) {
+                    InterlockedExchange(&g_fault_diag, 0);
+                    g_enc_labels = -1;   /* back to madeira.cfg encoder-labels */
+                    d3d12_log("[madeira-d3d12] GPU fault: %d presents without a new fault -- diagnostics off, %ld pipeline(s) stay skipped (gpu-fault-settle)\n",
+                              settle, (long)g_fault_nbad);
+                }
+            }
             if (want >= 1 && want <= 6 && want != 4 && want != g_fence_chain && g_fence_chain >= 0) {
                 d3d12_log("[madeira-d3d12] ml1136 fence-chain %d -> %d at present #%llu\n", g_fence_chain, want, (unsigned long long)s->presents);
                 if (g_fence_chain == 0) {   /* madeira-bcd: leaving F0 -- forget its faults */
