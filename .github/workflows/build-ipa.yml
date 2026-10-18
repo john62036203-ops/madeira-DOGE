@@ -427,6 +427,14 @@ jobs:
           python3 tests/host/check-pool-split.py
           python3 tests/host/check-pool-low.py
 
+      - name: Check opt-in fence, eco and swap switches (willfaust/Madeira #342)
+        continue-on-error: true
+        run: |
+          python3 tests/host/check-fence-poll-backoff.py
+          python3 tests/host/check-eco-prio.py
+          python3 tests/host/check-wsex-mincore.py
+          python3 tests/host/check-swap-heat.py
+
       # [dns]: every guest getaddrinfo by name, and MADEIRA_DNS_TIMEOUT_MS to
       # bound one (Social Club's Chromium sat in three getaddrinfo calls for a
       # minute, GTA V Enhanced build 378). Patches wine/dlls/ws2_32/unixlib.c.
