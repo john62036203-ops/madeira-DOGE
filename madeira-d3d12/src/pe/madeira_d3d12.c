@@ -16849,6 +16849,15 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
         d->resset = MTLDevice_newResidencySet(d->mtl_device, 4096);
         if (d->resset) MTLCommandQueue_addResidencySet(d->mtl_queue, d->resset);
         d3d12_log("[madeira-d3d12] residency set: %s\n", d->resset ? "attached to the queue" : "UNAVAILABLE (per-draw lists only)");
+        if (mad_cfg_int_pe("sparse-probe", 0)) {   /* 1: run the Metal 4 placement-sparse buffer probe once (winemetal [sparse-probe] lines) */
+            static LONG probed;
+            if (!InterlockedExchange(&probed, 1)) {
+                struct madeira_ctl_args a;
+                memset(&a, 0, sizeof a); a.op = 40; a.ptr = (UINT64)(ULONG_PTR)d->mtl_device;
+                MadeiraCtl(&a);
+                d3d12_log("[madeira-d3d12] sparse-probe: winemetal answered 0x%x (8 = a mapped tile works from our queue)\n", a.ret);
+            }
+        }
         memset(&nbi, 0, sizeof nbi);
         nbi.length = 65536;
         nbi.options = WMTResourceStorageModeShared;

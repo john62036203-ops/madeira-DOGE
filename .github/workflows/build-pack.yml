@@ -103,6 +103,7 @@ jobs:
         run: |
           python3 tools/patch-dxmt-frame-limits.py
           python3 tools/patch-dxmt-gpu-fault-info.py
+          python3 tools/patch-dxmt-sparse-probe.py
           python3 tools/patch-dxmt-b2t-aspect.py
           python3 tools/patch-dxmt-dxil-tess.py
 

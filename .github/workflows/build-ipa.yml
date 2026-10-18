@@ -995,6 +995,11 @@ jobs:
       - name: Patch DXMT with GPU fault attribution
         run: python3 tools/patch-dxmt-gpu-fault-info.py
 
+      # Metal 4 placement-sparse buffer probe (MadeiraCtl op 40; madeira.cfg
+      # sparse-probe = 1) before D3D12 reserved resources get real tiling.
+      - name: Patch DXMT with the Metal 4 sparse probe
+        run: python3 tools/patch-dxmt-sparse-probe.py
+
       - name: Patch DXMT buffer->texture blits with a depth/stencil aspect
         run: python3 tools/patch-dxmt-b2t-aspect.py
 
