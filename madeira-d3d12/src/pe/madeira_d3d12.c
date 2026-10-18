@@ -604,6 +604,20 @@ static void mad_xp_role(char role) {   /* tell the probe which thread this is (u
     memset(&a, 0, sizeof a); a.op = 4; a.len = (UINT64)(unsigned char)role; a.ptr = me; MadeiraCtl(&a);
 }
 static LONG64 mad_qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+/* madeira-bcd eco-prio (opt-in, env.MADEIRA_ECO_PRIO; build/ntdll-unix/thread_ios.c
+ * ios_eco_prio_note): the runtime's own latency-critical threads -- the fence
+ * worker, which advances a fence once the GPU is done, and async-submit's
+ * submission workers -- ask for THREAD_PRIORITY_TIME_CRITICAL, which the switch
+ * turns into the user-interactive QoS (the performance cores) while eco keeps the
+ * game's threads on the efficiency cores. The fence worker also gets an [xp-t]
+ * role, F. Without the switch nothing here runs. */
+static void mad_eco_prio_self(char role) {
+    char v[8];
+    DWORD n = GetEnvironmentVariableA("MADEIRA_ECO_PRIO", v, sizeof v);   /* madeira-bcd: 1 or 2 = the runtime's own worker threads ask for TIME_CRITICAL (performance cores under eco); unset/0 = off */
+    if (!n || n >= sizeof v || v[0] == '0') return;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    if (role) mad_xp_role(role);
+}
 
 /* madeira-bcd: WHERE ExecuteCommandLists SPENDS ITS TIME. Ghost of Tsushima's
  * render thread spends 10-16 ms of a 40 ms frame inside our replay (14:04 log,
@@ -1223,10 +1237,19 @@ struct mad_fence {
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
     struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
     unsigned nwaiters;
+    /* madeira-bcd fence-poll-backoff (opt-in, see mad_fpb_init): the last value a
+     * poll returned, when (mad_tick), how many polls in a row saw it unchanged,
+     * and polls not yet added to the ml1109 count. Written without atomics by the
+     * threads that poll: a lost update only shortens or lengthens one run. */
+    UINT64 fpb_seen, fpb_t;
+    LONG fpb_run, fpb_polls;
 };
 
 static void fence_set_locked(struct mad_fence *f, UINT64 v) {
-    f->value = v;
+    /* madeira-bcd fence-poll-backoff: a release store, so a poll that reads the
+     * value without the lock sees what was written before it (the same order the
+     * critical section gives a locked reader) */
+    __atomic_store_n(&f->value, v, __ATOMIC_RELEASE);
     WakeAllConditionVariable(&f->cv);
     unsigned w = 0;
     for (unsigned i = 0; i < f->nwaiters; i++) {
@@ -1294,8 +1317,91 @@ static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
             d3d12_log("[gcv]   %04lx  +0x%llx <- +0x%llx  x%ld\n", g_gcv_site[i].tid, (unsigned long long)g_gcv_site[i].r0, (unsigned long long)g_gcv_site[i].r1, (long)g_gcv_site[i].n);
     }
 }
+static long long mad_cfg_int_pe(const char *key, long long dflt);   /* madeira-bcd fence-poll-backoff reads its keys below */
+/* madeira-bcd fence-poll-backoff (opt-in; madeira.cfg or the game's file,
+ * default 0). Horizon Forbidden West with FSR 3 frame generation, build 531
+ * (2026-10-14 11:01-11:24 logs): 34,000-137,000 GetCompletedValue calls per
+ * present (ml1109), ~2.5 million a second, ~70 % of them from FSR's "AMD FSR
+ * Interpolation Thread" and most of the rest from its presenter thread ([gcv]
+ * ml1142): a loop that polls a fence until the GPU gets there. Every call took
+ * the fence's critical section and two process-wide interlocked counters, and
+ * the loop kept an efficiency core busy ([thread-stacks]: the two FSR threads
+ * at 25-55 % of a core) while, with eco = 1, 6-8 threads waited for a core
+ * ([xp] run=) -- the game's own job workers among them.
+ * With fence-poll-backoff = N (2 or more; 64 suggested) a call reads the value
+ * without the lock (fence_set_locked stores it with release order) and adds to
+ * the ml1109 / ml1142 counters 256 at a time. A thread that sees the same value
+ * N times in a row, each call within 50 us of the one before (a spin, not a
+ * once-a-frame check), sleeps on the fence's condition variable until the value
+ * moves (fence_set_locked wakes every sleeper) or for at most
+ * fence-poll-backoff-us (default 200, 20..2000), then returns the value as it
+ * is then. Every answer is a value the fence really had; a spinning caller just
+ * spins less. A [perf] line every 5 s gives the back-offs per frame, how many
+ * ended because the fence moved, and the time asleep. 0 (the default): the
+ * locked read and the per-call counters, as before. Read once. */
+static volatile int g_fpb = -1;          /* polls before a back-off, 0 = off; -1 = not read yet */
+static LONG64 g_fpb_win = 1200;           /* 50 us in mad_tick units */
+static LONG64 g_fpb_wait = 2000;          /* the longest sleep, 100 ns units */
+static volatile LONG g_fpb_n, g_fpb_moved;   /* back-offs; of which the fence moved */
+static volatile LONG64 g_fpb_ticks;       /* time asleep, mad_tick units */
+static void mad_fpb_init(void) {
+    static LONG said;
+    long long n = mad_cfg_int_pe("fence-poll-backoff", 0);   /* madeira-bcd: N >= 2 = a thread that polls one unchanged fence N times in a row (each within 50 us) sleeps until it moves, at most fence-poll-backoff-us; 0 = the locked read, as before */
+    long long us = mad_cfg_int_pe("fence-poll-backoff-us", 200);   /* madeira-bcd fence-poll-backoff: the longest sleep in microseconds (20..2000) */
+    if (n < 0) n = 0;
+    if (n == 1) n = 2;
+    if (n > 1000000) n = 1000000;
+    if (us < 20) us = 20;
+    if (us > 2000) us = 2000;
+    g_fpb_win = (LONG64)(mad_tick_freq() / 20000);   /* 50 us */
+    if (g_fpb_win < 1) g_fpb_win = 1;
+    g_fpb_wait = us * 10;
+    if (n && !InterlockedExchange(&said, 1))
+        d3d12_log("[madeira-d3d12] fence-poll-backoff = %lld (opt-in): GetCompletedValue reads without the lock; a thread that polls an unchanged "
+                  "fence %lld times in a row sleeps until it moves, at most %lld us\n", n, n, us);
+    __atomic_store_n(&g_fpb, (int)n, __ATOMIC_RELEASE);
+}
+/* The back-off: wait for fence_set_locked's broadcast, bounded. Returns the value now. */
+static UINT64 mad_fpb_sleep(struct mad_fence *f, UINT64 seen) {
+    typedef LONG (WINAPI *sleep_cs_fn)(CONDITION_VARIABLE *, CRITICAL_SECTION *, const LARGE_INTEGER *);
+    static sleep_cs_fn sleep_cs; static volatile LONG looked;
+    UINT64 t0 = mad_tick(), v;
+    LARGE_INTEGER rel;
+    if (!looked) {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        if (nt) sleep_cs = (sleep_cs_fn)(void *)GetProcAddress(nt, "RtlSleepConditionVariableCS");
+        looked = 1;
+    }
+    rel.QuadPart = -g_fpb_wait;   /* relative, 100 ns units */
+    EnterCriticalSection(&f->lock);
+    if (f->value == seen) {
+        if (sleep_cs) sleep_cs(&f->cv, &f->lock, &rel);
+        else SleepConditionVariableCS(&f->cv, &f->lock, 1);
+    }
+    v = f->value;
+    LeaveCriticalSection(&f->lock);
+    InterlockedIncrement(&g_fpb_n);
+    if (v != seen) InterlockedIncrement(&g_fpb_moved);
+    InterlockedExchangeAdd64(&g_fpb_ticks, (LONG64)(mad_tick() - t0));
+    return v;
+}
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
+    if (g_fpb < 0) mad_fpb_init();
+    if (g_fpb > 0) {   /* madeira-bcd fence-poll-backoff */
+        UINT64 v = __atomic_load_n(&f->value, __ATOMIC_ACQUIRE), now = mad_tick();
+        if (!(++f->fpb_polls & 255)) {   /* ml1109 / ml1142: 256 polls at a time */
+            InterlockedExchangeAdd(&g_perf_polls, 256);
+            if (((InterlockedExchangeAdd(&g_gcv_calls, 256) + 256) & 0x3ffff) == 0) mad_gcv_sample(f, v);
+        }
+        if (v != f->fpb_seen || now - f->fpb_t > (UINT64)g_fpb_win) { f->fpb_seen = v; f->fpb_run = 0; }
+        f->fpb_t = now;
+        if (++f->fpb_run < g_fpb) return v;
+        f->fpb_run = 0;
+        v = mad_fpb_sleep(f, v);
+        f->fpb_seen = v; f->fpb_t = mad_tick();
+        return v;
+    }
     InterlockedIncrement(&g_perf_polls);   /* ml1109 */
     if ((InterlockedIncrement(&g_gcv_calls) & 0x3ffff) == 0) mad_gcv_sample(f, f->value);   /* ml1142 */
     EnterCriticalSection(&f->lock);
@@ -7935,6 +8041,13 @@ static void mad_perf_present(void) {
                   g_perf_presents ? 1000.0 * g_perf_wait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0, 100.0 * g_perf_wait_ticks / (double)fq.QuadPart / wall,
                   g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
+        if (g_fpb > 0 && g_perf_presents) {   /* madeira-bcd fence-poll-backoff */
+            LONG bn = InterlockedExchange(&g_fpb_n, 0), bm = InterlockedExchange(&g_fpb_moved, 0);
+            LONG64 bt = InterlockedExchange64(&g_fpb_ticks, 0);
+            d3d12_log("[perf] fence-poll-backoff per frame: %.1f back-offs, %.1f of them ended by the fence moving, %.2f ms asleep (fence-poll-backoff = %d, at most %lld us each)\n",
+                      (double)bn / g_perf_presents, (double)bm / g_perf_presents, 1000.0 * (double)bt / (double)mad_tick_freq() / g_perf_presents,
+                      g_fpb, (long long)(g_fpb_wait / 10));
+        }
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
     }
@@ -8062,6 +8175,7 @@ static void mad_list_rings_rewind(struct mad_list *l) {
  * advances the fence. Jobs are FIFO, so fence values stay ordered. */
 static DWORD WINAPI mad_fence_worker(void *arg) {
     struct mad_device *d = arg;
+    mad_eco_prio_self('F');   /* madeira-bcd eco-prio (opt-in) */
     for (;;) {
         struct mad_fence_job job; int have = 0; unsigned k, stalled_ms = 0;
         EnterCriticalSection(&d->fence_lock);
@@ -8304,6 +8418,7 @@ static void mad_wait_committed(struct mad_fence *f, UINT64 value) {
 static DWORD WINAPI mad_sub_worker(void *arg) {
     struct mad_queue *q = arg;
     mad_xp_role('W');   /* ml1128 */
+    mad_eco_prio_self(0);   /* madeira-bcd eco-prio (opt-in) */
     for (;;) {
         struct mad_subjob *j;
         LARGE_INTEGER t0, t1;
