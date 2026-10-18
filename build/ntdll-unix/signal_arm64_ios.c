@@ -6348,6 +6348,76 @@ skip_reclaim_band: ;
                             }
                             fp_walk = frame_buf[0];
                         }
+                        /* madeira-doge: the code that loaded x16, and the lr module's
+                         * ARM64X dispatch slots. Build 231 (pool images, dockhost):
+                         * `blr x16` with x16 = 0 from ucrtbase+0x90f1c, x9 = a kernel32
+                         * .text address -- the exit-thunk shape, so x16 came from one
+                         * of the module's __os_arm64x_* slots. Print the instructions
+                         * before lr (which slot) and every slot's value (whether the
+                         * loader's arm64ec_update_hybrid_metadata ever wrote them). */
+                        {
+                            uint32_t code[12];
+                            mach_vm_size_t got_c = 0;
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(lr_exec - 48),
+                                                        sizeof(code), (mach_vm_address_t)code, &got_c ) == KERN_SUCCESS
+                                && got_c == sizeof(code))
+                                dprintf( STDERR_FILENO,
+                                         "[thunk-slot] code lr-48..lr-4: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                         code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7],
+                                         code[8], code[9], code[10], code[11] );
+                        }
+                        if (lr_mod)
+                        {
+                            IMAGE_DOS_HEADER dos;
+                            IMAGE_NT_HEADERS64 nth;
+                            IMAGE_LOAD_CONFIG_DIRECTORY64 lcfg;
+                            IMAGE_ARM64EC_METADATA meta;
+                            mach_vm_size_t got_m = 0;
+                            uint64_t cfg_va, meta_va;
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)lr_mod, sizeof(dos),
+                                                        (mach_vm_address_t)&dos, &got_m ) == KERN_SUCCESS && got_m == sizeof(dos) &&
+                                dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 && dos.e_lfanew < 0x1000 &&
+                                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(lr_mod + dos.e_lfanew), sizeof(nth),
+                                                        (mach_vm_address_t)&nth, &got_m ) == KERN_SUCCESS && got_m == sizeof(nth) &&
+                                nth.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG &&
+                                (cfg_va = lr_mod + nth.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress) > lr_mod &&
+                                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)cfg_va, sizeof(lcfg),
+                                                        (mach_vm_address_t)&lcfg, &got_m ) == KERN_SUCCESS && got_m == sizeof(lcfg))
+                            {
+                                meta_va = lcfg.CHPEMetadataPointer;
+                                dprintf( STDERR_FILENO,
+                                         "[thunk-slot] %.32s header ImageBase=0x%llx load-config @0x%llx size=0x%x CHPEMetadataPointer=0x%llx (%s the module)\n",
+                                         ios_pe_module_name( lr_mod ), (unsigned long long)nth.OptionalHeader.ImageBase,
+                                         (unsigned long long)cfg_va, (unsigned)lcfg.Size, (unsigned long long)meta_va,
+                                         (meta_va > lr_mod && meta_va < lr_mod + nth.OptionalHeader.SizeOfImage) ? "inside" : "OUTSIDE" );
+                                if (meta_va > lr_mod && meta_va < lr_mod + nth.OptionalHeader.SizeOfImage &&
+                                    mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)meta_va, sizeof(meta),
+                                                            (mach_vm_address_t)&meta, &got_m ) == KERN_SUCCESS && got_m == sizeof(meta))
+                                {
+                                    static const char *const names[5] = { "dispatch_call_no_redirect", "dispatch_ret", "dispatch_call",
+                                                                          "dispatch_icall", "dispatch_icall_cfg" };
+                                    uint32_t rvas[5] = { meta.__os_arm64x_dispatch_call_no_redirect, meta.__os_arm64x_dispatch_ret,
+                                                         meta.__os_arm64x_dispatch_call, meta.__os_arm64x_dispatch_icall,
+                                                         meta.__os_arm64x_dispatch_icall_cfg };
+                                    int k;
+                                    for (k = 0; k < 5; k++)
+                                    {
+                                        uint64_t v = 0;
+                                        got_m = 0;
+                                        if (rvas[k] && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(lr_mod + rvas[k]), 8,
+                                                                                (mach_vm_address_t)&v, &got_m ) == KERN_SUCCESS && got_m == 8)
+                                            dprintf( STDERR_FILENO, "[thunk-slot]   __os_arm64x_%s @+0x%x = 0x%llx\n",
+                                                     names[k], rvas[k], (unsigned long long)v );
+                                        else
+                                            dprintf( STDERR_FILENO, "[thunk-slot]   __os_arm64x_%s rva 0x%x (unreadable or 0)\n",
+                                                     names[k], rvas[k] );
+                                    }
+                                }
+                            }
+                            else
+                                dprintf( STDERR_FILENO, "[thunk-slot] %.32s: PE header / load config not readable at 0x%llx\n",
+                                         ios_pe_module_name( lr_mod ), (unsigned long long)lr_mod );
+                        }
                     }
                     /* One-shot dump: on the first UNHANDLED exec fault, dump the
                      * JIT-pool RW alias contents around the relevant FEX CodeBuffer

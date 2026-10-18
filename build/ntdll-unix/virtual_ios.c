@@ -22916,7 +22916,8 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
      * image_info->wine_builtin with is_builtin FALSE; those are the targets. */
     if (image_info->wine_builtin && !is_builtin && !wow_image && ios_pool_images_enabled() && ios_jit_rx_base_global &&
         !ios_map_resource_view && image_info->alignment >= 0x4000 && size <= ((SIZE_T)256 << 20) &&
-        (image_info->is_hybrid || image_info->machine == IMAGE_FILE_MACHINE_ARM64))
+        (image_info->is_hybrid || image_info->machine == IMAGE_FILE_MACHINE_ARM64) &&
+        (image_info->image_charact & IMAGE_FILE_DLL))   /* DLLs only: a builtin .exe (conhost.exe, build 230) keeps the copy path */
     {
         static unsigned int pool_img_n, pool_img_fail;
         size_t want = ROUND_SIZE( 0, size, 0xffff ) + IOS_POOL_IMAGE_TRAMP;   /* 64 KB base + x18 slack */
