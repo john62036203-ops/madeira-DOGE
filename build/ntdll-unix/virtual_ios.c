@@ -2541,6 +2541,20 @@ static void ios_hook_island_init( void )
         ceiling = (unsigned long long)vmi.max_address;
     if (!ceiling) return;
 
+    /* madeira-doge: the island must sit ABOVE the images, not at the top of
+     * the task map. On the 63 GB map (iOS 26) those were the same place: the
+     * image band ended at the map's ceiling, so the highest hole was right
+     * above every ntdll. On iOS 27's 512 GB map the images still go top-down
+     * below the cage holdback at 0x7200000000, but the highest hole is under
+     * the FEX arena at 0x7bffc00000, 40 GB above ntdll -- and the hook engine
+     * walks only 0x70000000 up from the function (MHR, 2026-10-18 17:50 log:
+     * 483,136 refused requests from 0x71f53e7a00 to 0x72653a7a00, then
+     * 'Error at hooking API "NtProtectVirtualMemory"' and the game exited).
+     * With the cage held, search below it: the hole just under the cage is
+     * the top of the image band on every layout seen. */
+    if (ios_cage_holdback_live && (unsigned long long)IOS_CAGE_BASE < ceiling)
+        ceiling = (unsigned long long)IOS_CAGE_BASE;
+
     /* the highest free hole that can hold the island */
     while (addr < ceiling)
     {
