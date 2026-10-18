@@ -253,6 +253,47 @@ OVERLAY = {
                         "memory, performance data); with env.MADEIRA_DXGI_SRC = 1 DXGI's CheckInterfaceSupport gives "
                         "the same driver version. Off (default): no adapter is listed, as before. Set it in the game's "
                         "own file; read at session start."},
+    # madeira-bcd: the wineserver request-path switches (willfaust/Madeira #294).
+    "env.MADEIRA_SRV_DIRECT": {"category": "Wine server", "title": "Run simple server requests on the calling thread",
+                "kind": "text", "default": "0",
+                "choices": [("", "Off (default)"), ("1", "Files, handles, registry, events, semaphores"),
+                            ("2", "Also waits, timers and the cursor")],
+                "sources": ["build/wineserver/request_ios.c", "build/wineserver/fd_ios.c", "build/ntdll-unix/server_ios.c"],
+                "note": "Default off. 1: the Wine server's simplest requests (opening files and their descriptors, "
+                        "closing handles, mappings looked up, registry keys and values, events, semaphores, mutexes, "
+                        "completion ports) run on the thread that asks, under the server's lock, instead of a round "
+                        "trip through a pipe to the server thread: no thread switches, and the work runs on the asking "
+                        "thread's core. 2: waits (select), timers and set_cursor too. Every other request goes through "
+                        "the pipe as before. Horizon Zero Dawn's menu sends ~7000 requests a second. Read at each launch."},
+    "env.MADEIRA_SRV_ECO_FOLLOW": {"category": "Wine server", "title": "Server thread follows ECO",
+                "kind": "bool", "default": "0",
+                "sources": ["build/wineserver/fd_ios.c", "app/Madeira/WineProcessBridge.m"],
+                "note": "Default off. 1: while ECO is on, the Wine server thread runs at utility QoS (ECO's default "
+                        "class) instead of user-interactive, so it moves to the efficiency cores with the game's "
+                        "threads, and back when ECO goes off. In Horizon Zero Dawn's menu with "
+                        "eco = 1 the server was the only thread left on a performance core (0.54 cores at ~3.9 GHz). "
+                        "Server requests may take longer. Read at each launch."},
+    "env.MADEIRA_SRV_IDLE_US": {"category": "Wine server", "title": "Server loop's longest sleep (us)",
+                "kind": "int", "default": "1000",
+                "sources": ["build/wineserver/fd_ios.c", "app/Madeira/WineProcessBridge.m"],
+                "note": "Default 1000 (1 ms, as before); 100 to 50000. Requests and timers wake the Wine server at "
+                        "once; only its socket polls and fd scans wait for this tick, so a longer one means fewer "
+                        "server wake-ups while idle (1000 a second at the default) and slower readiness of network "
+                        "sockets and pipes. Mostly useful with env.MADEIRA_SRV_DIRECT. Read at each launch."},
+    "env.MADEIRA_SRV_FD_SOCKET": {"category": "Wine server", "title": "File descriptors through the process socket",
+                "kind": "bool", "default": "0",
+                "sources": ["build/ntdll-unix/server_ios.c", "build/wineserver/fd_ios.c"],
+                "note": "Kill switch, default 0: a file's descriptor comes back in the server's get_handle_fd reply "
+                        "(a copy the server makes; it shares this process's descriptor table), the same descriptor "
+                        "without a sendmsg, a recvmsg, an fcntl and two server log lines per file. 1: through the "
+                        "process socket, as before. Read once per app run."},
+    "env.MADEIRA_SRV_LOG_ALL": {"category": "Wine server", "title": "Every per-descriptor server log line",
+                "kind": "bool", "default": "0",
+                "sources": ["build/wineserver/fd_ios.c", "build/wineserver/request_ios.c"],
+                "note": "Kill switch, default 0: the Wine server's add_poll_user and send_client_fd log lines (one per "
+                        "opened file or descriptor sent, each a formatted write to the log file on the server thread) "
+                        "are written for their first 64 and then every 1000th; a failed send is always written. 1: "
+                        "every line, as before. Read at each launch."},
     "dxmt": {"title": "DXMT options (a=b;c=d)",
              "note": "Exported as DXMT_CONFIG with the options joined by ';', a library game's own dxmt options after these: "
                      "e.g. d3d11.mipClampBC=1;d3d11.preferredMaxFrameRate=30. DXMT reads at most 259 characters of it, "
