@@ -443,8 +443,16 @@ static volatile LONG g_att_census;   /* ml1083: built pipelines, draws that RAN,
  * of IOAccelerator memory against a 1.5 GB advertised budget, and nothing said
  * which kind of resource holds it. Estimated bytes, live and peak, by kind. */
 enum { MAD_CAT_TEX_RT, MAD_CAT_TEX_DS, MAD_CAT_TEX_UAV, MAD_CAT_TEX_PLAIN, MAD_CAT_TEX_MSAA,
-       MAD_CAT_BUF_PRIVATE, MAD_CAT_BUF_SHARED, MAD_CAT_N };
-static const char *const g_cat_name[MAD_CAT_N] = { "tex-RT", "tex-DS", "tex-UAV", "tex-sampled", "tex-MSAA", "buf-private", "buf-shared" };
+       MAD_CAT_BUF_PRIVATE, MAD_CAT_BUF_SHARED, MAD_CAT_BUF_OWN, MAD_CAT_N };
+/* madeira-doge: buf-own = buffers on storage WE allocate (ml1154 upload-swap and
+ * default-swap), file-backed and off the jetsam footprint; buf-private and
+ * buf-shared are Metal-owned only. Until build 247 buf-private included the
+ * default-swap buffers, which made 2.1 GB look Metal-owned (Wilds 2026-10-18). */
+static const char *const g_cat_name[MAD_CAT_N] = { "tex-RT", "tex-DS", "tex-UAV", "tex-sampled", "tex-MSAA", "buf-private", "buf-shared", "buf-own" };
+/* madeira-doge: size classes of the Metal-owned GPU-only buffers (buf-private) */
+static const UINT64 g_bp_lim[6] = { 64u << 10, 256u << 10, 1u << 20, 4u << 20, 16u << 20, ~(UINT64)0 };
+static const char *const g_bp_name[6] = { "<64K", "<256K", "<1M", "<4M", "<16M", ">=16M" };
+static volatile LONG64 g_bp_bytes[6]; static volatile LONG g_bp_count[6];
 static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
@@ -460,6 +468,7 @@ static volatile LONG64 g_dheap_bytes, g_dheap_kept_bytes; static volatile LONG g
 static volatile LONG g_lheap_n; static volatile LONG64 g_lheap_bytes;   /* madeira-doge: heaps whose Metal backing is still deferred */
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
+static UINT64 mad_default_swap_min(void);   /* madeira-doge: used by the census report */
 static void mad_resident(struct mad_device *d, obj_handle_t h) {
     if (!d || !h || !d->resset) return;
     MTLResidencySet_addAllocation(d->resset, h);
@@ -723,6 +732,13 @@ static void mad_acct_report(void) {
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
     d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+    {   /* madeira-doge: what the Metal-owned GPU-only buffers are made of */
+        char h[256]; int hn = 0, k;
+        for (k = 0; k < 6; k++)
+            hn += snprintf(h + hn, sizeof h - hn, " %s=%ld/%lldMB", g_bp_name[k], g_bp_count[k], (long long)(g_bp_bytes[k] >> 20));
+        d3d12_log("[madeira-d3d12] buf-private by size (Metal-owned, count/MB):%s; default-swap from %llu KB\n", h,
+                  (unsigned long long)(mad_default_swap_min() >> 10));
+    }
     if (g_hp_dev) d3d12_log("[madeira-d3d12] ml1072 texture heaps: %u (%lld MB reserved, %lld MB live in them), %ld textures placed, %ld fallbacks, %u blocks awaiting GPU\n",
                             g_hp_dev->ntheaps, (long long)(g_hp_dev->hp_total_bytes >> 20), (long long)(g_hp_dev->hp_live_bytes >> 20),
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
@@ -2890,8 +2906,10 @@ static volatile LONG64 g_default_swap_bytes; static volatile LONG g_default_swap
 static UINT64 mad_default_swap_min(void) {
     static LONG64 min = -1;
     if (min < 0) { int mb = mad_cfg_int_pe("default-swap-mb", 0);
-                   min = mb > 0 ? (LONG64)mb << 20 : 0;
-                   d3d12_log("[madeira-d3d12] default-swap-mb = %d (%s)\n", mb, mb > 0 ? "GPU-only buffers from that size live on file-backed storage" : "off: GPU-only buffers are Metal-owned"); }
+                   int kb = mad_cfg_int_pe("default-swap-kb", 0);   /* KB threshold for default-swap; overrides default-swap-mb when > 0 */
+                   min = kb > 0 ? (LONG64)kb << 10 : mb > 0 ? (LONG64)mb << 20 : 0;
+                   d3d12_log("[madeira-d3d12] default-swap from %lld KB (default-swap-mb = %d, default-swap-kb = %d): %s\n", (long long)(min >> 10), mb, kb,
+                             min ? "GPU-only buffers from that size live on file-backed storage" : "off: GPU-only buffers are Metal-owned"); }
     return (UINT64)min;
 }
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
@@ -9282,6 +9300,12 @@ static int mad_map_texture_format(DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags, enu
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign) {
     LONG64 now;
     if (cat >= MAD_CAT_N) return;
+    if (cat == MAD_CAT_BUF_PRIVATE) {   /* madeira-doge: size classes */
+        unsigned k = 0;
+        while (k < 5 && bytes >= g_bp_lim[k]) k++;
+        if (sign > 0) InterlockedIncrement(&g_bp_count[k]); else InterlockedDecrement(&g_bp_count[k]);
+        InterlockedExchangeAdd64(&g_bp_bytes[k], sign > 0 ? (LONG64)bytes : -(LONG64)bytes);
+    }
     if (sign > 0) { r->acct_bytes = bytes; r->acct_cat = cat; InterlockedIncrement(&g_cat_count[cat]); }
     else InterlockedDecrement(&g_cat_count[cat]);
     now = InterlockedExchangeAdd64(&g_cat_bytes[cat], sign > 0 ? (LONG64)bytes : -(LONG64)bytes) + (sign > 0 ? (LONG64)bytes : -(LONG64)bytes);
@@ -10834,7 +10858,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if (!r->buffer) r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
         if (!r->buffer) { free(r); return mad_creation_failure(d, "newBuffer"); }
         if (!r->placed_heap) {
-            mad_acct(r, heap_type == D3D12_HEAP_TYPE_DEFAULT ? MAD_CAT_BUF_PRIVATE : MAD_CAT_BUF_SHARED, info.length, +1);   /* ml1057 */
+            mad_acct(r, r->own_mem ? MAD_CAT_BUF_OWN : heap_type == D3D12_HEAP_TYPE_DEFAULT ? MAD_CAT_BUF_PRIVATE : MAD_CAT_BUF_SHARED,
+                     info.length, +1);   /* ml1057; madeira-doge buf-own */
             mad_resident(d, r->buffer);
         }
         r->cpu = info.memory.ptr;      /* NULL for GPU-private, which is correct */
