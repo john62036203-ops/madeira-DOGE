@@ -1154,11 +1154,15 @@ static void madeira_steam_session_log( const UNICODE_STRING *image )
  *     GTA log 2026-10-02 22:25, the browser connected to the game's IPC
  *     channel, started its in-process V8 "PAC thread"s and never created a
  *     renderer -- proxy resolution is where Steam's webhelper stalled too;
- *   - env.MADEIRA_SC_CEF_FLAGS (madeira.cfg) is appended verbatim, for tests.
+ *   - env.MADEIRA_SC_CEF_FLAGS (madeira.cfg) is appended verbatim, for tests;
+ *     when it carries a --js-flags= of its own (V8 heap limits such as
+ *     --max-semi-space-size), --jitless goes into that value instead of a
+ *     second switch: Chromium keeps only the LAST --js-flags=, so the appended
+ *     one would silently turn V8's JIT back on (see sc_extra_js_flags).
  * env.MADEIRA_SC_CEF = 0 turns this off, together with virtual_ios.c's parts. */
 enum { SC_NOT_HELPER = 0, SC_BROWSER = 1, SC_CHILD = 2 };
 enum { SC_BRP_SPLICED = 1, SC_BRP_NEW = 2, SC_SINGLE_ADDED = 4, SC_JITLESS_ADDED = 8,
-       SC_OWN_JS_FLAGS = 16, SC_EXTRA_ADDED = 32, SC_NOPROXY_ADDED = 64 };
+       SC_OWN_JS_FLAGS = 16, SC_EXTRA_ADDED = 32, SC_NOPROXY_ADDED = 64, SC_JITLESS_MERGED = 128 };
 
 /* Index of the first character after the LAST `sw` (an ASCII switch such as
  * "--disable-features=") in `cl` that starts an argument, or -1. A switch
@@ -1213,20 +1217,75 @@ static const char *child_extra_args( const char *spec, const WCHAR *image, int i
     return spec;
 }
 
+/* madeira-bcd: consoles without a window. kernelbase's alloc_console starts
+ * conhost.exe with a window unless the program asked for none
+ * (CREATE_NO_WINDOW appends --headless). In a Dock session explorer's desktop
+ * starts dockhost.exe, a console program, without a console, so it gets one
+ * with a window: build 442 (2026-10-08, both runs) had exactly one conhost,
+ * `conhost.exe --server 0x34` from dockhost's main thread at t+4 s, window
+ * 0x20056 shown at {0,0,505,434}, the "DOS window" left of the game, showing
+ * what dockhost, Valve's client in it and console children print. Social
+ * Club's helper opened one the same way when --enable-logging made Chromium
+ * call AllocConsole. On the phone it only covers the game, and painting what
+ * is written to it costs CPU, so a conhost.exe started for a console
+ * (--server) without --headless or --unix gets --headless: the console works
+ * as before (WriteConsole, modes, Ctrl handlers), only GetConsoleWindow() is
+ * NULL, as with CREATE_NO_WINDOW. Pseudo-consoles already start headless.
+ * env.MADEIRA_CONSOLE_WINDOW=1 keeps the window. Writes the new command line
+ * to `out` (`cap` WCHARs with the NUL) and returns its length, or -1 when it
+ * stays as it is. */
+static int console_headless_cmdline( const char *env, const WCHAR *image, int image_len,
+                                     const WCHAR *cl, int cl_len, WCHAR *out, int cap )
+{
+    static const char headless[] = " --headless";
+    int n = (int)sizeof(headless) - 1, k;
+
+    if ((env && env[0] == '1') || !ios_image_name_is( image, image_len, "conhost.exe" )) return -1;
+    if (sc_switch_end( cl, cl_len, "--server" ) < 0 || sc_switch_end( cl, cl_len, "--headless" ) >= 0 ||
+        sc_switch_end( cl, cl_len, "--unix" ) >= 0 || cl_len + n + 1 > cap) return -1;
+    memcpy( out, cl, cl_len * sizeof(WCHAR) );
+    for (k = 0; k < n; k++) out[cl_len + k] = (WCHAR)headless[k];
+    out[cl_len + n] = 0;
+    return cl_len + n;
+}
+
+/* madeira-bcd: index of the first character after the LAST "--js-flags=" in
+ * `extra` (env.MADEIRA_SC_CEF_FLAGS) that starts an argument, or -1. The memory
+ * study of 2026-10-09 (467 log: V8's cage 167 MB dirty when RDR2.exe started)
+ * suggests V8 heap flags through env.MADEIRA_SC_CEF_FLAGS, and a bare
+ * --js-flags=--max-semi-space-size=1 there would replace --jitless. */
+static int sc_extra_js_flags( const char *extra )
+{
+    static const char sw[] = "--js-flags=";
+    int n = sizeof(sw) - 1, k, last = -1;
+
+    for (k = 0; extra && extra[k]; k++)
+    {
+        if (k && extra[k - 1] != ' ' && extra[k - 1] != '\t' && extra[k - 1] != '"') continue;
+        if (!strncmp( extra + k, sw, n )) last = k + n;
+    }
+    return last;
+}
+
 /* The browser's new command line, written to `out` (`cap` WCHARs with the
  * NUL): `cl` with PartitionAllocBackupRefPtr put first in its last
  * --disable-features= list (Chromium uses only the last one; a second switch
  * would drop the app's own list), or a new --disable-features= when it has
  * none; then --single-process unless present, --js-flags=--jitless when
- * `jitless` and `cl` has no --js-flags= of its own, and ` extra` when
- * non-empty. Returns the length and the SC_* bits in *how, or -1 when `cap` is
- * too small. */
+ * `jitless` and neither `cl` nor `extra` has a --js-flags= of its own, and
+ * ` extra` when non-empty. With `jitless` and a --js-flags= in `extra`,
+ * "--jitless" becomes the first flag of extra's last one, the same argument
+ * however Windows splits it: --js-flags="--a --b" -> --js-flags="--jitless --a
+ * --b", and --js-flags=--a -> --js-flags=--jitless" "--a (CommandLineToArgvW
+ * reads "--jitless --a"). Returns the length and the SC_* bits in *how, or -1
+ * when `cap` is too small. */
 static int sc_browser_cmdline( const WCHAR *cl, int cl_len, int jitless, const char *extra,
                                WCHAR *out, int cap, int *how )
 {
     static const char brp[] = "PartitionAllocBackupRefPtr";
     int df = sc_switch_end( cl, cl_len, "--disable-features=" ), o = 0, k;
     int need = cl_len + 1 + 64 + 24 + 24 + 20 + (extra ? 1 + (int)strlen( extra ) : 0);
+    int xj = (jitless && extra) ? sc_extra_js_flags( extra ) : -1;   /* madeira-bcd: see sc_extra_js_flags */
     const char *add;
 
     *how = 0;
@@ -1252,7 +1311,7 @@ static int sc_browser_cmdline( const WCHAR *cl, int cl_len, int jitless, const c
         *how |= SC_SINGLE_ADDED;
     }
     if (sc_switch_end( cl, cl_len, "--js-flags=" ) >= 0) *how |= SC_OWN_JS_FLAGS;
-    else if (jitless)
+    else if (jitless && xj < 0)
     {
         for (add = " --js-flags=--jitless"; *add; add++) out[o++] = (WCHAR)*add;
         *how |= SC_JITLESS_ADDED;
@@ -1266,7 +1325,22 @@ static int sc_browser_cmdline( const WCHAR *cl, int cl_len, int jitless, const c
     if (extra && *extra)
     {
         out[o++] = ' ';
-        for (add = extra; *add; add++) out[o++] = (WCHAR)(unsigned char)*add;
+        for (k = 0; extra[k]; k++)
+        {
+            if (k == xj)   /* madeira-bcd: --jitless first in extra's last --js-flags= */
+            {
+                int quoted = extra[k] == '"';
+                for (add = quoted ? "\"--jitless " : "--jitless\" \""; *add; add++) out[o++] = (WCHAR)*add;
+                *how |= SC_JITLESS_MERGED;
+                if (quoted) continue;   /* its opening quote is the one just written */
+            }
+            out[o++] = (WCHAR)(unsigned char)extra[k];
+        }
+        if (xj == k)   /* "--js-flags=" ends extra: the value is --jitless alone */
+        {
+            for (add = "--jitless"; *add; add++) out[o++] = (WCHAR)*add;
+            *how |= SC_JITLESS_MERGED;
+        }
         *how |= SC_EXTRA_ADDED;
     }
     out[o] = 0;
@@ -1871,6 +1945,32 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         return STATUS_ACCESS_DENIED;
     }
 
+    /* madeira-bcd: a console's conhost.exe starts without a window (see
+     * console_headless_cmdline); env.MADEIRA_CONSOLE_WINDOW=1 keeps it. */
+    {
+        int cl_len = params->CommandLine.Length / sizeof(WCHAR), o = -1;
+        WCHAR *nbuf = malloc( (cl_len + 16) * sizeof(WCHAR) );   /* kept when used: leaks once per console, as above */
+        const char *window = getenv( "MADEIRA_CONSOLE_WINDOW" );   /* 1: consoles keep their conhost window (default: none, as with CREATE_NO_WINDOW) */
+
+        if (nbuf)
+            o = console_headless_cmdline( window, params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
+                                          params->CommandLine.Buffer, cl_len, nbuf, cl_len + 16 );
+        if (o < 0) free( nbuf );
+        else
+        {
+            const RTL_USER_PROCESS_PARAMETERS *own = NtCurrentTeb()->Peb->ProcessParameters;
+            static int console_n;
+
+            params->CommandLine.Buffer = nbuf;
+            params->CommandLine.Length = o * sizeof(WCHAR);
+            params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+            if (console_n++ < 16)
+                dprintf( 2, "[console] the console of %s starts without a window (conhost --headless, as with "
+                            "CREATE_NO_WINDOW; env.MADEIRA_CONSOLE_WINDOW=1 shows it)\n",
+                         own ? debugstr_us( &own->ImagePathName ) : "?" );
+        }
+    }
+
     /* madeira-bcd: Social Club's Chromium -- see sc_helper_kind. */
     {
         const char *sc = getenv( "MADEIRA_SC_CEF" );
@@ -1909,6 +2009,8 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                          (how & SC_BRP_SPLICED) ? "spliced into its --disable-features list"
                                                 : "new --disable-features switch",
                          (how & SC_JITLESS_ADDED) ? "--jitless (MADEIRA_JITLESS=0 turns it off)"
+                         : (how & SC_JITLESS_MERGED) ? "--jitless put first in MADEIRA_SC_CEF_FLAGS' --js-flags "
+                                                       "(Chromium keeps only the last one)"
                          : (how & SC_OWN_JS_FLAGS) ? "flags left as the app set them"
                                                    : "JIT (MADEIRA_JITLESS=0)",
                          (how & SC_NOPROXY_ADDED) ? "--no-proxy-server added" : "its own proxy switch kept",
