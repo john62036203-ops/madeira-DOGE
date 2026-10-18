@@ -22116,6 +22116,10 @@ static BOOL ios_subfloor_window_held( ULONG_PTR low, ULONG_PTR real )
  * Map an executable (PE format) image into an existing view.
  * virtual_mutex must be held by caller.
  */
+#ifdef WINE_IOS
+static void ios_pool_image_finish( struct file_view *view, IMAGE_NT_HEADERS *nt,
+                                   const IMAGE_SECTION_HEADER *sec, const UNICODE_STRING *nt_name, char *alias );
+#endif
 static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRING *nt_name, int fd,
                                      struct pe_image_info *image_info, USHORT machine,
                                      int shared_fd, BOOL removable )
@@ -22898,9 +22902,10 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
                 image_info->map_addr = wine_server_client_ptr( (void *)b );   /* relocate to the pool address */
                 if (pool_img_n++ < 64)
                     dprintf( 2, "[pool-image] #%u builtin image of 0x%lx bytes mapped IN the pool at %p "
-                                "(range off=0x%lx+0x%lx, machine=%#x hybrid=%d): no PE backing, no copy\n",
-                             pool_img_n, (unsigned long)size, (void *)b, (unsigned long)off,
-                             (unsigned long)(want + 0xc000), image_info->machine, image_info->is_hybrid );
+                                "(range off=0x%lx+0x%lx, slack 0x%lx, machine=%#x hybrid=%d): no PE backing, no copy\n",
+                             pool_img_n, (unsigned long)size, pi->base, (unsigned long)off,
+                             (unsigned long)(want + 0xc000), (unsigned long)(pi->alloc - size),
+                             image_info->machine, image_info->is_hybrid );
                 return STATUS_SUCCESS;
             }
             if (!status) { delete_view( *view_ret ); *view_ret = NULL; }
