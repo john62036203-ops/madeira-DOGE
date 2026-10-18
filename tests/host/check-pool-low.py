@@ -89,7 +89,8 @@ assert 'a < ios_jit_low_rx_global + low' in scan and 'pool_base = ios_jit_low_rw
 assert 'if (ios_jit_low_overlaps( (uintptr_t)a, size )) return 1;' in function(native, 'static int ios_jit_pool_intersects(')
 assert 'ios_jit_low_overlaps( a, size ))) return;' in function(native, 'static void ios_jit_range_tripwire( const char *tag, const void *addr, size_t size,\n                                    int prot, void *retaddr )\n{')
 assert 'if (ios_jit_low_overlaps( b, size )) return 1;' in function(native, 'static int ios_swap_is_fexjit(')
-assert 'if (ios_jit_low_overlaps( p, host_page_size )) return 0;' in function(native, 'IOS_DC_INLINE int ios_dc_prepare(')
+if 'IOS_DC_INLINE int ios_dc_prepare(' in native:   # the decommit helpers (never called) are not upstream
+    assert 'if (ios_jit_low_overlaps( p, host_page_size )) return 0;' in function(native, 'IOS_DC_INLINE int ios_dc_prepare(')
 assert '!ios_jit_low_contains( (uintptr_t)block_begin )' in function(native, 'void ios_mono_bridge_capture(')
 floor = function(native, 'static inline ULONG_PTR ios_usable_va_floor_get(void)')
 assert 'if (ios_jit_low_size_global && sz)' in floor, 'the furniture floor follows the moved pool alias'
@@ -131,8 +132,14 @@ assert 'MadeiraConfig.gameValue("pool-low-margin") ?? MadeiraConfig.get("pool-lo
 take = function(swift, 'private static func takeLowRegion(')
 assert 'Int(marginText) ?? 128' in take, 'the margin defaults to 128 MB'
 assert 'guard poolRx >= exeWindow.base + exeWindow.size else {' in take, 'C only with the pool above the window'
-assert 'let available = best.map { $0.size > margin ? $0.size - margin : 0 } ?? 0' in take
-assert 'let size = poolRunSize(available: available, wanted: available, pageFit: pageFit)' in take
+assert 'runs.contains(where: { $0.base < r.base && $0.size >= margin }) ? 0 : margin' in take, \
+    'a run keeps the margin unless a lower run alone holds it'
+assert 'let available = r.size > keep ? r.size - keep : 0' in take
+assert 'let pick = fits.max(by: { $0.size < $1.size })' in take, 'the run that leaves the largest C'
+assert 'poolRunSize(available: available, wanted: available, pageFit: pageFit)' in take
+# madeira-doge: on iOS 27's 512 GB map (bigMap) every run keeps its own margin, as before the shared-margin rule
+assert 'sharedMargin && runs.contains(where: { $0.base < r.base && $0.size >= margin }) ? 0 : margin' in take
+assert 'sharedMargin: !bigMap)' in swift
 assert 'let target = best.base + best.size - size' in take
 assert 'freeRuns(0x100000000, best.base, minSize: size)' in take and 'plugs.append(' in take
 assert 'if c < lowFloor || c + size > exeWindow.base || c + size > poolRx {' in take, 'a stray placement is released'

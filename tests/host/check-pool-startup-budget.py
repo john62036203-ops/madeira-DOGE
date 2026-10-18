@@ -30,7 +30,8 @@ def function(source, signature, closing='\n}'):
 ec = native[native.index('size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;'):]
 ec = ec[:ec.index('size_t reserve_offset, tail_added, tail_skipped = 0;')]
 assert 'int low_ok = ios_jit_low_size_global && !ios_wow_base();' in ec
-assert ec.count('goto retry_code_carve_reuse;') == 1
+assert ec.count('goto retry_code_carve_reuse;') == 2
+assert ec.count('ios_tail_carve_ready( &ios_tail_carves[') == 2, 'cap lift and reuse share one readiness rule'
 assert 'if (kept_large_carve && !reuse_all_carves)' in ec
 assert 'reuse_all_carves = 1;\n                low_fits = 0;' in ec
 assert ec.count('(low_ok || !ios_tail_carve_in_low( ios_tail_carves[') == 2
@@ -41,7 +42,10 @@ helpers = ''.join(function(native, signature) for signature in (
     'static int ios_pool_low_take(',
     'static int ios_tail_carve_in_low(',
     'static int ios_pool_preserve_code_carve(',
+    'static int ios_tail_carve_ready(',
 ))
+carve_start = native.index('#define IOS_TAIL_CARVE_MAX ')
+carve_table = native[carve_start:native.index('\n\n', carve_start)]
 
 c_fixture = r'''
 #include <stdint.h>
@@ -49,24 +53,29 @@ c_fixture = r'''
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 #define MB ((size_t)1 << 20)
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "failed line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
 #define STATUS_SUCCESS 0
 #define STATUS_NO_MEMORY -1
 #define FALLBACK_TAIL 2
 #define IOS_POOL_LOW_CARVE_MAX 0x8000000u
-#define IOS_TAIL_CARVE_MAX 256
+#define IOS_POOL_REUSE_GRACE_SEC 3
 static void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
 static uintptr_t ios_jit_low_rx_global, ios_jit_low_rw_global;
 static size_t ios_jit_low_size_global, ios_jit_pool_size_global;
 static volatile size_t ios_jit_low_reserved;
 static size_t jit_pool_offset, ios_jit_tail_reserved, ios_pool_head_reserve;
 static size_t ios_jit_hole_off_eff, ios_jit_hole_end_eff;
+static size_t ios_jit_hole2_off, ios_jit_hole2_end;
 static int ios_jit_low_full_logged, wow, lose_race;
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct { size_t off, size; int free; time_t freed_at; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
+''' + carve_table + r'''
 static uintptr_t ios_wow_base(void) { return wow; }
+static void *ios_jit_current_peb(void) { return (void *)(uintptr_t)1; }
+static int ios_tail_carve_scan(const void *base, size_t size, int strict)
+{ (void)base; (void)size; (void)strict; return 0; }
 ''' + helpers + r'''
 static int racing_low_take(volatile size_t *used, size_t total, size_t want, size_t *off)
 {
@@ -92,12 +101,16 @@ static void reset(void *memory)
     ios_jit_pool_size_global = 864 * MB;
     jit_pool_offset = 600 * MB;
     ios_jit_tail_reserved = ios_jit_hole_off_eff = ios_jit_hole_end_eff = 0;
+    ios_jit_hole2_off = ios_jit_hole2_end = 0;
     ios_pool_head_reserve = 128 * MB;
     ios_jit_low_full_logged = wow = lose_race = 0;
     ios_tail_carve_n = 1;
     ios_tail_carves[0].off = (size_t)(ios_jit_low_rx_global + 2 * MB - (uintptr_t)ios_jit_rx_base_global);
     ios_tail_carves[0].size = 16 * MB;
     ios_tail_carves[0].free = 1;
+    ios_tail_carves[0].freed_at = 0;
+    ios_tail_carves[0].peb = NULL;
+    ios_tail_carves[0].retired = 0;
 }
 int main(void)
 {
@@ -216,10 +229,11 @@ assert 'b + size > ceiling' in take and 'gapHitsWindow' in take
 assert 'VM_FLAGS_OVERWRITE' not in take
 low = function(swift, 'private static func takeLowRegion(', '\n    }')
 assert 'Int(marginText) ?? 128' in low
-assert 'let available = best.map { $0.size > margin ? $0.size - margin : 0 } ?? 0' in low
-assert 'let size = poolRunSize(available: available, wanted: available, pageFit: pageFit)' in low
+assert 'let available = r.size > keep ? r.size - keep : 0' in low
+assert 'poolRunSize(available: available, wanted: available, pageFit: pageFit)' in low
+assert 'runs.contains(where: { $0.base < r.base && $0.size >= margin }) ? 0 : margin' in low
 assert 'guard let best = best, size >= 64 << 20' in low
-assert 'exeWindow: (exeWinBase, exeWinSize), pageFit: pageFit)' in swift
+assert 'exeWindow: (exeWinBase, exeWinSize), pageFit: pageFit,\n                                      sharedMargin: !bigMap)' in swift   # madeira-doge: iOS 27 keeps per-run margins
 allocator = (root / 'app/Madeira/JITAllocator.c').read_text()
 prepare = function(allocator, 'void *jit26_prepare_region(')
 assert 'register size_t x1 __asm__("x1") = len;' in prepare
