@@ -293,7 +293,7 @@ link_dll() {  # link_dll <output> <objects...>
     local out="$1"; shift
     "$CXX" -shared -o "$out" "$@" "$OUT/obj/version.o" "$D/src/d3d11/d3d11.def" \
         "$OUT/libdxgi.a" "$OUT/libDXBCParser.a" "$OUT/libdxmt.a" -L"$OUT" -lwinemetal "$OUT/libutil.a" -lntdll \
-        -static -Wl,--file-alignment=4096 \
+        -static -Wl,--file-alignment=4096 -Wl,--section-alignment=16384 \
         -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 \
         2>> "$OUT/build.err" || { grep -m 20 "error" "$OUT/build.err"; fail "linking $(basename "$out") failed"; }
 }

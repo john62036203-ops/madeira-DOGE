@@ -183,6 +183,8 @@ struct ios_jit_mapping {
                          * docs/dxgi-config-fault.md. */
     unsigned char  hybrid_cached;   /* ml1245 (upstream aa70ae1): image carries ARM64EC metadata */
     unsigned char  hybrid_valid;    /* 0 = hybrid_cached not yet populated */
+    unsigned char  identity;        /* madeira-doge: pe_base == jit_base, an in-pool image (ios_pool_images):
+                                     * every translate is the identity and the emulator gets no alias entry */
 };
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
 static int ios_jit_mapping_count = 0;
@@ -4187,10 +4189,14 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
         ios_jit_mappings[slot].unmapped = 0;
         ios_jit_mappings[slot].hybrid_cached = 0;    /* ml1245: same for the EC memo */
         ios_jit_mappings[slot].hybrid_valid = 0;
+        ios_jit_mappings[slot].identity = (pe_base == jit_base);
         __sync_synchronize();
         ios_jit_mappings[slot].pe_base = pe_base;
         if (slot == ios_jit_mapping_count) ios_jit_mapping_count++;
     }
+    /* madeira-doge: an in-pool image IS its own executable address -- the
+     * emulator's alias table (pool RIP -> PE VA) has nothing to say about it. */
+    if (pe_base == jit_base) return;
 
     /* If xtajit64 has already registered its alias-mapping push callback
      * (via the unix_ios_push_jit_aliases unix-call), forward this new
@@ -4611,6 +4617,8 @@ static int ios_jit_owned_copy( void *pe_base, void *peb )
 static int ios_jit_alias_drain_wants( int i, void *own )
 {
     void *owner = ios_jit_mappings[i].owner_peb;
+
+    if (ios_jit_mappings[i].identity) return 0;   /* madeira-doge: in-pool image, nothing to alias */
 
     if (owner)
         return own && owner == own && ios_jit_mappings[i].pe_base && ios_jit_mappings[i].size;
@@ -7354,6 +7362,7 @@ struct file_view
  * Set once by map_image_into_view (MADEIRA_X64_IMAGE_NOCOPY), read by
  * mprotect_exec. Follows the view through splits like VPROT_ARM64EC. */
 #define VPROT_X64DATA          0x1000
+#define VPROT_INPOOL           0x2000  /* madeira-doge: the view IS JIT-pool memory (see ios_pool_images) */
 
 /* Conversion from VPROT_* to Win32 flags */
 static const BYTE VIRTUAL_Win32Flags[16] =
@@ -13596,7 +13605,17 @@ static void delete_view( struct file_view *view ) /* [in] View */
         ios_jit_retire_image( view->base, view->size );
     if (view->protect & SEC_IMAGE) ios_jit_note_image_unmapped( view->base, view->size );
     ios_swap_release_range( view->base, view->size, 0 );   /* ml1077 */
-    if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
+    if (view->protect & VPROT_INPOOL)
+    {
+        /* madeira-doge: pool pages are never unmapped; the range stays in the
+         * process's ledger until the process exits, like an image copy. The
+         * entry is kept too -- a later image at the same range purges it. */
+        static unsigned int n;
+        if (n++ < 32)
+            dprintf( 2, "[pool-image] %s view %p+0x%lx deleted: pool pages kept (ledger frees them at process exit)\n",
+                     ios_pe_module_name( view->base, view->size ), view->base, (unsigned long)view->size );
+    }
+    else if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
     if (ios_retire_trace_armed) ios_retire_mark( "D1u\n" );   /* unmap_area done */
     set_page_vprot( view->base, view->size, 0 );
     if (ios_retire_trace_armed) ios_retire_mark( "D2v\n" );   /* vprot cleared */
@@ -15774,6 +15793,138 @@ static int ios_x64_image_in_rwx_section( const void *base, size_t size )
     return 0;
 }
 
+/* madeira-doge: IMAGES IN THE POOL (env.MADEIRA_POOL_IMAGES = 1; default off).
+ *
+ * WHY. Every ARM64EC image Wine maps today exists twice: a file-backed PE view at
+ * a Wine-chosen VA (never executable: iOS TXM only executes the debugger's pool
+ * pages, and only at their own address) and a copy of the whole image in the
+ * pool, relocated to the pool address, which is what actually runs. The pair
+ * costs a second set of pages in footprint, a Mach exception for every call
+ * that reaches the PE VA ([exec-redir]: Sekiro 2026-10-18 10:05, 400k in 270 s,
+ * 80% from kernel32 into ntdll), and ~600 lines that keep the two copies'
+ * data coherent (the NtProtect IAT sync, DIR64 re-application, pointer
+ * translation, stale-pointer healing). NutsEmu's Wine (nutsdeveloping.com,
+ * patch 0005 of its 1521 source package) shows the other way: the image's VA
+ * IS the executable memory, written through the RW alias, no second copy.
+ *
+ * WHAT. For a Wine builtin that is ARM64EC/ARM64 (never ntdll: it is pre-mapped
+ * by loader_ios and copied per child), map_image_view takes a pool range
+ * instead of a VA and creates the view THERE (VPROT_INPOOL). map_image_into_view
+ * reads the file into the RW alias (map_pe_header, map_file_into_view) and
+ * relocates/ARM64X-fixes through the alias; set_vprot's requests reach
+ * mprotect_exec, which keeps code pages RX untouched (a write request on them
+ * is served by the store emulator through the alias, as pool code always was)
+ * and mprotects data pages R or RW (dropping X from a data page of the pool is
+ * harmless and is what the copy path does at copy time). After the sections,
+ * ios_pool_image_finish registers an IDENTITY mapping (pe_base == jit_base, so
+ * every translate is the identity and FEX gets no alias entry), patches x18
+ * into trampolines right behind the image (the slack reserved with the range),
+ * and places the x64-fast stubs. delete_view keeps the pages (the range stays
+ * in the process's ledger until the process exits, as copies do today).
+ *
+ * REQUIRES 16 KB section alignment (PE sections 4 KB-aligned would share host
+ * pages between code and data; Wine's builtins have it, the DXMT DLLs get it
+ * from --section-alignment); images that lack it keep the copy path. The DXMT
+ * build scripts pass -Wl,--section-alignment=16384 since this change. */
+#define IOS_POOL_IMAGES 256
+#define IOS_POOL_IMAGE_TRAMP 0x10000      /* x18 trampoline slack behind the image */
+#define IOS_POOL_IMAGE_EXEC_MAX 8
+struct ios_pool_image
+{
+    void *base;                 /* view base = pool RX address (64 KB aligned) */
+    size_t size;                /* view size */
+    size_t alloc;               /* the range taken from the pool, from base */
+    int exec_n;
+    uintptr_t exec_lo[IOS_POOL_IMAGE_EXEC_MAX], exec_hi[IOS_POOL_IMAGE_EXEC_MAX];
+};
+static struct ios_pool_image ios_pool_images[IOS_POOL_IMAGES];
+static volatile int ios_pool_image_count;
+
+static int ios_pool_images_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_POOL_IMAGES" );   /* Map Wine's ARM64EC builtin DLLs directly in the JIT pool: no PE backing copy, no exec-fault redirect. Default off. */
+        cached = (s && s[0] == '1' && !s[1]) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* The entry whose range contains [addr, addr+size), validated against the view
+ * tree (virtual_mutex is held by every caller) so a dead entry whose range the
+ * pool handed to something else never answers. */
+static struct ios_pool_image *ios_pool_image_find( const void *addr, size_t size )
+{
+    int i, n = ios_pool_image_count;
+    uintptr_t lo = (uintptr_t)addr, hi = lo + size;
+    for (i = 0; i < n; i++)
+    {
+        struct ios_pool_image *pi = &ios_pool_images[i];
+        uintptr_t b = (uintptr_t)pi->base;
+        struct file_view *v;
+        if (!b || lo < b || hi > b + pi->alloc || hi < lo) continue;
+        /* the view must still be there: after the process that mapped the image
+         * exited, the pool hands the range to anything (an anon RWX alias, a copy) */
+        if (!(v = find_view( (void *)b, 0 )) || v->base != (void *)b || !(v->protect & VPROT_INPOOL))
+        {
+            pi->base = NULL;
+            continue;
+        }
+        return pi;
+    }
+    return NULL;
+}
+
+static struct ios_pool_image *ios_pool_image_of_view( const struct file_view *view )
+{
+    return (view->protect & VPROT_INPOOL) ? ios_pool_image_find( view->base, 0 ) : NULL;
+}
+
+/* The RW alias of a pool address, NULL when addr is not an in-pool image. */
+static char *ios_pool_image_alias( const void *addr )
+{
+    if (!ios_pool_image_find( addr, 0 )) return NULL;
+    return (char *)ios_jit_rw_base_global + ((const char *)addr - (const char *)ios_jit_rx_base_global);
+}
+
+static int ios_pool_image_in_exec( const struct ios_pool_image *pi, const void *addr, size_t size )
+{
+    int i;
+    uintptr_t lo = (uintptr_t)addr, hi = lo + size;
+    for (i = 0; i < pi->exec_n; i++)
+        if (lo < pi->exec_hi[i] && hi > pi->exec_lo[i]) return 1;
+    return 0;
+}
+
+static struct ios_pool_image *ios_pool_image_register( void *base, size_t size, size_t alloc )
+{
+    int i, n = ios_pool_image_count, slot = -1;
+    uintptr_t lo = (uintptr_t)base, hi = lo + alloc;
+    for (i = 0; i < n; i++)
+    {
+        uintptr_t b = (uintptr_t)ios_pool_images[i].base;
+        if (!b) { if (slot < 0) slot = i; continue; }
+        if (lo < b + ios_pool_images[i].alloc && hi > b)   /* the pool reused a dead image's range */
+        {
+            ios_pool_images[i].base = NULL;
+            if (slot < 0) slot = i;
+        }
+    }
+    if (slot < 0)
+    {
+        if (n >= IOS_POOL_IMAGES) return NULL;
+        slot = n;
+    }
+    ios_pool_images[slot].size = size;
+    ios_pool_images[slot].alloc = alloc;
+    ios_pool_images[slot].exec_n = 0;
+    __sync_synchronize();
+    ios_pool_images[slot].base = base;
+    if (slot == n) ios_pool_image_count = n + 1;
+    return &ios_pool_images[slot];
+}
+
 
 /* A guest's anonymous RWX data heap is plain read/write memory to the host.
  *
@@ -16064,6 +16215,30 @@ static int ios_hexval( char c )
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
 #ifdef WINE_IOS
+    /* madeira-doge: an in-pool image (see ios_pool_images). Its code pages are
+     * the executable pool pages themselves: never mprotect them (that would
+     * take EXECUTE away for good -- the ml140 "poison"), so a write request on
+     * code is answered by leaving the page RX; the write then faults into the
+     * store emulator, which lands it through the RW alias, exactly as writes to
+     * pool code have always been served. Data pages take the requested R or RW
+     * on the pool page directly. */
+    {
+        struct ios_pool_image *pi = ios_pool_image_find( base, size );
+        if (pi)
+        {
+            static unsigned long pim_n;
+            int code = (unix_prot & PROT_EXEC) || ios_pool_image_in_exec( pi, base, size );
+            int ret = 0;
+            if (!code) ret = mprotect( base, size, (unix_prot & ~PROT_EXEC) ? (unix_prot & ~PROT_EXEC) : PROT_READ );
+            if (++pim_n <= 48 && !ios_in_mach_exc)
+                dprintf( 2, "[pool-image] protect %p+0x%lx %c%c%c in %s: %s%s\n", base, (unsigned long)size,
+                         (unix_prot & PROT_READ) ? 'r' : '-', (unix_prot & PROT_WRITE) ? 'w' : '-',
+                         (unix_prot & PROT_EXEC) ? 'x' : '-', ios_pe_module_name( pi->base, pi->size ),
+                         code ? "code page stays RX (writes go through the alias)" : "data page mprotected",
+                         (!code && ret) ? " -- FAILED" : "" );
+            return ret;
+        }
+    }
     /* iOS-Madeira ml1030: A 32-BIT IMAGE PAGE IS DATA TO THE HOST — SO STOP
      * ROUTING ITS WRITE REQUESTS THROUGH THE EXECUTABLE MACHINERY.
      *
@@ -19435,6 +19610,21 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
 static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start, size_t size,
                                     off_t offset, unsigned int vprot, BOOL removable )
 {
+#ifdef WINE_IOS
+    /* madeira-doge: an in-pool image is never mapped over -- the pool pages
+     * are the image; the file is read into them through the RW alias. */
+    if (view->protect & VPROT_INPOOL)
+    {
+        char *alias = ios_pool_image_alias( (char *)view->base + start );
+        ssize_t got;
+        if (!alias) return STATUS_INVALID_PARAMETER;
+        if (vprot & VPROT_WRITE) return STATUS_NOT_SUPPORTED;   /* a shared section cannot be in the pool */
+        got = pread( fd, alias, size, offset );
+        if (got < 0) return STATUS_NO_MEMORY;
+        if ((size_t)got < size) memset( alias + got, 0, size - got );
+        return STATUS_SUCCESS;
+    }
+#endif
     return map_file_into_view_ex( view, fd, start, size, offset, vprot, removable, TRUE );
 }
 
@@ -21707,6 +21897,12 @@ static void update_arm64x_mapping( struct file_view *view, IMAGE_NT_HEADERS *nt,
     const IMAGE_DYNAMIC_RELOCATION_TABLE *table;
     const char *ptr, *end;
     char *base = view->base;
+#ifdef WINE_IOS
+    /* madeira-doge: an in-pool image is written through its RW alias (same
+     * offsets, so the table is read and the fixups applied there). */
+    char *alias = (view->protect & VPROT_INPOOL) ? ios_pool_image_alias( view->base ) : NULL;
+    if (alias) base = alias;
+#endif
     const IMAGE_LOAD_CONFIG_DIRECTORY *cfg = (void *)(base + dir->VirtualAddress);
     ULONG sec, offset, size = min( dir->Size, cfg->Size );
 
@@ -21937,6 +22133,15 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     SIZE_T header_size, header_map_size, total_size = view->size;
     SIZE_T align_mask = max( image_info->alignment - 1, page_mask );
     INT_PTR delta;
+#ifdef WINE_IOS
+    /* madeira-doge: an in-pool image (VPROT_INPOOL) is READ through ptr (its
+     * pool RX pages) and WRITTEN through wptr, the RW alias; for any other
+     * view the two are the same pointer. */
+    char *walias = (view->protect & VPROT_INPOOL) ? ios_pool_image_alias( view->base ) : NULL;
+    char *wptr = walias ? walias : ptr;
+#else
+    char *wptr = ptr;
+#endif
 
 #ifdef WINE_IOS
     ios_wow_note_image( view->base, nt_name );   /* ml1282 */
@@ -21977,6 +22182,22 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     fstat( fd, &st );
     header_size = min( image_info->header_size, st.st_size );
     header_map_size = min( image_info->header_map_size, ROUND_SIZE( 0, st.st_size, host_page_mask ));
+#ifdef WINE_IOS
+    if (walias)
+    {
+        /* madeira-doge: the pool range may hold a dead image's bytes; the whole
+         * view is zeroed (so .bss and section tails are clean), then read. */
+        memset( walias, 0, total_size );
+        if (pread( fd, walias, header_size, 0 ) != (ssize_t)header_size)
+        {
+            dprintf( 2, "[pool-image] %s: header read of 0x%lx bytes failed (errno=%d)\n",
+                     debugstr_us(nt_name), (unsigned long)header_size, errno );
+            return STATUS_NO_MEMORY;
+        }
+        status = STATUS_SUCCESS;
+    }
+    else
+#endif
     if ((status = map_pe_header( view->base, header_size, header_map_size, fd, &removable )))
     {
         ERR("[map_image_into_view] map_pe_header FAILED: 0x%x st_size=0x%llx\n", status, (unsigned long long)st.st_size);
@@ -22001,7 +22222,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     dos = (IMAGE_DOS_HEADER *)ptr;
     nt = (IMAGE_NT_HEADERS *)(ptr + dos->e_lfanew);
     header_end = ptr + ROUND_SIZE( 0, header_size, align_mask );
-    memset( ptr + header_size, 0, header_end - (ptr + header_size) );
+    memset( wptr + header_size, 0, header_end - (ptr + header_size) );
     if ((char *)(nt + 1) > header_end) do { IOS_IMG_FAIL(1); return status; } while (0);
     sec = IMAGE_FIRST_SECTION( nt );
     if ((char *)(sec + nt->FileHeader.NumberOfSections) > header_end) do { IOS_IMG_FAIL(2); return status; } while (0);
@@ -22147,7 +22368,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             TRACE_(module)("clearing %p - %p\n",
                            ptr + sec[i].VirtualAddress + file_size,
                            ptr + sec[i].VirtualAddress + end );
-            memset( ptr + sec[i].VirtualAddress + file_size, 0, end - file_size );
+            memset( wptr + sec[i].VirtualAddress + file_size, 0, end - file_size );
         }
     }
 
@@ -22181,9 +22402,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
                         (ULONG_PTR)image_info->base, (ULONG_PTR)image_info->map_addr, ptr );
 
         if (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-            ((IMAGE_NT_HEADERS64 *)nt)->OptionalHeader.ImageBase = image_info->map_addr;
+            ((IMAGE_NT_HEADERS64 *)(wptr + dos->e_lfanew))->OptionalHeader.ImageBase = image_info->map_addr;
         else
-            ((IMAGE_NT_HEADERS32 *)nt)->OptionalHeader.ImageBase = image_info->map_addr;
+            ((IMAGE_NT_HEADERS32 *)(wptr + dos->e_lfanew))->OptionalHeader.ImageBase = image_info->map_addr;
 
         /* ml949: DO NOT APPLY A RELOCS_STRIPPED IMAGE'S DIRECTORY.
          *
@@ -22232,7 +22453,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             IMAGE_BASE_RELOCATION *end = (IMAGE_BASE_RELOCATION *)((char *)rel + dir->Size);
 
             while (rel && rel < end - 1 && rel->SizeOfBlock && rel->VirtualAddress < total_size)
-                rel = process_relocation_block( ptr + rel->VirtualAddress, rel, delta );
+                rel = process_relocation_block( wptr + rel->VirtualAddress, rel, delta );
         }
     }
 #ifdef WINE_IOS
@@ -22398,6 +22619,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     status = STATUS_SUCCESS;
 
 #ifdef WINE_IOS
+    /* madeira-doge: an in-pool image needs no copy; finish it (mprotect_exec
+     * answers the eager requests below by leaving its code pages RX). */
+    if (walias && !ios_noexec_resource) ios_pool_image_finish( view, nt, sec, nt_name, walias );
     /* Eagerly JIT-copy all EXEC sections right here — every PE load goes
      * through map_image_into_view, regardless of whether it's via
      * virtual_map_image (builtin flag) or any alternate path. */
@@ -22477,6 +22701,83 @@ static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigne
     return STATUS_SUCCESS;
 }
 
+
+#ifdef WINE_IOS
+/* madeira-doge: the in-pool image is read, relocated and protected; now make it
+ * what a pool copy is: a known image (identity mapping), x18-patched, with its
+ * x64-fast stubs. See ios_pool_images. */
+static void ios_pool_image_finish( struct file_view *view, IMAGE_NT_HEADERS *nt,
+                                   const IMAGE_SECTION_HEADER *sec, const UNICODE_STRING *nt_name, char *alias )
+{
+    struct ios_pool_image *pi = ios_pool_image_of_view( view );
+    char *base = view->base;
+    size_t size = view->size, align = max( nt->OptionalHeader.SectionAlignment, 0x4000u );
+    size_t image_alloc = (size + 0x3fff) & ~(size_t)0x3fff;
+    size_t text_off = 0, text_sz = 0, tramp_off = image_alloc, tramp_room, tramp_need = 0, tramp_alloc = 0;
+    int i, patched = 0;
+
+    if (!pi || !alias) return;
+    tramp_room = pi->alloc > image_alloc ? pi->alloc - image_alloc : 0;
+
+    /* code sections: remembered for mprotect_exec; the last one is "the .text"
+     * for the x18 patcher, as the copy path records it */
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        size_t vsize = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+        size_t ssize = (vsize + align - 1) & ~(align - 1);
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) || !vsize) continue;
+        if (pi->exec_n < IOS_POOL_IMAGE_EXEC_MAX)
+        {
+            pi->exec_lo[pi->exec_n] = (uintptr_t)base + sec[i].VirtualAddress;
+            pi->exec_hi[pi->exec_n] = (uintptr_t)base + sec[i].VirtualAddress + ssize;
+            pi->exec_n++;
+        }
+        text_off = sec[i].VirtualAddress;
+        text_sz = vsize;
+    }
+
+    ios_jit_add_mapping( base, base, size );                 /* identity: no copy, no FEX alias */
+    if (text_sz) ios_jit_set_text_section( base, text_off, text_sz );
+
+    /* x18 -> trampolines behind the image, inside the range taken with it */
+    if (text_sz)
+    {
+        tramp_need = ios_jit_x18_tramp_need( alias + text_off, text_sz );
+        tramp_alloc = (tramp_need + 0x3fff) & ~(size_t)0x3fff;
+        if (tramp_need && tramp_alloc <= tramp_room)
+        {
+            patched = ios_jit_patch_x18( alias + text_off, base + text_off, text_sz,
+                                         alias + tramp_off, base + tramp_off, tramp_alloc );
+            if (arm64ec_view)
+            {
+                size_t bm_start = ((size_t)(base + tramp_off) >> 12) / 8;
+                size_t bm_end   = ((size_t)(base + tramp_off + tramp_alloc) >> 12) / 8;
+                size_t bm_size  = ROUND_SIZE( bm_start, bm_end + 1 - bm_start, page_mask );
+                void *bm_page   = ROUND_ADDR( (char *)arm64ec_view->base + bm_start, page_mask );
+                set_vprot( arm64ec_view, bm_page, bm_size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
+                set_arm64ec_range( base + tramp_off, tramp_alloc );
+            }
+        }
+        else if (tramp_need)
+            dprintf( 2, "[pool-image] %s: x18 trampolines need 0x%lx, only 0x%lx behind the image -- "
+                        "x18 accesses stay as faults (emulated)\n", debugstr_us(nt_name),
+                     (unsigned long)tramp_alloc, (unsigned long)tramp_room );
+    }
+
+    /* x64-fast stubs: x64f_poke writes the alias only for an in-pool image */
+    x64f_patch_image( (unsigned char *)base, size, (unsigned char *)alias, (unsigned char *)base,
+                      ios_pe_module_name( base, size ) );
+
+    __asm__ __volatile__( "dsb sy" ::: "memory" );
+    sys_icache_invalidate( base, size );
+    if (tramp_alloc && patched > 0) sys_icache_invalidate( base + tramp_off, tramp_alloc );
+
+    dprintf( 2, "[pool-image] %s IN the pool at %p+0x%lx: %d code section(s), identity mapping, "
+                "x18 patched %d (tramp 0x%lx of 0x%lx at +0x%lx); no PE backing, no copy, no redirect\n",
+             debugstr_us(nt_name), base, (unsigned long)size, pi->exec_n, patched,
+             (unsigned long)tramp_alloc, (unsigned long)tramp_room, (unsigned long)tramp_off );
+}
+#endif
 
 /***********************************************************************
  *             map_image_view
@@ -22575,6 +22876,44 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
             limit_high = ios_furniture_ceiling ? min( (ULONG_PTR)user_space_limit, ios_furniture_ceiling - 1 )
                                                : (ULONG_PTR)user_space_limit;
     }
+
+#ifdef WINE_IOS
+    /* madeira-doge: a Wine ARM64EC builtin goes INTO the pool (see ios_pool_images).
+     * ntdll never comes through here (loader_ios pre-maps it). */
+    if (is_builtin && !wow_image && ios_pool_images_enabled() && ios_jit_rx_base_global &&
+        !ios_map_resource_view && image_info->alignment >= 0x4000 && size <= ((SIZE_T)256 << 20) &&
+        (image_info->is_hybrid || image_info->machine == IMAGE_FILE_MACHINE_ARM64))
+    {
+        static unsigned int pool_img_n, pool_img_fail;
+        size_t want = ROUND_SIZE( 0, size, 0xffff ) + IOS_POOL_IMAGE_TRAMP;   /* 64 KB base + x18 slack */
+        size_t off = ios_pool_alloc_range( want + 0xc000, ios_jit_pool_size_global - ios_jit_tail_reserved );
+        if (off != (size_t)-1)
+        {
+            uintptr_t rx = (uintptr_t)ios_jit_rx_base_global + off;
+            uintptr_t b = (rx + 0xffff) & ~(uintptr_t)0xffff;
+            struct ios_pool_image *pi;
+            status = create_view( view_ret, (void *)b, size, vprot | VPROT_INPOOL );
+            if (!status && (pi = ios_pool_image_register( (void *)b, size, want )))
+            {
+                image_info->map_addr = wine_server_client_ptr( (void *)b );   /* relocate to the pool address */
+                if (pool_img_n++ < 64)
+                    dprintf( 2, "[pool-image] #%u builtin image of 0x%lx bytes mapped IN the pool at %p "
+                                "(range off=0x%lx+0x%lx, machine=%#x hybrid=%d): no PE backing, no copy\n",
+                             pool_img_n, (unsigned long)size, (void *)b, (unsigned long)off,
+                             (unsigned long)(want + 0xc000), image_info->machine, image_info->is_hybrid );
+                return STATUS_SUCCESS;
+            }
+            if (!status) { delete_view( *view_ret ); *view_ret = NULL; }
+            if (pool_img_fail++ < 16)
+                dprintf( 2, "[pool-image] create_view at %p failed (status=%#x) or the table is full -- "
+                            "normal mapping (the pool range 0x%lx+0x%lx stays in the ledger)\n",
+                         (void *)b, (unsigned int)status, (unsigned long)off, (unsigned long)(want + 0xc000) );
+        }
+        else if (pool_img_fail++ < 16)
+            dprintf( 2, "[pool-image] no pool range of 0x%lx bytes for a builtin image -- normal mapping\n",
+                     (unsigned long)(want + 0xc000) );
+    }
+#endif
 
     /* first try the specified base */
 
@@ -30548,6 +30887,7 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
             {
                 uintptr_t pe_start;
                 if (idx != sync_pick) continue;
+                if (ios_jit_mappings[idx].identity) break;   /* madeira-doge: one copy, nothing to sync */
                 pe_start = (uintptr_t)ios_jit_mappings[idx].pe_base;
                 uintptr_t pe_end = pe_start + ios_jit_mappings[idx].size;
                 uintptr_t rgn_start = (uintptr_t)base;

@@ -175,6 +175,15 @@ OVERLAY = {
                 "sources": ["app/Madeira/GamepadInput.swift", "app/Madeira/PadOutput.m"]},
     "env.MADEIRA_PROMOTE": {"title": "Hold the display at its maximum rate"},
     # madeira-bcd: GTA V Enhanced's Social Club (StikJITHelper.swift, process_ios.c, virtual_ios.c).
+    "env.MADEIRA_POOL_IMAGES": {"category": "Memory & JIT pool", "title": "Wine's ARM64EC DLLs live in the JIT pool",
+                "kind": "bool", "default": "0",
+                "note": "Default off: every ARM64EC builtin DLL is mapped at a normal address (never executable on "
+                        "iOS) and copied into the JIT pool, and a call that reaches the original address costs a "
+                        "Mach exception. 1: such a DLL is mapped directly in the pool -- one copy, executable where it "
+                        "is, no redirect; its data pages are protected on the pool pages. ntdll and non-builtin images "
+                        "keep the copy. Needs 16 KB section alignment (Wine's builtins have it). Restart the session "
+                        "after changing it.",
+                "sources": ["build/ntdll-unix/virtual_ios.c"]},
     "pool-split": {"category": "Memory & JIT pool", "title": "Split JIT pool around the main thread's stack",
                 "kind": "bool", "default": "0",
                 "note": "1: when the pool would shrink below its size (pool, 896 MB by default) because the main "

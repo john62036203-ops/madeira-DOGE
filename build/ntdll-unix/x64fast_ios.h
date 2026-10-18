@@ -303,7 +303,9 @@ static int x64f_poke_image( unsigned char *img, unsigned int rva, const unsigned
 static int x64f_poke( unsigned char *img, unsigned char *pool_rw, unsigned char *pool_rx,
                       unsigned int rva, const unsigned char *bytes, unsigned int len )
 {
-    int ok = x64f_poke_image( img, rva, bytes, len );
+    /* madeira-doge: an in-pool image (img == pool_rx) has no second view and its
+     * pool pages must never be mprotected -- the alias write below is the write. */
+    int ok = img == pool_rx ? 1 : x64f_poke_image( img, rva, bytes, len );
     memcpy( pool_rw + rva, bytes, len );
     sys_icache_invalidate( pool_rx + rva, len );
     return ok;

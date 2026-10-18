@@ -139,7 +139,7 @@ link_dll() {  # link_dll <factory object> <output> <adapter object>
         "$3" "$1" "$OUT/obj/dxgi_output.o" "$OUT/obj/dxgi_options.o" "$OUT/obj/dxgi.o" \
         "$OUT/obj/version.o" "$G/dxgi.def" \
         "$OUT/libdxmt.a" "$OUT/libutil.a" -L"$OUT" -lwinemetal -lntdll \
-        -static -Wl,--file-alignment=4096 \
+        -static -Wl,--file-alignment=4096 -Wl,--section-alignment=16384 \
         -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 \
         2>> "$OUT/build.err" || { grep -m 20 "error" "$OUT/build.err"; fail "linking $(basename "$2") failed"; }
 }

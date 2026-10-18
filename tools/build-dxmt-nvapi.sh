@@ -52,7 +52,7 @@ python3 "$R/tools/patch-nvapi-trace.py" "$OUT/nvapi.cpp"
     -I"$D/include" -I"$D/libs" -I"$U" -I"$D/src/winemetal" -I"$D/external/nvapi" -I"$D/src/nvapi" -I"$D/src/d3d11" -I"$D/src/dxgi" \
     -DNOMINMAX -D_WIN32_WINNT=0xa00 -DDXMT_IOS=1 -DDXMT_PAGE_SIZE=4096 -fblocks \
     -Wno-microsoft-exception-spec \
-    -L"$OUT" -lwinemetal -ldxgi -lntdll -static -Wl,--file-alignment=4096 \
+    -L"$OUT" -lwinemetal -ldxgi -lntdll -static -Wl,--file-alignment=4096 -Wl,--section-alignment=16384 \
     2> "$OUT/nvapi.err" || { grep -m 20 "error" "$OUT/nvapi.err"; exit 1; }
 "$MINGW/llvm-strip" --strip-debug "$OUT/nvapi64.dll"
 
