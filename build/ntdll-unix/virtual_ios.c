@@ -15863,7 +15863,12 @@ static struct ios_pool_image *ios_pool_image_find( const void *addr, size_t size
         struct ios_pool_image *pi = &ios_pool_images[i];
         uintptr_t b = (uintptr_t)pi->base;
         struct file_view *v;
-        if (!b || lo < b || hi > b + pi->alloc || hi < lo) continue;
+        /* lo must lie INSIDE the range: a query of size 0 at the very end of a
+         * range used to match it (build 230, 2026-10-18 17:16: conhost.exe at
+         * 0x162640000 matched kernelbase's entry ending there, kernelbase in the
+         * next process matched kernel32's; wrong tramp room, wrong exec ranges,
+         * code pages mprotected and poisoned, `str [x18,#0x1488]` with x18 = 0). */
+        if (!b || lo < b || lo >= b + pi->alloc || hi > b + pi->alloc || hi < lo) continue;
         /* the view must still be there: after the process that mapped the image
          * exited, the pool hands the range to anything (an anon RWX alias, a copy) */
         if (!(v = find_view( (void *)b, 0 )) || v->base != (void *)b || !(v->protect & VPROT_INPOOL))
