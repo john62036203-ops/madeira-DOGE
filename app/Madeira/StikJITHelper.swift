@@ -445,9 +445,26 @@ enum StikJITHelper {
         // so that nothing of ours could land in it. Release it now -- the very
         // next allocation of this size is the debugger's.
         var plugs: [(vm_address_t, vm_size_t)] = []
+        // madeira-doge (iOS 27): on the 512 GB task map the kernel reserves everything
+        // from the dyld shared region to 0x7000000000 -- a 63 GB SHARED_PMAP placeholder
+        // (VM tag 32, SM_EMPTY) up to 0xfc0000000 and a 384 GB GUARD (tag 31) above it
+        // (Sekiro log 2026-10-18 07:59, the ml1036 region list). iOS 26's 52 GB hole at
+        // 0x300000000 is gone and the app's own malloc lands in the low band, so a
+        // one-region pool is 256-320 MB on every launch. The split pool (A+B above the
+        // window) and region C below it are the only way to a usable pool there, so
+        // both default ON when the map top is 0x8000000000; `pool-split = 0` /
+        // `pool-low = 0` in a cfg still turn them off. The 63 GB map keeps its defaults.
+        var mapLo: UInt64 = 0, mapHi: UInt64 = 0
+        let bigMap = jit_task_map_range(&mapLo, &mapHi) && mapHi >= 0x8000000000
+        if bigMap {
+            LogStore.shared.log("ml1036: madeira-doge: 512 GB task map -- pool-split and pool-low default on (the band above the dyld shared region is reserved by the kernel on iOS 27)")
+        }
+        func poolSwitch(_ raw: String?, defaultOn: Bool) -> String {
+            let v = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return v.isEmpty && defaultOn ? "1" : v
+        }
         // madeira-bcd split pool switch (see SPLIT POOL below); the census reads it too.
-        let splitValue = (MadeiraConfig.gameValue("pool-split") ?? MadeiraConfig.get("pool-split") ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let splitValue = poolSwitch(MadeiraConfig.gameValue("pool-split") ?? MadeiraConfig.get("pool-split"), defaultOn: bigMap)
         // Opt-in: keep page-sized remainders in A/B instead of discarding up to
         // 16MB from each free run. The requested A+B budget and region C stay unchanged.
         let pageFit = ["1", "on", "true", "yes"].contains(splitValue)
@@ -564,13 +581,19 @@ enum StikJITHelper {
                 // (holes below the placeholder, only when a hole above it fits).
                 let steered = earlyPoolBase != 0 && holes.contains { $0.base + $0.size > earlyPoolBase && $0.size >= singleFit }
                 let singleAt = holes.first(where: { $0.size >= singleFit && !(steered && $0.base + $0.size <= earlyPoolBase) })
-                if let s = singleAt, s.base + s.size <= exeWinBase {
+                // madeira-doge (iOS 27): the pair is worth taking wherever the single pool
+                // would land, not only below the window. On the 512 GB map the band above
+                // the window is cut into 189/293/325 MB runs by malloc and the main thread's
+                // stack; the single pool takes the 325 MB run above the window and the old
+                // test (single below the window) never looked at 293+325. The plugs below
+                // steer first-fit to A whatever lies under it.
+                if let s = singleAt, bigMap || s.base + s.size <= exeWinBase {
                     var best = singleFit
                     var bestB: (base: vm_address_t, size: vm_address_t) = (base: 0, size: 0)
                     for run in holes where run.base >= exeWinBase + exeWinSize && run.base < ceiling {
                         let aFit = min(poolRunSize(available: min(run.size, ceiling - run.base),
                                                   wanted: vm_address_t(poolSize), pageFit: pageFit), vm_address_t(poolSize))
-                        guard aFit >= 256 << 20, aFit < vm_address_t(poolSize) else { continue }
+                        guard aFit >= (bigMap ? 128 : 256) << 20, aFit < vm_address_t(poolSize) else { continue }
                         // B as takeSecondRegion picks it: the largest run in [A's end, ceiling),
                         // the rest of A's own run included.
                         let aEnd = run.base + aFit
@@ -589,7 +612,7 @@ enum StikJITHelper {
                         pairSingle = Int(singleFit)
                         poolSize = Int(pa.size)
                         LogStore.shared.log(String(format: "[pool-split] ml1036 pair above the window: A=0x%lx+%luMB B=0x%lx+%luMB "
-                            + "total=%luMB (single best was %luMB at 0x%lx, below the window, where the pool cannot split; "
+                            + "total=%luMB (single best was %luMB at 0x%lx, where the pool would not have split; "
                             + "pool-pair = 0 turns this off)",
                             Int(pa.base), Int(pa.size >> 20), Int(bestB.base), Int(bestB.size >> 20), Int(best >> 20),
                             Int(singleFit >> 20), Int(s.base)), level: .success)
@@ -907,8 +930,7 @@ enum StikJITHelper {
         // copies. `pool-low-margin` MB (128 by default) of the run stay free for the
         // children's relocatable main exes. Costs C's size in footprint, like region B.
         poolLow = nil
-        let lowValue = (MadeiraConfig.gameValue("pool-low") ?? MadeiraConfig.get("pool-low") ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lowValue = poolSwitch(MadeiraConfig.gameValue("pool-low") ?? MadeiraConfig.get("pool-low"), defaultOn: bigMap)
         var lowRegion: (base: vm_address_t, size: vm_address_t)? = nil
         if ["1", "on", "true", "yes"].contains(lowValue) {
             lowRegion = takeLowRegion(poolRx: rxAddrV, exeWindow: (exeWinBase, exeWinSize), pageFit: pageFit)
