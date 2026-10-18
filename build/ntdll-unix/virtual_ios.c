@@ -21862,6 +21862,18 @@ static void update_arm64ec_ranges( struct file_view *view, IMAGE_NT_HEADERS *nt,
     {
         if ((map[i].StartOffset & 0x3) != 1 /* arm64ec */) continue;
         set_arm64ec_range( base + (map[i].StartOffset & ~3), map[i].Length );
+#ifdef WINE_IOS
+        /* madeira-doge: an in-pool image's EC ranges are set at its pool address;
+         * log them (build 233: a .text address in such an image was judged non-EC). */
+        if (view->protect & VPROT_INPOOL)
+        {
+            static unsigned pool_ec_n;
+            if (pool_ec_n++ < 48)
+                dprintf( 2, "[pool-image] EC range %p+0x%x marked (CodeMap entry %u of %u, view %p)\n",
+                         base + (map[i].StartOffset & ~3), (unsigned)map[i].Length, i,
+                         (unsigned)metadata->CodeMapCount, view->base );
+        }
+#endif
     }
 }
 

@@ -6418,6 +6418,30 @@ skip_reclaim_band: ;
                                 dprintf( STDERR_FILENO, "[thunk-slot] %.32s: PE header / load config not readable at 0x%llx\n",
                                          ios_pe_module_name( lr_mod ), (unsigned long long)lr_mod );
                         }
+                        /* madeira-doge: is the x64 target (x9) marked EC, and is the caller (lr)?
+                         * Build 233: both in in-pool images; the slot the thunk read held 0 at
+                         * the time and a valid pointer at the dump, so the question is why the
+                         * exit thunk was taken at all for a .text address. */
+                        if (thread_teb)
+                        {
+                            PEB *wpeb = ((TEB *)thread_teb)->Peb;
+                            const UINT64 *ecmap = wpeb ? (const UINT64 *)wpeb->EcCodeBitMap : NULL;
+                            uint64_t probe[2] = { state.__x[9], lr_exec };
+                            int q;
+                            for (q = 0; q < 2 && ecmap; q++)
+                            {
+                                uint64_t pg = probe[q] >> 12, word = 0;
+                                mach_vm_size_t got_w = 0;
+                                if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(ecmap + pg / 64), 8,
+                                                            (mach_vm_address_t)&word, &got_w ) == KERN_SUCCESS && got_w == 8)
+                                    dprintf( STDERR_FILENO, "[thunk-slot] EcCodeBitMap(%s 0x%llx) = %d (map=%p)\n",
+                                             q ? "lr" : "x9", (unsigned long long)probe[q],
+                                             (int)((word >> (pg & 63)) & 1), ecmap );
+                                else
+                                    dprintf( STDERR_FILENO, "[thunk-slot] EcCodeBitMap(%s 0x%llx): bitmap word unreadable (map=%p)\n",
+                                             q ? "lr" : "x9", (unsigned long long)probe[q], ecmap );
+                            }
+                        }
                     }
                     /* One-shot dump: on the first UNHANDLED exec fault, dump the
                      * JIT-pool RW alias contents around the relevant FEX CodeBuffer
