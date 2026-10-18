@@ -7,9 +7,11 @@ on:
     paths: [".github/workflows/build-ipa.yml"]
 
 # A push and a manual dispatch seconds apart used to start two parallel
-# multi-hour macOS jobs on the same commit.
+# multi-hour macOS jobs on the same commit. Per branch: a dispatch on one
+# branch no longer cancels a run on another (plan-a vs. port-upstream-1,
+# 2026-10-18: four runs cancelled in an hour).
 concurrency:
-  group: build-ipa
+  group: build-ipa-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
