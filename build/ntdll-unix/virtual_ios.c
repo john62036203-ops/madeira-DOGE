@@ -15729,6 +15729,51 @@ static int ios_x64_image_is_host_data( const void *base, size_t size )
 #endif
 }
 
+/* madeira-doge: THE WRITABLE CODE SECTIONS OF A NOCOPY IMAGE STAY WRITABLE.
+ *
+ * With a pool copy, a section the image declares EXECUTE|WRITE keeps a
+ * writable backing for the whole run: the emulator's SMC arming
+ * (PAGE_EXECUTE_READ through NtProtectVirtualMemory) lands on the pool copy,
+ * never on the backing, which is why tools/patch-fex-ios-rwx-section-smc.py
+ * exists ("on iOS the write never faults") and validates such code by bytes
+ * instead (env.MADEIRA_FEX_RWX_SMC = 1). Without a copy the same arming reaches
+ * mprotect_exec as PROT_READ|PROT_EXEC and the x64-image rule below made the
+ * backing r--. MHR's start-up stub then wrote into its own EXECUTE|WRITE
+ * section from a stack of its own (sp at the top of a fresh 64 KB region, no
+ * TEB's stack contains it, x18 = 0 on iOS 27), the Mach handler could only
+ * deliver best-effort, the untrap never happened and the store re-faulted
+ * forever: 2026-10-18 10:13 log, `[mach_exc] UNHANDLED #1..#200+ pc=0x13b07be9c
+ * addr=0x15095fbe5`, section vprot 0x2d, 0 presents. So the sections an
+ * x64-image (NOCOPY) view declares both executable and writable are recorded
+ * at map time, and a request that drops write on their pages keeps it: the
+ * same contract the copy had. The byte validator remains the SMC detector for
+ * them, exactly as with a copy. Plain .text keeps the arming. */
+#define IOS_X64_RWX_SECTIONS 64
+static struct { uintptr_t base, end; } ios_x64_rwx_sections[IOS_X64_RWX_SECTIONS];
+static volatile int ios_x64_rwx_section_count;
+
+static void ios_x64_image_note_rwx_section( const void *base, size_t size )
+{
+    int n = ios_x64_rwx_section_count;
+    if (n >= IOS_X64_RWX_SECTIONS) return;
+    ios_x64_rwx_sections[n].base = (uintptr_t)base;
+    ios_x64_rwx_sections[n].end = (uintptr_t)base + size;
+    __sync_synchronize();
+    ios_x64_rwx_section_count = n + 1;
+}
+
+static int ios_x64_image_in_rwx_section( const void *base, size_t size )
+{
+    int i, n = ios_x64_rwx_section_count;
+    uintptr_t lo = (uintptr_t)base, hi = lo + size;
+    /* Overlap, not containment: the stub section is tiny (MHR: 0x2a5 bytes)
+     * and shares its 16 KB host page with its neighbours; the request covers
+     * the host page. With a pool copy the whole backing stays writable anyway. */
+    for (i = 0; i < n; i++)
+        if (lo < ios_x64_rwx_sections[i].end && hi > ios_x64_rwx_sections[i].base) return 1;
+    return 0;
+}
+
 
 /* A guest's anonymous RWX data heap is plain read/write memory to the host.
  *
@@ -16090,7 +16135,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
      * meaning, the page keeps VPROT_EXEC in Wine's tables, no pool copy. */
     if ((unix_prot & PROT_EXEC) && ios_x64_image_is_host_data( base, size ))
     {
-        static unsigned long x64_n;
+        static unsigned long x64_n, x64_rwx_n;
+        /* madeira-doge: an EXECUTE|WRITE section's backing stays writable, as
+         * it does with a pool copy (see ios_x64_image_note_rwx_section). */
+        int keep_write = !(unix_prot & PROT_WRITE) && ios_x64_image_in_rwx_section( base, size );
         if (++x64_n <= 24 && !ios_in_mach_exc)
             dprintf( 2, "[x64-image] #%lu %p+0x%lx prot=%c%c%c -- pure-x64 image page, EXEC has no host "
                         "meaning here (the emulator runs it at the PE VA); applying %c%c- (MADEIRA_X64_IMAGE_NOCOPY)\n",
@@ -16099,7 +16147,16 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                      (unix_prot & PROT_WRITE) ? 'w' : '-',
                      (unix_prot & PROT_EXEC)  ? 'x' : '-',
                      (unix_prot & PROT_READ)  ? 'r' : '-',
-                     (unix_prot & PROT_WRITE) ? 'w' : '-' );
+                     (unix_prot & PROT_WRITE) || keep_write ? 'w' : '-' );
+        if (keep_write)
+        {
+            if (++x64_rwx_n <= 16 && !ios_in_mach_exc)
+                dprintf( 2, "[x64-image] madeira-doge: %p+0x%lx lies in a section the image declares "
+                            "EXECUTE|WRITE -- the backing stays writable as it would with a pool copy "
+                            "(the byte validator, env.MADEIRA_FEX_RWX_SMC, is the SMC detector there)\n",
+                         base, (unsigned long)size );
+            unix_prot |= PROT_WRITE | PROT_READ;
+        }
         unix_prot &= ~PROT_EXEC;
         if (!unix_prot) unix_prot = PROT_READ;
     }
@@ -22284,6 +22341,19 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
         if (sec[i].Characteristics & IMAGE_SCN_MEM_READ)    vprot |= VPROT_READ;
         if (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)   vprot |= VPROT_WRITECOPY;
         if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) vprot |= VPROT_EXEC;
+
+#ifdef WINE_IOS
+        /* madeira-doge: a NOCOPY image's EXECUTE|WRITE section, recorded BEFORE
+         * its protection is set so the first mprotect_exec already sees it. */
+        if ((view->protect & VPROT_X64DATA) &&
+            (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE) && (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+        {
+            ios_x64_image_note_rwx_section( ptr + sec[i].VirtualAddress, size );
+            dprintf( 2, "[x64-image] madeira-doge: %s section %.8s %p+0x%lx is EXECUTE|WRITE -- its backing "
+                        "will stay writable when the emulator arms it\n",
+                     debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress, (unsigned long)size );
+        }
+#endif
 
         if (!set_vprot( view, ptr + sec[i].VirtualAddress, size, vprot ) && (vprot & VPROT_EXEC))
         {
