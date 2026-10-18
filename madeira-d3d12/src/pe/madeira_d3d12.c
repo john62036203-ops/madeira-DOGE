@@ -10884,6 +10884,12 @@ static struct mad_sp_key *g_sp_keys; static unsigned g_sp_keys_cap, g_sp_keys_fi
 static obj_handle_t g_sp_event; static volatile LONG64 g_sp_value;
 static UINT64 g_sp_tile = 65536;
 static volatile DWORD g_sp_create_tid;
+static UINT32 g_sp_scratch = ~0u;   /* the pool tile every unmapped tile points at (d3d12-sparse-scratch) */
+static int mad_sparse_scratch_on(void) {
+    static int on = -1;
+    if (on < 0) on = mad_cfg_int_pe("d3d12-sparse-scratch", 1) ? 1 : 0;   /* 1: unmapped tiles point at one shared scratch tile (GPU writes to them land there); 0: truly unmapped */
+    return on;
+}
 static volatile LONG g_sp_buffers, g_sp_tiles_live, g_sp_maps, g_sp_unmaps, g_sp_calls, g_sp_fail;
 static volatile LONG64 g_sp_virtual;
 static int mad_sparse_on(void) {
@@ -11011,6 +11017,30 @@ static void mad_sp_batch_add(struct mad_device *d, struct mad_resource *r, struc
     o = &b->op[b->n++];
     o->mode = mode; o->loc = tile; o->len = 1; o->heap_off = heap_off;
 }
+/* lock held: the shared scratch pool tile (allocated once, never freed) */
+static UINT32 mad_sp_scratch_tile(struct mad_device *d) {
+    if (g_sp_scratch == ~0u) {
+        g_sp_scratch = mad_sp_pool_alloc(d);
+        if (g_sp_scratch != ~0u) d3d12_log("[d3d12-sparse] scratch tile = pool tile %u: unmapped tiles point at it, so a GPU write to "
+                                           "one cannot fault (build 252 hung the GPU in PersistentShadowClusterCulling without it)\n", g_sp_scratch);
+    }
+    return g_sp_scratch;
+}
+/* A new sparse buffer: every tile onto the scratch tile, before anything can use it. */
+static void mad_sp_scratch_all(struct mad_device *d, struct mad_resource *r) {
+    static struct mad_sp_batch b;   /* under g_sp_lock */
+    UINT32 sc, t;
+    if (!mad_sparse_scratch_on()) return;
+    AcquireSRWLockExclusive(&g_sp_lock);
+    sc = mad_sp_scratch_tile(d);
+    if (sc != ~0u) {
+        b.n = 0; b.heap = -1;
+        for (t = 0; t < r->sp_ntiles; t++)
+            mad_sp_batch_add(d, r, &b, 0, 0, t, (int)(sc / MAD_SP_HEAP_TILES), sc % MAD_SP_HEAP_TILES);
+        mad_sp_batch_flush(d, r, &b, 0);
+    }
+    ReleaseSRWLockExclusive(&g_sp_lock);
+}
 /* Called from mad_create_resource_at for the buffer of a reserved resource. */
 static obj_handle_t mad_sparse_new_buffer(struct mad_device *d, struct mad_resource *r, struct WMTBufferInfo *info) {
     struct mad_sparse_args sa;
@@ -11075,7 +11105,11 @@ static void mad_sparse_update(struct mad_device *d, struct mad_resource *r, UINT
             if ((flag & D3D12_TILE_RANGE_FLAG_NULL) || !heap) {
                 if (old.hs) {
                     mad_sp_unref(old.hs, old.ht); r->sp_map[t].hs = 0; r->sp_map[t].ht = 0; unmapped++;
-                    mad_sp_batch_add(d, r, &b, wait_value, 1, t, b.n ? b.heap : 0, 0);
+                    {
+                        UINT32 sc = mad_sparse_scratch_on() ? mad_sp_scratch_tile(d) : ~0u;
+                        if (sc != ~0u) mad_sp_batch_add(d, r, &b, wait_value, 0, t, (int)(sc / MAD_SP_HEAP_TILES), sc % MAD_SP_HEAP_TILES);
+                        else mad_sp_batch_add(d, r, &b, wait_value, 1, t, b.n ? b.heap : 0, 0);
+                    }
                 }
             } else {
                 UINT ht = (heap_offs ? heap_offs[range] : 0) + ((flag & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE) ? 0 : range_i);
@@ -11232,7 +11266,10 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             else { mad_placed_fallback(ph, desc, poff, psz, pal); info.memory.ptr = NULL; info.gpu_address = 0; }
         }
         if (!r->buffer && heap_type == D3D12_HEAP_TYPE_DEFAULT && !ph && g_sp_create_tid == GetCurrentThreadId())
+        {
             r->buffer = mad_sparse_new_buffer(d, r, &info);   /* madeira-doge d3d12-sparse; 0 = fully backed as before */
+            if (r->buffer && r->sp_map) mad_sp_scratch_all(d, r);
+        }
         /* ml1154: a large CPU-visible buffer gets storage WE allocate, handed to
          * Metal as a no-copy buffer. A fresh >= 8 MB guest commit is backed by
          * the file tier (ml1077), whose dirty pages iOS writes back and never

@@ -139,9 +139,21 @@ static uint32_t madeira_sparse_probe(id<MTLDevice> dev) {
                 (r & 32) ? "zeros, as D3D12 Tier 2 wants" : "not zeros");
       }
     }
+    {   /* a GPU WRITE to an unmapped tile (D3D12 discards it) */
+      id<MTLCommandBuffer> cb = [cq commandBuffer];
+      id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+      [be fillBuffer:sb range:NSMakeRange(6 * tile, tile) value:0x77];
+      [be endEncoding];
+      [cb commit];
+      if (!madeira_sparse_wait(cb, 3.0))
+        fprintf(stderr, "[sparse-probe] unmapped WRITE: command buffer did not finish in 3 s\n");
+      else if ([cb status] == MTLCommandBufferStatusError)
+        fprintf(stderr, "[sparse-probe] unmapped WRITE: command buffer ERROR: %s\n", [[[cb error] description] UTF8String]);
+      else { r |= 64; fprintf(stderr, "[sparse-probe] unmapped WRITE: survived\n"); }
+    }
   done:
     fprintf(stderr, "[sparse-probe] result 0x%x (1 API missing, 2 objects made, 4 mapping sent, 8 mapped tile correct, "
-                    "16 unmapped read survived, 32 unmapped read zeros)\n", r);
+                    "16 unmapped read survived, 32 unmapped read zeros, 64 unmapped write survived)\n", r);
     if (rs) [rs release];
     if (cq) [cq release];
     if (ev) [ev release];
