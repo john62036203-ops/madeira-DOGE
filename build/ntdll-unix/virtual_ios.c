@@ -22883,8 +22883,13 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
 
 #ifdef WINE_IOS
     /* madeira-doge: a Wine ARM64EC builtin goes INTO the pool (see ios_pool_images).
-     * ntdll never comes through here (loader_ios pre-maps it). */
-    if (is_builtin && !wow_image && ios_pool_images_enabled() && ios_jit_rx_base_global &&
+     * `is_builtin` (virtual_map_builtin_module) is the unix loader's own load of
+     * ntdll -- build 228 (2026-10-18 13:08) put both ntdlls in the pool and the
+     * Dock never started: ntdll is pre-mapped and patched by loader_ios (dispatcher
+     * slots, translate hooks, per-child copies), so it keeps the copy path. The
+     * builtins the PE loader maps through NtMapViewOfSection carry
+     * image_info->wine_builtin with is_builtin FALSE; those are the targets. */
+    if (image_info->wine_builtin && !is_builtin && !wow_image && ios_pool_images_enabled() && ios_jit_rx_base_global &&
         !ios_map_resource_view && image_info->alignment >= 0x4000 && size <= ((SIZE_T)256 << 20) &&
         (image_info->is_hybrid || image_info->machine == IMAGE_FILE_MACHINE_ARM64))
     {
