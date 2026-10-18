@@ -97,6 +97,12 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
             compile_one "$BUILD_DIR/defwnd_ios.c" "defwnd"
             continue
             ;;
+        window)
+            # madeira-doge: wraps upstream window.c -- env.MADEIRA_WINDOW_CLAMP
+            # (header comment in window_ios.c).
+            compile_one "$BUILD_DIR/window_ios.c" "window"
+            continue
+            ;;
         driver)
             compile_one "$BUILD_DIR/driver_ios.c" "driver"
             continue
