@@ -472,6 +472,7 @@ static UINT64 mad_default_swap_min(void);   /* madeira-doge: used by the census 
 static void mad_sparse_release(struct mad_resource *r);   /* madeira-doge d3d12-sparse */
 static void mad_sparse_cb_wait(obj_handle_t cb);
 static void mad_sparse_report(void);
+static void mad_sparse_heap_gone(UINT32 hs);
 static void mad_resident(struct mad_device *d, obj_handle_t h) {
     if (!d || !h || !d->resset) return;
     MTLResidencySet_addAllocation(d->resset, h);
@@ -10985,12 +10986,36 @@ static void mad_sp_pool_free(UINT32 p) {
 }
 /* lock held: drop one reference of (heap serial, heap tile); its pool tile is freed at zero */
 static void mad_sp_unref(UINT32 hs, UINT32 ht) {
+    /* A heap tile KEEPS its pool tile, and so its contents, after the last
+     * resource unmaps it: in D3D12 the heap is the storage, and an engine that
+     * unmaps a tile and maps it again (or maps it into another reserved
+     * resource) expects the data still there. Build 252 freed the pool tile at
+     * the last unmap, the next (heap, tile) mapped got someone else's bytes,
+     * and PersistentShadowClusterCulling hung the GPU after ~4 minutes (252 and
+     * 253, 762 unmaps each). The pool tiles of a heap go back when the heap is
+     * released (mad_sparse_heap_gone). refs stays >= 1 while the key lives. */
     int k = hs ? mad_sp_key_find(hs, ht, 0) : -1;
-    if (k < 0 || g_sp_keys[k].refs <= 0) return;
-    if (--g_sp_keys[k].refs == 0) {
-        mad_sp_pool_free(g_sp_keys[k].pool);
-        g_sp_keys[k].refs = -1;   /* tombstone */
-        InterlockedDecrement(&g_sp_tiles_live);
+    if (k < 0 || g_sp_keys[k].refs <= 1) return;
+    g_sp_keys[k].refs--;
+}
+/* An ID3D12Heap is gone: its tiles' pool tiles return to the pool. */
+static void mad_sparse_heap_gone(UINT32 hs) {
+    unsigned i, freed = 0;
+    if (!hs || !g_sp_keys_cap) return;
+    AcquireSRWLockExclusive(&g_sp_lock);
+    for (i = 0; i < g_sp_keys_cap; i++) {
+        if (g_sp_keys[i].refs <= 0 || g_sp_keys[i].heap_serial != hs) continue;
+        mad_sp_pool_free(g_sp_keys[i].pool);
+        g_sp_keys[i].refs = -1;   /* tombstone */
+        freed++;
+    }
+    ReleaseSRWLockExclusive(&g_sp_lock);
+    if (freed) {
+        static LONG said;
+        InterlockedExchangeAdd(&g_sp_tiles_live, -(LONG)freed);
+        if (InterlockedIncrement(&said) <= 16)
+            d3d12_log("[d3d12-sparse] heap #%u released: %u pool tile(s) (%llu MB) back to the pool\n", hs, freed,
+                      (unsigned long long)(((UINT64)freed * g_sp_tile) >> 20));
     }
 }
 /* Operations collected for one MTL4 update call: one pool heap per call. */
@@ -11394,6 +11419,7 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
             d3d12_log("[transient] list#%u heap %p DESTROYED (%llu KB)\n", g_list_seq, (void *)h,
                       (unsigned long long)h->desc.SizeInBytes >> 10);   /* ml895 */
         if (h->lazy) { InterlockedDecrement(&g_lheap_n); InterlockedExchangeAdd64(&g_lheap_bytes, -(LONG64)h->desc.SizeInBytes); }   /* madeira-doge: never backed */
+        mad_sparse_heap_gone(h->serial);   /* madeira-doge d3d12-sparse: its tiles' backing */
         if (h->mtl) {   /* ml1145: every placed resource held a reference, so none is left; ml1148: but the GPU may still hold them */
             struct mad_device *hd = h->device; int queued = 0;
             InterlockedExchangeAdd64(&g_aheap_bytes, -(LONG64)h->desc.SizeInBytes);   /* madeira-doge */
