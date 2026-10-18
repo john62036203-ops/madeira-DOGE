@@ -1000,6 +1000,11 @@ jobs:
       - name: Patch DXMT with the Metal 4 sparse probe
         run: python3 tools/patch-dxmt-sparse-probe.py
 
+      # Metal 4 placement-sparse buffers behind D3D12 reserved buffers
+      # (MadeiraCtl ops 41-43; madeira.cfg d3d12-sparse = 1). After the probe.
+      - name: Patch DXMT with Metal 4 sparse buffers
+        run: python3 tools/patch-dxmt-sparse-buffers.py
+
       - name: Patch DXMT buffer->texture blits with a depth/stencil aspect
         run: python3 tools/patch-dxmt-b2t-aspect.py
 

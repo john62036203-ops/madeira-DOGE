@@ -469,6 +469,9 @@ static volatile LONG g_lheap_n; static volatile LONG64 g_lheap_bytes;   /* madei
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
 static UINT64 mad_default_swap_min(void);   /* madeira-doge: used by the census report */
+static void mad_sparse_release(struct mad_resource *r);   /* madeira-doge d3d12-sparse */
+static void mad_sparse_cb_wait(obj_handle_t cb);
+static void mad_sparse_report(void);
 static void mad_resident(struct mad_device *d, obj_handle_t h) {
     if (!d || !h || !d->resset) return;
     MTLResidencySet_addAllocation(d->resset, h);
@@ -732,6 +735,7 @@ static void mad_acct_report(void) {
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
     d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+    mad_sparse_report();
     {   /* madeira-doge: what the Metal-owned GPU-only buffers are made of */
         char h[256]; int hn = 0, k;
         for (k = 0; k < 6; k++)
@@ -844,6 +848,7 @@ struct mad_resource {
     struct mad_u10 *u10;   /* madeira-doge: unpacked copies of R10G10B10A2_UINT vertex elements */
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
+    struct mad_sp_tile { UINT32 hs, ht; } *sp_map; UINT32 sp_ntiles;   /* madeira-doge d3d12-sparse: per tile the (heap serial, heap tile) it maps; hs 0 = unmapped */
 };
 /* srv_res / uav_res membership, O(1) through the resource's slot (the linear
  * scan it replaces ran over ~15,000 textures on every view creation). */
@@ -7726,6 +7731,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             /* commandBuffer returns an AUTORELEASED object locally and an interned
              * one remotely; holding it across calls means taking our own reference. */
             NSObject_retain(q->open_cb);
+            mad_sparse_cb_wait(q->open_cb);   /* madeira-doge d3d12-sparse: after every tile mapping change so far */
             if (g_sd_state > 0) {   /* madeira-bcd: sync diagnostics */
                 if (g_fence_strict) mad_strict_cb_wait(q->device, q->open_cb);
                 if (g_upload_guard || g_desc_guard || g_ic_frames) q->open_ticket = mad_ticket_new();
@@ -10323,6 +10329,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->hp_used && r->owner) mad_hp_release(r->owner, r);   /* ml1072: block returns after the GPU is done with it */
         { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->xview); }
         if (r->u10) mad_u10_free(r);   /* madeira-doge */
+        if (r->sp_map) mad_sparse_release(r);   /* madeira-doge d3d12-sparse */
         if (r->buffer) NSObject_release(r->buffer);
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
         if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
@@ -10687,6 +10694,260 @@ static int mad_mip_live(const struct mad_resource *r, UINT *level) {
     *level -= r->mip_drop;
     return 1;
 }
+/* madeira-doge: d3d12-sparse = 1 (with d3d12-tiled-resources = 1). A reserved
+ * BUFFER becomes a Metal 4 placement-sparse buffer that owns no memory; each
+ * tile the application maps with UpdateTileMappings gets a 64 KB tile of a pool
+ * placement heap, and an unmapped tile reads zeros (Tier 2). Fully backed, Monster
+ * Hunter Wilds kept 400-512 MB of reserved buffers live and mapped a fraction
+ * (r#28: 161 of 1024 tiles), all of it wired while the GPU runs -- the device
+ * died at ~5 GB wired right after Start (2026-10-18). Two reserved buffers that
+ * map the same (heap, heap tile) share one pool tile, so tile aliasing holds.
+ * Mapping changes go through an MTL4 queue (winemetal ops 41-43, probe 0x3e on
+ * device): the queue's open work is flushed first, the MTL4 queue waits for the
+ * committed batches (d3d12-sparse-wait, default 1), and every later command
+ * buffer waits for the mapping's event. Reserved textures keep full backing. */
+struct mad_sparse_args { UINT64 device, length, buffer, gpu, tile, heap, ops, count, wait_event, wait_value, signal_event, signal_value; };
+struct mad_sparse_op { UINT64 mode, loc, len, heap_off; };   /* MTL4UpdateSparseBufferMappingOperation, in tiles */
+#define MAD_SP_HEAP_TILES 512u   /* 32 MB pool heaps */
+struct mad_sp_heap { obj_handle_t mtl; UINT32 used[MAD_SP_HEAP_TILES / 32]; unsigned nused; };
+struct mad_sp_key { UINT32 heap_serial, heap_tile, pool; INT32 refs; };   /* refs 0: never used; -1: deleted */
+static SRWLOCK g_sp_lock = SRWLOCK_INIT;
+static struct mad_sp_heap *g_sp_heaps; static unsigned g_sp_nheaps, g_sp_heaps_cap;
+static struct mad_sp_key *g_sp_keys; static unsigned g_sp_keys_cap, g_sp_keys_fill;
+static obj_handle_t g_sp_event; static volatile LONG64 g_sp_value;
+static UINT64 g_sp_tile = 65536;
+static volatile DWORD g_sp_create_tid;
+static volatile LONG g_sp_buffers, g_sp_tiles_live, g_sp_maps, g_sp_unmaps, g_sp_calls, g_sp_fail;
+static volatile LONG64 g_sp_virtual;
+static int mad_sparse_on(void) {
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("d3d12-sparse", 0) ? 1 : 0;   /* 1: reserved buffers are Metal 4 placement-sparse, memory only for mapped tiles (needs d3d12-tiled-resources) */
+                  d3d12_log("[d3d12-sparse] madeira-doge: d3d12-sparse = %d (%s)\n", on, on ? "reserved buffers get memory per mapped tile" : "off: reserved resources are fully backed"); }
+    return on;
+}
+static int mad_sparse_wait_on(void) {
+    static int on = -1;
+    if (on < 0) on = mad_cfg_int_pe("d3d12-sparse-wait", 1) ? 1 : 0;   /* 1: a mapping change waits for the work committed before it (0: no wait, hazards possible) */
+    return on;
+}
+static int mad_sparse_ctl(UINT32 op, struct mad_sparse_args *sa) {
+    struct madeira_ctl_args a;
+    memset(&a, 0, sizeof a); a.op = op; a.ptr = (UINT64)(ULONG_PTR)sa;
+    MadeiraCtl(&a);
+    return a.ret == 1;
+}
+/* A later command buffer starts after every mapping change made so far. */
+static void mad_sparse_cb_wait(obj_handle_t cb) {
+    UINT64 v = (UINT64)g_sp_value;
+    if (cb && v && g_sp_event) MTLCommandBuffer_encodeWaitForEvent(cb, g_sp_event, v);
+}
+static unsigned mad_sp_hash(UINT32 hs, UINT32 ht) { return (hs * 2654435761u) ^ (ht * 40503u); }
+static int mad_sp_keys_grow(void);
+/* lock held: the key of (heap, heap tile), inserted when absent; -1 on failure */
+static int mad_sp_key_find(UINT32 hs, UINT32 ht, int insert) {
+    unsigned i, mask, tomb = ~0u;
+    if (!g_sp_keys_cap || (insert && (g_sp_keys_fill + 1) * 2 > g_sp_keys_cap)) { if (!mad_sp_keys_grow()) return -1; }
+    mask = g_sp_keys_cap - 1;
+    for (i = mad_sp_hash(hs, ht) & mask;; i = (i + 1) & mask) {
+        struct mad_sp_key *k = &g_sp_keys[i];
+        if (k->refs == 0) {
+            if (!insert) return -1;
+            if (tomb != ~0u) i = tomb; else g_sp_keys_fill++;
+            g_sp_keys[i].heap_serial = hs; g_sp_keys[i].heap_tile = ht; g_sp_keys[i].pool = ~0u; g_sp_keys[i].refs = -2;   /* -2: new, no pool tile yet */
+            return (int)i;
+        }
+        if (k->refs == -1) { if (tomb == ~0u) tomb = i; continue; }
+        if (k->heap_serial == hs && k->heap_tile == ht) return (int)i;
+    }
+}
+static int mad_sp_keys_grow(void) {
+    unsigned ncap = g_sp_keys_cap ? g_sp_keys_cap * 2 : 4096, i, j;
+    struct mad_sp_key *old = g_sp_keys, *nk = calloc(ncap, sizeof *nk);
+    if (!nk) return 0;
+    for (i = 0; i < g_sp_keys_cap; i++) {
+        if (old[i].refs <= 0 && old[i].refs != -2) continue;
+        for (j = mad_sp_hash(old[i].heap_serial, old[i].heap_tile) & (ncap - 1); nk[j].refs; j = (j + 1) & (ncap - 1)) ;
+        nk[j] = old[i];
+    }
+    g_sp_keys = nk; g_sp_keys_cap = ncap; free(old);
+    g_sp_keys_fill = 0;
+    for (i = 0; i < ncap; i++) if (nk[i].refs) g_sp_keys_fill++;
+    return 1;   /* indices move; nothing keeps one across calls (sp_map holds the (heap, tile) pair) */
+}
+/* lock held: a free pool tile, making a new pool heap when all are full */
+static UINT32 mad_sp_pool_alloc(struct mad_device *d) {
+    unsigned h, w, b;
+    for (h = 0; h < g_sp_nheaps; h++) {
+        if (g_sp_heaps[h].nused >= MAD_SP_HEAP_TILES) continue;
+        for (w = 0; w < MAD_SP_HEAP_TILES / 32; w++) {
+            if (g_sp_heaps[h].used[w] == ~0u) continue;
+            for (b = 0; b < 32; b++) if (!(g_sp_heaps[h].used[w] & (1u << b))) {
+                g_sp_heaps[h].used[w] |= 1u << b; g_sp_heaps[h].nused++;
+                return h * MAD_SP_HEAP_TILES + w * 32 + b;
+            }
+        }
+    }
+    {
+        struct mad_sparse_args sa;
+        if (!mad_grow((void **)&g_sp_heaps, &g_sp_heaps_cap, g_sp_nheaps + 1, sizeof *g_sp_heaps)) return ~0u;
+        memset(&sa, 0, sizeof sa); sa.device = (UINT64)d->mtl_device; sa.length = (UINT64)MAD_SP_HEAP_TILES * g_sp_tile;
+        if (!mad_sparse_ctl(42, &sa) || !sa.heap) {
+            static LONG said; if (InterlockedIncrement(&said) <= 4) d3d12_log("[d3d12-sparse] a %llu MB pool heap could not be made\n", (unsigned long long)(sa.length >> 20));
+            return ~0u;
+        }
+        h = g_sp_nheaps++;
+        memset(&g_sp_heaps[h], 0, sizeof g_sp_heaps[h]);
+        g_sp_heaps[h].mtl = (obj_handle_t)sa.heap;
+        mad_resident(d, g_sp_heaps[h].mtl);
+        d3d12_log("[d3d12-sparse] pool heap #%u: %llu MB (%u tiles of %llu KB)\n", h + 1, (unsigned long long)(sa.length >> 20),
+                  MAD_SP_HEAP_TILES, (unsigned long long)(g_sp_tile >> 10));
+        g_sp_heaps[h].used[0] = 1; g_sp_heaps[h].nused = 1;
+        return h * MAD_SP_HEAP_TILES;
+    }
+}
+static void mad_sp_pool_free(UINT32 p) {
+    unsigned h = p / MAD_SP_HEAP_TILES, t = p % MAD_SP_HEAP_TILES;
+    if (h >= g_sp_nheaps || !(g_sp_heaps[h].used[t / 32] & (1u << (t % 32)))) return;
+    g_sp_heaps[h].used[t / 32] &= ~(1u << (t % 32)); g_sp_heaps[h].nused--;
+}
+/* lock held: drop one reference of (heap serial, heap tile); its pool tile is freed at zero */
+static void mad_sp_unref(UINT32 hs, UINT32 ht) {
+    int k = hs ? mad_sp_key_find(hs, ht, 0) : -1;
+    if (k < 0 || g_sp_keys[k].refs <= 0) return;
+    if (--g_sp_keys[k].refs == 0) {
+        mad_sp_pool_free(g_sp_keys[k].pool);
+        g_sp_keys[k].refs = -1;   /* tombstone */
+        InterlockedDecrement(&g_sp_tiles_live);
+    }
+}
+/* Operations collected for one MTL4 update call: one pool heap per call. */
+struct mad_sp_batch { struct mad_sparse_op op[256]; unsigned n; int heap; };
+static void mad_sp_batch_flush(struct mad_device *d, struct mad_resource *r, struct mad_sp_batch *b, UINT64 wait_value) {
+    struct mad_sparse_args sa;
+    if (!b->n) return;
+    memset(&sa, 0, sizeof sa);
+    sa.device = (UINT64)d->mtl_device; sa.buffer = (UINT64)r->buffer;
+    sa.heap = (UINT64)g_sp_heaps[b->heap >= 0 ? b->heap : 0].mtl;
+    sa.ops = (UINT64)(ULONG_PTR)b->op; sa.count = b->n;
+    if (wait_value && d->gpu_event) { sa.wait_event = (UINT64)d->gpu_event; sa.wait_value = wait_value; }
+    sa.signal_event = (UINT64)g_sp_event; sa.signal_value = (UINT64)InterlockedIncrement64(&g_sp_value);
+    if (!mad_sparse_ctl(43, &sa)) InterlockedIncrement(&g_sp_fail);
+    b->n = 0;
+}
+static void mad_sp_batch_add(struct mad_device *d, struct mad_resource *r, struct mad_sp_batch *b, UINT64 wait_value,
+                             UINT64 mode, UINT32 tile, int heap, UINT32 heap_off) {
+    struct mad_sparse_op *o;
+    if (b->n && (b->heap != heap || b->n == 256)) mad_sp_batch_flush(d, r, b, wait_value);
+    b->heap = heap;
+    o = b->n ? &b->op[b->n - 1] : NULL;
+    if (o && o->mode == mode && o->loc + o->len == tile && (mode == 1 || o->heap_off + o->len == heap_off)) { o->len++; return; }
+    o = &b->op[b->n++];
+    o->mode = mode; o->loc = tile; o->len = 1; o->heap_off = heap_off;
+}
+/* Called from mad_create_resource_at for the buffer of a reserved resource. */
+static obj_handle_t mad_sparse_new_buffer(struct mad_device *d, struct mad_resource *r, struct WMTBufferInfo *info) {
+    struct mad_sparse_args sa;
+    UINT64 len;
+    if (!g_sp_event) {
+        AcquireSRWLockExclusive(&g_sp_lock);
+        if (!g_sp_event) g_sp_event = MTLDevice_newSharedEvent(d->mtl_device);
+        ReleaseSRWLockExclusive(&g_sp_lock);
+        if (!g_sp_event) return 0;
+    }
+    len = (info->length + 0xffff) & ~(UINT64)0xffff;
+    memset(&sa, 0, sizeof sa); sa.device = (UINT64)d->mtl_device; sa.length = len;
+    if (!mad_sparse_ctl(41, &sa) || !sa.buffer) { InterlockedIncrement(&g_sp_fail); return 0; }
+    if (sa.tile) g_sp_tile = sa.tile;
+    r->sp_ntiles = (UINT32)((len + g_sp_tile - 1) / g_sp_tile);
+    r->sp_map = calloc(r->sp_ntiles, sizeof *r->sp_map);
+    if (!r->sp_map) { NSObject_release((obj_handle_t)sa.buffer); r->sp_ntiles = 0; return 0; }
+    info->length = len; info->gpu_address = sa.gpu; info->memory.ptr = NULL;
+    InterlockedIncrement(&g_sp_buffers); InterlockedExchangeAdd64(&g_sp_virtual, (LONG64)len);
+    return (obj_handle_t)sa.buffer;
+}
+static void mad_sparse_release(struct mad_resource *r) {
+    UINT32 t;
+    if (!r->sp_map) return;
+    AcquireSRWLockExclusive(&g_sp_lock);
+    for (t = 0; t < r->sp_ntiles; t++) if (r->sp_map[t].hs) mad_sp_unref(r->sp_map[t].hs, r->sp_map[t].ht);
+    ReleaseSRWLockExclusive(&g_sp_lock);
+    InterlockedDecrement(&g_sp_buffers); InterlockedExchangeAdd64(&g_sp_virtual, -(LONG64)((UINT64)r->sp_ntiles * g_sp_tile));
+    free(r->sp_map); r->sp_map = NULL; r->sp_ntiles = 0;
+}
+static void mad_sparse_report(void) {
+    if (!g_sp_buffers && !g_sp_calls) return;
+    d3d12_log("[d3d12-sparse] %ld sparse buffers, %lld MB virtual; %ld tiles mapped live = %lld MB in %u pool heap(s) (%llu MB); "
+              "%ld UpdateTileMappings calls, %ld tile maps, %ld unmaps, %ld failures\n", (long)g_sp_buffers, (long long)(g_sp_virtual >> 20),
+              (long)g_sp_tiles_live, (long long)(((UINT64)g_sp_tiles_live * g_sp_tile) >> 20), g_sp_nheaps,
+              (unsigned long long)(((UINT64)g_sp_nheaps * MAD_SP_HEAP_TILES * g_sp_tile) >> 20), (long)g_sp_calls, (long)g_sp_maps,
+              (long)g_sp_unmaps, (long)g_sp_fail);
+}
+/* UpdateTileMappings for a sparse buffer (D3D12 region/range walk, buffers only). */
+static void mad_sparse_update(struct mad_device *d, struct mad_resource *r, UINT nreg, const D3D12_TILED_RESOURCE_COORDINATE *starts,
+                              const D3D12_TILE_REGION_SIZE *sizes, struct mad_memheap *heap, UINT nrange, const D3D12_TILE_RANGE_FLAGS *rflags,
+                              const UINT *heap_offs, const UINT *counts) {
+    static struct mad_sp_batch b;   /* used under g_sp_lock only */
+    UINT reg = 0, reg_i = 0, range = 0, range_i = 0, nreg_e = nreg ? nreg : 1, k;
+    UINT64 total = 0, wait_value = 0, done = 0;
+    unsigned mapped = 0, unmapped = 0;
+    LONG n;
+#define REG_N(i) (sizes ? (sizes[i].UseBox ? sizes[i].Width : sizes[i].NumTiles) : 1u)
+#define REG_X(i) (starts ? starts[i].X : 0u)
+    for (k = 0; k < nreg_e; k++) total += REG_N(k);
+#define RANGE_N(i) (counts ? counts[i] : (nrange <= 1 ? (UINT)total : 1u))
+    if (!total || !nrange) return;
+    mad_device_flush_all(d);   /* work submitted before the change is committed before it */
+    if (mad_sparse_wait_on()) wait_value = (UINT64)d->gpu_serial_committed;
+    AcquireSRWLockExclusive(&g_sp_lock);
+    b.n = 0; b.heap = -1;
+    while (done < total && range < nrange) {
+        UINT t = REG_X(reg) + reg_i;
+        UINT flag = rflags ? (UINT)rflags[range] : 0;
+        if (t < r->sp_ntiles && !(flag & D3D12_TILE_RANGE_FLAG_SKIP)) {
+            struct mad_sp_tile old = r->sp_map[t];
+            if ((flag & D3D12_TILE_RANGE_FLAG_NULL) || !heap) {
+                if (old.hs) {
+                    mad_sp_unref(old.hs, old.ht); r->sp_map[t].hs = 0; r->sp_map[t].ht = 0; unmapped++;
+                    mad_sp_batch_add(d, r, &b, wait_value, 1, t, b.n ? b.heap : 0, 0);
+                }
+            } else {
+                UINT ht = (heap_offs ? heap_offs[range] : 0) + ((flag & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE) ? 0 : range_i);
+                int key = (old.hs == heap->serial && old.ht == ht) ? -1 : mad_sp_key_find(heap->serial, ht, 1);
+                if (key >= 0) {
+                    if (g_sp_keys[key].refs == -2) {
+                        UINT32 p = mad_sp_pool_alloc(d);
+                        if (p == ~0u) { g_sp_keys[key].refs = -1; InterlockedIncrement(&g_sp_fail); goto next; }
+                        g_sp_keys[key].pool = p; g_sp_keys[key].refs = 0;
+                        InterlockedIncrement(&g_sp_tiles_live);
+                    }
+                    g_sp_keys[key].refs++;
+                    {   /* the unref may rehash nothing (it never inserts), so key stays valid */
+                        UINT32 pool = g_sp_keys[key].pool;
+                        if (old.hs) mad_sp_unref(old.hs, old.ht);
+                        r->sp_map[t].hs = heap->serial; r->sp_map[t].ht = ht; mapped++;
+                        mad_sp_batch_add(d, r, &b, wait_value, 0, t, (int)(pool / MAD_SP_HEAP_TILES), pool % MAD_SP_HEAP_TILES);
+                    }
+                }
+            }
+        }
+    next:
+        done++;
+        if (++reg_i >= REG_N(reg)) { reg++; reg_i = 0; if (reg >= nreg_e) break; }
+        if (++range_i >= RANGE_N(range)) { range++; range_i = 0; }
+    }
+    mad_sp_batch_flush(d, r, &b, wait_value);
+    ReleaseSRWLockExclusive(&g_sp_lock);
+#undef REG_N
+#undef REG_X
+#undef RANGE_N
+    InterlockedExchangeAdd(&g_sp_maps, (LONG)mapped); InterlockedExchangeAdd(&g_sp_unmaps, (LONG)unmapped);
+    n = InterlockedIncrement(&g_sp_calls);
+    if (n <= 16 || !(n % 500))
+        d3d12_log("[d3d12-sparse] UpdateTileMappings #%ld r#%u: %u tile(s) mapped, %u unmapped; live %ld tiles (%lld MB) in %u pool heap(s), "
+                  "%ld sparse buffers (%lld MB virtual)%s\n", (long)n, r->serial, mapped, unmapped, (long)g_sp_tiles_live,
+                  (long long)(((UINT64)g_sp_tiles_live * g_sp_tile) >> 20), g_sp_nheaps, (long)g_sp_buffers, (long long)(g_sp_virtual >> 20),
+                  g_sp_fail ? " -- FAILURES, see g_sp_fail" : "");
+}
 static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                    const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out) {
     return mad_create_resource_at(d, heap_type, desc, riid, out, NULL, 0);
@@ -10803,6 +11064,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             if (r->buffer) { r->placed_heap = ph; r->placed_off = poff; r->placed_size = psz; mad_pl_add(ph, r); ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
             else { mad_placed_fallback(ph, desc, poff, psz, pal); info.memory.ptr = NULL; info.gpu_address = 0; }
         }
+        if (!r->buffer && heap_type == D3D12_HEAP_TYPE_DEFAULT && !ph && g_sp_create_tid == GetCurrentThreadId())
+            r->buffer = mad_sparse_new_buffer(d, r, &info);   /* madeira-doge d3d12-sparse; 0 = fully backed as before */
         /* ml1154: a large CPU-visible buffer gets storage WE allocate, handed to
          * Metal as a no-copy buffer. A fresh >= 8 MB guest commit is backed by
          * the file tier (ml1077), whose dirty pages iOS writes back and never
@@ -10858,8 +11121,9 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if (!r->buffer) r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
         if (!r->buffer) { free(r); return mad_creation_failure(d, "newBuffer"); }
         if (!r->placed_heap) {
-            mad_acct(r, r->own_mem ? MAD_CAT_BUF_OWN : heap_type == D3D12_HEAP_TYPE_DEFAULT ? MAD_CAT_BUF_PRIVATE : MAD_CAT_BUF_SHARED,
-                     info.length, +1);   /* ml1057; madeira-doge buf-own */
+            if (!r->sp_map)   /* madeira-doge: a sparse buffer owns no memory; its pool tiles are counted by d3d12-sparse */
+                mad_acct(r, r->own_mem ? MAD_CAT_BUF_OWN : heap_type == D3D12_HEAP_TYPE_DEFAULT ? MAD_CAT_BUF_PRIVATE : MAD_CAT_BUF_SHARED,
+                         info.length, +1);   /* ml1057; madeira-doge buf-own */
             mad_resident(d, r->buffer);
         }
         r->cpu = info.memory.ptr;      /* NULL for GPU-private, which is correct */
@@ -16025,6 +16289,11 @@ static HRESULT mad_create_reserved(struct mad_device *d, const D3D12_RESOURCE_DE
         return E_OUTOFMEMORY;
     }
     if (!out) return S_FALSE;   /* the documented capability test: valid, nothing created */
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && mad_sparse_on()) {   /* madeira-doge d3d12-sparse */
+        g_sp_create_tid = GetCurrentThreadId();
+        hr = mad_create_resource(d, D3D12_HEAP_TYPE_DEFAULT, desc, riid, out);
+        g_sp_create_tid = 0;
+    } else
     hr = mad_create_resource(d, D3D12_HEAP_TYPE_DEFAULT, desc, riid, out);
     if (SUCCEEDED(hr) && *out) {
         struct mad_resource *r = (struct mad_resource *)*out;   /* every resource interface is the object itself (ml886) */
@@ -16120,6 +16389,9 @@ static void STDMETHODCALLTYPE queue_UpdateTileMappings(ID3D12CommandQueue *This,
                   starts && nreg ? starts[0].Subresource : 0, sizes && nreg ? sizes[0].NumTiles : 1, sizes && nreg && sizes[0].UseBox ? " box" : "",
                   (void *)heap, nrange, rflags && nrange ? (unsigned)rflags[0] : 0, heap_offs && nrange ? heap_offs[0] : 0,
                   counts && nrange ? counts[0] : 0, (unsigned)flags);
+    if (res && ((struct mad_resource *)res)->sp_map)   /* madeira-doge d3d12-sparse: the tiles really move */
+        mad_sparse_update(((struct mad_queue *)This)->device, (struct mad_resource *)res, nreg, starts, sizes, (struct mad_memheap *)heap,
+                          nrange, rflags, heap_offs, counts);
 }
 static void STDMETHODCALLTYPE queue_CopyTileMappings(ID3D12CommandQueue *This, ID3D12Resource *dst, const D3D12_TILED_RESOURCE_COORDINATE *dst_start,
         ID3D12Resource *src, const D3D12_TILED_RESOURCE_COORDINATE *src_start, const D3D12_TILE_REGION_SIZE *size, D3D12_TILE_MAPPING_FLAGS flags) {
@@ -17276,6 +17548,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     { LONG64 tc = mad_qpc();   /* ml1128: blit + presentDrawable + commit */
     tex = MetalDrawable_texture(drawable);
     cb = MTLCommandQueue_commandBuffer(s->queue->device->mtl_queue);
+    mad_sparse_cb_wait(cb);   /* madeira-doge d3d12-sparse */
     if (cb && g_sd_state > 0 && g_fence_strict) mad_strict_cb_wait(s->queue->device, cb);   /* madeira-bcd: the copy starts after the frame's batches */
     if (cb && tex) {
         obj_handle_t copy_src = src->texture;
