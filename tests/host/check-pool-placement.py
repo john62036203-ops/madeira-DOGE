@@ -62,8 +62,8 @@ harness = r'''
 #define IOS_POOL_LEDGER_MAX 1024
 #define IOS_POOL_FREE_MAX 256
 #define IOS_POOL_REUSE_GRACE_SEC 3
-struct ios_pool_free { size_t off, size; time_t freed_at; int advised; };
-struct ios_pool_alloc { size_t off, size; void *peb; };
+struct ios_pool_free { size_t off, size; time_t freed_at; int advised; uint64_t tag; };
+struct ios_pool_alloc { size_t off, size; void *peb; uint64_t tag; };
 static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
 static struct ios_pool_alloc ios_pool_ledger[IOS_POOL_LEDGER_MAX];
 static int ios_pool_free_count, ios_pool_ledger_count, ios_pool_last_alloc_reused;
@@ -116,7 +116,7 @@ static void advance(size_t from, size_t to, size_t tail)
     while (from < to)
     {
         size_t size = to - from < 4 * MB ? to - from : 4 * MB;
-        size_t off = ios_pool_alloc_range_ex(size, total - tail, (size_t)-1, 0);
+        size_t off = ios_pool_alloc_range_ex(size, total - tail, (size_t)-1, 0, 0);
         CHECK(off != (size_t)-1);
         CHECK(off >= native_hi || off + size <= native_lo);
         CHECK(off >= ios_pool_big_off + ios_pool_big_size || off + size <= ios_pool_big_off);
@@ -127,7 +127,7 @@ static void advance(size_t from, size_t to, size_t tail)
 static int launch_case(int below, size_t reserve)
 {
     setup(below);
-    size_t cef = ios_pool_alloc_range_ex(0xefc0000, total, (size_t)-1, 0);
+    size_t cef = ios_pool_alloc_range_ex(0xefc0000, total, (size_t)-1, 0, 0);
     CHECK(cef == ios_pool_big_off && ios_pool_big_taken);
     CHECK(ios_pool_ledger[0].off == cef && ios_pool_ledger[0].peb == (void *)(uintptr_t)1);
     advance(0, 0x1dd14000, 0); /* head when the first 64MB tail carve happened */
@@ -155,7 +155,7 @@ static int launch_case(int below, size_t reserve)
     CHECK(granted == (reserve == 48 * MB ? 64 * MB : 32 * MB));
     CHECK(tail == (reserve == 48 * MB ? 64 * MB : 0));
     advance(0x1dd14000, 0x1f074000, tail);
-    size_t off = ios_pool_alloc_range_ex(0x5b4c000, total - tail, (size_t)-1, 0);
+    size_t off = ios_pool_alloc_range_ex(0x5b4c000, total - tail, (size_t)-1, 0, 0);
     if (off != (size_t)-1)
     {
         CHECK(off >= native_hi && off + 0x5b4c000 <= total - tail);
@@ -180,14 +180,14 @@ static int imports_case(int page_fit, int preserve_code)
     total = native_hi + (page_fit ? 316 : 304) * MB;
     CHECK(total - (native_hi - native_lo) <= 896 * MB);
     setup(1);
-    CHECK(ios_pool_alloc_range_ex(0xefc0000, total, (size_t)-1, 0) == ios_pool_big_off);
+    CHECK(ios_pool_alloc_range_ex(0xefc0000, total, (size_t)-1, 0, 0) == ios_pool_big_off);
     jit_pool_offset = before_shell - old_skip + ios_jit_hole_end_eff - ios_jit_hole_off_eff;
     size_t limit = total - (preserve_code ? 0 : 16 * MB);
-    if (ios_pool_alloc_range_ex(0x984000, limit, (size_t)-1, 0) == (size_t)-1) return 0;
+    if (ios_pool_alloc_range_ex(0x984000, limit, (size_t)-1, 0, 0) == (size_t)-1) return 0;
     /* 31.078MB of unique missing-image requests plus 4.531MB of other later
      * imports, less the 9.516MB SHELL32 allocation already made. */
     size_t rest = 0x1f14000 + (0x363c8000 - before_shell) - 0x984000;
-    return ios_pool_alloc_range_ex(rest, limit, (size_t)-1, 0) != (size_t)-1;
+    return ios_pool_alloc_range_ex(rest, limit, (size_t)-1, 0, 0) != (size_t)-1;
 }
 
 /* Keep the exact A/B geometry from the 411 log. Recovering C's unused 8MB
@@ -201,14 +201,14 @@ static int imports_411_case(int fit_c)
     native_hi = 0x2566c000;
     setup(1);
     CHECK(ios_pool_big_off == 0x15ff4000);
-    CHECK(ios_pool_alloc_range_ex(0xefc0000, total, (size_t)-1, 0) == ios_pool_big_off);
+    CHECK(ios_pool_alloc_range_ex(0xefc0000, total, (size_t)-1, 0, 0) == ios_pool_big_off);
     jit_pool_offset = 0x35f78000;
     size_t limit = total - (fit_c ? 0 : 32 * MB);
-    if (ios_pool_alloc_range_ex(0xf4000, limit, (size_t)-1, 0) == (size_t)-1) return 0;
+    if (ios_pool_alloc_range_ex(0xf4000, limit, (size_t)-1, 0, 0) == (size_t)-1) return 0;
     /* Unique failed-image requests (22.703125MB), plus later successful
      * head bytes (0.515625MB), less the RPCRT4 request already made. */
     size_t rest = 0x16b4000 + (0x35ffc000 - 0x35f78000) - 0xf4000;
-    return ios_pool_alloc_range_ex(rest, limit, (size_t)-1, 0) != (size_t)-1;
+    return ios_pool_alloc_range_ex(rest, limit, (size_t)-1, 0, 0) != (size_t)-1;
 }
 
 int main(void)
@@ -254,22 +254,22 @@ int main(void)
 
     setup(1);
     jit_pool_offset = 319 * MB;
-    size_t after = ios_pool_alloc_range_ex(4 * MB, total, (size_t)-1, 0);
+    size_t after = ios_pool_alloc_range_ex(4 * MB, total, (size_t)-1, 0, 0);
     CHECK(after == native_hi && ios_pool_free_count == 1);
     CHECK(ios_pool_freelist[0].off == 319 * MB && ios_pool_freelist[0].size == MB);
-    CHECK(ios_pool_alloc_range_ex(MB, total, (size_t)-1, 0) == 319 * MB);
+    CHECK(ios_pool_alloc_range_ex(MB, total, (size_t)-1, 0, 0) == 319 * MB);
     CHECK(!ios_pool_free_count && !ios_pool_big_taken);
-    CHECK(ios_pool_alloc_range_ex(MB, total, (size_t)-1, 0) == native_hi + 4 * MB);
+    CHECK(ios_pool_alloc_range_ex(MB, total, (size_t)-1, 0, 0) == native_hi + 4 * MB);
     puts("PASS: jumping a lower slot returns only the preceding unused bytes to the freelist");
 
     /* A pool-tail freelist-only request may not steal either image slot. */
     for (int below = 0; below < 2; below++)
     {
         setup(below);
-        CHECK(ios_pool_alloc_range_ex(64 * MB, 0, (size_t)-1, 0) == (size_t)-1);
+        CHECK(ios_pool_alloc_range_ex(64 * MB, 0, (size_t)-1, 0, 0) == (size_t)-1);
         CHECK(!ios_pool_big_taken && !ios_pool_ledger_count);
         /* An anchored image out of reach also cannot consume the reserved slot. */
-        CHECK(ios_pool_alloc_range_ex(64 * MB, 0x4000, 0, 0x4000) == (size_t)-1);
+        CHECK(ios_pool_alloc_range_ex(64 * MB, 0x4000, 0, 0x4000, 0) == (size_t)-1);
         CHECK(!ios_pool_big_taken);
         size_t reserve = ios_pool_hole_tail_start(total, 0, 128 * MB,
                                                  ios_jit_hole_off_eff, ios_jit_hole_end_eff);
