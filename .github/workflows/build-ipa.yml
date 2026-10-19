@@ -445,6 +445,8 @@ jobs:
           python3 tests/host/check-eco-prio.py
           python3 tests/host/check-wsex-mincore.py
           python3 tests/host/check-swap-heat.py
+          python3 tests/host/check-default-buffer-swap.py
+          python3 tests/host/check-readback-swap.py
 
       # [dns]: every guest getaddrinfo by name, and MADEIRA_DNS_TIMEOUT_MS to
       # bound one (Social Club's Chromium sat in three getaddrinfo calls for a

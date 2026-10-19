@@ -456,6 +456,9 @@ static volatile LONG64 g_bp_bytes[6]; static volatile LONG g_bp_count[6];
 static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
+static volatile LONG64 g_defswap_bytes; static volatile LONG g_defswap_n;   /* madeira-bcd default-buffer-swap: LIVE moved DEFAULT buffers (default-swap-mb/-kb or default-buffer-swap), a part of the ml1154 count */
+static volatile LONG64 g_defswap_wired; static volatile LONG g_defswap_nwired, g_defswap_wire_fail;   /* madeira-bcd default-buffer-swap-wire (opt-in) */
+static void mad_dsw_census(void);   /* madeira-bcd default-buffer-swap residency census (opt-in) */
 static volatile LONG64 g_reserved_live_bytes; static volatile LONG g_reserved_live_n;   /* madeira-bcd: d3d12-tiled-resources */
 static int mad_upload_swap_on(void);
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
@@ -750,6 +753,13 @@ static void mad_acct_report(void) {
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
     d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+    if (g_defswap_n || g_defswap_bytes)   /* madeira-bcd default-buffer-swap (default-swap-mb/-kb or default-buffer-swap, opt-in) */
+        d3d12_log("[madeira-d3d12] default-buffer-swap: %ld DEFAULT buffers on file-backed storage, %lld MB (inside the ml1154 count above)\n",
+                  (long)g_defswap_n, (long long)(g_defswap_bytes >> 20));
+    if (g_defswap_nwired || g_defswap_wire_fail)   /* madeira-bcd default-buffer-swap-wire (opt-in) */
+        d3d12_log("[madeira-d3d12] default-buffer-swap-wire: %ld of them wired, %lld MB; %ld refused by VirtualLock\n",
+                  (long)g_defswap_nwired, (long long)(g_defswap_wired >> 20), (long)g_defswap_wire_fail);
+    if (g_defswap_n) mad_dsw_census();   /* madeira-bcd: opt-in, env.MADEIRA_WSEX_MINCORE */
     mad_sparse_report();
     {   /* madeira-doge: what the Metal-owned GPU-only buffers are made of */
         char h[256]; int hn = 0, k;
@@ -821,6 +831,7 @@ struct mad_resource {
     UINT64 placed_off, placed_size;    /* madeira-bcd: where in that heap, and how much Metal took */
     unsigned serial;                   /* madeira-bcd: creation number, names a resource in capture / alias logs */
     void *own_mem;                     /* ml1154: our VirtualAlloc'd storage behind a CPU-visible buffer */
+    int own_wired;                     /* madeira-bcd default-buffer-swap-wire: own_mem is VirtualLock'ed (VirtualFree unwires it) */
     unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
     obj_handle_t buffer;
     void *cpu;                 /* NULL for GPU-private */
@@ -3007,6 +3018,28 @@ static int mad_pso_lazy_on(void) {   /* madeira-bcd: madeira.cfg pso-lazy (defau
                   d3d12_log("[madeira-d3d12] pipelines are built %s (madeira.cfg pso-lazy)\n", on ? "at their first draw/dispatch" : "at creation"); }
     return on;
 }
+/* madeira-bcd default-buffer-swap (BCD 0.1.573, opt-in, default 0) is the same
+ * mechanism under BCD's names, so it turns THIS path on rather than adding a
+ * second one. BCD: Horizon Forbidden West keeps 1.3-1.6 GB of committed DEFAULT
+ * buffers live (256 MB each, flags 0) on GPU-private Metal memory. 1: a committed
+ * DEFAULT buffer of at least default-buffer-swap-mb (default 64, never below 8)
+ * with no UAV, render-target or depth flag moves; 2: UAV ones too. When
+ * default-swap-mb or default-swap-kb is set it wins (its threshold, every flag,
+ * as before) and default-buffer-swap is ignored.
+ * default-buffer-swap-wire and default-buffer-swap-max-mb (both opt-in, default
+ * 0) apply to every buffer this path moves, whichever key turned it on. BCD build
+ * 531 (Forbidden West): the six moved 256 MB buffers took the footprint peak from
+ * 7.7 to 6.05 GB, but 20-30 s into play the GPU time per present went from 16.5
+ * to 48-57 ms with a burst of 8,081 page-ins a second; the suspect is the pageout
+ * scan evicting file-backed pages only the GPU touches.
+ * wire = 1: VirtualLock (mlock) the storage once Metal has accepted it, so its
+ * pages stay resident; a refusal (the per-process wire limit) is logged and the
+ * buffer stays as it is. VirtualFree, after the GPU (the ml1154 path), unwires it.
+ * max-mb = N: buffers move only while the LIVE moved total stays at or below N
+ * MB; the rest stay GPU-private. 0 = no limit. */
+static int g_defswap_mode;   /* 0 = default-swap-mb/-kb (every flag), 1 = default-buffer-swap 1 (no UAV/RT/DS), 2 = UAV too */
+static int g_defswap_wire;
+static UINT64 g_defswap_max;
 /* madeira-doge: madeira.cfg default-swap-mb = N (0 = off, the default). A GPU-only
  * (DEFAULT heap) committed buffer of N MB or more gets storage WE allocate, like
  * ml1154 does for CPU-visible ones: a Metal shared, no-copy buffer over a fresh
@@ -3021,15 +3054,127 @@ static UINT64 mad_default_swap_min(void) {
     static LONG64 min = -1;
     if (min < 0) { int mb = mad_cfg_int_pe("default-swap-mb", 0);
                    int kb = mad_cfg_int_pe("default-swap-kb", 0);   /* KB threshold for default-swap; overrides default-swap-mb when > 0 */
-                   min = kb > 0 ? (LONG64)kb << 10 : mb > 0 ? (LONG64)mb << 20 : 0;
-                   d3d12_log("[madeira-d3d12] default-swap from %lld KB (default-swap-mb = %d, default-swap-kb = %d): %s\n", (long long)(min >> 10), mb, kb,
-                             min ? "GPU-only buffers from that size live on file-backed storage" : "off: GPU-only buffers are Metal-owned"); }
+                   long long m = mad_cfg_int_pe("default-buffer-swap", 0);   /* 1 = committed DEFAULT buffers of default-buffer-swap-mb or more with no UAV/RT/DS flag on file-backed storage (BCD's name for default-swap), 2 = UAV ones too; 0 = off. default-swap-mb/-kb win when set */
+                   long long bmb = mad_cfg_int_pe("default-buffer-swap-mb", 64);   /* default-buffer-swap: the smallest DEFAULT buffer moved, in MB (at least 8); unused when default-swap-mb/-kb is set */
+                   long long w = mad_cfg_int_pe("default-buffer-swap-wire", 0);   /* 1 = VirtualLock (mlock) the storage of every DEFAULT buffer default-swap moves, so its pages stay resident; 0 = pageable (as before) */
+                   long long cap = mad_cfg_int_pe("default-buffer-swap-max-mb", 0);   /* default-swap moves DEFAULT buffers only while the live moved total stays at or below this many MB; 0 = no limit */
+                   LONG64 v = kb > 0 ? (LONG64)kb << 10 : mb > 0 ? (LONG64)mb << 20 : 0;
+                   g_defswap_mode = 0;
+                   if (!v && m > 0) { v = (LONG64)(bmb < 8 ? 8 : bmb) << 20; g_defswap_mode = m >= 2 ? 2 : 1; }
+                   g_defswap_wire = v && w > 0;
+                   g_defswap_max = v && cap > 0 ? (UINT64)cap << 20 : 0;
+                   d3d12_log("[madeira-d3d12] default-swap from %lld KB (default-swap-mb = %d, default-swap-kb = %d): %s\n", (long long)(v >> 10), mb, kb,
+                             v ? "GPU-only buffers from that size live on file-backed storage" : "off: GPU-only buffers are Metal-owned");
+                   if (m > 0)
+                       d3d12_log("[madeira-d3d12] default-buffer-swap = %lld (opt-in): %s; default-buffer-swap-wire = %d, default-buffer-swap-max-mb = %lld\n", m,
+                                 g_defswap_mode ? (g_defswap_mode >= 2 ? "committed DEFAULT buffers from that size, UAV ones too, move"
+                                                                       : "committed DEFAULT buffers from that size without a UAV flag move")
+                                                : "ignored, default-swap-mb/-kb is set and moves every flag",
+                                 g_defswap_wire, (long long)(g_defswap_max >> 20));
+                   else if (v && (g_defswap_wire || g_defswap_max))
+                       d3d12_log("[madeira-d3d12] default-swap: default-buffer-swap-wire = %d, default-buffer-swap-max-mb = %lld\n",
+                                 g_defswap_wire, (long long)(g_defswap_max >> 20));
+                   MemoryBarrier();
+                   min = v; }
     return (UINT64)min;
+}
+/* default-buffer-swap: may a DEFAULT buffer with these flags move? (read after mad_default_swap_min) */
+static int mad_defswap_flags_ok(UINT flags) {
+    if (!g_defswap_mode) return 1;   /* default-swap-mb/-kb: every flag, as before */
+    if (flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return 0;
+    return g_defswap_mode >= 2 || !(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+}
+/* default-buffer-swap-max-mb: is there room for a buffer of this length? */
+static int mad_defswap_room(UINT64 length) {
+    static LONG said;
+    UINT64 len = (length + 0xffff) & ~(UINT64)0xffff;
+    if (!g_defswap_max || (UINT64)g_defswap_bytes + len <= g_defswap_max) return 1;
+    if (InterlockedIncrement(&said) <= 4)
+        d3d12_log("[madeira-d3d12] default-buffer-swap: a %llu MB DEFAULT buffer stays GPU-private: %lld MB moved already, default-buffer-swap-max-mb = %llu\n",
+                  (unsigned long long)(len >> 20), (long long)(g_defswap_bytes >> 20), (unsigned long long)(g_defswap_max >> 20));
+    return 0;
+}
+/* default-buffer-swap-wire: lock a moved buffer's storage. Returns 1 when it is locked. */
+static int mad_defswap_wire(void *mem, SIZE_T len) {
+    static LONG said;
+    UINT64 t0 = mad_tick();
+    BOOL ok = VirtualLock(mem, len);
+    DWORD err = ok ? 0 : GetLastError();
+    double ms = 1000.0 * (double)(mad_tick() - t0) / (double)mad_tick_freq();
+    if (ok) { InterlockedExchangeAdd64(&g_defswap_wired, (LONG64)len); InterlockedIncrement(&g_defswap_nwired); }
+    else InterlockedIncrement(&g_defswap_wire_fail);
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] default-buffer-swap-wire: %llu MB at %p %s (error %lu) in %.1f ms; %ld wired so far, %lld MB\n",
+                  (unsigned long long)(len >> 20), mem, ok ? "wired (VirtualLock)" : "NOT wired, stays pageable: VirtualLock failed",
+                  (unsigned long)err, ms, (long)g_defswap_nwired, (long long)(g_defswap_wired >> 20));
+    return ok ? 1 : 0;
+}
+/* madeira-bcd default-buffer-swap residency census (opt-in, env.MADEIRA_WSEX_MINCORE = 1,
+ * the switch that also makes QueryWorkingSetEx answer from mincore in
+ * build/ntdll-unix/virtual_ios.c). Every 5 s, next to the default-buffer-swap
+ * line: of 128 pages spread over each moved buffer (the first 32), how many are
+ * in memory. Logging only; nothing changes without it. */
+#define MAD_DSW_MAX 32
+static struct { void *mem; SIZE_T len; } g_dsw[MAD_DSW_MAX];
+static SRWLOCK g_dsw_lock = SRWLOCK_INIT;
+static void mad_dsw_track(void *mem, SIZE_T len, int add) {
+    unsigned i;
+    AcquireSRWLockExclusive(&g_dsw_lock);
+    for (i = 0; i < MAD_DSW_MAX; i++) {
+        if (add && !g_dsw[i].mem) { g_dsw[i].mem = mem; g_dsw[i].len = len; break; }
+        if (!add && g_dsw[i].mem == mem) { g_dsw[i].mem = NULL; g_dsw[i].len = 0; break; }
+    }
+    ReleaseSRWLockExclusive(&g_dsw_lock);
+}
+static void mad_dsw_census(void) {
+    struct mad_wsex { void *va; ULONG_PTR attr; } info[128];   /* PSAPI_WORKING_SET_EX_INFORMATION: bit 0 of attr = Valid */
+    typedef BOOL (WINAPI *qwse_fn)(HANDLE, void *, DWORD);
+    static qwse_fn qwse; static int on = -1;
+    char line[900]; int n = 0, k = 0; unsigned i, j, res, all = 0, all_res = 0;
+    if (on < 0) {
+        char v[4];
+        DWORD m = GetEnvironmentVariableA("MADEIRA_WSEX_MINCORE", v, sizeof v);   /* 1 = also the default-buffer-swap residency census in madeira-d3d12 */
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        qwse = k32 ? (qwse_fn)(void *)GetProcAddress(k32, "K32QueryWorkingSetEx") : NULL;
+        on = m == 1 && v[0] == '1' && qwse;
+    }
+    if (!on) return;
+    line[0] = 0;
+    AcquireSRWLockShared(&g_dsw_lock);
+    for (i = 0; i < MAD_DSW_MAX; i++) {
+        SIZE_T step;
+        if (!g_dsw[i].mem) continue;
+        step = (g_dsw[i].len / 128) & ~(SIZE_T)0x3fff;
+        if (!step) step = 0x4000;
+        for (j = 0; j < 128; j++) { info[j].va = (char *)g_dsw[i].mem + (SIZE_T)j * step; info[j].attr = 0; }
+        res = 0;
+        if (qwse(GetCurrentProcess(), info, sizeof info))
+            for (j = 0; j < 128; j++) res += (unsigned)(info[j].attr & 1);
+        all += 128; all_res += res; k++;
+        if (n < (int)sizeof line - 40) n += snprintf(line + n, sizeof line - n, " #%u %u%%", i, res * 100 / 128);
+    }
+    ReleaseSRWLockShared(&g_dsw_lock);
+    if (k)
+        d3d12_log("[madeira-d3d12] default-buffer-swap residency (QueryWorkingSetEx over mincore, 128 pages a buffer): %u%% of the sampled pages in memory;%s\n",
+                  all ? all_res * 100 / all : 0, line);
 }
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
     static int on = -1;
     if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
                   d3d12_log("[madeira-d3d12] ml1154 upload-swap = %d (%s)\n", on, on ? "CPU-visible buffers >= 8 MB live on file-backed storage, off the jetsam footprint" : "Metal-owned storage"); }
+    return on;
+}
+/* madeira-bcd readback-swap = 0 (opt-in; 1, the default, is the behaviour so
+ * far): READBACK buffers stay on Metal-owned storage while upload-swap keeps
+ * UPLOAD buffers on the file tier. The GPU writes READBACK memory and the CPU
+ * reads it; with the file tier between them the CPU's view may not have the
+ * GPU's writes. Horizon Zero Dawn has two 32 MB READBACK buffers. */
+static int mad_readback_swap_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = mad_cfg_int_pe("readback-swap", 1) ? 1 : 0;   /* 0 = READBACK buffers on Metal-owned storage, not the file tier (UPLOAD buffers stay as upload-swap says); 1 = as before */
+        if (!on) d3d12_log("[madeira-d3d12] madeira-bcd readback-swap = 0: READBACK buffers on Metal-owned storage, UPLOAD buffers as upload-swap says\n");
+    }
     return on;
 }
 
@@ -9662,7 +9807,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         ti.pixel_format = pf; ti.width = (uint32_t)width; ti.height = 1; ti.depth = 1; ti.array_length = 1;
         ti.type = WMTTextureTypeTextureBuffer; ti.mipmap_level_count = 1; ti.sample_count = 1;
         ti.usage = uav ? (WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite) : WMTTextureUsageShaderRead;
-        ti.options = r->cpu ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;
+        ti.options = (r->cpu || r->own_mem) ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;   /* madeira-bcd: a DEFAULT buffer on our storage (default-swap) is Shared to Metal */
         if (uav && (pf == WMTPixelFormatR32Uint || pf == WMTPixelFormatR32Sint) && mad_typed_uav_atomic())   /* madeira-bcd, opt-in */
             ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsageShaderAtomic);
         tex = MTLBuffer_newTexture(r->buffer, &ti, aligned, bpr);
@@ -10516,6 +10661,13 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
             InterlockedExchangeAdd64(&g_upload_swap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_upload_swap_n);
+            if (r->heap == D3D12_HEAP_TYPE_DEFAULT) {   /* madeira-bcd default-buffer-swap: only default-swap puts a DEFAULT buffer on our storage */
+                InterlockedExchangeAdd64(&g_defswap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_defswap_n);
+                mad_dsw_track(r->own_mem, 0, 0);   /* madeira-bcd default-buffer-swap residency census: no longer sampled */
+                if (r->own_wired) {   /* madeira-bcd default-buffer-swap-wire: the VirtualFree below unwires it */
+                    InterlockedExchangeAdd64(&g_defswap_wired, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_defswap_nwired);
+                }
+            }
             if (md) {
                 EnterCriticalSection(&md->heap_lock);
                 if (mad_grow((void **)&md->mhret, &md->mhret_cap, md->nmhret + 1, sizeof *md->mhret)) {
@@ -11347,7 +11499,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * 0.4-0.9 GB of UPLOAD buffers live (ph-valley08-13), and its load-time
          * peak is what kills the Lumen runs. Metal-allocated shared storage is
          * charged in full. madeira.cfg upload-swap = 0 turns it off. */
-        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on()) {
+        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on() &&
+            (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {   /* madeira-bcd readback-swap */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
             void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (mem) {
@@ -11366,7 +11519,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             }
         }
         if (!r->buffer && heap_type == D3D12_HEAP_TYPE_DEFAULT && !r->placed_heap && mad_default_swap_min()
-            && info.length >= mad_default_swap_min()) {   /* madeira-doge: default-swap-mb */
+            && info.length >= mad_default_swap_min() && mad_defswap_flags_ok(desc->Flags)
+            && mad_defswap_room(info.length)) {   /* madeira-doge: default-swap-mb; madeira-bcd default-buffer-swap (flags, -max-mb) */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
             void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (mem) {
@@ -11378,6 +11532,9 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                     /* released through the ml1154 path, which subtracts from its counter */
                     InterlockedExchangeAdd64(&g_upload_swap_bytes, (LONG64)len); InterlockedIncrement(&g_upload_swap_n);
                     InterlockedExchangeAdd64(&g_default_swap_bytes, (LONG64)len); InterlockedIncrement(&g_default_swap_n);
+                    InterlockedExchangeAdd64(&g_defswap_bytes, (LONG64)len); InterlockedIncrement(&g_defswap_n);   /* madeira-bcd: live, for -max-mb and the census */
+                    if (g_defswap_wire) r->own_wired = mad_defswap_wire(mem, len);   /* madeira-bcd default-buffer-swap-wire */
+                    mad_dsw_track(mem, len, 1);   /* madeira-bcd default-buffer-swap residency census */
                     info.memory.ptr = NULL;   /* never CPU-visible to the application */
                 } else {
                     VirtualFree(mem, 0, MEM_RELEASE);

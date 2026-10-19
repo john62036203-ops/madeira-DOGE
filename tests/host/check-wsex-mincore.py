@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """wsex-mincore: env.MADEIRA_WSEX_MINCORE = 1 (opt-in) makes QueryWorkingSetEx
-answer from mincore() on iOS; no Wine runs. (Upstream also turns on
-madeira-d3d12's default-buffer-swap residency census with it; this tree has no
-default-buffer-swap, so that part is not here.)
+answer from mincore() on iOS, and turns on madeira-d3d12's default-buffer-swap
+residency census; no Wine runs.
 
 iOS has no /proc/self/pagemap, so build/ntdll-unix/virtual_ios.c's
 fill_working_set_info read every page as not resident. The census needs a real
@@ -19,6 +18,10 @@ Checks:
   - mincore on this (Darwin) host says what the census relies on: a touched
     page of a MAP_SHARED file mapping is in memory, an untouched page of a
     fresh sparse file is not;
+  - madeira-d3d12: the census reads the same switch, uses K32QueryWorkingSetEx,
+    samples 128 pages a moved buffer, runs from the 5 s memory report only when
+    buffers were moved; buffers enter the census when Metal accepted them and
+    leave it at release;
   - the catalog lists the switch and CI runs this check.
 """
 from pathlib import Path
@@ -129,10 +132,16 @@ check("p->VirtualAttributes.Valid = !(vprot & VPROT_GUARD) && (vprot & 0x0f) && 
       "the Valid test itself is unchanged and comes after")
 check(virt.count("ios_wsex_mincore_on(") == 2, "no other caller in virtual_ios.c")
 
-# madeira-d3d12's default-buffer-swap residency census (upstream's user of this
-# switch) is not in this tree: the default-buffer-swap feature it samples was
-# never merged here. Only the ntdll side is checked.
-check("MADEIRA_WSEX_MINCORE" not in d3d12 or "mad_dsw_census" in d3d12, "no half-ported census in madeira-d3d12")
+# madeira-d3d12's default-buffer-swap residency census (BCD 0.1.573), over the
+# fork's default-swap path (default-swap-mb/-kb or default-buffer-swap).
+census = func_body(d3d12, "static void mad_dsw_census(void) {")
+check('GetEnvironmentVariableA("MADEIRA_WSEX_MINCORE", v, sizeof v)' in census and 'GetProcAddress(k32, "K32QueryWorkingSetEx")' in census and
+      "on = m == 1 && v[0] == '1' && qwse;" in census and "if (!on) return;" in census,
+      "census: same switch, K32QueryWorkingSetEx, off without it")
+check("info[128]" in census and "for (j = 0; j < 128; j++) res += (unsigned)(info[j].attr & 1);" in census, "census: 128 pages a buffer, the Valid bit")
+check("if (g_defswap_n) mad_dsw_census();   /* madeira-bcd: opt-in, env.MADEIRA_WSEX_MINCORE */" in func_body(d3d12, "static void mad_acct_report(void) {"),
+      "census runs from the 5 s memory report, only with moved buffers")
+check("mad_dsw_track(mem, len, 1);" in d3d12 and "mad_dsw_track(r->own_mem, 0, 0);" in d3d12, "buffers enter at acceptance and leave at release")
 
 cat = CAT.read_text(encoding="utf-8")
 check('ConfigOption(key: "env.MADEIRA_WSEX_MINCORE"' in cat, "the catalog documents env.MADEIRA_WSEX_MINCORE")
