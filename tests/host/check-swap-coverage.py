@@ -487,6 +487,29 @@ static void test_smallmap( int high )
     test_is_game = 0;
 }
 
+/* madeira-doge: MADEIRA_SWAP_FEX=1 -- the game's commits of 1 MB and up inside FEX's arena
+ * go to the file tier (16 MB ones too, past broad's band check); never the JIT pool,
+ * never another process, never under the floor. */
+static void test_swapfex( void )
+{
+    struct file_view v = { 0, 0, 0 };
+    void *fex = (void *)0x7c10000000ULL;
+    unsigned rw = VPROT_READ | VPROT_WRITE;
+
+    env( "broad", "64", NULL );
+    test_is_game = 0;
+    CHECK( ios_swap_why( fex, 1u << 20, rw, &v ) != IOS_SW_BACKED, "swap-fex: not the game process, not backed" );
+    test_is_game = 1;
+    CHECK( ios_swap_why( fex, 1u << 20, rw, &v ) == IOS_SW_BACKED, "swap-fex: 1 MB FEX commit backed" );
+    CHECK( ios_swap_why( fex, 16u << 20, rw, &v ) == IOS_SW_BACKED, "swap-fex: 16 MB FEX span backed" );
+    CHECK( ios_swap_why( fex, 512u << 10, rw, &v ) == IOS_SW_SMALL, "swap-fex: under 1 MB small" );
+    CHECK( ios_swap_why( fex, 1u << 20, rw | VPROT_EXEC, &v ) == IOS_SW_PROT, "swap-fex: exec never" );
+    CHECK( ios_swap_why( (void *)0x7c00000000ULL - 0x100000, 0x200000, rw, &v ) != IOS_SW_BACKED, "swap-fex: straddling the arena never" );
+    CHECK( ios_swap_why( (void *)0x7000100000ULL, 64u << 20, rw, &v ) == IOS_SW_FEXJIT, "swap-fex: JIT pool RW alias never" );
+    CHECK( ios_swap_why( (void *)0x7050000000ULL, 1u << 20, rw, &v ) == IOS_SW_BACKED, "swap-fex: the guest band as before" );
+    test_is_game = 0;
+}
+
 int main( int argc, char **argv )
 {
     char path[] = "/tmp/madeira-swap-XXXXXX";
@@ -499,6 +522,12 @@ int main( int argc, char **argv )
     ios_swap_init();
     unlink( path );
     if (ios_swap_fd < 0) { printf( "FAIL: tier did not start\n" ); return 1; }
+    if (argc > 1 && !strcmp( argv[1], "swapfex" ))
+    {
+        test_swapfex();
+        printf( "%d failures (swap-fex)\n", bad );
+        return bad != 0;
+    }
     if (argc > 1 && !strcmp( argv[1], "smallmap" ))
     {
         test_smallmap( argc > 2 );
@@ -529,7 +558,8 @@ with tempfile.TemporaryDirectory() as tmp:
     print(r.stdout.strip())
     check(r.returncode == 0, 'swap-tier core run failed:\n' + r.stdout + r.stderr)
     for extra, args in (({'MADEIRA_SWAP_SMALLMAP': '1'}, ['smallmap']),
-                        ({'MADEIRA_SWAP_SMALLMAP': '1', 'MADEIRA_SWAP_HIGH': '1'}, ['smallmap', 'high'])):
+                        ({'MADEIRA_SWAP_SMALLMAP': '1', 'MADEIRA_SWAP_HIGH': '1'}, ['smallmap', 'high']),
+                        ({'MADEIRA_SWAP_FEX': '1'}, ['swapfex'])):
         rs = subprocess.run([str(exe)] + args, capture_output=True, text=True, env=dict(base_env, **extra))
         print(rs.stdout.strip())
         check(rs.returncode == 0, 'smallmap run failed:\n' + rs.stdout + rs.stderr)

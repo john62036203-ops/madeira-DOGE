@@ -20862,6 +20862,7 @@ static int ios_swap_eligible( const void *base, size_t size, unsigned int vprot,
     return 1;
 }
 /* blocks/wide/broad: why a range is (not) eligible; the census counts by this. */
+static unsigned long ios_swap_fex_backed;   /* madeira-doge MADEIRA_SWAP_FEX */
 static int ios_swap_is_fexjit( uintptr_t b, size_t size )
 {
     uintptr_t e = b + size, rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
@@ -20892,6 +20893,35 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
     if (!view || !is_view_valloc( view ) ||
         (view->protect & (SEC_FILE | SEC_IMAGE | SEC_RESERVE | VPROT_SYSTEM | VPROT_PLACEHOLDER |
                           VPROT_FREE_PLACEHOLDER | VPROT_ARM64EC | VPROT_WRITEWATCH))) return IOS_SW_VIEW;
+    {   /* madeira-doge: MADEIRA_SWAP_FEX=1 (game process only): commits of 1 MB and up inside
+         * FEX's own arena (its rpmalloc heap: IR, block and lookup caches -- never the JIT
+         * pool, which is outside the arena) go to the file tier too, 16 MB spans included and
+         * past the broad band check. MH Wilds (build 258): ~770 MB of FEX heap, 94 % of it in
+         * the compressor once a scene loads; regions of 1 MB and up are ~570 MB of it in a few
+         * hundred commits (the <1 MB ones are ~9,500 regions, too many extents).
+         * MADEIRA_SWAP_FEX_MIN_KB overrides the 1 MB floor. */
+        static int fexsw = -1; static size_t fexmin;
+        if (fexsw < 0)
+        {
+            const char *v = getenv( "MADEIRA_SWAP_FEX" ), *m = getenv( "MADEIRA_SWAP_FEX_MIN_KB" );
+            long kb = m && m[0] ? atol( m ) : 1024;
+            fexsw = v && v[0] == '1';
+            if (kb < 64) kb = 64;
+            fexmin = (size_t)kb << 10;
+        }
+        if (fexsw && ios_fex_arena_base_unix && b >= ios_fex_arena_base_unix && b + size <= ios_fex_arena_end_unix &&
+            ios_swap_proc_is_game())
+        {
+            uintptr_t e = b + size, rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
+            size_t ps = ios_jit_pool_size_global;
+            if ((ps && rx && b < rx + ps && e > rx) || (ps && rw && b < rw + ps && e > rw) || ios_jit_low_overlaps( b, size ))
+                return IOS_SW_FEXJIT;
+            if (size < fexmin || size < ios_swap_min) return IOS_SW_SMALL;
+            if (ios_swap_churny( size )) { ios_swap_churn_skips++; return IOS_SW_CHURN; }
+            ios_swap_fex_backed++;
+            return IOS_SW_BACKED;
+        }
+    }
     if (ios_swap_is_fexjit( b, size ))
     {
         /* madeira-doge: RE Engine heap blocks (0x3ff000 each, tens of GB of commit
@@ -21147,11 +21177,11 @@ void ios_swap_stats_line( void )
     disk = ios_swap_disk_used();
     dprintf( 2, "[swap] ml1077 stats: %llu MB file-backed now (peak %llu), %u extents, file used %llu of %llu MB, backs %llu releases %llu unbacks %llu refused %llu"
              " | coverage %s: disk %llu MB of %llu cap, reservations %llu, holes %llu, disk-full refusals %llu"
-             " | ml1258 churn: %u sizes, %llu blocks left anonymous\n",
+             " | ml1258 churn: %u sizes, %llu blocks left anonymous | fex commits backed %lu (MADEIRA_SWAP_FEX)\n",
              ios_swap_bytes >> 20, ios_swap_peak >> 20, ios_swap_n, (unsigned long long)(ios_swap_bump >> 20),
              (unsigned long long)(ios_swap_logical >> 20), ios_swap_backs, ios_swap_releases, ios_swap_unbacks, ios_swap_refused,
              ios_swap_mode, disk >> 20, (unsigned long long)(ios_swap_cap >> 20), ios_swap_resv_n, ios_swap_holes,
-             ios_swap_disk_refused, ios_swap_nchurny, ios_swap_churn_skips );
+             ios_swap_disk_refused, ios_swap_nchurny, ios_swap_churn_skips, ios_swap_fex_backed );
     if (ios_pool_takes || ios_pool_guarded)
         dprintf( 2, "[swap] ml1150 pool: %llu MB in use (peak %llu), %llu takes, %llu guarded, %llu MB lost to a full free list\n",
                  ios_pool_bytes >> 20, ios_pool_peak >> 20, ios_pool_takes, ios_pool_guarded, ios_pool_lost >> 20 );
