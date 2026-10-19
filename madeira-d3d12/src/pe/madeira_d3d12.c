@@ -15482,6 +15482,23 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         dsi.depth_compare_function = WMTCompareFunctionAlways;
         dsi.depth_write_enabled = false;
     }
+    {   /* madeira-doge: madeira.cfg depth-equal-as = N, a diagnostic for RE Engine's visibility-buffer
+         * material pass (RE9: drawMaterialID writes each pixel's material ID as 16-bit depth, then one
+         * PS_VisibleGBuffer draw per material tests it with EQUAL; the room stays black, only a few
+         * materials match). For pipelines with a 16-bit depth format, an EQUAL test and no depth write:
+         * 1 = ALWAYS, 2 = LESS_EQUAL, 3 = GREATER_EQUAL (0 = as the game asks, the default). If the room
+         * appears with 1 (blocky at material borders), the EQUAL comparison is what fails. */
+        static int deq = -1; static LONG said;
+        if (deq < 0) { long long v = mad_cfg_int_pe("depth-equal-as", 0); deq = v >= 1 && v <= 3 ? (int)v : 0; }
+        if (deq && desc->DepthStencilState.DepthEnable && desc->DepthStencilState.DepthFunc == D3D12_COMPARISON_FUNC_EQUAL &&
+            desc->DepthStencilState.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ALL &&
+            (desc->DSVFormat == DXGI_FORMAT_D16_UNORM || desc->DSVFormat == DXGI_FORMAT_R16_TYPELESS)) {
+            dsi.depth_compare_function = deq == 1 ? WMTCompareFunctionAlways : deq == 2 ? WMTCompareFunctionLessEqual : WMTCompareFunctionGreaterEqual;
+            if (InterlockedIncrement(&said) <= 8)
+                d3d12_log("[madeira-d3d12] depth-equal-as %d: pipeline vs '%s' ps '%s' (16-bit depth, EQUAL) compares %s\n", deq,
+                          p->vs_name, p->ps_name, deq == 1 ? "ALWAYS" : deq == 2 ? "LESS_EQUAL" : "GREATER_EQUAL");
+        }
+    }
     mad_stencil_face(&dsi.front_stencil, &desc->DepthStencilState.FrontFace, desc->DepthStencilState.StencilEnable,
                      desc->DepthStencilState.StencilReadMask, desc->DepthStencilState.StencilWriteMask);
     mad_stencil_face(&dsi.back_stencil, &desc->DepthStencilState.BackFace, desc->DepthStencilState.StencilEnable,
