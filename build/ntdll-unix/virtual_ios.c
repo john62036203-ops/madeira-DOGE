@@ -16210,6 +16210,51 @@ static struct ios_pool_image *ios_pool_image_of_view( const struct file_view *vi
     return (view->protect & VPROT_INPOOL) ? ios_pool_image_find( view->base, 0 ) : NULL;
 }
 
+/* madeira-doge: the five __os_arm64x_dispatch_* slots of the in-pool image that
+ * contains addr (build 260, 2026-10-19 17:12: dockhost's in-pool ucrtbase read
+ * its dispatch_call_no_redirect as 0 at a blr x16, yet the fault dump found it
+ * set). Printed at map finish and after every protection change in the image,
+ * to see WHEN the loader fills them. No view lookup (callers differ in locks):
+ * the image is only read if its header still looks like a PE. */
+static void ios_pool_image_log_slots( const void *addr, const char *tag )
+{
+    static unsigned int n;
+    int i, cnt = ios_pool_image_count;
+    uintptr_t a = (uintptr_t)addr;
+    if (!ios_pool_images_enabled() || n >= 160) return;
+    for (i = 0; i < cnt && i < IOS_POOL_IMAGES; i++)
+    {
+        const unsigned char *b = ios_pool_images[i].base;
+        const IMAGE_NT_HEADERS64 *nt;
+        const IMAGE_LOAD_CONFIG_DIRECTORY64 *cfg;
+        const IMAGE_ARM64EC_METADATA *meta;
+        DWORD cfg_rva, cfg_sz;
+        ULONGLONG mva;
+        if (!b || a < (uintptr_t)b || a >= (uintptr_t)b + ios_pool_images[i].alloc) continue;
+        if (((const IMAGE_DOS_HEADER *)b)->e_magic != IMAGE_DOS_SIGNATURE) return;
+        nt = (const IMAGE_NT_HEADERS64 *)(b + ((const IMAGE_DOS_HEADER *)b)->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) return;
+        cfg_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress;
+        cfg_sz = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size;
+        if (!cfg_rva || cfg_sz <= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY64, CHPEMetadataPointer )) return;
+        cfg = (const void *)(b + cfg_rva);
+        mva = cfg->CHPEMetadataPointer;
+        if (mva < (uintptr_t)b || mva >= (uintptr_t)b + ios_pool_images[i].alloc) return;   /* not relocated (yet) */
+        meta = (const void *)(uintptr_t)mva;
+        n++;
+        dprintf( 2, "[pool-image] slots %s %s: no_redirect@+0x%x=%llx ret=%llx call=%llx icall=%llx icall_cfg=%llx (tid %04x)\n",
+                 tag, ios_pe_module_name( b, ios_pool_images[i].alloc ),
+                 (unsigned)meta->__os_arm64x_dispatch_call_no_redirect,
+                 meta->__os_arm64x_dispatch_call_no_redirect ? *(const ULONGLONG *)(b + meta->__os_arm64x_dispatch_call_no_redirect) : 0ull,
+                 meta->__os_arm64x_dispatch_ret ? *(const ULONGLONG *)(b + meta->__os_arm64x_dispatch_ret) : 0ull,
+                 meta->__os_arm64x_dispatch_call ? *(const ULONGLONG *)(b + meta->__os_arm64x_dispatch_call) : 0ull,
+                 meta->__os_arm64x_dispatch_icall ? *(const ULONGLONG *)(b + meta->__os_arm64x_dispatch_icall) : 0ull,
+                 meta->__os_arm64x_dispatch_icall_cfg ? *(const ULONGLONG *)(b + meta->__os_arm64x_dispatch_icall_cfg) : 0ull,
+                 (unsigned)GetCurrentThreadId() );
+        return;
+    }
+}
+
 /* madeira-doge: an EC-bitmap clear that meets a registered in-pool image (build
  * 233: a .text address of an in-pool kernel32 was judged non-EC). Log only:
  * which image, what range, who cleared it. No view lookup (callers differ in
@@ -23358,6 +23403,7 @@ static void ios_pool_image_finish( struct file_view *view, IMAGE_NT_HEADERS *nt,
                      (unsigned long)tramp_alloc, (unsigned long)tramp_room );
     }
 
+    ios_pool_image_log_slots( base, "map" );
     /* x64-fast stubs: x64f_poke writes the alias only for an in-pool image */
     x64f_patch_image( (unsigned char *)base, size, (unsigned char *)alias, (unsigned char *)base,
                       ios_pe_module_name( base, size ) );
@@ -34134,6 +34180,9 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 {
     void *a = addr_ptr ? *addr_ptr : NULL; SIZE_T z = size_ptr ? *size_ptr : 0;
     NTSTATUS st = ios_na_inner_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
+    if (!st && a && process == NtCurrentProcess() &&
+        (new_prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        ios_pool_image_log_slots( a, "protect" );   /* madeira-doge pool images; never reads a page just made unreadable */
     if (ios_na_trace_on())
         dprintf( 2, "[near-trace] Protect %p+0x%lx new=0x%x -> %08x old=0x%x got %p+0x%lx\n", a, (unsigned long)z,
                  (unsigned)new_prot, (unsigned)st, old_prot ? (unsigned)*old_prot : 0,
