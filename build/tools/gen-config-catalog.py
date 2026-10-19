@@ -302,6 +302,42 @@ OVERLAY = {
                         "opened file or descriptor sent, each a formatted write to the log file on the server thread) "
                         "are written for their first 64 and then every 1000th; a failed send is always written. 1: "
                         "every line, as before. Read at each launch."},
+    # madeira-bcd: the frame-cap power governor (build/ntdll-unix/server_ios.c ios_fps_gov_step,
+    # madeira-d3d12 Present, tools/patch-winemetal-fps-cap.py).
+    "env.MADEIRA_FPS_CAP": {"category": "Windows, display & input", "title": "Fixed frame cap (fps)",
+                "kind": "int", "default": "",
+                "sources": ["build/ntdll-unix/server_ios.c", "madeira-d3d12/src/pe/madeira_d3d12.c",
+                            "tools/patch-winemetal-fps-cap.py"],
+                "note": "Unset (default): no cap beyond the FPS limit. 10-120: frames start at most N times a second for "
+                        "the whole session: a Direct3D 12 game's thread waits after each Present, a DXMT game's encode "
+                        "thread before each present (a timed kernel wait, not a spin). Any value, e.g. 20 or 24, unlike "
+                        "the FPS limit's 30/40/60; the lower of the two applies. While it is set, env.MADEIRA_FPS_GOV_MW "
+                        "is ignored. Needs the [xp] sampler (MADEIRA_PROBES not 0). Read at session start."},
+    "env.MADEIRA_FPS_GOV_MW": {"category": "Windows, display & input", "title": "Hold CPU power with a frame cap (mW)",
+                "kind": "int", "default": "",
+                "sources": ["build/ntdll-unix/server_ios.c", "madeira-d3d12/src/pe/madeira_d3d12.c",
+                            "tools/patch-winemetal-fps-cap.py"],
+                "note": "Unset (default): off. N: while the game presents, the process's CPU power ([xp]'s energy) is "
+                        "held at N mW on average by moving a frame cap between 60, 40, 30, 24 and 20 fps (at most one "
+                        "step per 3 s; held while nothing presents); it moves no thread to the efficiency cores. "
+                        "Menus and loading at 3-4 W fill the budget after which iOS clamps the "
+                        "CPU; e.g. 1500 keeps a 60 fps menu near 30-40 fps. [fps-gov] lines every 10 s. "
+                        "env.MADEIRA_FPS_GOV_MIN / _MAX (20 / 60) bound the cap, _BAND_MJ (1500) is the energy the "
+                        "average may drift before it moves. Needs the [xp] sampler. Read at session start."},
+    "env.MADEIRA_FPS_GOV_MAX": {"category": "Windows, display & input", "title": "Frame-cap governor: highest cap (fps)",
+                "kind": "int", "default": "60", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_GOV_MW set: the highest frame cap the governor uses, the largest of "
+                        "60, 40, 30, 24 and 20 at or below this value (20 when lower). Unset: 60. Read at session start."},
+    "env.MADEIRA_FPS_GOV_MIN": {"category": "Windows, display & input", "title": "Frame-cap governor: lowest cap (fps)",
+                "kind": "int", "default": "20", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_GOV_MW set: the lowest frame cap the governor goes down to, the "
+                        "smallest of 60, 40, 30, 24 and 20 at or above this value, never above the highest cap. "
+                        "Unset: 20. Read at session start."},
+    "env.MADEIRA_FPS_GOV_BAND_MJ": {"category": "Windows, display & input", "title": "Frame-cap governor: energy band (mJ)",
+                "kind": "int", "default": "1500", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_GOV_MW set: how much energy the running balance may drift above or "
+                        "below the target before the cap moves one step (100-100000; unset or out of range: 1500). "
+                        "Smaller moves the cap sooner and more often. Read at session start."},
     "dxmt": {"title": "DXMT options (a=b;c=d)",
              "note": "Exported as DXMT_CONFIG with the options joined by ';', a library game's own dxmt options after these: "
                      "e.g. d3d11.mipClampBC=1;d3d11.preferredMaxFrameRate=30. DXMT reads at most 259 characters of it, "
