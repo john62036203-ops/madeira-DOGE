@@ -448,6 +448,16 @@ jobs:
           python3 tests/host/check-default-buffer-swap.py
           python3 tests/host/check-readback-swap.py
 
+      # madeira-bcd: ring-share (opt-in) and d3d12-fl-12-1 / d3d12-sm-6-7 (opt-in).
+      - name: Check ring-share and D3D12 feature level switches
+        run: |
+          python3 tests/host/check-ring-share.py
+          python3 tests/host/check-d3d12-fl-12-1.py
+
+      # madeira-bcd: the frame-cap power governor (opt-in: env.MADEIRA_FPS_CAP / MADEIRA_FPS_GOV_MW).
+      - name: Check fps-gov
+        run: python3 tests/host/check-fps-gov.py
+
       # [dns]: every guest getaddrinfo by name, and MADEIRA_DNS_TIMEOUT_MS to
       # bound one (Social Club's Chromium sat in three getaddrinfo calls for a
       # minute, GTA V Enhanced build 378). Patches wine/dlls/ws2_32/unixlib.c.
@@ -1165,6 +1175,12 @@ jobs:
       # the white border get transparent black).
       - name: Patch winemetal GPU trace and render-pass experiment
         run: python3 tools/patch-winemetal-gpu-trace.py
+
+      # madeira-bcd fps-gov (opt-in, env.MADEIRA_FPS_CAP / MADEIRA_FPS_GOV_MW):
+      # winemetal's presentDrawable calls server_ios.c's ios_fps_cap_dxmt_pace,
+      # which returns at once while neither is set. Native only.
+      - name: Patch winemetal frame cap
+        run: python3 tools/patch-winemetal-fps-cap.py
 
       # WoW64's 32-bit Windows farm (app/Madeira/i386-windows), which upstream
       # builds from the pinned wine and DXMT (build/wine-i386) and does not

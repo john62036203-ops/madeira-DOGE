@@ -605,6 +605,11 @@ static struct mad_xp {
     LONG64 t_flush, n_lat, t_lat, t_draw, t_cmt;         /* inside Present: flush, frame-latency GPU wait, nextDrawable, blit+present+commit */
     LONG64 t_pool;                                       /* worker autorelease pool drain */
     LONG64 ecl_calls, t_ecl_caller;                      /* caller side */
+    /* madeira-bcd fps-gov (server_ios.c struct ios_xp_pe_cap): the frame cap the unix-side
+     * governor writes (fps, 0 = none; env.MADEIRA_FPS_CAP / MADEIRA_FPS_GOV_MW), and the
+     * time / number of times Present held the game's thread for it */
+    volatile LONG64 fps_cap;
+    LONG64 t_cap, n_cap;
 } g_xp;
 static void mad_xp_role(char role) {   /* tell the probe which thread this is (unix side records its thread id) */
     static DWORD seen[32]; static LONG nseen;
@@ -1720,6 +1725,8 @@ struct mad_queue {
     obj_handle_t open_cb;
     UINT64 last_serial;            /* ml1061: serial of the newest committed batch */
     UINT64 batch_serial[64];       /* serial of batch n at [n & 63] */
+    struct mad_ringchunk *ring_parked;   /* madeira-bcd ring-share: chunks the open batch reads */
+    unsigned nring_parked, ring_parked_cap;
     unsigned open_lists;
     UINT64 batches;
     /* ml1021: SUBMISSION LOCK.
@@ -1797,6 +1804,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         }
         d3d12_log("[madeira-d3d12] destroyed %s\n", q->name);
         DeleteCriticalSection(&q->submit_lock);   /* ml1021 */
+        free(q->ring_parked);   /* madeira-bcd ring-share: emptied by the flush above */
         free(q);
     }
     return (ULONG)r;
@@ -3888,6 +3896,64 @@ static void mad_ring_retire(struct mad_device *d, struct mad_list *l, UINT64 ser
             struct mad_ringchunk *c = &d->ring_retired[d->nring_retired++];
             c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = serial;
         } else NSObject_release(l->rings[k]);   /* the command buffer still holds it */
+    LeaveCriticalSection(&d->ring_lock);
+    l->nrings = 0;
+}
+/* madeira-bcd: ring-share (madeira.cfg ring-share = 1, opt-in). A command list
+ * kept the argument-ring chunks of its last replay until it was reset (and
+ * reused them once the GPU was done), and a list executed again without a reset
+ * went on taking new ones, so the chunks added up over every list the game
+ * keeps. Red Dead Redemption 2 (2026-10-09 14:48): they grew from 32 MB to
+ * 1575 MB within two minutes of play, almost half of Metal's 3.6 GB, while one
+ * frame's arguments take a few MB. With the switch a list gives its chunks back
+ * at every reset and before every replay: those the GPU has finished go to the
+ * device pool at once, the others retire with their batch's serial
+ * (mad_ring_retire), and any list takes them from the pool. */
+static int g_ring_share = -1;
+static int mad_ring_share_on(void) {
+    if (g_ring_share < 0) {
+        g_ring_share = mad_cfg_int_pe("ring-share", 0) ? 1 : 0;   /* 1: command lists give their argument-ring chunks back to a shared pool after every replay (0 = each list keeps its own) */
+        if (g_ring_share)
+            d3d12_log("[madeira-d3d12] ring-share = 1: command lists give their argument-ring chunks back to the "
+                      "device pool after every replay\n");
+    }
+    return g_ring_share;
+}
+/* At the end of a replay: the list's chunks go to the queue, read by its open batch.
+ * Called with the queue's submit_lock held (ExecuteCommandLists). */
+static void mad_ring_park(struct mad_queue *q, struct mad_list *l) {
+    unsigned k;
+    if (!mad_grow((void **)&q->ring_parked, &q->ring_parked_cap, q->nring_parked + l->nrings, sizeof *q->ring_parked))
+        return;   /* the list keeps them, as without ring-share */
+    for (k = 0; k < l->nrings; k++) {
+        struct mad_ringchunk *c = &q->ring_parked[q->nring_parked++];
+        c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = 0;
+    }
+    l->nrings = 0; l->ring_used = 0;
+}
+/* At the batch's commit (mad_queue_flush, submit_lock held): its chunks retire with its serial. */
+static void mad_ring_unpark(struct mad_queue *q, UINT64 serial) {
+    struct mad_device *d = q->device;
+    unsigned k;
+    if (!serial) serial = q->last_serial;
+    EnterCriticalSection(&d->ring_lock);
+    for (k = 0; k < q->nring_parked; k++)
+        if (mad_grow((void **)&d->ring_retired, &d->ring_retired_cap, d->nring_retired + 1, sizeof *d->ring_retired)) {
+            struct mad_ringchunk *c = &d->ring_retired[d->nring_retired++];
+            *c = q->ring_parked[k]; c->serial = serial;
+        } else NSObject_release(q->ring_parked[k].buf);   /* the command buffer still holds it */
+    LeaveCriticalSection(&d->ring_lock);
+    q->nring_parked = 0;
+}
+/* The GPU has finished with every chunk of the list: all of them to the pool. */
+static void mad_ring_pool_put(struct mad_device *d, struct mad_list *l) {
+    unsigned k;
+    EnterCriticalSection(&d->ring_lock);
+    for (k = 0; k < l->nrings; k++)
+        if (mad_grow((void **)&d->ring_pool, &d->ring_pool_cap, d->nring_pool + 1, sizeof *d->ring_pool)) {
+            struct mad_ringchunk *c = &d->ring_pool[d->nring_pool++];
+            c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = 0;
+        } else NSObject_release(l->rings[k]);
     LeaveCriticalSection(&d->ring_lock);
     l->nrings = 0;
 }
@@ -7952,6 +8018,9 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             d3d12_log("[madeira-d3d12] list executed: %u commands, %u draws, %u skipped\n", l->ncmds, e.draws, e.skipped);
         }
     }
+    /* madeira-bcd ring-share: the chunks this replay wrote belong to the open batch now;
+     * mad_queue_flush retires them with its serial, and the list keeps none. */
+    if (l->nrings && q->device->gpu_event && mad_ring_share_on()) mad_ring_park(q, l);
 }
 
 /* ml1120: the replay itself; runs on the caller (async-submit = 0) or on the
@@ -8307,6 +8376,7 @@ static void mad_queue_flush(struct mad_queue *q) {
         if (q->open_ticket) { mad_ticket_commit(q->open_ticket, serial); q->open_ticket = 0; }   /* madeira-bcd: sync diagnostics */
         LeaveCriticalSection(&sd->fence_lock);
         q->batch_serial[(q->batches + 1) & 63] = serial;
+        if (q->nring_parked) mad_ring_unpark(q, serial);   /* madeira-bcd ring-share */
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
     q->open_cb = 0; q->open_lists = 0; q->batches++;
@@ -8341,6 +8411,7 @@ static void mad_list_rings_rewind(struct mad_list *l) {
         UINT64 serial = (q->batches - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;
         if (!serial) serial = q->last_serial;
         if (serial && mad_gpu_completed(q->device) < serial) mad_ring_retire(q->device, l, serial);
+        else if (mad_ring_share_on()) mad_ring_pool_put(q->device, l);   /* madeira-bcd: ring-share */
     }
 }
 
@@ -8800,6 +8871,36 @@ static BOOL mad_tile_based_answer(void) {
     return v ? TRUE : FALSE;
 }
 
+/* madeira-bcd: the highest feature level claimed, by D3D12CreateDevice, its
+ * probe and FEATURE_LEVELS. 12_0 unless madeira.cfg d3d12-fl-12-1 = 1 raises
+ * it to 12_1: Microsoft Flight Simulator 2024 creates its device at 12_1 and
+ * stops at "Impossible to create DirectX12 device, Error 0x80004001" when
+ * that is refused (2026-10-14 21:41). 12_1 adds conservative rasterization
+ * and ROVs; OPTIONS still reports both absent. */
+static D3D_FEATURE_LEVEL mad_fl_ceiling(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("d3d12-fl-12-1", 0) ? 1 : 0;   /* 1: feature level 12_1 claimed (12_0 otherwise); OPTIONS still reports no conservative rasterization or ROVs */
+        if (v) d3d12_log("[d3d12-caps] fl-12-1=1 (d3d12-fl-12-1): feature level 12_1 claimed; OPTIONS still reports no conservative rasterization or ROVs\n");
+    }
+    return v ? D3D_FEATURE_LEVEL_12_1 : D3D_FEATURE_LEVEL_12_0;
+}
+
+/* madeira-bcd: the highest shader model SHADER_MODEL reports. 6.6 (the
+ * converter's DXIL ceiling as far as tested) unless madeira.cfg d3d12-sm-6-7 = 1
+ * raises it to 6.7: Microsoft Flight Simulator 2024 requires shader model 6.7.
+ * Whether the converter takes every 6.7 shader is not known; one it refuses
+ * fails its pipeline as any other conversion failure does. 0x67 is
+ * D3D_SHADER_MODEL_6_7 (named by value: older headers stop at 6_6). */
+static D3D_SHADER_MODEL mad_sm_ceiling(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("d3d12-sm-6-7", 0) ? 1 : 0;   /* 1: SHADER_MODEL reports up to 6.7 (6.6 otherwise); the converter may still refuse a 6.7 shader */
+        if (v) d3d12_log("[d3d12-caps] sm-6-7=1 (d3d12-sm-6-7): SHADER_MODEL reports up to 6.7\n");
+    }
+    return v ? (D3D_SHADER_MODEL)0x67 : D3D_SHADER_MODEL_6_6;
+}
+
 static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         D3D12_FEATURE feature, void *data, UINT size) {
     (void)This;
@@ -8896,22 +8997,24 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         if (size < sizeof *f) return E_INVALIDARG;
         /* The highest of the levels the caller listed that this runtime
          * claims. 12_0 is the ceiling: it is what makes an engine choose its
-         * DXIL shaders, and the converter takes nothing older. */
+         * DXIL shaders, and the converter takes nothing older. madeira-bcd:
+         * 12_1 with d3d12-fl-12-1 = 1 (mad_fl_ceiling). */
         {
             UINT i;
+            D3D_FEATURE_LEVEL top = mad_fl_ceiling();
             f->MaxSupportedFeatureLevel = (D3D_FEATURE_LEVEL)0;
             for (i = 0; f->pFeatureLevelsRequested && i < f->NumFeatureLevels; i++) {
                 D3D_FEATURE_LEVEL lv = f->pFeatureLevelsRequested[i];
-                if (lv <= D3D_FEATURE_LEVEL_12_0 && lv > f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = lv;
+                if (lv <= top && lv > f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = lv;
             }
-            if (!f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
+            if (!f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = top;
         }
         return S_OK;
     }
     case D3D12_FEATURE_SHADER_MODEL: {
         D3D12_FEATURE_DATA_SHADER_MODEL *m = data;
         if (size < sizeof *m) return E_INVALIDARG;
-        if (m->HighestShaderModel > D3D_SHADER_MODEL_6_6) m->HighestShaderModel = D3D_SHADER_MODEL_6_6;
+        if (m->HighestShaderModel > mad_sm_ceiling()) m->HighestShaderModel = mad_sm_ceiling();   /* madeira-bcd: 6.7 with d3d12-sm-6-7 = 1 */
         return S_OK;
     }
     case D3D12_FEATURE_ROOT_SIGNATURE: {
@@ -17489,8 +17592,9 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     /* The design is explicit that accepting the controlled sample's requested
      * baseline is a documented limitation, not a conformance claim. Anything
      * above 11_0 is refused rather than quietly accepted. */
-    if (min_feature_level > D3D_FEATURE_LEVEL_12_0) {
-        d3d12_log("[madeira-d3d12] feature level %#x refused; 12_0 is the ceiling claimed\n", min_feature_level);
+    if (min_feature_level > mad_fl_ceiling()) {   /* madeira-bcd: 12_1 with d3d12-fl-12-1 = 1 */
+        d3d12_log("[madeira-d3d12] feature level %#x refused; %s is the ceiling claimed (d3d12-fl-12-1 = 1 claims 12_1)\n",
+                  min_feature_level, mad_fl_ceiling() == D3D_FEATURE_LEVEL_12_1 ? "12_1" : "12_0");
         return E_NOTIMPL;
     }
     if (!device) return S_FALSE;   /* the documented "is it supported" probe */
@@ -17624,6 +17728,7 @@ struct mad_swapchain {
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
     UINT app_w, app_h;   /* madeira-doge: swap-fit-client -- the size the application asked for, reported back unchanged (0 = not fitted) */
+    LONG64 cap_next;   /* madeira-bcd fps-gov: QPC time the next frame may start (0 = no cap running) */
 };
 static IDXGISwapChain4Vtbl g_swap_vtbl;
 
@@ -17821,6 +17926,44 @@ static HRESULT STDMETHODCALLTYPE swap_GetDevice(IDXGISwapChain4 *T, REFIID riid,
  * It also stops leaking one command buffer per frame. */
 static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags);
 static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags);
+/* madeira-bcd fps-gov: the D3D12 side of the frame cap (opt-in). The unix-side
+ * governor (server_ios.c ios_fps_gov_step: env.MADEIRA_FPS_CAP = fps, or
+ * env.MADEIRA_FPS_GOV_MW = a CPU power target) writes the cap into this DLL's
+ * counter block, g_xp.fps_cap; 0, the default, skips everything below. After
+ * a Present has queued its frame, the game's thread waits until one period
+ * after the previous deadline, so the next frame starts at most fps_cap times a
+ * second and the frame just presented is not delayed. The deadline moves one
+ * period at a time and is re-based when the game fell more than a period
+ * behind: a slow frame is not paid for twice and a stall banks no credit. The
+ * wait is NtDelayExecution (a timed kernel wait, 100 ns units), never a spin. */
+static void mad_fps_cap_pace(struct mad_swapchain *s, LONG64 now) {
+    typedef LONG (WINAPI *delay_fn)(BOOLEAN, const LARGE_INTEGER *);
+    static delay_fn delay;
+    static LONG looked;
+    LONG64 cap = g_xp.fps_cap, period, wait;
+    if (cap < 10 || cap > 240 || g_xp.qpf <= 0) { s->cap_next = 0; return; }
+    period = g_xp.qpf / cap;
+    if (!s->cap_next || now > s->cap_next + period) { s->cap_next = now + period; return; }
+    wait = s->cap_next - now;
+    s->cap_next += period;
+    if (wait <= 0) return;
+    if (!looked) {
+        HMODULE nt = GetModuleHandleA("ntdll.dll");
+        if (nt) delay = (delay_fn)(void *)GetProcAddress(nt, "NtDelayExecution");
+        looked = 1;
+    }
+    {
+        LONG64 t0 = mad_qpc();
+        if (delay) {
+            LARGE_INTEGER rel;
+            rel.QuadPart = -(LONGLONG)(wait * 10000000 / g_xp.qpf);   /* relative, 100 ns units */
+            if (rel.QuadPart < 0) delay(FALSE, &rel);
+        } else
+            Sleep((DWORD)(wait * 1000 / g_xp.qpf));
+        InterlockedExchangeAdd64(&g_xp.t_cap, mad_qpc() - t0);
+        InterlockedIncrement64(&g_xp.n_cap);
+    }
+}
 static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;
     mad_xp_role('P'); InterlockedIncrement64(&g_xp.pres_enq);   /* ml1128 */
@@ -17828,6 +17971,7 @@ static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UIN
     hr = swap_Present_pool(T, sync, flags);
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_present_ticks, t1.QuadPart - t0.QuadPart);
+    if (g_xp.fps_cap && !(flags & DXGI_PRESENT_TEST)) mad_fps_cap_pace((struct mad_swapchain *)T, t1.QuadPart);   /* madeira-bcd fps-gov */
     return hr;
 }
 static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags) {
@@ -18708,7 +18852,7 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL min_level,
               adapter, (unsigned)min_level, device ? "create" : "probe");
     if (!device) {
         mad_pin_graphics_dlls();
-        return (min_level <= D3D_FEATURE_LEVEL_12_0) ? S_FALSE : E_INVALIDARG;
+        return (min_level <= mad_fl_ceiling()) ? S_FALSE : E_INVALIDARG;   /* madeira-bcd: 12_1 with d3d12-fl-12-1 = 1 */
     }
     mad_log_vtable_rvas();
     return MadeiraD3D12CreateDevice(adapter, min_level, riid, device);
