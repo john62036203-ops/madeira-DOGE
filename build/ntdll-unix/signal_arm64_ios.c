@@ -6401,6 +6401,8 @@ skip_reclaim_band: ;
                     if (fault_pc < 0x1000 && thunk_probe_shots < 3)
                     {
                         extern void ios_dump_ec_dispatch_slots( unsigned long long lr_va, unsigned long long x9 );
+                        extern void ios_pool_image_slot_watch_ext( const char *where );
+                        ios_pool_image_slot_watch_ext( "WEDGE" );
                         extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
                         uint64_t lr_exec = state.__lr & 0x0000007fffffffffull;
                         uint64_t lr_mod = 0, lr_va = ios_jit_reverse_translate( lr_exec, &lr_mod );

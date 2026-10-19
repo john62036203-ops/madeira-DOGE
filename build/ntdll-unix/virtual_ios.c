@@ -6406,11 +6406,13 @@ static int ios_iat_skip_exec_dest( void )
     return cached;
 }
 
+static void ios_pool_image_slot_watch( const char *where );   /* madeira-doge pool images, defined below */
 void ios_jit_sync_write(void *addr, size_t size)
 {
     int i, fallback = -1;
     uintptr_t a = (uintptr_t)addr;
     void *cur_peb = ios_jit_current_peb();
+    ios_pool_image_slot_watch( "sync_write" );
 
     /* Owner-aware: sync into the copy the CURRENT process's PE code reads
      * (child init syncs into the child's ntdll copy; parent boot into the
@@ -12594,6 +12596,7 @@ void ios_jit_reclaim_process( void *peb )
  *           clear_arm64ec_range
  */
 static void ios_pool_image_note_ec_clear( const void *addr, size_t size, void *caller );   /* defined with ios_pool_images */
+static void ios_pool_image_slot_watch( const char *where );   /* defined with ios_pool_images */
 static void clear_arm64ec_range( const void *addr, size_t size )
 {
     UINT64 *map = arm64ec_view->base;
@@ -16210,6 +16213,67 @@ static struct ios_pool_image *ios_pool_image_of_view( const struct file_view *vi
     return (view->protect & VPROT_INPOOL) ? ios_pool_image_find( view->base, 0 ) : NULL;
 }
 
+/* madeira-doge: WATCH the dispatch_call_no_redirect slot of every in-pool image
+ * once it is filled (build 264, 2026-10-20 00:19: dockhost's own thread logged
+ * ucrtbase's slot = 161c32b38 at its last protect, then read 0 from the same
+ * address 160 ms later at the exit thunk, while a mach read at the fault still
+ * found 161c32b38). Reads the slot through the RX view and the RW alias; the
+ * first read that differs from the last value seen is logged with the caller
+ * site and both views' vm_region facts. Cheap: one load per image per call. */
+static struct { const unsigned char *base; size_t alloc; uintptr_t slot; ULONGLONG last; } ios_pi_watch[16];
+static int ios_pi_watch_n;
+static void ios_pool_image_watch_region( uintptr_t a, const char *tag )
+{
+    mach_vm_address_t addr = a & ~(mach_vm_address_t)0x3fff;
+    mach_vm_size_t sz = 0;
+    natural_t depth = 1;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    if (mach_vm_region_recurse( mach_task_self(), &addr, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt ) != KERN_SUCCESS)
+    { dprintf( 2, "[pool-image] slot-watch   %s page %p: region query failed\n", tag, (void *)a ); return; }
+    dprintf( 2, "[pool-image] slot-watch   %s page %p: region %p+0x%llx prot=%x max=%x share=%u obj=%u tag=%u private=%u shared=%u\n",
+             tag, (void *)a, (void *)(uintptr_t)addr, (unsigned long long)sz, info.protection, info.max_protection,
+             info.share_mode, info.object_id, info.user_tag, info.pages_resident, info.pages_shared_now_private );
+}
+static void ios_pool_image_slot_watch( const char *where )
+{
+    static unsigned int said;
+    int i, n = __atomic_load_n( &ios_pi_watch_n, __ATOMIC_ACQUIRE );
+    if (!n || said >= 40) return;
+    for (i = 0; i < n; i++)
+    {
+        ULONGLONG rx, rw;
+        const unsigned char *alias;
+        if (!ios_pi_watch[i].slot) continue;
+        rx = *(volatile ULONGLONG *)ios_pi_watch[i].slot;
+        alias = (const unsigned char *)ios_jit_rw_base_global + (ios_pi_watch[i].slot - (uintptr_t)ios_jit_rx_base_global);
+        rw = *(volatile ULONGLONG *)alias;
+        if (rx == ios_pi_watch[i].last && rw == ios_pi_watch[i].last) continue;
+        said++;
+        dprintf( 2, "[pool-image] slot-watch %s: %s no_redirect slot %p CHANGED: rx=%llx rw-alias=%llx was %llx (tid %04x)\n",
+                 where, ios_pe_module_name( ios_pi_watch[i].base, ios_pi_watch[i].alloc ), (void *)ios_pi_watch[i].slot,
+                 rx, rw, ios_pi_watch[i].last, (unsigned)GetCurrentThreadId() );
+        ios_pool_image_watch_region( ios_pi_watch[i].slot, "rx" );
+        ios_pool_image_watch_region( (uintptr_t)alias, "rw" );
+        ios_pi_watch[i].last = rx;
+    }
+}
+void ios_pool_image_slot_watch_ext( const char *where )
+{
+    int i, n = __atomic_load_n( &ios_pi_watch_n, __ATOMIC_ACQUIRE );
+    for (i = 0; i < n; i++)   /* at a fault: every watched slot, changed or not, both views */
+    {
+        const unsigned char *alias;
+        if (!ios_pi_watch[i].slot) continue;
+        alias = (const unsigned char *)ios_jit_rw_base_global + (ios_pi_watch[i].slot - (uintptr_t)ios_jit_rx_base_global);
+        dprintf( 2, "[pool-image] slot-watch %s: %s slot %p rx=%llx rw-alias=%llx last-seen %llx\n", where,
+                 ios_pe_module_name( ios_pi_watch[i].base, ios_pi_watch[i].alloc ), (void *)ios_pi_watch[i].slot,
+                 *(volatile ULONGLONG *)ios_pi_watch[i].slot, *(volatile ULONGLONG *)alias, ios_pi_watch[i].last );
+        ios_pool_image_watch_region( ios_pi_watch[i].slot, "rx" );
+        ios_pool_image_watch_region( (uintptr_t)alias, "rw" );
+    }
+}
+
 /* madeira-doge: the five __os_arm64x_dispatch_* slots of the in-pool image that
  * contains addr (build 260, 2026-10-19 17:12: dockhost's in-pool ucrtbase read
  * its dispatch_call_no_redirect as 0 at a blr x16, yet the fault dump found it
@@ -16242,6 +16306,20 @@ static void ios_pool_image_log_slots( const void *addr, const char *tag )
         if (mva < (uintptr_t)b || mva >= (uintptr_t)b + ios_pool_images[i].alloc) return;   /* not relocated (yet) */
         meta = (const void *)(uintptr_t)mva;
         n++;
+        if (meta->__os_arm64x_dispatch_call_no_redirect && *(const ULONGLONG *)(b + meta->__os_arm64x_dispatch_call_no_redirect))
+        {
+            int k, w = __atomic_load_n( &ios_pi_watch_n, __ATOMIC_ACQUIRE );
+            for (k = 0; k < w; k++) if (ios_pi_watch[k].base == b) break;
+            if (k == w && w < 16)
+            {
+                ios_pi_watch[w].base = b; ios_pi_watch[w].alloc = ios_pool_images[i].alloc;
+                ios_pi_watch[w].slot = (uintptr_t)(b + meta->__os_arm64x_dispatch_call_no_redirect);
+                ios_pi_watch[w].last = *(const ULONGLONG *)(b + meta->__os_arm64x_dispatch_call_no_redirect);
+                __atomic_store_n( &ios_pi_watch_n, w + 1, __ATOMIC_RELEASE );
+                dprintf( 2, "[pool-image] slot-watch armed on %s slot %p = %llx\n", ios_pe_module_name( b, ios_pool_images[i].alloc ),
+                         (void *)ios_pi_watch[w].slot, ios_pi_watch[w].last );
+            }
+        }
         dprintf( 2, "[pool-image] slots %s %s: no_redirect@+0x%x=%llx ret=%llx call=%llx icall=%llx icall_cfg=%llx (tid %04x)\n",
                  tag, ios_pe_module_name( b, ios_pool_images[i].alloc ),
                  (unsigned)meta->__os_arm64x_dispatch_call_no_redirect,
@@ -28301,6 +28379,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
 {
 #ifdef WINE_IOS
     ios_tls38_poll( "valloc" );
+    ios_pool_image_slot_watch( "Allocate" );
 #endif
     static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET;
     ULONG_PTR limit;
@@ -33138,7 +33217,11 @@ done:
  */
 NTSTATUS WINAPI NtUnmapViewOfSection( HANDLE process, PVOID addr )
 {
-    return unmap_view_of_section( process, addr, 0 );
+    NTSTATUS st;
+    ios_pool_image_slot_watch( "before Unmap" );
+    st = unmap_view_of_section( process, addr, 0 );
+    ios_pool_image_slot_watch( "after Unmap" );
+    return st;
 }
 
 
@@ -34169,7 +34252,10 @@ NTSTATUS WINAPI NtWow64IsProcessorFeaturePresent( UINT feature )
 NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
 {
     void *a = addr_ptr ? *addr_ptr : NULL; SIZE_T z = size_ptr ? *size_ptr : 0;
-    NTSTATUS st = ios_na_inner_NtFreeVirtualMemory( process, addr_ptr, size_ptr, type );
+    NTSTATUS st;
+    ios_pool_image_slot_watch( "before Free" );
+    st = ios_na_inner_NtFreeVirtualMemory( process, addr_ptr, size_ptr, type );
+    ios_pool_image_slot_watch( "after Free" );
     if (ios_na_trace_on())
         dprintf( 2, "[near-trace] Free %p+0x%lx type=0x%x -> %08x\n", a, (unsigned long)z, (unsigned)type, (unsigned)st );
     return st;
@@ -34179,7 +34265,10 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                                         ULONG new_prot, ULONG *old_prot )
 {
     void *a = addr_ptr ? *addr_ptr : NULL; SIZE_T z = size_ptr ? *size_ptr : 0;
-    NTSTATUS st = ios_na_inner_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
+    NTSTATUS st;
+    ios_pool_image_slot_watch( "before Protect" );
+    st = ios_na_inner_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
+    ios_pool_image_slot_watch( "after Protect" );
     if (!st && a && process == NtCurrentProcess() &&
         (new_prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
         ios_pool_image_log_slots( a, "protect" );   /* madeira-doge pool images; never reads a page just made unreadable */
