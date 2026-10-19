@@ -414,6 +414,7 @@ struct mad_device {
     struct { UINT32 value[4]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 16-byte period) */
     obj_handle_t k_lib, k_tind_pso, k_ring, k_null_fs; UINT64 k_ring_pos; int k_state; SRWLOCK k_lock;   /* madeira-bcd: helper kernels (mad_kernels.metal) */
     obj_handle_t k_probe_pso; unsigned char *k_ring_cpu;   /* madeira-bcd: indirect-argument probes */
+    obj_handle_t k_clamp_pso; struct mad_resource *k_ring_res;   /* madeira-doge: ExecuteIndirect count buffers (mad_clamp_indirect_args) */
     obj_handle_t k_u10_pso;   /* madeira-doge: R10G10B10A2_UINT vertex elements (mad_u1010102) */
     obj_handle_t k_gui_pso, gui_tmp; UINT gui_tmp_w, gui_tmp_h, gui_tmp_pf;   /* madeira-doge: gui-overlay (mad_gui_over) */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
@@ -4721,6 +4722,7 @@ static void mad_gs_draw(UINT pt, UINT vertex_size, UINT max_prims, UINT instance
 #ifdef MAD_HAVE_KERNELS
 #include "mad_kernels_metallib.h"
 #endif
+static ID3D12Resource2Vtbl g_res_vtbl;   /* madeira-doge: defined below; the kernel ring stand-in resource needs it here */
 #define MAD_KRING_BYTES (4u << 20)
 static int mad_kernels_ready(struct mad_device *d) {
     if (d->k_state) return d->k_state > 0;
@@ -4750,6 +4752,13 @@ static int mad_kernels_ready(struct mad_device *d) {
             if (err) mad_log_nserror("mad_probe_words", err);
             NSObject_release(fn);
         }
+        fn = d->k_lib ? MTLLibrary_newFunction(d->k_lib, "mad_clamp_indirect_args") : 0;   /* madeira-doge */
+        if (fn) {
+            memset(&ci, 0, sizeof ci); ci.compute_function = fn; err = 0;
+            d->k_clamp_pso = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
+            if (err) mad_log_nserror("mad_clamp_indirect_args", err);
+            NSObject_release(fn);
+        }
         fn = d->k_lib ? MTLLibrary_newFunction(d->k_lib, "mad_u1010102") : 0;   /* madeira-doge */
         if (fn) {
             memset(&ci, 0, sizeof ci); ci.compute_function = fn; err = 0;
@@ -4767,6 +4776,13 @@ static int mad_kernels_ready(struct mad_device *d) {
         memset(&bi, 0, sizeof bi); bi.length = MAD_KRING_BYTES; bi.options = WMTResourceStorageModeShared;
         if (d->k_tind_pso) d->k_ring = MTLDevice_newBuffer(d->mtl_device, &bi);
         if (d->k_ring) { mad_resident(d, d->k_ring); d->k_ring_cpu = (unsigned char *)bi.memory.ptr; }
+        if (d->k_ring && d->k_clamp_pso && (d->k_ring_res = calloc(1, sizeof *d->k_ring_res))) {   /* madeira-doge: the ring as an indirect-argument source */
+            d->k_ring_res->vtbl = &g_res_vtbl; d->k_ring_res->refs = 1; d->k_ring_res->iid = &IID_ID3D12Resource; d->k_ring_res->name = "k_ring";
+            d->k_ring_res->buffer = d->k_ring; d->k_ring_res->gpu_address = bi.gpu_address; d->k_ring_res->size = MAD_KRING_BYTES;
+            d->k_ring_res->heap = D3D12_HEAP_TYPE_DEFAULT; d->k_ring_res->owner = d;
+            d->k_ring_res->desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; d->k_ring_res->desc.Width = MAD_KRING_BYTES; d->k_ring_res->desc.Height = 1;
+            d->k_ring_res->desc.DepthOrArraySize = 1; d->k_ring_res->desc.MipLevels = 1; d->k_ring_res->desc.SampleDesc.Count = 1;
+        }
         d->k_state = d->k_tind_pso && d->k_ring ? 1 : -1;
         d3d12_log("[madeira-d3d12] helper kernels: %s (library %d, indirect tessellation kernel %d, probe kernel %d, ring %d%s)\n",
                   d->k_state > 0 ? "ready" : "NOT available", !!d->k_lib, !!d->k_tind_pso, !!d->k_probe_pso, !!d->k_ring,
@@ -7128,6 +7144,52 @@ static int exec_tess_indirect_prep(struct mad_exec *e, const struct mad_cmd *c, 
     *out_off = off;
     return 1;
 }
+/* madeira-doge: madeira.cfg ind-count-clamp = 1 (default): an ExecuteIndirect with a
+ * count buffer runs mad_clamp_indirect_args first, which copies the first `count`
+ * records to the kernel ring and zeroes the rest; the draws or dispatches then read
+ * the ring. 0 = the old behaviour (every MaxCommandCount record is issued, stale
+ * ones included). Records of more than 8 words, or an unaligned stride/offset,
+ * keep the old behaviour. */
+static int g_ind_clamp = -1;
+static volatile LONG g_ind_clamp_n, g_ind_clamp_recs;
+static int exec_clamp_indirect_prep(struct mad_exec *e, const struct mad_cmd *c, UINT64 *out_off) {
+    struct mad_device *d = e->q->device;
+    struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_setbuffer sb[3]; struct wmtcmd_compute_setbytes sby; struct wmtcmd_compute_dispatch dsp;
+    struct { UINT32 max_count, rec_words, pad0, pad1; } prm;
+    UINT64 off, bytes;
+    static unsigned said;
+    if (g_ind_clamp < 0) g_ind_clamp = mad_cfg_int_pe("ind-count-clamp", 1) ? 1 : 0;
+    if (!g_ind_clamp || !c->u.ind.cnt || !c->u.ind.cnt->buffer || !c->u.ind.count || (c->u.ind.stride & 3) || (c->u.ind.off & 3) ||
+        (c->u.ind.cnt_off & 3) || c->u.ind.stride > 32 || !mad_kernels_ready(d) || !d->k_clamp_pso || !d->k_ring_res) return 0;
+    bytes = (UINT64)c->u.ind.count * c->u.ind.stride;
+    off = mad_kring_alloc(d, bytes);
+    if (off == ~(UINT64)0) return 0;
+    if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
+    exec_end(e);
+    e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false);
+    if (!e->cenc) return 0;
+    g_enc_seq++; e->cenc_pso = NULL; e->cenc_seq = g_enc_seq;
+    exec_fence_compute(e, e->cenc, 0);
+    e->wr_all = 1;
+    prm.max_count = c->u.ind.count; prm.rec_words = (UINT32)(c->u.ind.stride / 4); prm.pad0 = prm.pad1 = 0;
+    memset(&sp, 0, sizeof sp); memset(sb, 0, sizeof sb); memset(&sby, 0, sizeof sby); memset(&dsp, 0, sizeof dsp);
+    sp.type = WMTComputeCommandSetPSO; sp.pso = d->k_clamp_pso;
+    sp.threadgroup_size.width = 64; sp.threadgroup_size.height = 1; sp.threadgroup_size.depth = 1;
+    sb[0].type = WMTComputeCommandSetBuffer; sb[0].buffer = c->u.ind.args->buffer; sb[0].offset = c->u.ind.off; sb[0].index = 0;
+    sb[1].type = WMTComputeCommandSetBuffer; sb[1].buffer = c->u.ind.cnt->buffer; sb[1].offset = c->u.ind.cnt_off; sb[1].index = 1;
+    sb[2].type = WMTComputeCommandSetBuffer; sb[2].buffer = d->k_ring; sb[2].offset = off; sb[2].index = 2;
+    sby.type = WMTComputeCommandSetBytes; sby.bytes.ptr = &prm; sby.length = sizeof prm; sby.index = 3;
+    dsp.type = WMTComputeCommandDispatch; dsp.size.width = (c->u.ind.count + 63) / 64; dsp.size.height = 1; dsp.size.depth = 1;
+    sp.next.ptr = &sb[0]; sb[0].next.ptr = &sb[1]; sb[1].next.ptr = &sb[2]; sb[2].next.ptr = &sby; sby.next.ptr = &dsp;
+    MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&sp);
+    InterlockedIncrement(&g_ind_clamp_n); InterlockedExchangeAdd(&g_ind_clamp_recs, (LONG)c->u.ind.count);
+    if (said++ < 6)
+        d3d12_log("[madeira-d3d12] ind-count-clamp: %u record(s) of %u bytes (%s) clamped to the GPU count for %s '%s'\n",
+                  c->u.ind.count, c->u.ind.stride, c->kind == MC_DISPATCH_INDIRECT ? "dispatch" : c->kind == MC_DRAW_INDEXED_INDIRECT ? "draw-indexed" : "draw",
+                  e->pso ? (e->pso->is_compute ? "compute" : "vs") : "?", e->pso ? e->pso->vs_name : "-");
+    *out_off = off;
+    return 1;
+}
 static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth);
 
 /* ResolveSubresource. Metal resolves as the store action of a render pass, so
@@ -7735,14 +7797,17 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             }
             break;
         case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: {
-            struct mad_cmd t = *c; UINT k; UINT64 toff = 0;
+            struct mad_cmd t = *c; UINT k; UINT64 toff = 0, coff = 0;
             int tess = 0;
             if (!c->u.ind.args || !c->u.ind.args->buffer) { e.skipped++; break; }
             exec_indirect_probe(&e, c);   /* madeira-bcd: diagnostics, every 3 s per pipeline */
+            if (c->u.ind.cnt && exec_clamp_indirect_prep(&e, c, &coff)) {   /* madeira-doge: the count buffer, honoured through a clamped copy */
+                t.u.ind.args = e.q->device->k_ring_res; t.u.ind.off = coff;
+            }
             if (c->kind != MC_DISPATCH_INDIRECT && e.pso && e.pso->gs_emu == 2)   /* madeira-bcd */
-                tess = exec_tess_indirect_prep(&e, c, &toff);
+                tess = exec_tess_indirect_prep(&e, &t, &toff);
             for (k = 0; k < c->u.ind.count; k++) {
-                t.u.ind.off = c->u.ind.off + (UINT64)k * c->u.ind.stride;
+                t.u.ind.off = (t.u.ind.args == c->u.ind.args ? c->u.ind.off : coff) + (UINT64)k * c->u.ind.stride;
                 if (tess) { e.tind_buf = e.q->device->k_ring; e.tind_off = toff + (UINT64)k * 16; }
                 if (c->kind == MC_DISPATCH_INDIRECT) exec_dispatch(&e, &t); else exec_draw(&e, &t);
             }
@@ -7781,6 +7846,9 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                       InterlockedExchange(&g_pass_end_clear, 0), InterlockedExchange(&g_pass_end_dispatch, 0), InterlockedExchange(&g_pass_end_blit, 0),
                       InterlockedExchange(&g_pass_end_list, 0), InterlockedExchange(&g_pass_end_attachless, 0), InterlockedExchange(&g_pass_clear_only, 0),
                       (long long)(InterlockedExchange64(&g_pass_attach_bytes, 0) >> 20));
+            if (g_ind_clamp_n)
+                d3d12_log("[madeira-d3d12] ind-count-clamp: %ld ExecuteIndirect(s) with a count buffer clamped, %ld records, in those lists\n",
+                          InterlockedExchange(&g_ind_clamp_n, 0), InterlockedExchange(&g_ind_clamp_recs, 0));
             if ((n % 3000) == 0) mad_skip_report();   /* ml1049 */
         }
     }
@@ -16215,7 +16283,7 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(ID3D12GraphicsCommandList *Th
         return;
     }
     if (count_buf && said_count++ < 1)
-        d3d12_log("[madeira-d3d12] ExecuteIndirect: count buffers are not honoured yet; issuing all %u records\n", max_count);
+        d3d12_log("[madeira-d3d12] ExecuteIndirect: count buffer seen (%u records max); honoured through ind-count-clamp when the helper kernels are available\n", max_count);
     if (max_count > 8192) { if (said_big++ < 4) d3d12_log("[madeira-d3d12] ExecuteIndirect: %u records capped at 8192\n", max_count); max_count = 8192; }
     if (g_scbv_on > 0) mad_scbv_latch((struct mad_list *)This, kind == MC_DISPATCH_INDIRECT ? 1 : 0);   /* madeira-bcd static-cbv */
     c = mad_list_push((struct mad_list *)This, kind);

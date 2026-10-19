@@ -30,6 +30,31 @@ kernel void mad_tess_indirect_args(device const uint *args [[buffer(0)]],
     o[3] = 0;
 }
 
+struct mad_clamp_ind_params {
+    uint max_count;      // MaxCommandCount
+    uint rec_words;      // record stride in 32-bit words (ByteStride / 4), <= 8
+    uint pad0, pad1;
+};
+
+// madeira-doge: ExecuteIndirect count buffers. Metal has no indirect count, so
+// the first `count` records (the GPU-written UINT at `count`) are copied to the
+// ring and the records past it are zeroed: a zero record draws or dispatches
+// nothing. RE Engine (RE9, MH Wilds) leaves stale arguments past the count.
+kernel void mad_clamp_indirect_args(device const uint *args [[buffer(0)]],
+                                    device const uint *count [[buffer(1)]],
+                                    device uint *out [[buffer(2)]],
+                                    constant mad_clamp_ind_params &p [[buffer(3)]],
+                                    uint i [[thread_position_in_grid]])
+{
+    if (i >= p.max_count)
+        return;
+    uint n = min(count[0], p.max_count);
+    device const uint *a = args + i * p.rec_words;
+    device uint *o = out + i * p.rec_words;
+    for (uint w = 0; w < p.rec_words; w++)
+        o[w] = i < n ? a[w] : 0u;
+}
+
 // Diagnostics: copy the first n words of an argument record (indirect draw or
 // dispatch arguments the GPU wrote) to a CPU-visible ring, read seconds later.
 kernel void mad_probe_words(device const uint *src [[buffer(0)]],
