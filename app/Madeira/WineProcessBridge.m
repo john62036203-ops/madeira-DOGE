@@ -11,6 +11,8 @@
  * in via autolink — the static-lib driver code can't autolink itself. */
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
+/* madeira-bcd: the app's activity notifications (MADEIRA_AUDIO_RESUME). */
+#import <UIKit/UIKit.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <fcntl.h>
@@ -895,6 +897,101 @@ static void madeira_publish_host_probe(void)
     dprintf(STDERR_FILENO, "[WineProc] FEX host feature probe: %s\n", buf);
 }
 
+/* ---- madeira-bcd: the audio session, for the audio driver (BCD 0.1.573) ----
+ *
+ * env.MADEIRA_AUDIO_RESUME = 1 (opt-in, off by default): game audio comes back
+ * after an interruption. The session is set up once (Playback, active), and iOS
+ * stops it for a phone call, Siri, an alarm, another app's sound, or when it
+ * suspends the app; nothing started the output again, so the sound stayed off
+ * until the game was restarted and an audio-clocked game could stall. These
+ * observers report the events to the audio driver (audio_null_ios.c,
+ * madeira_audio_session_event), which keeps its clients' clock running while
+ * the output is stopped and starts the output again:
+ *   - an interruption began: the output stops; the clock runs on;
+ *   - the interruption ended, or the app is active again: the session is
+ *     activated and the output started where a client plays;
+ *   - the route changed: an output that stopped behind our back starts again;
+ *   - media services were reset: category, session and a new output unit.
+ * Log: "[audio] interruption began", "[audio] interruption ended, resumed=1"
+ * (0: the output did not start; the next event tries again).
+ *
+ * Switch not set: no observer is registered and nothing here runs. */
+extern int madeira_audio_session_event(int what);   /* build/ntdll-unix/audio_null_ios.c */
+
+static int madeira_audio_resume_switch(void)
+{
+    const char *v = getenv("MADEIRA_AUDIO_RESUME");   /* 1: the app reports the audio session's interruptions to the audio driver, which restarts the output (audio_null_ios.c) */
+    return v && v[0] == '1' && !v[1];
+}
+
+/* Activate the session and ask the driver to start the output again. */
+static void madeira_audio_resume(const char *why, int always_log)
+{
+    NSError *err = nil;
+    BOOL active = [[AVAudioSession sharedInstance] setActive:YES error:&err];
+    int r = active ? madeira_audio_session_event(1) : 0;
+    if (always_log || r == 0 || r == 2)
+        dprintf(STDERR_FILENO, "[audio] %s, resumed=%d (%s%s)\n", why, r >= 1 ? 1 : 0,
+                !active ? "the audio session could not be activated: " :
+                r == 2 ? "output started again" : r == 1 ? "output running" : r == 3 ? "no stream playing" :
+                r < 0 ? "switch off in the driver" : "output still stopped",
+                !active ? err.localizedDescription.UTF8String : "");
+}
+
+/* Once per app run, when a session with the switch starts; each observer
+ * checks the switch again when it fires (a later session may have it off). */
+static void madeira_audio_observers_install(void)
+{
+    static dispatch_once_t once;
+
+    if (!madeira_audio_resume_switch()) return;
+    dprintf(STDERR_FILENO, "[audio] interruption handling on (env.MADEIRA_AUDIO_RESUME = 1)\n");
+    dispatch_once(&once, ^{
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        /* setActive can block for a while: the audio events run on their own serial queue */
+        NSOperationQueue *q = [[NSOperationQueue alloc] init];
+        q.maxConcurrentOperationCount = 1;
+        q.qualityOfService = NSQualityOfServiceUserInitiated;
+        q.name = @"madeira.audio-session";
+        [nc addObserverForName:AVAudioSessionInterruptionNotification object:session queue:q
+                    usingBlock:^(NSNotification *n) {
+            if (!madeira_audio_resume_switch()) return;
+            if ([n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue] == AVAudioSessionInterruptionTypeBegan) {
+                madeira_audio_session_event(0);
+                dprintf(STDERR_FILENO, "[audio] interruption began (reason %lu)\n",
+                        (unsigned long)[n.userInfo[AVAudioSessionInterruptionReasonKey] unsignedIntegerValue]);
+            } else {
+                madeira_audio_resume("interruption ended", 1);
+            }
+        }];
+        [nc addObserverForName:AVAudioSessionRouteChangeNotification object:session queue:q
+                    usingBlock:^(NSNotification *n) {
+            if (!madeira_audio_resume_switch()) return;
+            if (madeira_audio_session_event(3) == 2)
+                dprintf(STDERR_FILENO, "[audio] route changed (reason %lu), resumed=1 (output started again)\n",
+                        (unsigned long)[n.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue]);
+        }];
+        [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:session queue:q
+                    usingBlock:^(NSNotification *n) {
+            (void)n;
+            if (!madeira_audio_resume_switch()) return;
+            NSError *err = nil;
+            [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&err];
+            BOOL active = [[AVAudioSession sharedInstance] setActive:YES error:&err];
+            int r = madeira_audio_session_event(2);
+            dprintf(STDERR_FILENO, "[audio] media services were reset, resumed=%d (session %s)\n",
+                    r >= 1 ? 1 : 0, active ? "active" : "not active");
+        }];
+        [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil
+                    usingBlock:^(NSNotification *n) {
+            (void)n;
+            if (madeira_audio_resume_switch())
+                [q addOperationWithBlock:^{ madeira_audio_resume("app active again", 0); }];
+        }];
+    });
+}
+
 static void *wine_process_thread(void *arg) {
     @autoreleasepool {
         /* Perf: the guest main thread runs ON this pthread. Promote to
@@ -1398,6 +1495,8 @@ static void *wine_process_thread(void *arg) {
                 close(logfd);
             }
         }
+
+        madeira_audio_observers_install();   /* madeira-bcd: env.MADEIRA_AUDIO_RESUME; not set: nothing */
 
         // Pick which exe to run (env var override, default = cube.exe).
         // Set MADEIRA_EXE=hello-x64.exe in env to launch the ARM64EC test path.
