@@ -3235,11 +3235,22 @@ static int mad_fault_info_on(void) {
     if (g_fault_info < 0) g_fault_info = mad_cfg_int_pe("gpu-fault-info", 1) ? 1 : 0;
     return g_fault_info;
 }
+/* madeira-doge: gpu-fault-skip-name (default 1): a marked pipeline is also matched by its
+ * entry-point NAME, so a game that rebuilds the same pipeline (new Metal function) keeps it
+ * skipped. MH Wilds (build 256): PersistentShadowClusterCulling was marked once but hung the
+ * GPU 19 more times through recreated pipelines. Generic names (main, CSMain, ... or shorter
+ * than 8 characters) still need the same function. */
+static int mad_fault_name_specific(const char *name) {
+    static int on = -1;
+    if (on < 0) on = mad_cfg_int_pe("gpu-fault-skip-name", 1) ? 1 : 0;
+    if (!on || !name || strlen(name) < 8) return 0;
+    return _stricmp(name, "CSMain") && _stricmp(name, "cs_main") && _stricmp(name, "mainCS") && _stricmp(name, "ComputeMain");
+}
 static int mad_fault_bad_fn(obj_handle_t fn, const char *name) {
     LONG i, n = g_fault_nbad;
     if (!fn) return 0;
     for (i = 0; i < n && i < 32; i++)
-        if (g_fault_bad[i].fn == fn && !strcmp(g_fault_bad[i].name, name)) return 1;
+        if (!strcmp(g_fault_bad[i].name, name) && (g_fault_bad[i].fn == fn || mad_fault_name_specific(name))) return 1;
     return 0;
 }
 /* A pipeline to skip: one a faulted encoder named alone. */
