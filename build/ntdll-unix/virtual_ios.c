@@ -1342,6 +1342,7 @@ static void *ios_pool_warmer_thread( void *arg )
                  * 128 MB arenas, so those bands were never attributed. */
                 struct { unsigned long long base, size, dirty; unsigned tag, prot; } btop[B_MAX][4];
                 memset(btop, 0, sizeof btop);
+                unsigned long long fex_sz_n[6] = {0}, fex_sz_dirty[6] = {0}, fex_sz_res[6] = {0}, fex_sz_swap[6] = {0};
                 uintptr_t prx = (uintptr_t)ios_jit_rx_base_global;
                 uintptr_t prw = (uintptr_t)ios_jit_rw_base_global;
                 size_t pps = ios_jit_pool_size_global;
@@ -1410,7 +1411,15 @@ static void *ios_pool_warmer_thread( void *arg )
                         else b = B_OTHER;
                         band_dirty[b] += d;
                         band_res[b] += (unsigned long long)info.pages_resident << 14;
-                        if (b == B_HOST_LOW || b == B_PA)
+                        if (b == B_FEX)
+                        {   /* madeira-doge: the fex band by region size (MH Wilds build 256: 822 MB
+                             * dirty, 29 MB resident at the end -- whose?). */
+                            int sb = rsize < (1ULL << 20) ? 0 : rsize < (4ULL << 20) ? 1 : rsize < (16ULL << 20) ? 2 :
+                                     rsize <= (16ULL << 20) + (1ULL << 20) ? 3 : rsize < (64ULL << 20) ? 4 : 5;
+                            fex_sz_n[sb]++; fex_sz_dirty[sb] += d; fex_sz_res[sb] += (unsigned long long)info.pages_resident << 14;
+                            fex_sz_swap[sb] += (unsigned long long)info.pages_swapped_out << 14;
+                        }
+                        if (b == B_HOST_LOW || b == B_PA || b == B_FEX)
                         {
                             int w = 0, q;
                             for (q = 1; q < 4; q++) if (btop[b][q].dirty < btop[b][w].dirty) w = q;
@@ -1530,11 +1539,19 @@ static void *ios_pool_warmer_thread( void *arg )
                 for (ti = 0; ti < B_MAX; ti++)
                 {
                     int q;
-                    if (ti != B_HOST_LOW && ti != B_PA) continue;
+                    if (ti != B_HOST_LOW && ti != B_PA && ti != B_FEX) continue;
                     dprintf(2, "[phys-map]   ml1074 %s dirtiest:", band_name[ti]);
                     for (q = 0; q < 4; q++) if (btop[ti][q].dirty)
                         dprintf(2, " 0x%llx+0x%llx=%lluMB(tag%u,prot%u)", btop[ti][q].base, btop[ti][q].size,
                                 btop[ti][q].dirty >> 20, btop[ti][q].tag, btop[ti][q].prot);
+                    dprintf(2, "\n");
+                }
+                {   /* madeira-doge: fex band by region size */
+                    static const char *szn[6] = { "<1M", "1-4M", "4-16M", "16M", "17-64M", ">=64M" };
+                    int q;
+                    dprintf(2, "[phys-map]   fex by size (regions dirty/res/compressed MB):");
+                    for (q = 0; q < 6; q++) if (fex_sz_n[q])
+                        dprintf(2, " %s=%llu %llu/%llu/%llu", szn[q], fex_sz_n[q], fex_sz_dirty[q] >> 20, fex_sz_res[q] >> 20, fex_sz_swap[q] >> 20);
                     dprintf(2, "\n");
                 }
                 dprintf(2, "[holes<64G] rev=ml894 free=%llu MB largest=%llu MB gaps>=128K=%u lowest=0x%llx+0x%llx (cycle=%u)\n",
