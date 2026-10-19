@@ -10857,9 +10857,14 @@ static UINT mad_mip_drop_why(const D3D12_RESOURCE_DESC *desc, int why, UINT k) {
     return k;
 }
 static UINT mad_mip_drop_for(const D3D12_RESOURCE_DESC *desc, D3D12_HEAP_TYPE heap_type, const struct WMTTextureInfo *ti) {
-    static int k = -1, min_side = 512; UINT bytes = 0, block = 0, mips, w, h, lng, sht, kk;
+    static int k = -1, min_side = 512, keep = 3; UINT bytes = 0, block = 0, mips, w, h, lng, sht, kk;
     if (k < 0) {
         int v = (int)mad_cfg_int_pe("tex-mip-drop", 0), m = (int)mad_cfg_int_pe("tex-mip-drop-min", 512);
+        /* madeira-doge: tex-mip-drop-keep = mips a reduced texture keeps at least (default 3,
+         * 1..3). MH Wilds (build 255) creates most streamed textures with 1-3 mips: 2113 of
+         * 13500 textures, ~680 MB, were skipped as few-mips. */
+        int kp = (int)mad_cfg_int_pe("tex-mip-drop-keep", 3);
+        keep = kp < 1 ? 1 : kp > 3 ? 3 : kp;
         if (v < 0) v = 0; if (v > 3) v = 3; if (m < 64) m = 64;
         min_side = m; k = v;
         d3d12_log("[madeira-d3d12] tex-mip-drop = %d (%s; textures from %d on the long side)\n", v,
@@ -10879,9 +10884,9 @@ static UINT mad_mip_drop_for(const D3D12_RESOURCE_DESC *desc, D3D12_HEAP_TYPE he
      * instead of none -- a short chain or a size not divisible by 4 << k used to keep
      * the whole texture. */
     for (kk = (UINT)k; kk >= 1; kk--)
-        if (mips >= kk + 3 && !(w & ((4u << kk) - 1)) && !(h & ((4u << kk) - 1)) && (sht >> kk) >= 4)
+        if (mips >= kk + (UINT)keep && !(w & ((4u << kk) - 1)) && !(h & ((4u << kk) - 1)) && (sht >> kk) >= 4)
             return mad_mip_drop_why(desc, MDW_DROPPED, kk);
-    if (mips < 4) return mad_mip_drop_why(desc, MDW_MIPS, 0);
+    if (mips < (UINT)keep + 1) return mad_mip_drop_why(desc, MDW_MIPS, 0);
     return mad_mip_drop_why(desc, MDW_ALIGN, 0);
 }
 /* The application's mip level of a texture -> Metal's, or 0 when that mip was dropped. */
