@@ -23417,6 +23417,41 @@ static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigne
 /* madeira-doge: the in-pool image is read, relocated and protected; now make it
  * what a pool copy is: a known image (identity mapping), x18-patched, with its
  * x64-fast stubs. See ios_pool_images. */
+/* madeira-doge: the x64 (AMD64) CodeMap ranges of a hybrid image that fall inside
+ * [text_off, text_off+text_sz), read through the image's RW alias. Returns how many
+ * were stored in out (at most max). 0 for an image without CHPE metadata. */
+static int ios_pool_image_x64_ranges( char *alias, IMAGE_NT_HEADERS *nt, size_t text_off, size_t text_sz,
+                                      void *out_v, int max )
+{
+    struct { size_t off, len; unsigned char *save; } *out = out_v;
+    IMAGE_DATA_DIRECTORY *dir;
+    const IMAGE_LOAD_CONFIG_DIRECTORY64 *cfg;
+    const IMAGE_ARM64EC_METADATA *meta;
+    const IMAGE_CHPE_RANGE_ENTRY *map;
+    ULONGLONG mva, ib = nt->OptionalHeader.ImageBase;
+    ULONG i;
+    int n = 0;
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) return 0;
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    if (!dir->VirtualAddress || dir->Size <= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY64, CHPEMetadataPointer )) return 0;
+    cfg = (const void *)(alias + dir->VirtualAddress);
+    if (!(mva = cfg->CHPEMetadataPointer) || mva < ib || mva - ib >= nt->OptionalHeader.SizeOfImage) return 0;
+    meta = (const void *)(alias + (mva - ib));
+    if (!meta->CodeMap || meta->CodeMap >= nt->OptionalHeader.SizeOfImage) return 0;
+    map = (const void *)(alias + meta->CodeMap);
+    for (i = 0; i < meta->CodeMapCount && n < max; i++)
+    {
+        size_t lo = map[i].StartOffset & ~3u, hi = lo + map[i].Length;
+        if ((map[i].StartOffset & 3) != 2) continue;   /* 2 = AMD64 */
+        if (lo < text_off) lo = text_off;
+        if (hi > text_off + text_sz) hi = text_off + text_sz;
+        if (hi <= lo) continue;
+        out[n].off = lo; out[n].len = hi - lo; out[n].save = NULL;
+        n++;
+    }
+    return n;
+}
+
 static void ios_pool_image_finish( struct file_view *view, IMAGE_NT_HEADERS *nt,
                                    const IMAGE_SECTION_HEADER *sec, const UNICODE_STRING *nt_name, char *alias )
 {
@@ -23463,8 +23498,36 @@ static void ios_pool_image_finish( struct file_view *view, IMAGE_NT_HEADERS *nt,
         tramp_alloc = (tramp_need + 0x3fff) & ~(size_t)0x3fff;
         if (tramp_need && tramp_alloc <= tramp_room)
         {
+            /* madeira-doge: the patcher reads .text as ARM64 instructions throughout,
+             * but a hybrid DLL's .text also holds x64 code (the CodeMap's AMD64
+             * entries: kernel32's `jmp [rip+slot]` forwarders such as
+             * GetCommandLineW). Build 268 (2026-10-20 07:20): GetCommandLineW's
+             * `ff 25 d2 ab` had become `b9 32 02 14` = B into the x18 trampolines,
+             * so check_call no longer saw the forwarder, sent ucrtbase's CRT-init
+             * call to the exit thunk, and the not-yet-initialised emulator branched
+             * to 0 (dockhost died). A pool COPY carries the same damage but its
+             * callers pass the untouched PE address. So: keep the x64 ranges'
+             * bytes and put them back after patching. */
+            struct { size_t off, len; unsigned char *save; } x64r[16];
+            int nx = ios_pool_image_x64_ranges( alias, nt, text_off, text_sz, x64r, 16 ), k;
+            for (k = 0; k < nx; k++)
+                if ((x64r[k].save = malloc( x64r[k].len ))) memcpy( x64r[k].save, alias + x64r[k].off, x64r[k].len );
             patched = ios_jit_patch_x18( alias + text_off, base + text_off, text_sz,
                                          alias + tramp_off, base + tramp_off, tramp_alloc );
+            for (k = 0; k < nx; k++)
+            {
+                if (!x64r[k].save) continue;
+                if (memcmp( alias + x64r[k].off, x64r[k].save, x64r[k].len ))
+                {
+                    size_t j, changed = 0;
+                    for (j = 0; j + 4 <= x64r[k].len; j += 4)
+                        if (memcmp( alias + x64r[k].off + j, x64r[k].save + j, 4 )) changed++;
+                    memcpy( alias + x64r[k].off, x64r[k].save, x64r[k].len );
+                    dprintf( 2, "[pool-image] %s: x64 range +0x%lx+0x%lx had %lu word(s) x18-patched as ARM64 -- restored\n",
+                             debugstr_us(nt_name), (unsigned long)x64r[k].off, (unsigned long)x64r[k].len, (unsigned long)changed );
+                }
+                free( x64r[k].save );
+            }
             if (arm64ec_view)
             {
                 size_t bm_start = ((size_t)(base + tramp_off) >> 12) / 8;
