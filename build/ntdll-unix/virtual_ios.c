@@ -12593,9 +12593,11 @@ void ios_jit_reclaim_process( void *peb )
 /***********************************************************************
  *           clear_arm64ec_range
  */
+static void ios_pool_image_note_ec_clear( const void *addr, size_t size, void *caller );   /* defined with ios_pool_images */
 static void clear_arm64ec_range( const void *addr, size_t size )
 {
     UINT64 *map = arm64ec_view->base;
+    ios_pool_image_note_ec_clear( addr, size, __builtin_return_address(0) );
     /* ml113 (task #35 fallout, but a pre-existing bug): commit the covering
      * bitmap pages BEFORE writing, exactly as ios_jit_mark_ec_range does for
      * the set path. This clear runs from ios_jit_reclaim_process for EVERY
@@ -16206,6 +16208,27 @@ static struct ios_pool_image *ios_pool_image_find( const void *addr, size_t size
 static struct ios_pool_image *ios_pool_image_of_view( const struct file_view *view )
 {
     return (view->protect & VPROT_INPOOL) ? ios_pool_image_find( view->base, 0 ) : NULL;
+}
+
+/* madeira-doge: an EC-bitmap clear that meets a registered in-pool image (build
+ * 233: a .text address of an in-pool kernel32 was judged non-EC). Log only:
+ * which image, what range, who cleared it. No view lookup (callers differ in
+ * the locks they hold); a dead entry can show up too, its range is printed. */
+static void ios_pool_image_note_ec_clear( const void *addr, size_t size, void *caller )
+{
+    static unsigned int n;
+    int i, cnt = ios_pool_image_count;
+    uintptr_t lo = (uintptr_t)addr, hi = lo + size;
+    if (!ios_pool_images_enabled()) return;
+    for (i = 0; i < cnt && i < IOS_POOL_IMAGES; i++)
+    {
+        uintptr_t b = (uintptr_t)ios_pool_images[i].base;
+        if (!b || lo >= b + ios_pool_images[i].alloc || hi <= b) continue;
+        if (n++ < 64)
+            dprintf( 2, "[pool-image] EC bits CLEARED %p+0x%lx over in-pool image %p+0x%lx (%s) by %p\n",
+                     addr, (unsigned long)size, (void *)b, (unsigned long)ios_pool_images[i].alloc,
+                     ios_pe_module_name( (void *)b, ios_pool_images[i].alloc ), caller );
+    }
 }
 
 /* The RW alias of a pool address, NULL when addr is not an in-pool image. */
@@ -22368,7 +22391,7 @@ static void update_arm64ec_ranges( struct file_view *view, IMAGE_NT_HEADERS *nt,
         if (view->protect & VPROT_INPOOL)
         {
             static unsigned pool_ec_n;
-            if (pool_ec_n++ < 48)
+            if (pool_ec_n++ < 400)
                 dprintf( 2, "[pool-image] EC range %p+0x%x marked (CodeMap entry %u of %u, view %p)\n",
                          base + (map[i].StartOffset & ~3), (unsigned)map[i].Length, i,
                          (unsigned)metadata->CodeMapCount, view->base );
