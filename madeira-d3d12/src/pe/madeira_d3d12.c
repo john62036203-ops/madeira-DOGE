@@ -3363,6 +3363,19 @@ static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (defa
                   d3d12_log("[madeira-d3d12] ml1154 upload-swap = %d (%s)\n", on, on ? "CPU-visible buffers >= 8 MB live on file-backed storage, off the jetsam footprint" : "Metal-owned storage"); }
     return on;
 }
+/* madeira-bcd readback-swap = 0 (opt-in; 1, the default, is the behaviour so
+ * far): READBACK buffers stay on Metal-owned storage while upload-swap keeps
+ * UPLOAD buffers on the file tier. The GPU writes READBACK memory and the CPU
+ * reads it; with the file tier between them the CPU's view may not have the
+ * GPU's writes. Horizon Zero Dawn has two 32 MB READBACK buffers. */
+static int mad_readback_swap_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = mad_cfg_int_pe("readback-swap", 1) ? 1 : 0;   /* 0 = READBACK buffers on Metal-owned storage, not the file tier (UPLOAD buffers stay as upload-swap says); 1 = as before */
+        if (!on) d3d12_log("[madeira-d3d12] madeira-bcd readback-swap = 0: READBACK buffers on Metal-owned storage, UPLOAD buffers as upload-swap says\n");
+    }
+    return on;
+}
 
 static int mad_rtvp_eq(const struct mad_rtvp *a, const struct mad_rtvp *b) {
     return a->level == b->level && a->slice == b->slice && a->layers == b->layers && a->plane == b->plane;
@@ -12203,7 +12216,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * 0.4-0.9 GB of UPLOAD buffers live (ph-valley08-13), and its load-time
          * peak is what kills the Lumen runs. Metal-allocated shared storage is
          * charged in full. madeira.cfg upload-swap = 0 turns it off. */
-        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on()) {
+        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on() &&
+            (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {   /* madeira-bcd readback-swap */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
             void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (mem) {
