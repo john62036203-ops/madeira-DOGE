@@ -51,6 +51,12 @@ OVERLAY = {
                         "that draw use another object's constants. Ranges marked VOLATILE stay as before. 2: VOLATILE "
                         "ones too (vkd3d-proton's force_static_cbv). 3: only count the rewrites ([static-cbv] lines). "
                         "Read once per game start."},
+    "ring-share": {"category": "Direct3D 12", "title": "Share argument buffers between command lists",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a command list gives the argument-buffer chunks its replay wrote back as "
+                        "soon as the GPU is done with them, instead of keeping them until it is recorded again; "
+                        "all lists then share one pool. Red Dead Redemption 2 kept 1.5 GB of them (half of its "
+                        "Metal memory) with the switch off."},
     "env.MADEIRA_PIN_GRAPHICS_DLLS": {"category": "Memory & JIT pool", "title": "Keep graphics DLLs loaded",
                 "kind": "bool", "default": "0",
                 "note": "Default off. On a D3D12 device/probe call, pins already loaded D3D12, DXGI and Wine Metal "

@@ -1709,6 +1709,8 @@ struct mad_queue {
     obj_handle_t open_cb;
     UINT64 last_serial;            /* ml1061: serial of the newest committed batch */
     UINT64 batch_serial[64];       /* serial of batch n at [n & 63] */
+    struct mad_ringchunk *ring_parked;   /* madeira-bcd ring-share: chunks the open batch reads */
+    unsigned nring_parked, ring_parked_cap;
     unsigned open_lists;
     UINT64 batches;
     /* ml1021: SUBMISSION LOCK.
@@ -1786,6 +1788,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         }
         d3d12_log("[madeira-d3d12] destroyed %s\n", q->name);
         DeleteCriticalSection(&q->submit_lock);   /* ml1021 */
+        free(q->ring_parked);   /* madeira-bcd ring-share: emptied by the flush above */
         free(q);
     }
     return (ULONG)r;
@@ -3743,6 +3746,64 @@ static void mad_ring_retire(struct mad_device *d, struct mad_list *l, UINT64 ser
             struct mad_ringchunk *c = &d->ring_retired[d->nring_retired++];
             c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = serial;
         } else NSObject_release(l->rings[k]);   /* the command buffer still holds it */
+    LeaveCriticalSection(&d->ring_lock);
+    l->nrings = 0;
+}
+/* madeira-bcd: ring-share (madeira.cfg ring-share = 1, opt-in). A command list
+ * kept the argument-ring chunks of its last replay until it was reset (and
+ * reused them once the GPU was done), and a list executed again without a reset
+ * went on taking new ones, so the chunks added up over every list the game
+ * keeps. Red Dead Redemption 2 (2026-10-09 14:48): they grew from 32 MB to
+ * 1575 MB within two minutes of play, almost half of Metal's 3.6 GB, while one
+ * frame's arguments take a few MB. With the switch a list gives its chunks back
+ * at every reset and before every replay: those the GPU has finished go to the
+ * device pool at once, the others retire with their batch's serial
+ * (mad_ring_retire), and any list takes them from the pool. */
+static int g_ring_share = -1;
+static int mad_ring_share_on(void) {
+    if (g_ring_share < 0) {
+        g_ring_share = mad_cfg_int_pe("ring-share", 0) ? 1 : 0;   /* 1: command lists give their argument-ring chunks back to a shared pool after every replay (0 = each list keeps its own) */
+        if (g_ring_share)
+            d3d12_log("[madeira-d3d12] ring-share = 1: command lists give their argument-ring chunks back to the "
+                      "device pool after every replay\n");
+    }
+    return g_ring_share;
+}
+/* At the end of a replay: the list's chunks go to the queue, read by its open batch.
+ * Called with the queue's submit_lock held (ExecuteCommandLists). */
+static void mad_ring_park(struct mad_queue *q, struct mad_list *l) {
+    unsigned k;
+    if (!mad_grow((void **)&q->ring_parked, &q->ring_parked_cap, q->nring_parked + l->nrings, sizeof *q->ring_parked))
+        return;   /* the list keeps them, as without ring-share */
+    for (k = 0; k < l->nrings; k++) {
+        struct mad_ringchunk *c = &q->ring_parked[q->nring_parked++];
+        c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = 0;
+    }
+    l->nrings = 0; l->ring_used = 0;
+}
+/* At the batch's commit (mad_queue_flush, submit_lock held): its chunks retire with its serial. */
+static void mad_ring_unpark(struct mad_queue *q, UINT64 serial) {
+    struct mad_device *d = q->device;
+    unsigned k;
+    if (!serial) serial = q->last_serial;
+    EnterCriticalSection(&d->ring_lock);
+    for (k = 0; k < q->nring_parked; k++)
+        if (mad_grow((void **)&d->ring_retired, &d->ring_retired_cap, d->nring_retired + 1, sizeof *d->ring_retired)) {
+            struct mad_ringchunk *c = &d->ring_retired[d->nring_retired++];
+            *c = q->ring_parked[k]; c->serial = serial;
+        } else NSObject_release(q->ring_parked[k].buf);   /* the command buffer still holds it */
+    LeaveCriticalSection(&d->ring_lock);
+    q->nring_parked = 0;
+}
+/* The GPU has finished with every chunk of the list: all of them to the pool. */
+static void mad_ring_pool_put(struct mad_device *d, struct mad_list *l) {
+    unsigned k;
+    EnterCriticalSection(&d->ring_lock);
+    for (k = 0; k < l->nrings; k++)
+        if (mad_grow((void **)&d->ring_pool, &d->ring_pool_cap, d->nring_pool + 1, sizeof *d->ring_pool)) {
+            struct mad_ringchunk *c = &d->ring_pool[d->nring_pool++];
+            c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = 0;
+        } else NSObject_release(l->rings[k]);
     LeaveCriticalSection(&d->ring_lock);
     l->nrings = 0;
 }
@@ -7807,6 +7868,9 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             d3d12_log("[madeira-d3d12] list executed: %u commands, %u draws, %u skipped\n", l->ncmds, e.draws, e.skipped);
         }
     }
+    /* madeira-bcd ring-share: the chunks this replay wrote belong to the open batch now;
+     * mad_queue_flush retires them with its serial, and the list keeps none. */
+    if (l->nrings && q->device->gpu_event && mad_ring_share_on()) mad_ring_park(q, l);
 }
 
 /* ml1120: the replay itself; runs on the caller (async-submit = 0) or on the
@@ -8162,6 +8226,7 @@ static void mad_queue_flush(struct mad_queue *q) {
         if (q->open_ticket) { mad_ticket_commit(q->open_ticket, serial); q->open_ticket = 0; }   /* madeira-bcd: sync diagnostics */
         LeaveCriticalSection(&sd->fence_lock);
         q->batch_serial[(q->batches + 1) & 63] = serial;
+        if (q->nring_parked) mad_ring_unpark(q, serial);   /* madeira-bcd ring-share */
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
     q->open_cb = 0; q->open_lists = 0; q->batches++;
@@ -8196,6 +8261,7 @@ static void mad_list_rings_rewind(struct mad_list *l) {
         UINT64 serial = (q->batches - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;
         if (!serial) serial = q->last_serial;
         if (serial && mad_gpu_completed(q->device) < serial) mad_ring_retire(q->device, l, serial);
+        else if (mad_ring_share_on()) mad_ring_pool_put(q->device, l);   /* madeira-bcd: ring-share */
     }
 }
 
