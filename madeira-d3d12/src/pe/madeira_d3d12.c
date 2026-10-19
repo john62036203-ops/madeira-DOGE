@@ -8721,6 +8721,36 @@ static BOOL mad_tile_based_answer(void) {
     return v ? TRUE : FALSE;
 }
 
+/* madeira-bcd: the highest feature level claimed, by D3D12CreateDevice, its
+ * probe and FEATURE_LEVELS. 12_0 unless madeira.cfg d3d12-fl-12-1 = 1 raises
+ * it to 12_1: Microsoft Flight Simulator 2024 creates its device at 12_1 and
+ * stops at "Impossible to create DirectX12 device, Error 0x80004001" when
+ * that is refused (2026-10-14 21:41). 12_1 adds conservative rasterization
+ * and ROVs; OPTIONS still reports both absent. */
+static D3D_FEATURE_LEVEL mad_fl_ceiling(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("d3d12-fl-12-1", 0) ? 1 : 0;   /* 1: feature level 12_1 claimed (12_0 otherwise); OPTIONS still reports no conservative rasterization or ROVs */
+        if (v) d3d12_log("[d3d12-caps] fl-12-1=1 (d3d12-fl-12-1): feature level 12_1 claimed; OPTIONS still reports no conservative rasterization or ROVs\n");
+    }
+    return v ? D3D_FEATURE_LEVEL_12_1 : D3D_FEATURE_LEVEL_12_0;
+}
+
+/* madeira-bcd: the highest shader model SHADER_MODEL reports. 6.6 (the
+ * converter's DXIL ceiling as far as tested) unless madeira.cfg d3d12-sm-6-7 = 1
+ * raises it to 6.7: Microsoft Flight Simulator 2024 requires shader model 6.7.
+ * Whether the converter takes every 6.7 shader is not known; one it refuses
+ * fails its pipeline as any other conversion failure does. 0x67 is
+ * D3D_SHADER_MODEL_6_7 (named by value: older headers stop at 6_6). */
+static D3D_SHADER_MODEL mad_sm_ceiling(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("d3d12-sm-6-7", 0) ? 1 : 0;   /* 1: SHADER_MODEL reports up to 6.7 (6.6 otherwise); the converter may still refuse a 6.7 shader */
+        if (v) d3d12_log("[d3d12-caps] sm-6-7=1 (d3d12-sm-6-7): SHADER_MODEL reports up to 6.7\n");
+    }
+    return v ? (D3D_SHADER_MODEL)0x67 : D3D_SHADER_MODEL_6_6;
+}
+
 static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         D3D12_FEATURE feature, void *data, UINT size) {
     (void)This;
@@ -8817,22 +8847,24 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         if (size < sizeof *f) return E_INVALIDARG;
         /* The highest of the levels the caller listed that this runtime
          * claims. 12_0 is the ceiling: it is what makes an engine choose its
-         * DXIL shaders, and the converter takes nothing older. */
+         * DXIL shaders, and the converter takes nothing older. madeira-bcd:
+         * 12_1 with d3d12-fl-12-1 = 1 (mad_fl_ceiling). */
         {
             UINT i;
+            D3D_FEATURE_LEVEL top = mad_fl_ceiling();
             f->MaxSupportedFeatureLevel = (D3D_FEATURE_LEVEL)0;
             for (i = 0; f->pFeatureLevelsRequested && i < f->NumFeatureLevels; i++) {
                 D3D_FEATURE_LEVEL lv = f->pFeatureLevelsRequested[i];
-                if (lv <= D3D_FEATURE_LEVEL_12_0 && lv > f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = lv;
+                if (lv <= top && lv > f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = lv;
             }
-            if (!f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
+            if (!f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = top;
         }
         return S_OK;
     }
     case D3D12_FEATURE_SHADER_MODEL: {
         D3D12_FEATURE_DATA_SHADER_MODEL *m = data;
         if (size < sizeof *m) return E_INVALIDARG;
-        if (m->HighestShaderModel > D3D_SHADER_MODEL_6_6) m->HighestShaderModel = D3D_SHADER_MODEL_6_6;
+        if (m->HighestShaderModel > mad_sm_ceiling()) m->HighestShaderModel = mad_sm_ceiling();   /* madeira-bcd: 6.7 with d3d12-sm-6-7 = 1 */
         return S_OK;
     }
     case D3D12_FEATURE_ROOT_SIGNATURE: {
@@ -17398,8 +17430,9 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     /* The design is explicit that accepting the controlled sample's requested
      * baseline is a documented limitation, not a conformance claim. Anything
      * above 11_0 is refused rather than quietly accepted. */
-    if (min_feature_level > D3D_FEATURE_LEVEL_12_0) {
-        d3d12_log("[madeira-d3d12] feature level %#x refused; 12_0 is the ceiling claimed\n", min_feature_level);
+    if (min_feature_level > mad_fl_ceiling()) {   /* madeira-bcd: 12_1 with d3d12-fl-12-1 = 1 */
+        d3d12_log("[madeira-d3d12] feature level %#x refused; %s is the ceiling claimed (d3d12-fl-12-1 = 1 claims 12_1)\n",
+                  min_feature_level, mad_fl_ceiling() == D3D_FEATURE_LEVEL_12_1 ? "12_1" : "12_0");
         return E_NOTIMPL;
     }
     if (!device) return S_FALSE;   /* the documented "is it supported" probe */
@@ -18617,7 +18650,7 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL min_level,
               adapter, (unsigned)min_level, device ? "create" : "probe");
     if (!device) {
         mad_pin_graphics_dlls();
-        return (min_level <= D3D_FEATURE_LEVEL_12_0) ? S_FALSE : E_INVALIDARG;
+        return (min_level <= mad_fl_ceiling()) ? S_FALSE : E_INVALIDARG;   /* madeira-bcd: 12_1 with d3d12-fl-12-1 = 1 */
     }
     mad_log_vtable_rvas();
     return MadeiraD3D12CreateDevice(adapter, min_level, riid, device);
