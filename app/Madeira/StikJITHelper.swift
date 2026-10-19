@@ -568,8 +568,14 @@ enum StikJITHelper {
             // the pair gives 688 / 752MB. Region A takes the run above the window (every
             // lower run that could hold it is plugged, so first-fit lands there) and
             // takeSecondRegion then takes B exactly as for any split pool. Used only when
-            // the single-region pool would land below the window and the pair is larger;
+            // the pair is larger than the single-region pool;
             // `pool-pair = 0` in the game's file or madeira.cfg turns it off.
+            // madeira-bcd: also when the single pool lands ABOVE the window, in the
+            // higher of two runs there. takeSecondRegion only looks above the pool, so
+            // the lower run was lost: The Adventures of Elliot (480MB window) got a
+            // 288MB pool at 0x16d848000+295MB while 0x15e000000+240MB sat unused below
+            // it, and FEX rebuilt its code cache 2,329 times in five minutes. Region A
+            // may now be any run of 128MB or more: B continues the same pool span.
             let pairOff = ["0", "off", "false", "no"].contains((MadeiraConfig.gameValue("pool-pair")
                 ?? MadeiraConfig.get("pool-pair") ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
             let ceiling: vm_address_t = 0x180000000           // SHARED_REGION_BASE_ARM64, as takeSecondRegion
@@ -586,14 +592,15 @@ enum StikJITHelper {
                 // the window is cut into 189/293/325 MB runs by malloc and the main thread's
                 // stack; the single pool takes the 325 MB run above the window and the old
                 // test (single below the window) never looked at 293+325. The plugs below
-                // steer first-fit to A whatever lies under it.
-                if let s = singleAt, bigMap || s.base + s.size <= exeWinBase {
+                // steer first-fit to A whatever lies under it. Upstream #407 (wamei) made the
+                // same change for every map, so it no longer depends on bigMap.
+                if let s = singleAt {
                     var best = singleFit
                     var bestB: (base: vm_address_t, size: vm_address_t) = (base: 0, size: 0)
                     for run in holes where run.base >= exeWinBase + exeWinSize && run.base < ceiling {
                         let aFit = min(poolRunSize(available: min(run.size, ceiling - run.base),
                                                   wanted: vm_address_t(poolSize), pageFit: pageFit), vm_address_t(poolSize))
-                        guard aFit >= (bigMap ? 128 : 256) << 20, aFit < vm_address_t(poolSize) else { continue }
+                        guard aFit >= 128 << 20, aFit < vm_address_t(poolSize) else { continue }
                         // B as takeSecondRegion picks it: the largest run in [A's end, ceiling),
                         // the rest of A's own run included.
                         let aEnd = run.base + aFit
@@ -612,10 +619,13 @@ enum StikJITHelper {
                         pairSingle = Int(singleFit)
                         poolSize = Int(pa.size)
                         LogStore.shared.log(String(format: "[pool-split] ml1036 pair above the window: A=0x%lx+%luMB B=0x%lx+%luMB "
-                            + "total=%luMB (single best was %luMB at 0x%lx, where the pool would not have split; "
+                            + "total=%luMB (single best was %luMB at 0x%lx, %@; "
                             + "pool-pair = 0 turns this off)",
                             Int(pa.base), Int(pa.size >> 20), Int(bestB.base), Int(bestB.size >> 20), Int(best >> 20),
-                            Int(singleFit >> 20), Int(s.base)), level: .success)
+                            Int(singleFit >> 20), Int(s.base),
+                            s.base + s.size <= exeWinBase ? "below the window, where the pool cannot split"
+                                                          : "above the window, with a run below it the split could not reach"),
+                            level: .success)
                         if best < 500 << 20 {
                             LogStore.shared.log("⚠️ SMALL JIT POOL (\(best >> 20)MB) on this launch: expect ~1 s freezes in heavy games. "
                                 + "Quit and relaunch the app for a smooth session.", level: .error)
