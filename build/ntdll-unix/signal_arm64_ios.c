@@ -6403,6 +6403,43 @@ skip_reclaim_band: ;
                         extern void ios_dump_ec_dispatch_slots( unsigned long long lr_va, unsigned long long x9 );
                         extern void ios_pool_image_slot_watch_ext( const char *where );
                         ios_pool_image_slot_watch_ext( "WEDGE" );
+                        {   /* madeira-doge pool images (build 265, 2026-10-20 00:19): check_icall sent
+                             * x9 = in-pool kernel32's x64 forwarder to the exit thunk, and ExitToX64
+                             * then branched to EmulatorData[2] = 0 (FEX not initialised yet: this is
+                             * ucrtbase's CRT init, before arm64ec_process_init). With a pool copy the
+                             * same call never reaches the thunk -- check_call follows the forwarder's
+                             * `ff 25` to its import slot and the FFS behind it. So: the bytes at x9
+                             * through the RX view and the RW alias, the import slot a `ff 25` names
+                             * and the bytes there, to see where check_call lost the trail. */
+                            extern void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
+                            extern size_t ios_jit_pool_size_global;
+                            uint64_t x9v = state.__x[9];
+                            unsigned char b[16] = {0}, a[16] = {0};
+                            mach_vm_size_t got = 0;
+                            uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)x9v, 16, (mach_vm_address_t)b, &got ) == KERN_SUCCESS && got == 16)
+                            {
+                                if (rx && rw && x9v >= rx && x9v < rx + ios_jit_pool_size_global)
+                                    mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(x9v - rx + rw), 16, (mach_vm_address_t)a, &got );
+                                dprintf( STDERR_FILENO, "[thunk-slot] x9 %p bytes rx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | rw-alias: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                         (void *)x9v, b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15],
+                                         a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7] );
+                                if (b[0] == 0xff && b[1] == 0x25)
+                                {
+                                    int32_t disp; uint64_t slot, val = 0; unsigned char c[16] = {0};
+                                    memcpy( &disp, b + 2, 4 );
+                                    slot = x9v + 6 + disp;
+                                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)slot, 8, (mach_vm_address_t)&val, &got ) == KERN_SUCCESS)
+                                    {
+                                        mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)val, 16, (mach_vm_address_t)c, &got );
+                                        dprintf( STDERR_FILENO, "[thunk-slot] x9 is `jmp [rip]`: import slot %p = %p, bytes there: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                                 (void *)slot, (void *)val, c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13] );
+                                    }
+                                    else dprintf( STDERR_FILENO, "[thunk-slot] x9 is `jmp [rip]`: import slot %p unreadable\n", (void *)slot );
+                                }
+                            }
+                            else dprintf( STDERR_FILENO, "[thunk-slot] x9 %p: unreadable\n", (void *)x9v );
+                        }
                         extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
                         uint64_t lr_exec = state.__lr & 0x0000007fffffffffull;
                         uint64_t lr_mod = 0, lr_va = ios_jit_reverse_translate( lr_exec, &lr_mod );
