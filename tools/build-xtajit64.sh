@@ -48,6 +48,15 @@ if [ "$( (sha256sum "$SHIP" 2>/dev/null || shasum -a 256 "$SHIP") | cut -d' ' -f
     echo "=== xtajit64.dll is the WoW64 series' build; comparing with upstream's (${UPSTREAM_XTAJIT_COMMIT:0:7}) ==="
 fi
 
+# A cached tree configured on another runner (Apple silicon vs Intel: ninja in
+# /opt/homebrew vs /usr/local) makes cmake refuse to reconfigure; start fresh.
+if [ -f "$B/CMakeCache.txt" ]; then
+    _mp=$(sed -n 's/^CMAKE_MAKE_PROGRAM:[A-Z]*=//p' "$B/CMakeCache.txt")
+    if [ -n "$_mp" ] && [ ! -x "$_mp" ]; then
+        echo "::notice::cached FEX tree was configured with $_mp (not on this runner) -- reconfiguring from scratch"
+        rm -rf "$B/CMakeCache.txt" "$B/CMakeFiles"
+    fi
+fi
 # TUNE_CPU: FEX's default "native" probes /proc/cpuinfo through a script that
 # needs pkg_resources; on a Linux x86 host it settles on cortex-a78, which is
 # what reproduces the committed module, and on the macOS runner it aborts the

@@ -26,6 +26,15 @@ python3 "$R/tools/patch-fex-ios-teb-tsd.py" "$R/FEX/Source/Windows/Common/Priv.h
 restore() { git -C "$R/FEX" checkout -- "$CPUIDF" Source/Windows/Common/Priv.h; }
 trap restore EXIT
 
+# A cached tree configured on another runner (Apple silicon vs Intel: ninja in
+# /opt/homebrew vs /usr/local) makes cmake refuse to reconfigure; start fresh.
+if [ -f "$B/CMakeCache.txt" ]; then
+    _mp=$(sed -n 's/^CMAKE_MAKE_PROGRAM:[A-Z]*=//p' "$B/CMakeCache.txt")
+    if [ -n "$_mp" ] && [ ! -x "$_mp" ]; then
+        echo "::notice::cached FEX tree was configured with $_mp (not on this runner) -- reconfiguring from scratch"
+        rm -rf "$B/CMakeCache.txt" "$B/CMakeFiles"
+    fi
+fi
 cmake -S "$R/FEX" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_TOOLCHAIN_FILE="$R/FEX/Data/CMake/toolchain_mingw.cmake" \
     -DMINGW_TRIPLE=aarch64-w64-mingw32 \
