@@ -11465,6 +11465,99 @@ static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_ty
                                    const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out) {
     return mad_create_resource_at(d, heap_type, desc, riid, out, NULL, 0);
 }
+/* madeira-doge zero-init. RE9 demo (build 277, capture f4915, log 16:54): the
+ * volumetric-fog history volume (96x54x32 RGBA16F, a DEFAULT 3D UAV texture
+ * created on entering a new room) held NaN in every texel the game had not
+ * written yet, and the game's own 16-byte DEFAULT buffers read NaN too; the
+ * fog kernel accumulates into that history, FogPS multiplies the lit frame by
+ * it, and the room turns white (or black, or stays right -- it depends on what
+ * the recycled Metal memory held last). D3D12 leaves fresh DEFAULT memory
+ * undefined, but Windows drivers hand out zeroed pages and RE Engine relies on
+ * it. So every committed DEFAULT buffer is filled with zeros, and every
+ * committed DEFAULT texture that can be a UAV or is 3D is cleared through
+ * copies from a zero buffer (render targets and depth buffers the game clears
+ * itself; plain sampled textures are uploaded whole). Placed resources alias
+ * live memory of their heap and are left alone. One small command buffer per
+ * resource, committed right away, so the game's first use (in a batch that
+ * commits later) sees zeros. env.MADEIRA_ZERO_INIT = 0 turns it off; 2 also
+ * zeroes placed resources (dangerous for aliasing heaps). Name read through a
+ * variable: app plumbing, not a Settings row. */
+static int g_zero_init = -1;
+static obj_handle_t g_zero_src; static LONG g_zero_n, g_zero_tex_n; static LONGLONG g_zero_bytes;
+#define MAD_ZERO_SRC_BYTES (4u << 20)
+static int mad_zero_init_mode(void) {
+    if (g_zero_init < 0) {
+        static const char k_zi[] = "MADEIRA_ZERO_INIT"; char v[8];
+        g_zero_init = GetEnvironmentVariableA(k_zi, v, sizeof v) ? atoi(v) : 1;
+        d3d12_log("[madeira-d3d12] zero-init = %d (fresh DEFAULT buffers and UAV/3D textures start as zeros; env.MADEIRA_ZERO_INIT)\n", g_zero_init);
+    }
+    return g_zero_init;
+}
+static void mad_zero_init(struct mad_device *d, struct mad_resource *r, const D3D12_RESOURCE_DESC *desc) {
+    obj_handle_t cb, benc; int mode = mad_zero_init_mode(); LONG n;
+    if (mode <= 0 || !d->mtl_queue) return;
+    if (r->placed_heap && mode < 2) return;
+    if (r->own_mem || r->sp_map || r->hp_used) return;   /* VirtualAlloc'd pages are already zero; sparse and runtime-heap textures are not UAVs */
+    if (r->texture) {
+        if (r->is_depth || r->samples > 1) return;
+        if (!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && r->tex_type != WMTTextureType3D) return;
+        if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) return;   /* the game clears what it renders to */
+    } else if (!r->buffer) return;
+    if (!g_zero_src) {
+        struct WMTBufferInfo bi; obj_handle_t src;
+        memset(&bi, 0, sizeof bi); bi.length = MAD_ZERO_SRC_BYTES; bi.options = WMTResourceStorageModeShared;
+        src = MTLDevice_newBuffer(d->mtl_device, &bi);
+        if (!src) return;
+        if (bi.memory.ptr) memset(bi.memory.ptr, 0, MAD_ZERO_SRC_BYTES);
+        mad_resident(d, src);
+        if (InterlockedCompareExchangePointer((void **)&g_zero_src, (void *)src, NULL)) NSObject_release(src);
+    }
+    cb = MTLCommandQueue_commandBuffer(d->mtl_queue);
+    if (!cb) return;
+    benc = MTLCommandBuffer_blitCommandEncoder(cb);
+    if (!benc) { MTLCommandBuffer_commit(cb); return; }
+    if (r->buffer) {
+        struct wmtcmd_blit_fillbuffer k;
+        memset(&k, 0, sizeof k);
+        k.type = WMTBlitCommandFillBuffer; k.buffer = r->buffer; k.offset = 0; k.length = r->size ? r->size : desc->Width; k.value = 0;
+        MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&k);
+        InterlockedExchangeAdd64(&g_zero_bytes, (LONGLONG)k.length);
+    } else {
+        UINT bytes = 0, block = 1, level, layer, nl = r->tex_mips ? r->tex_mips : 1, nlay = r->tex_type == WMTTextureType3D ? 1 : (r->tex_layers ? r->tex_layers : 1);
+        mad_format_info(desc->Format, &bytes, &block);
+        if (!bytes || block > 1) { MTLCommandEncoder_endEncoding(benc); MTLCommandBuffer_commit(cb); return; }   /* block-compressed: never a UAV */
+        for (level = 0; level < nl; level++) {
+            UINT w = r->width >> level, h = r->height >> level, dep = r->tex_depth >> level, z, y;
+            UINT rows_per_copy, bpr;
+            if (!w) w = 1; if (!h) h = 1; if (!dep) dep = 1;
+            bpr = w * bytes;
+            if (bpr > MAD_ZERO_SRC_BYTES) break;
+            rows_per_copy = MAD_ZERO_SRC_BYTES / bpr; if (rows_per_copy > h) rows_per_copy = h;
+            for (layer = 0; layer < nlay; layer++)
+                for (z = 0; z < dep; z++)
+                    for (y = 0; y < h; y += rows_per_copy) {
+                        struct wmtcmd_blit_copy_from_buffer_to_texture k;
+                        UINT rows = h - y < rows_per_copy ? h - y : rows_per_copy;
+                        memset(&k, 0, sizeof k);
+                        k.type = WMTBlitCommandCopyFromBufferToTexture;
+                        k.src = g_zero_src; k.src_offset = 0; k.bytes_per_row = bpr; k.bytes_per_image = bpr * rows;
+                        k.size.width = w; k.size.height = rows; k.size.depth = 1;
+                        k.dst = r->texture; k.slice = layer; k.level = level;
+                        k.origin.x = 0; k.origin.y = y; k.origin.z = z;
+                        MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&k);
+                        InterlockedExchangeAdd64(&g_zero_bytes, (LONGLONG)bpr * rows);
+                    }
+        }
+        InterlockedIncrement(&g_zero_tex_n);
+    }
+    MTLCommandEncoder_endEncoding(benc);
+    MTLCommandBuffer_commit(cb);
+    n = InterlockedIncrement(&g_zero_n);
+    if (n <= 4 || (r->texture && g_zero_tex_n <= 12) || !(n % 2000))
+        d3d12_log("[madeira-d3d12] zero-init: r#%u %s %llux%ux%u %s zeroed (%ld resources, %ld textures, %lld MB so far)\n", r->serial,
+                  r->texture ? "tex" : "buf", (unsigned long long)desc->Width, r->texture ? r->height : 1u, r->texture ? r->tex_depth : 1u,
+                  r->placed_heap ? "placed" : "committed", n, g_zero_tex_n, (long long)(g_zero_bytes >> 20));
+}
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
                                       struct mad_memheap *ph, UINT64 poff) {
@@ -11541,6 +11634,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         r->is_depth = is_depth;
         r->has_stencil = (pf == WMTPixelFormatDepth32Float_Stencil8);
         r->samples = ti.sample_count;
+        if (heap_type == D3D12_HEAP_TYPE_DEFAULT) mad_zero_init(d, r, desc);   /* madeira-doge zero-init */
         if (!r->placed_heap) {   /* ml1057; ml1145: a placed texture costs nothing beyond its heap */
             UINT fb = 0, blk = 1; UINT64 px, bytes;
             mad_format_info(desc->Format, &fb, &blk);
@@ -11645,6 +11739,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         r->cpu = info.memory.ptr;      /* NULL for GPU-private, which is correct */
         r->gpu_address = info.gpu_address;
         mad_track(d, r);
+        if (heap_type == D3D12_HEAP_TYPE_DEFAULT) mad_zero_init(d, r, desc);   /* madeira-doge zero-init */
         if (info.length >= (16u << 20) && !r->placed_heap) {            /* ml885: big buffers, with where they live */
             static unsigned said_big;
             if (said_big++ < 40)
