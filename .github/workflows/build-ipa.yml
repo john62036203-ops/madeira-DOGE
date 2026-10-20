@@ -2,6 +2,11 @@ name: Build Madeira IPA (unsigned)
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (macos-15 = Apple silicon; macos-15-intel when arm64 runners are not available)"
+        required: false
+        default: macos-15
   push:
     branches: [main]
     paths: [".github/workflows/build-ipa.yml"]
@@ -11,7 +16,7 @@ on:
 # branch no longer cancels a run on another (plan-a vs. port-upstream-1,
 # 2026-10-18: four runs cancelled in an hour).
 concurrency:
-  group: build-ipa-${{ github.ref }}
+  group: build-ipa-${{ github.ref }}-${{ inputs.runner || 'macos-15' }}
   cancel-in-progress: true
 
 jobs:
@@ -19,7 +24,7 @@ jobs:
     # madeira-bcd: runs only in the owner's repository; a fork's run is skipped.
     # madeira-doge: and in this fork.
     if: github.repository == 'bahacan16/madeira-bcd' || github.repository_owner == 'john62036203-ops'
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     # contents: write only so the token can see DRAFT releases, which is where
     # the Metal Shader Converter installer is kept (drafts are not public).
     # Nothing in this job creates, edits or pushes anything.
@@ -141,7 +146,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: wine/build-native
-          key: wine-native-v1-${{ steps.winerev.outputs.sha }}
+          key: wine-native-v1-${{ runner.arch }}-${{ steps.winerev.outputs.sha }}
 
       - name: "Build native wine (for host-side tools: widl/wrc/wmc)"
         if: steps.winenative.outputs.cache-hit != 'true'
@@ -164,7 +169,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: wine/build-native
-          key: wine-native-v1-${{ steps.winerev.outputs.sha }}
+          key: wine-native-v1-${{ runner.arch }}-${{ steps.winerev.outputs.sha }}
 
       - name: Diagnose native wine tools build
         run: |
