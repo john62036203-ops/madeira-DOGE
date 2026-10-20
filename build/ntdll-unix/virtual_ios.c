@@ -12374,11 +12374,192 @@ static void clear_arm64ec_range( const void *addr, size_t size );
  * are cleared so a reused range starts with a clean call-routing slate. */
 static void ios_sc_grants_owner_died( void *peb );
 
+/* One ledger entry's range back to the pool, as at process exit: its mapping entries
+ * tombstoned, anon aliases inside it cleared, EC bits cleared, the range onto the
+ * freelist (poisoned ranges as their executable runs, or whole when tagged), the entry
+ * removed (swap with the last). ios_pool_lock held. Split out of
+ * ios_jit_reclaim_process so an unloaded in-pool image can give its range back. */
+static void ios_pool_free_ledger_entry_locked( int i, void *peb, size_t *total_p, int *ranges_p,
+                                               int *maps_killed_p, int *aliases_killed_p )
+{
+    char *rx_base = (char *)ios_jit_rx_base_global;
+    size_t total = 0; int ranges = 0, maps_killed = 0, aliases_killed = 0;
+    int j;
+    size_t off, size;
+    (void)peb;
+    off  = ios_pool_ledger[i].off;
+    size = ios_pool_ledger[i].size;
+
+    /* Tombstone mapping entries whose pool copy lives in this range.
+     * Write order matters for the lock-free readers (translate /
+     * fault handler): size=0 first — a zero-size entry matches no
+     * query — then pe_base=NULL (the free-slot marker). */
+    for (j = 0; j < ios_jit_mapping_count; j++)
+    {
+        char *jb = (char *)ios_jit_mappings[j].jit_base;
+        if (!ios_jit_mappings[j].pe_base) continue;
+        if (jb >= rx_base + off && jb < rx_base + off + size)
+        {
+            ios_jit_mappings[j].size = 0;
+            __sync_synchronize();
+            ios_jit_mappings[j].pe_base = NULL;
+            maps_killed++;
+        }
+    }
+
+    /* Clear anon RWX aliases (FEX CodeBuffers) backed by this range. */
+    for (j = 0; j < ios_jit_anon_alias_count; j++)
+    {
+        uintptr_t rx = ios_jit_anon_aliases[j].jit_rx_alias;
+        if (!ios_jit_anon_aliases[j].user_va) continue;
+        if (rx >= (uintptr_t)(rx_base + off) && rx < (uintptr_t)(rx_base + off + size))
+        {
+            ios_jit_anon_aliases[j].user_va_end = 0;
+            __sync_synchronize();
+            ios_mono_alias_retire( ios_jit_anon_aliases[j].user_va );  /* ml648: unmap/teardown */
+            ios_jit_anon_aliases[j].user_va = 0;
+            aliases_killed++;
+        }
+    }
+
+    /* ml244: bracket clear_arm64ec_range. The free-time check below fires on 20 ranges
+     * ("narrowed during the module's life"), but it sits AFTER this call -- which
+     * operates on the same pool range -- so it could be observing poison this very call
+     * creates. Check immediately before to separate "already poisoned when we got here"
+     * from "clear_arm64ec_range narrows it". */
+    {
+        unsigned int bcur = 0, bmax = 0;
+        static int prechk;
+
+        if (!ios_pool_range_execable( off, size, &bcur, &bmax ) && prechk++ < 20)
+        {
+            /* ml249: name the OWNER of the poisoned page here, not at hand-out -- the
+             * guard now rejects poisoned ranges before hand-out, so the probe there can
+             * never fire (0 hits vs 20 here). mprotect_exec is called ZERO times on pool
+             * VA, so nothing narrows maxprot in place; the pages must be REPLACED by a
+             * different mapping. Mach's user_tag identifies the allocator and share_mode
+             * distinguishes our dual-mapped alias from an ordinary private mapping, which
+             * is what tells us whether Wine handed out VA overlapping the pool. */
+            extern void *ios_jit_rx_base_global;
+            mach_vm_address_t ea = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off);
+            mach_vm_size_t esz = 0;
+            vm_region_extended_info_data_t ext;
+            mach_msg_type_number_t ecnt = VM_REGION_EXTENDED_INFO_COUNT;
+            mach_port_t eobj = MACH_PORT_NULL;
+            unsigned tag = 0, share = 0;
+            size_t scan;
+
+            /* walk to the first genuinely poisoned page inside the range */
+            for (scan = 0; scan < size; scan += 0x4000)
+            {
+                mach_vm_address_t a2 = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off + scan), q = a2;
+                mach_vm_size_t s2 = 0;
+                vm_region_basic_info_data_64_t b2;
+                mach_msg_type_number_t c2 = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t o2 = MACH_PORT_NULL;
+
+                if (mach_vm_region( mach_task_self(), &q, &s2, VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&b2, &c2, &o2 ) != KERN_SUCCESS) break;
+                if (q > a2) continue;
+                if (!(b2.max_protection & VM_PROT_EXECUTE)) { ea = a2; break; }
+            }
+            if (mach_vm_region( mach_task_self(), &ea, &esz, VM_REGION_EXTENDED_INFO,
+                                (vm_region_info_t)&ext, &ecnt, &eobj ) == KERN_SUCCESS)
+            { tag = ext.user_tag; share = ext.share_mode; }
+
+            dprintf( 2, "[pool-freechk] PRE-CLEAR poisoned off=0x%lx size=0x%lx cur=0x%x max=0x%x"
+                        " | page=%p user_tag=%u share_mode=%u regionsz=0x%llx\n",
+                     (unsigned long)off, (unsigned long)size, bcur, bmax,
+                     (void *)(uintptr_t)ea, tag, share, (unsigned long long)esz );
+        }
+    }
+    if (arm64ec_view) clear_arm64ec_range( rx_base + off, size );
+
+    /* ml243: is the range ALREADY poisoned when it is freed?
+     *
+     * The guard now refuses poisoned ranges (correct) but never recovers them -- 62
+     * drops = 164MB orphaned from an 896MB pool, which already sits at 86% used. The
+     * durable fix is to stop the poison being CREATED, so pin down when maxprot is
+     * narrowed: during the module's life (poisoned here at free time) or later while
+     * the range sits on the freelist (clean here, poisoned at reuse). Those need
+     * completely different fixes. Self-targeting: prints only when poisoned. */
+    {
+        unsigned int fcur = 0, fmax = 0;
+        static int freechk;
+
+        if (!ios_pool_range_execable( off, size, &fcur, &fmax ) && freechk++ < 20)
+            dprintf( 2, "[pool-freechk] POISONED AT FREE off=0x%lx size=0x%lx cur=0x%x max=0x%x"
+                        "  <== narrowed during the module's life\n",
+                     (unsigned long)off, (unsigned long)size, fcur, fmax );
+    }
+
+    /* madeira-bcd: a range in the big-image slot frees the slot (after the
+     * grace) instead of going on the freelist, where small images would
+     * carve it up. */
+    if (ios_pool_big_size && off < ios_pool_big_off + ios_pool_big_size && off + size > ios_pool_big_off)
+    {
+        ios_pool_big_taken = 0;
+        ios_pool_big_freed_at = time( NULL );
+        total += size;
+        ranges++;
+        dprintf(2, "[pool-big] madeira-bcd slot freed by peb=%p (off 0x%lx size 0x%lx), reusable after %ds\n",
+                peb, (unsigned long)off, (unsigned long)size, IOS_POOL_REUSE_GRACE_SEC);
+        ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
+        goto done;
+    }
+    /* madeira-pool-same-image: a POISONED range whose image is known goes
+     * on whole, with its tag, so the next copy of that image can have all
+     * of it -- the executable runs below are each smaller than the image
+     * that needs them. A request for another image that reaches it later
+     * still splits it into those runs, in the allocator. */
+    if (ios_pool_ledger[i].tag && !ios_pool_range_clean( off, size ) &&
+        ios_pool_free_count < IOS_POOL_FREE_MAX)
+    {
+        struct ios_pool_free *whole = &ios_pool_freelist[ios_pool_free_count++];
+        whole->off = off;
+        whole->size = size;
+        whole->freed_at = time( NULL );
+        whole->advised = 0;
+        whole->tag = ios_pool_ledger[i].tag;
+        total += size;
+        ranges++;
+        ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
+        goto done;
+    }
+    /* madeira-bcd: merged with its clean neighbours (ios_pool_free_put); a
+     * POISONED range goes on as its executable runs, which merge too. The
+     * MADV_FREE sweep that used to follow is gone (ml87), and nothing is
+     * purged here: laggard exit threads may still run this range during
+     * the grace window. */
+    {
+        size_t r_off[16], r_size[16];
+        int r, nr = 1, put = 0;
+
+        r_off[0] = off;
+        r_size[0] = size;
+        if (!ios_pool_range_clean( off, size ))
+            nr = ios_pool_execable_runs( (uint64_t)(uintptr_t)rx_base, off, size, ios_pool_mach_region,
+                                         r_off, r_size, 16 );
+        for (r = 0; r < nr; r++)
+            if (ios_pool_free_put( ios_pool_freelist, &ios_pool_free_count, IOS_POOL_FREE_MAX,
+                                   r_off[r], r_size[r], time( NULL ), ios_pool_range_clean ))
+                put = 1;
+            else dprintf(2, "[jit-pool] freelist FULL — leaking range off=0x%lx size=0x%lx\n",
+                         (unsigned long)r_off[r], (unsigned long)r_size[r]);
+        if (put) { total += size; ranges++; }
+    }
+
+    /* Remove ledger entry (swap-with-last). */
+    ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
+done:
+    *total_p += total; *ranges_p += ranges; *maps_killed_p += maps_killed; *aliases_killed_p += aliases_killed;
+}
+
 void ios_jit_reclaim_process( void *peb )
 {
     size_t total = 0;
     int ranges = 0, maps_killed = 0, aliases_killed = 0;
-    int i, j;
+    int i;
     char *rx_base = (char *)ios_jit_rx_base_global;
 
     /* madeira-bcd: its Social Club reservations go when the next helper asks */
@@ -12405,172 +12586,8 @@ void ios_jit_reclaim_process( void *peb )
 
     for (i = 0; i < ios_pool_ledger_count; )
     {
-        size_t off, size;
         if (ios_pool_ledger[i].peb != peb) { i++; continue; }
-        off  = ios_pool_ledger[i].off;
-        size = ios_pool_ledger[i].size;
-
-        /* Tombstone mapping entries whose pool copy lives in this range.
-         * Write order matters for the lock-free readers (translate /
-         * fault handler): size=0 first — a zero-size entry matches no
-         * query — then pe_base=NULL (the free-slot marker). */
-        for (j = 0; j < ios_jit_mapping_count; j++)
-        {
-            char *jb = (char *)ios_jit_mappings[j].jit_base;
-            if (!ios_jit_mappings[j].pe_base) continue;
-            if (jb >= rx_base + off && jb < rx_base + off + size)
-            {
-                ios_jit_mappings[j].size = 0;
-                __sync_synchronize();
-                ios_jit_mappings[j].pe_base = NULL;
-                maps_killed++;
-            }
-        }
-
-        /* Clear anon RWX aliases (FEX CodeBuffers) backed by this range. */
-        for (j = 0; j < ios_jit_anon_alias_count; j++)
-        {
-            uintptr_t rx = ios_jit_anon_aliases[j].jit_rx_alias;
-            if (!ios_jit_anon_aliases[j].user_va) continue;
-            if (rx >= (uintptr_t)(rx_base + off) && rx < (uintptr_t)(rx_base + off + size))
-            {
-                ios_jit_anon_aliases[j].user_va_end = 0;
-                __sync_synchronize();
-                ios_mono_alias_retire( ios_jit_anon_aliases[j].user_va );  /* ml648: unmap/teardown */
-                ios_jit_anon_aliases[j].user_va = 0;
-                aliases_killed++;
-            }
-        }
-
-        /* ml244: bracket clear_arm64ec_range. The free-time check below fires on 20 ranges
-         * ("narrowed during the module's life"), but it sits AFTER this call -- which
-         * operates on the same pool range -- so it could be observing poison this very call
-         * creates. Check immediately before to separate "already poisoned when we got here"
-         * from "clear_arm64ec_range narrows it". */
-        {
-            unsigned int bcur = 0, bmax = 0;
-            static int prechk;
-
-            if (!ios_pool_range_execable( off, size, &bcur, &bmax ) && prechk++ < 20)
-            {
-                /* ml249: name the OWNER of the poisoned page here, not at hand-out -- the
-                 * guard now rejects poisoned ranges before hand-out, so the probe there can
-                 * never fire (0 hits vs 20 here). mprotect_exec is called ZERO times on pool
-                 * VA, so nothing narrows maxprot in place; the pages must be REPLACED by a
-                 * different mapping. Mach's user_tag identifies the allocator and share_mode
-                 * distinguishes our dual-mapped alias from an ordinary private mapping, which
-                 * is what tells us whether Wine handed out VA overlapping the pool. */
-                extern void *ios_jit_rx_base_global;
-                mach_vm_address_t ea = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off);
-                mach_vm_size_t esz = 0;
-                vm_region_extended_info_data_t ext;
-                mach_msg_type_number_t ecnt = VM_REGION_EXTENDED_INFO_COUNT;
-                mach_port_t eobj = MACH_PORT_NULL;
-                unsigned tag = 0, share = 0;
-                size_t scan;
-
-                /* walk to the first genuinely poisoned page inside the range */
-                for (scan = 0; scan < size; scan += 0x4000)
-                {
-                    mach_vm_address_t a2 = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off + scan), q = a2;
-                    mach_vm_size_t s2 = 0;
-                    vm_region_basic_info_data_64_t b2;
-                    mach_msg_type_number_t c2 = VM_REGION_BASIC_INFO_COUNT_64;
-                    mach_port_t o2 = MACH_PORT_NULL;
-
-                    if (mach_vm_region( mach_task_self(), &q, &s2, VM_REGION_BASIC_INFO_64,
-                                        (vm_region_info_t)&b2, &c2, &o2 ) != KERN_SUCCESS) break;
-                    if (q > a2) continue;
-                    if (!(b2.max_protection & VM_PROT_EXECUTE)) { ea = a2; break; }
-                }
-                if (mach_vm_region( mach_task_self(), &ea, &esz, VM_REGION_EXTENDED_INFO,
-                                    (vm_region_info_t)&ext, &ecnt, &eobj ) == KERN_SUCCESS)
-                { tag = ext.user_tag; share = ext.share_mode; }
-
-                dprintf( 2, "[pool-freechk] PRE-CLEAR poisoned off=0x%lx size=0x%lx cur=0x%x max=0x%x"
-                            " | page=%p user_tag=%u share_mode=%u regionsz=0x%llx\n",
-                         (unsigned long)off, (unsigned long)size, bcur, bmax,
-                         (void *)(uintptr_t)ea, tag, share, (unsigned long long)esz );
-            }
-        }
-        if (arm64ec_view) clear_arm64ec_range( rx_base + off, size );
-
-        /* ml243: is the range ALREADY poisoned when it is freed?
-         *
-         * The guard now refuses poisoned ranges (correct) but never recovers them -- 62
-         * drops = 164MB orphaned from an 896MB pool, which already sits at 86% used. The
-         * durable fix is to stop the poison being CREATED, so pin down when maxprot is
-         * narrowed: during the module's life (poisoned here at free time) or later while
-         * the range sits on the freelist (clean here, poisoned at reuse). Those need
-         * completely different fixes. Self-targeting: prints only when poisoned. */
-        {
-            unsigned int fcur = 0, fmax = 0;
-            static int freechk;
-
-            if (!ios_pool_range_execable( off, size, &fcur, &fmax ) && freechk++ < 20)
-                dprintf( 2, "[pool-freechk] POISONED AT FREE off=0x%lx size=0x%lx cur=0x%x max=0x%x"
-                            "  <== narrowed during the module's life\n",
-                         (unsigned long)off, (unsigned long)size, fcur, fmax );
-        }
-
-        /* madeira-bcd: a range in the big-image slot frees the slot (after the
-         * grace) instead of going on the freelist, where small images would
-         * carve it up. */
-        if (ios_pool_big_size && off < ios_pool_big_off + ios_pool_big_size && off + size > ios_pool_big_off)
-        {
-            ios_pool_big_taken = 0;
-            ios_pool_big_freed_at = time( NULL );
-            total += size;
-            ranges++;
-            dprintf(2, "[pool-big] madeira-bcd slot freed by peb=%p (off 0x%lx size 0x%lx), reusable after %ds\n",
-                    peb, (unsigned long)off, (unsigned long)size, IOS_POOL_REUSE_GRACE_SEC);
-            ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
-            continue;
-        }
-        /* madeira-pool-same-image: a POISONED range whose image is known goes
-         * on whole, with its tag, so the next copy of that image can have all
-         * of it -- the executable runs below are each smaller than the image
-         * that needs them. A request for another image that reaches it later
-         * still splits it into those runs, in the allocator. */
-        if (ios_pool_ledger[i].tag && !ios_pool_range_clean( off, size ) &&
-            ios_pool_free_count < IOS_POOL_FREE_MAX)
-        {
-            struct ios_pool_free *whole = &ios_pool_freelist[ios_pool_free_count++];
-            whole->off = off;
-            whole->size = size;
-            whole->freed_at = time( NULL );
-            whole->advised = 0;
-            whole->tag = ios_pool_ledger[i].tag;
-            total += size;
-            ranges++;
-            ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
-            continue;
-        }
-        /* madeira-bcd: merged with its clean neighbours (ios_pool_free_put); a
-         * POISONED range goes on as its executable runs, which merge too. The
-         * MADV_FREE sweep that used to follow is gone (ml87), and nothing is
-         * purged here: laggard exit threads may still run this range during
-         * the grace window. */
-        {
-            size_t r_off[16], r_size[16];
-            int r, nr = 1, put = 0;
-
-            r_off[0] = off;
-            r_size[0] = size;
-            if (!ios_pool_range_clean( off, size ))
-                nr = ios_pool_execable_runs( (uint64_t)(uintptr_t)rx_base, off, size, ios_pool_mach_region,
-                                             r_off, r_size, 16 );
-            for (r = 0; r < nr; r++)
-                if (ios_pool_free_put( ios_pool_freelist, &ios_pool_free_count, IOS_POOL_FREE_MAX,
-                                       r_off[r], r_size[r], time( NULL ), ios_pool_range_clean ))
-                    put = 1;
-                else dprintf(2, "[jit-pool] freelist FULL — leaking range off=0x%lx size=0x%lx\n",
-                             (unsigned long)r_off[r], (unsigned long)r_size[r]);
-            if (put) { total += size; ranges++; }
-        }
-
-        /* Remove ledger entry (swap-with-last). */
-        ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
+        ios_pool_free_ledger_entry_locked( i, peb, &total, &ranges, &maps_killed, &aliases_killed );
     }
 
     pthread_mutex_unlock( &ios_pool_lock );
@@ -12597,6 +12614,7 @@ void ios_jit_reclaim_process( void *peb )
  */
 static void ios_pool_image_note_ec_clear( const void *addr, size_t size, void *caller );   /* defined with ios_pool_images */
 static void ios_pool_image_slot_watch( const char *where );   /* defined with ios_pool_images */
+static void ios_pool_image_unwatch( const void *base, size_t size );   /* defined with ios_pool_images */
 static void clear_arm64ec_range( const void *addr, size_t size )
 {
     UINT64 *map = arm64ec_view->base;
@@ -13934,11 +13952,42 @@ static void delete_view( struct file_view *view ) /* [in] View */
     ios_swap_release_range( view->base, view->size, 0 );   /* ml1077 */
     if (view->protect & VPROT_INPOOL)
     {
-        /* madeira-doge: pool pages are never unmapped; the range stays in the
-         * process's ledger until the process exits, like an image copy. The
-         * entry is kept too -- a later image at the same range purges it. */
+        /* madeira-doge: pool pages are never unmapped. Until 2026-10-20 the range
+         * then stayed in the ledger until the process exited, so a DLL loaded and
+         * unloaded twice (uxtheme in Sekiro, build 270) held two ranges of a
+         * 496 MB pool. Now the image's ledger entry goes back to the freelist at
+         * once, through the same path as process exit (mapping entries
+         * tombstoned, EC bits cleared, poisoned ranges as runs, 3 s reuse grace).
+         * MADEIRA_POOL_IMAGE_UNLOAD_FREE=0 keeps the old behaviour. The
+         * ios_pool_images entry needs nothing: a lookup checks the view. */
+        static int unload_free = -1;
         static unsigned int n;
-        if (n++ < 32)
+        int freed = 0;
+        if (unload_free < 0)
+        {
+            const char *e = getenv( "MADEIRA_POOL_IMAGE_UNLOAD_FREE" );   /* 0: an unloaded in-pool image keeps its pool range until its process exits (before 2026-10-20) */
+            unload_free = !(e && e[0] == '0');
+        }
+        if (unload_free && ios_jit_rx_base_global)
+        {
+            uintptr_t off_in = (uintptr_t)view->base - (uintptr_t)ios_jit_rx_base_global;
+            size_t total = 0; int ranges = 0, maps = 0, aliases = 0, li;
+            pthread_mutex_lock( &ios_pool_lock );
+            for (li = 0; li < ios_pool_ledger_count; li++)
+                if (off_in >= ios_pool_ledger[li].off && off_in < ios_pool_ledger[li].off + ios_pool_ledger[li].size)
+                {
+                    ios_pool_free_ledger_entry_locked( li, ios_pool_ledger[li].peb, &total, &ranges, &maps, &aliases );
+                    freed = 1;
+                    break;
+                }
+            pthread_mutex_unlock( &ios_pool_lock );
+            ios_pool_image_unwatch( view->base, view->size );
+            if (n++ < 32)
+                dprintf( 2, "[pool-image] %s view %p+0x%lx deleted: %s\n",
+                         ios_pe_module_name( view->base, view->size ), view->base, (unsigned long)view->size,
+                         freed ? "its pool range is back on the freelist" : "no ledger entry found, pool pages kept" );
+        }
+        else if (n++ < 32)
             dprintf( 2, "[pool-image] %s view %p+0x%lx deleted: pool pages kept (ledger frees them at process exit)\n",
                      ios_pe_module_name( view->base, view->size ), view->base, (unsigned long)view->size );
     }
@@ -16257,6 +16306,13 @@ static void ios_pool_image_slot_watch( const char *where )
         ios_pool_image_watch_region( (uintptr_t)alias, "rw" );
         ios_pi_watch[i].last = rx;
     }
+}
+/* Drop watch entries of an image whose view is going away (its range may be reused). */
+static void ios_pool_image_unwatch( const void *base, size_t size )
+{
+    int i, n = __atomic_load_n( &ios_pi_watch_n, __ATOMIC_ACQUIRE );
+    for (i = 0; i < n; i++)
+        if (ios_pi_watch[i].slot >= (uintptr_t)base && ios_pi_watch[i].slot < (uintptr_t)base + size) ios_pi_watch[i].slot = 0;
 }
 void ios_pool_image_slot_watch_ext( const char *where )
 {

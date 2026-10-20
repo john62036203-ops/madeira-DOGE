@@ -68,10 +68,11 @@ assert 'pool_limit && ios_pool_big_size && !ios_pool_big_taken && alloc_size >= 
 assert 'now - ios_pool_big_freed_at >= IOS_POOL_REUSE_GRACE_SEC' in slot_alloc
 assert 'if (pool_limit && off == (size_t)-1)' in native and 'if (off == (size_t)-1 && (alloc_size >= 32u * 1024 * 1024 || bump_short))' in native
 assert 'while (off == (size_t)-1 &&\n           (i = ios_pool_best_fit(' in native, 'the slot skips the freelist'
-reclaim = function(native, 'void ios_jit_reclaim_process( void *peb )')
+reclaim = function(native, 'void ios_jit_reclaim_process( void *peb )') + \
+    function(native, 'static void ios_pool_free_ledger_entry_locked(')
 slot_free = reclaim[reclaim.index('if (ios_pool_big_size && off < ios_pool_big_off + ios_pool_big_size'):][:700]
 assert 'ios_pool_big_taken = 0;' in slot_free and 'ios_pool_big_freed_at = time( NULL );' in slot_free
-assert 'ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];\n            continue;' in slot_free
+assert 'ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];\n        goto done;' in slot_free
 assert reclaim.index('if (ios_pool_big_size && off <') < reclaim.index('ios_pool_free_put( ios_pool_freelist'), \
     'the slot is given back before the freelist would take it'
 big_init = native[native.index('const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );'):][:3500]

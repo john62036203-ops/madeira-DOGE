@@ -135,7 +135,8 @@ assert 'if (ios_sc_grant_release( base, &served, &sc_rehold ))' in free
 assert free.index('ios_sc_grant_release(') < free.index('server_enter_uninterrupted_section( &virtual_mutex')
 assert free.index('server_leave_uninterrupted_section') < free.index('ios_sc_rehold( sc_rehold )')
 
-reclaim = function(native, 'void ios_jit_reclaim_process( void *peb )')
+reclaim = function(native, 'void ios_jit_reclaim_process( void *peb )') + \
+    function(native, 'static void ios_pool_free_ledger_entry_locked(')
 assert reclaim.index('ios_sc_grants_owner_died( peb );') < reclaim.index('if (!peb || !rx_base) return;')
 assert 'if (!ios_pool_range_clean( off, size ))' in reclaim
 assert 'nr = ios_pool_execable_runs( (uint64_t)(uintptr_t)rx_base, off, size, ios_pool_mach_region,' in reclaim

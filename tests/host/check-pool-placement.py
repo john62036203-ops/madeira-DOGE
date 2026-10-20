@@ -37,7 +37,8 @@ helpers = ''.join(function(sig) for sig in (
     'static int ios_pool_keep_big(',
 ))
 allocator = function('static size_t ios_pool_alloc_range_ex(')
-reclaim = function('void ios_jit_reclaim_process( void *peb )')
+reclaim = function('void ios_jit_reclaim_process( void *peb )') + \
+    function('static void ios_pool_free_ledger_entry_locked(')
 assert 'off < ios_pool_big_off + ios_pool_big_size && off + size > ios_pool_big_off' in reclaim
 assert 'ios_pool_big_taken = 0;' in reclaim and 'ios_pool_big_freed_at = time( NULL );' in reclaim
 assert reclaim.index('ios_pool_big_taken = 0;') < reclaim.index('ios_pool_free_put(')
