@@ -609,6 +609,17 @@ void *ios_jit_current_peb(void);
 static void ios_lowalloc_note_qualifying_image( unsigned long long pref_base, int relocs_stripped );
 extern void *ios_jit_rw_base_global;  /* defined below */
 extern void *ios_jit_rx_base_global;  /* defined below */
+static void ios_pool_range_back_rx( size_t off, size_t size )
+{
+    /* madeira-doge: see the caller in ios_pool_alloc_range_ex (reused range). */
+    static unsigned int nrx;
+    int prc;
+    if (!ios_jit_rx_base_global) return;
+    prc = mprotect( (char *)ios_jit_rx_base_global + off, size, PROT_READ | PROT_EXEC );
+    if (nrx++ < 16 || prc)
+        dprintf( 2, "[jit-pool] reused range off=0x%lx size=0x%lx back to r-x (rc=%d errno=%d)\n",
+                 (unsigned long)off, (unsigned long)size, prc, prc ? errno : 0 );
+}
 
 /* ml90 (task #35): walk the Mach map and report every free gap >= 1GB, so we
  * size the jumbo-reserve problem against real numbers instead of guesses.
@@ -3348,6 +3359,14 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
             dprintf(2, "[jit-pool] reused freed range off=0x%lx size=0x%lx (freelist %d ranges) no-madvise\n",
                     (unsigned long)off, (unsigned long)alloc_size, ios_pool_free_count);
         }
+        /* madeira-doge: an in-pool image (MADEIRA_POOL_IMAGES) mprotects its DATA
+         * pages r--/rw- on the pool RX pages themselves; freeing its range
+         * (unload-free, process exit) left those protections behind. The next
+         * image placed there runs code from them: exec faults, the store
+         * emulator then decoded instructions as stores and overwrote code
+         * (winhttp.dll in a reused range, Steam sign-in, log 2026-10-20 22:51).
+         * A handed-out range is always RX again; for copies this is a no-op. */
+        ios_pool_range_back_rx( off, alloc_size );
         ios_pool_last_alloc_reused = 1;
         break;
     }

@@ -74,6 +74,7 @@ static int ios_pool_big_taken;
 static time_t ios_pool_big_freed_at;
 static pthread_mutex_t ios_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *ios_jit_rx_base_global = (void *)(uintptr_t)0x148000000ULL;
+static void ios_pool_range_back_rx( size_t off, size_t size ) { (void)off; (void)size; }
 static void *ios_jit_rw_base_global = (void *)(uintptr_t)0x7929000000ULL;
 static size_t ios_jit_pool_size_global, ios_jit_low_size_global;
 static uintptr_t ios_wow_base(void) { return 0; }
