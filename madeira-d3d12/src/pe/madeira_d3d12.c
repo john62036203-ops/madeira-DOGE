@@ -2679,6 +2679,27 @@ static void mad_capture_drain(struct mad_device *d, UINT64 frame, int final) {
                     if (ln < sizeof line - 16) { snprintf(line + ln, sizeof line - ln, " %llu", (unsigned long long)nan); ln = strlen(line); }
                 }
                 d3d12_log("%s (of %u each)\n", line, c->w * c->h);
+                if (c->pf == 115 && bpp >= 8) {
+                    /* madeira-doge: RGBA16F volumes (RE9's fog: rgb in-scatter, a transmittance) -- whether the
+                     * kernels wrote anything: all-zero texels, mean alpha and max rgb at z 0, d/4, d/2, 3d/4, d-1. */
+                    UINT zs[5] = { 0, c->d / 4, c->d / 2, (3 * c->d) / 4, c->d - 1 }, q;
+                    snprintf(line, sizeof line, "[capture-vol] enc#%05u %s%u values (zero texels / mean a / max rgb):", c->enc, c->kind, c->idx);
+                    ln = strlen(line);
+                    for (q = 0; q < 5; q++) {
+                        UINT64 zero = 0; double asum = 0, rgbmax = 0; UINT x, y, cnt = 0;
+                        const unsigned char *base = (const unsigned char *)c->cpu + (size_t)zs[q] * img;
+                        for (y = 0; y < c->h; y++) for (x = 0; x < c->w; x++) {
+                            UINT16 h[4]; float f[4]; int k;
+                            memcpy(h, base + (size_t)y * c->bpr + (size_t)x * bpp, 8);
+                            if (!(h[0] | h[1] | h[2] | h[3])) zero++;
+                            for (k = 0; k < 4; k++) f[k] = mad_h2f(h[k]);
+                            if (isfinite(f[3])) { asum += f[3]; cnt++; }
+                            for (k = 0; k < 3; k++) if (isfinite(f[k]) && f[k] > rgbmax) rgbmax = f[k];
+                        }
+                        if (ln < sizeof line - 48) { snprintf(line + ln, sizeof line - ln, " z%u:%llu/%.3f/%.3g", zs[q], (unsigned long long)zero, cnt ? asum / cnt : 0.0, rgbmax); ln = strlen(line); }
+                    }
+                    d3d12_log("%s\n", line);
+                }
                 for (z = 0; z < c->d; z = (z == 0 ? c->d / 2 : (z == c->d / 2 ? c->d - 1 : c->d))) {
                     struct mad_capbuf s = *c;
                     s.cpu = (unsigned char *)c->cpu + (size_t)z * img; s.bytes = img; s.d = 1;
@@ -11622,7 +11643,7 @@ static void mad_zero_init(struct mad_device *d, struct mad_resource *r, const D3
     MTLCommandEncoder_endEncoding(benc);
     MTLCommandBuffer_commit(cb);
     n = InterlockedIncrement(&g_zero_n);
-    if (n <= 4 || (r->texture && g_zero_tex_n <= 12) || !(n % 2000))
+    if (n <= 4 || (r->texture && (g_zero_tex_n <= 12 || r->tex_type == WMTTextureType3D)) || !(n % 2000))
         d3d12_log("[madeira-d3d12] zero-init: r#%u %s %llux%ux%u %s zeroed (%ld resources, %ld textures, %lld MB so far)\n", r->serial,
                   r->texture ? "tex" : "buf", (unsigned long long)desc->Width, r->texture ? r->height : 1u, r->texture ? r->tex_depth : 1u,
                   r->placed_heap ? "placed" : "committed", n, g_zero_tex_n, (long long)(g_zero_bytes >> 20));
