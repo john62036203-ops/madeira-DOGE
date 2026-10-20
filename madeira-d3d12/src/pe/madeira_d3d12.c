@@ -1143,6 +1143,74 @@ static HRESULT mad_creation_failure(struct mad_device *d, const char *what) {
     return E_OUTOFMEMORY;
 }
 
+/* madeira-doge: ID3DDestructionNotifier on every D3D12 object (d3dcommon.idl).
+ * UE's Electra video decoder (Dynasty Warriors 3 demo, 2026-10-21) asks a D3D12
+ * object for it and uses the result without checking the HRESULT, so a refusal
+ * was a NULL dereference on the "ElectraPlayer::Video decoder" thread.
+ * A tear-off per QueryInterface holds a reference on its owner; callbacks are
+ * kept per owner and fired from mad_pd_purge(), which every destructor calls. */
+DEFINE_GUID(MAD_IID_ID3DDestructionNotifier, 0xa06eb39a, 0x50da, 0x425b, 0x8c, 0x31, 0x4e, 0xec, 0xd6, 0xc2, 0x70, 0xf3);
+typedef void (__stdcall *MAD_PFN_DESTRUCTION_CALLBACK)(void *data);
+struct mad_dn_cb { const void *obj; UINT id; MAD_PFN_DESTRUCTION_CALLBACK fn; void *data; struct mad_dn_cb *next; };
+static struct mad_dn_cb *g_dn_list; static SRWLOCK g_dn_lock = SRWLOCK_INIT; static LONG g_dn_count, g_dn_next_id;
+struct mad_dn { const void **vtbl; LONG refs; IUnknown *owner; };
+static HRESULT STDMETHODCALLTYPE mad_dn_QueryInterface(struct mad_dn *t, REFIID riid, void **out) {
+    if (!out) return E_POINTER;
+    if (IsEqualGUID(riid, &MAD_IID_ID3DDestructionNotifier)) { InterlockedIncrement(&t->refs); IUnknown_AddRef(t->owner); *out = t; return S_OK; }
+    return IUnknown_QueryInterface(t->owner, riid, out);
+}
+static ULONG STDMETHODCALLTYPE mad_dn_AddRef(struct mad_dn *t) { InterlockedIncrement(&t->refs); return IUnknown_AddRef(t->owner); }
+static ULONG STDMETHODCALLTYPE mad_dn_Release(struct mad_dn *t) {
+    IUnknown *o = t->owner;
+    if (!InterlockedDecrement(&t->refs)) free(t);
+    return IUnknown_Release(o);
+}
+static HRESULT STDMETHODCALLTYPE mad_dn_Register(struct mad_dn *t, MAD_PFN_DESTRUCTION_CALLBACK fn, void *data, UINT *id) {
+    struct mad_dn_cb *c;
+    if (!fn) return E_INVALIDARG;
+    if (!(c = calloc(1, sizeof *c))) return E_OUTOFMEMORY;
+    c->obj = t->owner; c->fn = fn; c->data = data; c->id = (UINT)InterlockedIncrement(&g_dn_next_id);
+    AcquireSRWLockExclusive(&g_dn_lock);
+    c->next = g_dn_list; g_dn_list = c; InterlockedIncrement(&g_dn_count);
+    ReleaseSRWLockExclusive(&g_dn_lock);
+    if (id) *id = c->id;
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE mad_dn_Unregister(struct mad_dn *t, UINT id) {
+    struct mad_dn_cb **pp, *hit = NULL;
+    AcquireSRWLockExclusive(&g_dn_lock);
+    for (pp = &g_dn_list; *pp; pp = &(*pp)->next)
+        if ((*pp)->id == id && (*pp)->obj == t->owner) { hit = *pp; *pp = hit->next; InterlockedDecrement(&g_dn_count); break; }
+    ReleaseSRWLockExclusive(&g_dn_lock);
+    if (!hit) return E_INVALIDARG;
+    free(hit);
+    return S_OK;
+}
+static const void *g_dn_vtbl[] = { (void *)mad_dn_QueryInterface, (void *)mad_dn_AddRef, (void *)mad_dn_Release,
+                                   (void *)mad_dn_Register, (void *)mad_dn_Unregister };
+static HRESULT mad_dn_make(void *owner, void **out) {
+    struct mad_dn *t = calloc(1, sizeof *t);
+    static unsigned said;
+    if (!t) return E_OUTOFMEMORY;
+    t->vtbl = g_dn_vtbl; t->refs = 1; t->owner = owner;
+    IUnknown_AddRef(t->owner);
+    if (said++ < 4) d3d12_log("[madeira-d3d12] ID3DDestructionNotifier handed out for %p\n", owner);
+    *out = t;
+    return S_OK;
+}
+static void mad_dn_fire(const void *obj) {   /* the owner is being destroyed */
+    struct mad_dn_cb **pp, *fire = NULL, *c;
+    if (!g_dn_count) return;
+    AcquireSRWLockExclusive(&g_dn_lock);
+    for (pp = &g_dn_list; *pp; ) {
+        c = *pp;
+        if (c->obj == obj) { *pp = c->next; c->next = fire; fire = c; InterlockedDecrement(&g_dn_count); }
+        else pp = &c->next;
+    }
+    ReleaseSRWLockExclusive(&g_dn_lock);
+    while (fire) { c = fire; fire = c->next; c->fn(c->data); free(c); }   /* outside the lock */
+}
+
 static HRESULT mad_qi(struct mad_obj *o, REFIID riid, void **out, int is_device_child) {
     if (!out) return E_POINTER;
     *out = NULL;
@@ -1153,6 +1221,7 @@ static HRESULT mad_qi(struct mad_obj *o, REFIID riid, void **out, int is_device_
         *out = o;
         return S_OK;
     }
+    if (IsEqualGUID(riid, &MAD_IID_ID3DDestructionNotifier)) return mad_dn_make(o, out);
     /* ml888: a refused interface on ANY object is named. The ID3D12Resource1
      * refusal that nulled the engine's RHI resource was invisible because only
      * the device logged its refusals. */
@@ -1234,6 +1303,7 @@ static HRESULT mad_pd_set(const void *obj, REFGUID g, UINT n, const void *d) { r
 static HRESULT mad_pd_set_iface(const void *obj, REFGUID g, const IUnknown *i) { return mad_pd_store(obj, g, 0, NULL, (IUnknown *)i); }
 static void mad_pd_purge(const void *obj) {
     struct mad_pd *old;
+    mad_dn_fire(obj);   /* madeira-doge: ID3DDestructionNotifier callbacks */
     if (!g_pd_count) return;
     AcquireSRWLockExclusive(&g_pd_lock);
     old = mad_pd_unlink_locked(obj, NULL);
