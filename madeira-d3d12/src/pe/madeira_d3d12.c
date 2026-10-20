@@ -197,7 +197,8 @@ static int g_census_on;   /* ml899: one frame at presents 1500,1700,...,2800 */
  * vanish before its draw, in depth, in the G-buffer, or only in lighting" can
  * then be answered from a Mac (build/tools/capture-to-png.py). */
 static int g_capture_on; static unsigned g_capture_left; static UINT64 g_capture_frame;
-struct mad_capbuf { obj_handle_t buf; void *cpu; UINT64 bytes; UINT w, h, bpr, pf, dxgi; unsigned enc, idx; char kind[8]; char name[40]; char what[64]; char alias[256]; void *own; };
+struct mad_capbuf { obj_handle_t buf; void *cpu; UINT64 bytes; UINT w, h, bpr, pf, dxgi; unsigned enc, idx; char kind[8]; char name[40]; char what[64]; char alias[256]; void *own;
+                    UINT d; };   /* madeira-doge: z-slices of a 3D texture ("vol"), 1 otherwise */
 /* madeira-bcd: CAP contact sheets. Attachments and compute UAV outputs of the
  * captured frame become numbered thumbnails on PNG sheets (Documents/capture/
  * f<frame>_sheetNN.png), converted on the phone, so no Mac is needed to look at
@@ -2289,22 +2290,31 @@ static void mad_capbuf_free(struct mad_capbuf *c) {
 /* ml1098: one attachment -> one shared buffer, one file later. */
 static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_resource *r, const struct mad_rtvp *v,
                             unsigned seq, unsigned idx, const char *kind, UINT options, const char *what) {
-    UINT w = 0, h = 0, d = 0, bytes = 0, block = 1; UINT64 bpr, total; obj_handle_t buf;
+    UINT w = 0, h = 0, d = 0, bytes = 0, block = 1; UINT64 bpr, img, total; obj_handle_t buf;
     struct WMTBufferInfo bi; struct wmtcmd_blit_copy_from_texture_to_buffer k; struct mad_capbuf *cb;
     static unsigned said_budget;
-    if (!r || !r->texture || r->samples > 1 || r->tex_type == WMTTextureType3D) return;
+    int is3d;
+    if (!r || !r->texture || r->samples > 1) return;
+    /* madeira-doge: a 3D texture (RE Engine's 96x54x32 volumetric-fog froxel
+     * volumes) is captured whole as kind "vol" -- a raw file, three z-slice
+     * thumbnails and a per-slice NaN census -- when it is a targeted input
+     * ("tex") or a dispatch's UAV output ("uav"). Render targets stay 2D. */
+    is3d = r->tex_type == WMTTextureType3D;
+    if (is3d && strcmp(kind, "tex") && strcmp(kind, "uav")) return;
+    if (is3d) kind = "vol";
     mad_mip_dims(r, v->level, &w, &h, &d);
+    if (!is3d) d = 1;
     if (options == 2) bytes = 1;                                              /* stencil aspect */
     else if (r->is_depth) { bytes = r->tex_pf == WMTPixelFormatDepth16Unorm ? 2 : 4; options = r->has_stencil ? 1 : 0; }
     else { mad_format_info(r->desc.Format, &bytes, &block); if (!bytes || (block != 1 && block != 4)) return; }
-    if (!w || !h) return;
+    if (!w || !h || !d) return;
     /* madeira-bcd: a block-compressed texture behind a UAV (a BC1 target written
      * through an R32G32 alias) has 4x4-block rows; the contact sheets read
      * texels, so only the targeted "tex" inputs keep them (raw files). */
     if (block != 1 && strcmp(kind, "tex")) return;
     /* ml1141: block-compressed textures (sampled inputs, never targets) copy out
      * as whole 4x4 blocks: bytes is per BLOCK there. */
-    bpr = (UINT64)((w + block - 1) / block) * bytes; total = bpr * ((h + block - 1) / block);
+    bpr = (UINT64)((w + block - 1) / block) * bytes; img = bpr * ((h + block - 1) / block); total = img * d;
     {   /* ml1140: big atlases (Lumen surface cache, shadow maps: 4096^2 at 16-64 MB
          * each) ate the whole budget in the first capture of a UE5 frame, so the
          * G-buffer, lighting and final image were never written. Skip targets over
@@ -2333,9 +2343,9 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
     if (!buf) { ReleaseSRWLockExclusive(&g_cap_lock); return; }
     memset(&k, 0, sizeof k);
     k.type = WMTBlitCommandCopyFromTextureToBuffer;
-    k.src = r->texture; k.slice = v->slice; k.level = v->level;
-    k.size.width = w; k.size.height = h; k.size.depth = 1;
-    k.dst = buf; k.offset = 0; k.bytes_per_row = (UINT32)bpr; k.bytes_per_image = (UINT32)total; k.options = options;
+    k.src = r->texture; k.slice = is3d ? 0 : v->slice; k.level = v->level;
+    k.size.width = w; k.size.height = h; k.size.depth = d;
+    k.dst = buf; k.offset = 0; k.bytes_per_row = (UINT32)bpr; k.bytes_per_image = (UINT32)img; k.options = options;
     MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&k);
     if (!mad_grow((void **)&g_capbufs, &g_capbufs_cap, g_ncapbufs + 1, sizeof *g_capbufs)) {
         struct mad_capbuf t; memset(&t, 0, sizeof t); t.buf = buf; t.own = bi.memory.ptr; mad_capbuf_free(&t);
@@ -2343,7 +2353,7 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
     }
     cb = &g_capbufs[g_ncapbufs++];
     memset(cb, 0, sizeof *cb);
-    cb->buf = buf; cb->cpu = bi.memory.ptr; cb->own = bi.memory.ptr; cb->bytes = total; cb->w = w; cb->h = h; cb->bpr = (UINT)bpr;
+    cb->buf = buf; cb->cpu = bi.memory.ptr; cb->own = bi.memory.ptr; cb->bytes = total; cb->w = w; cb->h = h; cb->d = d; cb->bpr = (UINT)bpr;
     if (what) snprintf(cb->what, sizeof cb->what, "%s", what);
     mad_alias_desc(r, cb->alias, sizeof cb->alias);   /* madeira-bcd: which placed resources share its memory */
     /* madeira-doge: a Depth16Unorm target copies out as 2-byte texels; recorded as
@@ -2638,12 +2648,41 @@ static void mad_capture_drain(struct mad_device *d, UINT64 frame, int final) {
     for (i = 0; i < n0 && i < g_ncapbufs; i++) {
         struct mad_capbuf *c = &g_capbufs[i];
         int thumb = !strcmp(c->kind, "rt") || !strcmp(c->kind, "depth") || !strcmp(c->kind, "stencil") || !strcmp(c->kind, "uav");
+        int vol = !strcmp(c->kind, "vol");
         if (thumb) mad_sheet_add(c, frame);
+        if (vol && c->d > 1 && c->cpu) {
+            /* madeira-doge: a 3D capture -- NaN/Inf texels per z-slice in the log,
+             * and slices 0, d/2 and d-1 on the sheets (what = "vol z=N"). */
+            UINT z, bpp = c->bpr / (c->w ? c->w : 1); UINT64 img = (UINT64)c->bpr * c->h; char line[800]; size_t ln;
+            snprintf(line, sizeof line, "[capture-vol] enc#%05u %s%u %ux%ux%u pf%u dx%u %s | %s | NaN/Inf per z:",
+                     c->enc, c->kind, c->idx, c->w, c->h, c->d, c->pf, c->dxgi, c->name, c->what[0] ? c->what : "-");
+            ln = strlen(line);
+            if (bpp >= mad_pf_texel_bytes(c->pf) && img * c->d <= c->bytes) {
+                for (z = 0; z < c->d; z++) {
+                    UINT64 nan = 0; UINT x, y;
+                    const unsigned char *base = (const unsigned char *)c->cpu + (size_t)z * img;
+                    for (y = 0; y < c->h; y++) for (x = 0; x < c->w; x++) {
+                        unsigned char o[3];
+                        nan += (UINT64)mad_texel_rgb(base + (size_t)y * c->bpr + (size_t)x * bpp, c->pf, bpp, 0, 0, o, 1);
+                    }
+                    if (ln < sizeof line - 16) { snprintf(line + ln, sizeof line - ln, " %llu", (unsigned long long)nan); ln = strlen(line); }
+                }
+                d3d12_log("%s (of %u each)\n", line, c->w * c->h);
+                for (z = 0; z < c->d; z = (z == 0 ? c->d / 2 : (z == c->d / 2 ? c->d - 1 : c->d))) {
+                    struct mad_capbuf s = *c;
+                    s.cpu = (unsigned char *)c->cpu + (size_t)z * img; s.bytes = img; s.d = 1;
+                    snprintf(s.kind, sizeof s.kind, "vol"); snprintf(s.what, sizeof s.what, "vol z=%u/%u %s", z, c->d, c->what);
+                    mad_sheet_add(&s, frame);
+                    if (c->d < 3) break;
+                }
+            } else d3d12_log("%s (layout not readable: bpp %u, %llu bytes)\n", line, bpp, (unsigned long long)c->bytes);
+        }
         if (!thumb || g_cap_raw) {
             struct madeira_ctl_args a;
             memset(&a, 0, sizeof a);
             a.op = 1; a.ptr = (UINT64)(ULONG_PTR)c->cpu; a.len = c->bytes;
-            snprintf(a.name, sizeof a.name, "f%llu_e%05u_%s%u_%ux%u_pf%u_dx%u_%s.raw", (unsigned long long)frame, c->enc, c->kind, c->idx, c->w, c->h, c->pf, c->dxgi, c->name);
+            if (vol) snprintf(a.name, sizeof a.name, "f%llu_e%05u_%s%u_%ux%ux%u_pf%u_dx%u_%s.raw", (unsigned long long)frame, c->enc, c->kind, c->idx, c->w, c->h, c->d, c->pf, c->dxgi, c->name);
+            else snprintf(a.name, sizeof a.name, "f%llu_e%05u_%s%u_%ux%u_pf%u_dx%u_%s.raw", (unsigned long long)frame, c->enc, c->kind, c->idx, c->w, c->h, c->pf, c->dxgi, c->name);
             MadeiraCtl(&a);
             ok += a.ret ? 1 : 0;
             d3d12_log("[capture] %s %s (%llu bytes, bpr %u)\n", a.ret ? "wrote" : "FAILED", a.name, (unsigned long long)c->bytes, c->bpr);
@@ -3014,7 +3053,7 @@ static void mad_capture_dispatch_outputs(struct mad_exec *e, const struct mad_cm
                 int xv = -1; struct mad_resource *r;
                 if (!de->texture_view_id || (de->metadata >> 63)) continue;
                 r = mad_texture_of_view(d, de->texture_view_id, &xv);
-                if (!r || !r->texture || r->samples > 1 || r->tex_type == WMTTextureType3D || r->width < 8 || r->height < 8) continue;
+                if (!r || !r->texture || r->samples > 1 || r->width < 8 || r->height < 8) continue;   /* madeira-doge: 3D UAVs captured too ("vol") */
                 for (u = 0; u < nout; u++) if (outs[u] == r) break;
                 if (u < nout) continue;
                 memset(&vs[nout], 0, sizeof vs[nout]); vs[nout].layers = 1;
