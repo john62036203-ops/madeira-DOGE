@@ -2335,7 +2335,12 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
     cb->buf = buf; cb->cpu = bi.memory.ptr; cb->own = bi.memory.ptr; cb->bytes = total; cb->w = w; cb->h = h; cb->bpr = (UINT)bpr;
     if (what) snprintf(cb->what, sizeof cb->what, "%s", what);
     mad_alias_desc(r, cb->alias, sizeof cb->alias);   /* madeira-bcd: which placed resources share its memory */
-    cb->pf = options == 2 ? (UINT)WMTPixelFormatStencil8 : (r->is_depth ? (UINT)WMTPixelFormatDepth32Float : (UINT)r->tex_pf);
+    /* madeira-doge: a Depth16Unorm target copies out as 2-byte texels; recorded as
+     * Depth32Float the sheet dropped it ("2 bytes per texel, the format needs 4"),
+     * which hid RE Engine's material-ID buffer (the D16 depth its visibility
+     * G-buffer pass tests EQUAL against) from every RE9 capture. */
+    cb->pf = options == 2 ? (UINT)WMTPixelFormatStencil8
+           : (r->is_depth ? (r->tex_pf == WMTPixelFormatDepth16Unorm ? (UINT)WMTPixelFormatDepth16Unorm : (UINT)WMTPixelFormatDepth32Float) : (UINT)r->tex_pf);
     cb->dxgi = (UINT)r->desc.Format; cb->enc = seq; cb->idx = idx;
     snprintf(cb->kind, sizeof cb->kind, "%s", kind);
     { const char *n = r->name ? r->name : "res"; unsigned i; for (i = 0; i < sizeof cb->name - 1 && n[i]; i++) cb->name[i] = isalnum((unsigned char)n[i]) ? n[i] : '_'; cb->name[i] = 0; }
@@ -2538,7 +2543,8 @@ static void mad_sheet_flush(UINT64 frame) {
 }
 /* One captured image -> the next cell of the current sheet, plus an index line. */
 static void mad_sheet_add(const struct mad_capbuf *c, UINT64 frame) {
-    UINT bpp, tw, th, x, y, cx, cy, ox, oy; float sc, dlo = 1e30f, dhi = -1e30f; UINT64 nan = 0; char line[640];
+    UINT bpp, tw, th, x, y, cx, cy, ox, oy; float sc, dlo = 1e30f, dhi = -1e30f; UINT64 nan = 0; char line[800];
+    UINT16 hv[12]; UINT64 hc[12]; unsigned nh = 0, hmore = 0;   /* madeira-doge: the distinct values of a D16 buffer (material IDs) */
     const unsigned char *base = c->cpu; int isdepth = c->pf == 250 || c->pf == 252 || c->pf == 260;
     if (!c->w || !c->h || !c->cpu) return;
     if (g_sheet_thumbs >= MAD_SH_MAX_THUMBS) { g_sheet_dropped++; return; }
@@ -2563,7 +2569,12 @@ static void mad_sheet_add(const struct mad_capbuf *c, UINT64 frame) {
             const unsigned char *t = base + (size_t)y * c->bpr + (size_t)x * bpp; unsigned char o[3];
             if (isdepth) {
                 float d; UINT16 u;
-                if (bpp == 2) { memcpy(&u, t, 2); d = u / 65535.0f; } else memcpy(&d, t, 4);
+                if (bpp == 2) {
+                    unsigned hi;
+                    memcpy(&u, t, 2); d = u / 65535.0f;
+                    for (hi = 0; hi < nh && hv[hi] != u; hi++) ;
+                    if (hi < nh) hc[hi]++; else if (nh < 12) { hv[nh] = u; hc[nh] = 1; nh++; } else hmore++;
+                } else memcpy(&d, t, 4);
                 if (d != d) nan++; else { if (d < dlo) dlo = d; if (d > dhi) dhi = d; }
             } else nan += (UINT64)mad_texel_rgb(t, c->pf, bpp, 0, 0, o, 1);
         }
@@ -2586,6 +2597,15 @@ static void mad_sheet_add(const struct mad_capbuf *c, UINT64 frame) {
              c->what[0] ? c->what : "-");
     if (nan) snprintf(line + strlen(line), sizeof line - strlen(line), " NaN/Inf=%llu", (unsigned long long)nan);
     if (isdepth && dhi >= dlo) snprintf(line + strlen(line), sizeof line - strlen(line), " depth %.5f..%.5f", dlo, dhi);
+    if (isdepth && dhi >= dlo && bpp == 2)   /* madeira-doge: a D16 buffer of IDs reads better as integers */
+        snprintf(line + strlen(line), sizeof line - strlen(line), " (u16 %u..%u)", (unsigned)(dlo * 65535.0f + 0.5f), (unsigned)(dhi * 65535.0f + 0.5f));
+    if (nh) {   /* madeira-doge: value census of a D16 buffer -- IDs and how many texels carry each */
+        unsigned hi;
+        snprintf(line + strlen(line), sizeof line - strlen(line), " values:");
+        for (hi = 0; hi < nh && strlen(line) < sizeof line - 40; hi++)
+            snprintf(line + strlen(line), sizeof line - strlen(line), " %u x%llu", (unsigned)hv[hi], (unsigned long long)hc[hi]);
+        if (hmore) snprintf(line + strlen(line), sizeof line - strlen(line), " +%u texels of other values", hmore);
+    }
     if (c->alias[0]) snprintf(line + strlen(line), sizeof line - strlen(line), " | %s", c->alias);
     d3d12_log("[capture-sheet] %s\n", line);
     strcat(line, "\n"); mad_sheet_index_add(line);
@@ -2789,6 +2809,7 @@ static void mad_capture_rs_tables(struct mad_exec *e, obj_handle_t benc, unsigne
     static struct mad_resource *seen[96]; static unsigned nseen; static UINT64 seen_frame;
     unsigned i, k, ri; char line[1024]; int n;
     static const char *const rt_name[4] = { "SRV", "UAV", "CBV", "SMP" };
+    struct { struct mad_resource *r; UINT64 off; } bufc[16]; unsigned nbufc = 0;   /* madeira-doge */
     if (!rs) return;
     if (seen_frame != g_capture_frame) { seen_frame = g_capture_frame; nseen = 0; }
     for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
@@ -2859,6 +2880,14 @@ static void mad_capture_rs_tables(struct mad_exec *e, obj_handle_t benc, unsigne
                                   br ? (br->name ? br->name : "buffer") : "NOTHING LIVE", br ? (unsigned long long)br->size : 0ull,
                                   (unsigned long long)boff, (unsigned long long)de->metadata, (de->metadata >> 63) ? " (typed)" : "");
                         if (br && br->buffer && rg->range_type == MADEIRA_IR_RANGE_CBV) mad_capture_buffer(e, benc, br, boff, 1024, "cb", i * 1000 + off + k, seq);
+                        else if (br && br->buffer && (rg->range_type == MADEIRA_IR_RANGE_SRV || rg->range_type == MADEIRA_IR_RANGE_UAV) && nbufc < 16) {
+                            /* madeira-doge: the first 2 KB of buffer SRVs/UAVs too (tile lists, visibility
+                             * redirect tables, material tables), each buffer+offset once per draw */
+                            unsigned u;
+                            for (u = 0; u < nbufc && !(bufc[u].r == br && bufc[u].off == boff); u++) ;
+                            if (u == nbufc) { bufc[nbufc].r = br; bufc[nbufc].off = boff; nbufc++;
+                                mad_capture_buffer(e, benc, br, boff, 2048, rg->range_type == MADEIRA_IR_RANGE_UAV ? "uavbuf" : "buf", i * 1000 + off + k, seq); }
+                        }
                     } else if (de->texture_view_id) {
                         d3d12_log("[%s] p%u %s %c%u space%u: typed buffer view %llx, metadata 0x%llx\n", tag, i, rn, rg->range_type == 1 ? 'u' : 't',
                                   reg, rg->register_space, (unsigned long long)de->texture_view_id, (unsigned long long)de->metadata);
