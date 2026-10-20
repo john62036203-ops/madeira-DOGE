@@ -1563,6 +1563,67 @@ static void ios_xp_heap_lock_thread( const char *tag, uintptr_t teb, thread_t po
     }
     wine_log_write( "%s", line );
 }
+/* madeira-doge: RE9 build 277 (logs 16:26:57 and 16:41:20, the second with
+ * pool images OFF): the heap cs OWNER is not idle, it waits in the same ntdll
+ * wait (RtlpWaitForCriticalSection) as the heap waiters -- on ANOTHER lock.
+ * Name that lock: scan the owner's guest stack for RTL_CRITICAL_SECTION
+ * pointers (a slot equal to cs or to cs+0x18, the LockSemaphore word the wait
+ * uses), validated by DebugInfo->CriticalSection == cs (or DebugInfo -1 and a
+ * plausible held state), print each one's state and report the thread that
+ * owns it with its frames. */
+static int ios_xp_cs_plausible( uint64_t p, uint64_t heap_cs, uint64_t w[5] )
+{
+    int32_t lc, rc; uint64_t dbg_cs = 0;
+    if (p < 0x10000 || (p & 7) || p == heap_cs) return 0;
+    if (!ios_ts_read( p, w, 5 * 8 )) return 0;
+    lc = (int32_t)(w[1] & 0xffffffff); rc = (int32_t)(w[1] >> 32);
+    if (lc < 0 || lc > 256 || rc < 1 || rc > 256 || !w[2] || w[2] > 0xffff) return 0;   /* held, small tid */
+    if (w[0] == ~0ull) return 1;
+    if (w[0] < 0x10000 || !ios_ts_read( w[0] + 8, &dbg_cs, 8 )) return 0;
+    return dbg_cs == p;
+}
+static void ios_xp_heap_lock_owner_waits( uint64_t owner_teb, uint64_t own_tid, uint64_t heap_cs )
+{
+    extern int ios_thread_registry_count(void);
+    extern uintptr_t ios_thread_registry_teb(int i);
+    extern thread_t ios_thread_registry_mach(int i);
+    uint64_t frame_ptr = 0, sp = 0, seen[4] = { 0, 0, 0, 0 };
+    int k, j, nseen = 0;
+    if (!ios_ts_read( owner_teb + 0x378, &frame_ptr, 8 ) || !frame_ptr || !ios_ts_read( frame_ptr + 0xf8, &sp, 8 ) || !sp) return;
+    for (k = 0; k < 512 && nseen < 4; k++)
+    {
+        uint64_t slot = 0, w[5], cand[2]; int c;
+        if (!ios_ts_read( sp + 8ull * k, &slot, 8 )) break;
+        cand[0] = slot; cand[1] = slot - 0x18;
+        for (c = 0; c < 2 && nseen < 4; c++)
+        {
+            uint64_t p = cand[c]; int dup = 0, i, count;
+            for (j = 0; j < nseen; j++) if (seen[j] == p) dup = 1;
+            if (dup || !ios_xp_cs_plausible( p, heap_cs, w )) continue;
+            seen[nseen++] = p;
+            {
+                char nm[96];
+                ios_xp_addr_name( p, nm, sizeof(nm) );
+                wine_log_write( "[heap-lock]   OWNER's stack +0x%x points at cs 0x%llx (%s): LockCount=%d Recursion=%d OwningThread=%04llx%s LockSemaphore=0x%llx SpinCount=%llu DebugInfo=0x%llx",
+                                k * 8, (unsigned long long)p, nm, (int32_t)(w[1] & 0xffffffff), (int32_t)(w[1] >> 32),
+                                (unsigned long long)w[2], w[2] == own_tid ? " (= the heap owner itself)" : "",
+                                (unsigned long long)w[3], (unsigned long long)w[4], (unsigned long long)w[0] );
+            }
+            if (w[2] == own_tid) continue;
+            count = ios_thread_registry_count();
+            for (i = 0; i < count; i++)
+            {
+                uintptr_t teb = ios_thread_registry_teb( i ); uint64_t tid = 0, peb = 0;
+                if (!teb || !ios_ts_read( teb + 0x60, &peb, 8 ) || peb != ios_xp_peb) continue;
+                if (!ios_ts_read( teb + 0x48, &tid, 8 ) || tid != w[2]) continue;
+                ios_xp_heap_lock_thread( "HOLDER of that cs", teb, ios_thread_registry_mach( i ), p );
+                break;
+            }
+        }
+    }
+    if (!nseen) wine_log_write( "[heap-lock]   OWNER's guest stack (512 slots) holds no other held critical section: it waits on something else (SRW lock, condition variable, RtlWaitOnAddress word)" );
+}
+
 static void ios_xp_heap_lock_watch( const char *wall )
 {
     extern int ios_thread_registry_count(void);
@@ -1599,7 +1660,12 @@ static void ios_xp_heap_lock_watch( const char *wall )
         int k, found = 0;
         if (!teb || !ios_ts_read( teb + 0x60, &peb, 8 ) || peb != ios_xp_peb) continue;
         ios_ts_read( teb + 0x48, &tid, 8 );
-        if (tid == owner) { ios_xp_heap_lock_thread( "OWNER", teb, port, cs_addr ); continue; }
+        if (tid == owner)
+        {
+            ios_xp_heap_lock_thread( "OWNER", teb, port, cs_addr );
+            if (reports == 1 || reports == 6) ios_xp_heap_lock_owner_waits( teb, owner, cs_addr );
+            continue;
+        }
         /* a waiter is parked in a syscall from RtlpWaitForCriticalSection, whose frames keep the cs pointer */
         if (!ios_ts_read( teb + 0x378, &frame_ptr, 8 ) || !frame_ptr || !ios_ts_read( frame_ptr + 0xf8, &sp, 8 ) || !sp) continue;
         for (k = 0; k < 256 && !found; k++)
