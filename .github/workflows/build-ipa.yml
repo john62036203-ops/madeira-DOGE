@@ -365,6 +365,10 @@ jobs:
       - name: Patch wine to print a hard error's text
         run: python3 tools/patch-wine-harderror-text.py
 
+      # Unreal LowLevelFatalError text past its first 110 characters.
+      - name: Patch wine to print the whole fatal report text
+        run: python3 tools/patch-wine-fatal-text.py
+
       # madeira.cfg eco-workers = 1: the ECO QoS class for threads other than
       # a process's first (build/ntdll-unix/thread_ios.c marks them).
       - name: Patch wine for eco-workers
