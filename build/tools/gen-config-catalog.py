@@ -115,6 +115,8 @@ OVERLAY = {
     "vram-mb": {"title": "Video memory budget (MB)", "category": "Direct3D 9/10/11 (DXMT)",
                 "note": "ml1095: madeira.cfg vram-mb = N"},
     "pool": { "category": "Memory & JIT pool","title": "JIT pool size (MB)"},
+    "barrier-render-uav": {"title": "Split render passes at UAV barriers",
+                "note": "1 (default): a UAV barrier inside a render pass that has already drawn closes the pass, so a buffer a pixel shader wrote is complete before a later vertex shader of the same pass reads it (RE Engine's visibility G-buffer tile masks; Apple GPUs run a pass's vertex stage first). 0: ignore, as before."},
     "totalphys": { "category": "Memory & JIT pool","title": "Reported physical memory (MB)"},
     "eco": { "note": 'Runs guest threads at a lower iOS QoS class so the system favours efficiency and saves power; can cost speed. Class chosen by eco-qos.',"title": "Eco scheduling"},
     "eco-qos": {"title": "Eco QoS class", "kind": "choice", "note": "The QoS class guest threads run at while eco is on.",
