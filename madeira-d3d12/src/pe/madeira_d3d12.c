@@ -214,6 +214,17 @@ static SRWLOCK g_cap_lock = SRWLOCK_INIT; static int g_cap_uav = 1, g_cap_raw; s
 static struct mad_capbuf *g_capbufs; static unsigned g_ncapbufs, g_capbufs_cap; static UINT64 g_cap_bytes;
 #define MAD_CAPTURE_BUDGET (384ull << 20)
 static int g_barrier_render = -1;   /* ml1098: madeira.cfg barrier-render = 1 closes render passes at barriers too */
+/* madeira-doge: barrier-render-uav (default 1). A UAV barrier INSIDE a render pass
+ * that has already drawn closes the pass. RE Engine's visibility G-buffer:
+ * drawMaterialID (a pixel shader) InterlockedOr()s a per-material tile mask into
+ * a UAV, a UAV barrier follows, then TileFillTriangleStrip's VERTEX shader reads
+ * that mask (t0) to place the tiles -- same colour targets, same depth, so all of
+ * it landed in ONE Metal render encoder. Apple GPUs run a pass's vertex stage
+ * (tiling) before its fragment stage, so the mask was read before it was
+ * written: zero mask = NaN tile corners = nothing drawn = black room / menu,
+ * or last frame's mask when the clear raced the other way (the "sometimes it
+ * shows" runs). Closing the pass at that barrier orders them. */
+static int g_barrier_render_uav = -1; static LONG g_barrier_uav_closed;
 static int g_occlusion_visible = -1;   /* ml1103: madeira.cfg occlusion-visible = 1 answers every occlusion query "fully visible" (diagnostic, Astra) */
 /* ml1106: TARGETED DRAW CAPTURE. madeira.cfg capture-ps = <pixel shader entry>:
  * during a CAP frame, the first draws with that pixel shader get their inputs
@@ -7783,7 +7794,22 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_BARRIER:   /* ml1091; ml1098: madeira.cfg barrier-render = 1 closes the render pass too (Astra's conservative experiment) */
             if (g_barrier_render < 0) { g_barrier_render = mad_cfg_int_pe("barrier-render", 0) ? 1 : 0;
                                         d3d12_log("[madeira-d3d12] ml1098 barrier-render = %d (render passes %s at ResourceBarrier)\n", g_barrier_render, g_barrier_render ? "CLOSED" : "left open"); }
+            if (g_barrier_render_uav < 0) { g_barrier_render_uav = mad_cfg_int_pe("barrier-render-uav", 1) ? 1 : 0;
+                                            d3d12_log("[madeira-d3d12] barrier-render-uav = %d (a UAV barrier inside a render pass that has drawn %s)\n", g_barrier_render_uav, g_barrier_render_uav ? "CLOSES the pass" : "is ignored"); }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
+            if (g_barrier_render_uav && e.renc && e.pass_draws) {   /* madeira-doge: see g_barrier_render_uav */
+                unsigned bi; int uav = c->u.barrier.all && c->u.barrier.cls_noref == BC_RAW_UAV;
+                for (bi = 0; bi < c->u.barrier.n && !uav; bi++) if (c->u.barrier.cls[bi] == BC_RAW_UAV) uav = 1;
+                if (uav) {
+                    LONG nn = InterlockedIncrement(&g_barrier_uav_closed);
+                    if (nn <= 6 || !(nn % 2000))
+                        d3d12_log("[madeira-d3d12] barrier-render-uav: list#%u enc#%u closed after %u draws (last %s|%s) at a UAV barrier (%ld so far)\n",
+                                  g_list_seq, e.renc_seq, e.pass_draws, e.pso ? e.pso->vs_name : "-", e.pso ? e.pso->ps_name : "-", (long)nn);
+                    InterlockedIncrement(&g_barrier_renc_closed);
+                    e.fence_needed = 1;
+                    exec_end(&e);
+                }
+            }
             if (e.mode == 6) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
