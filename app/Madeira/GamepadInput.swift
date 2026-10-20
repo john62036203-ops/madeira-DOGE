@@ -47,9 +47,17 @@ final class GamepadInput: @unchecked Sendable {
     /// so player 1 then shows as connected for the whole session even while no
     /// controller is in use. That is why it is opt-in: without the switch,
     /// slot 0 connects only when a real source appears, as before.
+    ///
+    /// madeira-doge: `= 2` reserves slot 0 whenever touch XInput is on, even
+    /// when the layout active at launch has no pad mappings (a keyboard-key
+    /// layout). Games that look for pads only at start (MH Wilds, Dynasty
+    /// Warriors 3 demo 2026-10-21: one XInput burst at launch) then still find
+    /// player 1, and switching to the Xbox layout later drives it.
     @MainActor func reserveSessionSlot(touchControls: Bool) {
-        guard Self.enabled, Self.optIn("MADEIRA_PAD_EARLY_SLOT") else { return }
-        let touch = touchControls && Self.touchEnabled
+        let earlyKey = "MADEIRA_PAD_EARLY_SLOT"
+        let early = MadeiraConfig.get("env.\(earlyKey)") ?? ProcessInfo.processInfo.environment[earlyKey]
+        guard Self.enabled, early == "1" || early == "2" else { return }
+        let touch = (touchControls || early == "2") && Self.touchEnabled
         let paired = !GCController.controllers().isEmpty
         guard touch || paired else { return }
         queue.async { [self] in touchState.reserved = true; sample() }
