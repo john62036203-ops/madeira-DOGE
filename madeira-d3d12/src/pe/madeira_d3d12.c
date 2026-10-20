@@ -7307,7 +7307,26 @@ static void mad_ic_collect(struct mad_device *d) {
 /* capture-cs: an entry name ("cs_main" -- every Ghost of Tsushima kernel), or
  * madeira-bcd: name/hash ("cs_main/3fa2..."), a prefix of the bytecode hash
  * that ind-count and the GPU fault reports print, for ONE of them. */
+static int mad_cs_match1(const struct mad_pso *p, const char *want);
+/* madeira-doge: capture-cs takes a comma list ("A,B" matched nothing before:
+ * RE9 log 2026-10-20 23:39 captured no fog kernel), each entry name or name/hash. */
 static int mad_cs_match(const struct mad_pso *p, const char *want) {
+    char one[64];
+    const char *s = want;
+    while (*s) {
+        size_t n;
+        while (*s == ',' || *s == ' ') s++;
+        n = strcspn(s, ",");
+        while (n && s[n - 1] == ' ') n--;
+        if (n && n < sizeof one) {
+            memcpy(one, s, n); one[n] = 0;
+            if (mad_cs_match1(p, one)) return 1;
+        }
+        s += strcspn(s, ",");
+    }
+    return 0;
+}
+static int mad_cs_match1(const struct mad_pso *p, const char *want) {
     const char *slash = strchr(want, '/');
     char hx[24];
     if (!slash) return !strcmp(p->vs_name, want);
