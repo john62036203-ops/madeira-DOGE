@@ -1775,6 +1775,7 @@ static HRESULT STDMETHODCALLTYPE queue_QI(ID3D12CommandQueue *This, REFIID riid,
 }
 static ULONG STDMETHODCALLTYPE queue_AddRef(ID3D12CommandQueue *This) { return mad_addref((struct mad_obj *)This); }
 static void mad_queue_flush(struct mad_queue *q);
+static obj_handle_t mad_queue_open(struct mad_queue *q);   /* madeira-doge perf-pass-split */
 static void mad_queue_drain(struct mad_queue *q);
 static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
     struct mad_queue *q = (struct mad_queue *)This;
@@ -2246,8 +2247,11 @@ static volatile LONG g_fault_diag;   /* madeira-bcd: GPU fault attribution, belo
 static volatile LONG64 g_fault_last_present;   /* madeira-doge: gpu-fault-settle -- present count at the last GPU fault */
 static void mad_fault_label_render(struct mad_exec *e);
 static void mad_cbprof_note(obj_handle_t cb, const char *name);   /* madeira-doge: gpu-cb profile */
+static volatile LONG g_pps_active;                                 /* madeira-doge: perf-pass-split, this frame is sampled */
+static void mad_pps_split(struct mad_exec *e);
 static void exec_end(struct mad_exec *e) {
     struct mad_resource *crt[8]; struct mad_resource *cdepth = NULL; struct mad_rtvp crtp[8], cdp; unsigned cn = 0, cseq = 0, cdraws = 0;   /* ml1098 */
+    int pps_render;
     if (e->renc) exec_fence_render(e, e->renc, 1);     /* ml1091 */
     if (e->benc) exec_fence_blit(e, e->benc, 1);
     if (e->cenc) exec_fence_compute(e, e->cenc, 1);
@@ -2259,6 +2263,7 @@ static void exec_end(struct mad_exec *e) {
     e->f7_next_rts = 0;
     if (e->renc && g_fault_diag && e->diag_npso) mad_fault_label_render(e);   /* madeira-bcd */
     if (e->renc && e->pass_draws) mad_cbprof_note(e->cb, e->pso && e->pso->ps_name[0] ? e->pso->ps_name : (e->pso ? e->pso->vs_name : "-"));   /* madeira-doge: gpu-cb profile */
+    pps_render = e->renc && e->pass_draws;
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
         MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
@@ -2266,10 +2271,14 @@ static void exec_end(struct mad_exec *e) {
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
         e->pass_draws = 0;
     }
-    if (e->benc) { MTLCommandEncoder_endEncoding(e->benc); e->benc = 0; }
-    if (e->cenc) { MTLCommandEncoder_endEncoding(e->cenc); e->cenc = 0; }
-    if (cdraws && g_capture_on) mad_capture_pass(e, crt, cn, crtp, cdepth, &cdp, cseq, cdraws);   /* ml1098: after the pass, before anything else */
-    if (e->nic) mad_ic_encode(e);   /* madeira-bcd: ind-count, the argument records this encoder consumed */
+    {
+        int ended = (e->cenc != 0) || pps_render;
+        if (e->benc) { MTLCommandEncoder_endEncoding(e->benc); e->benc = 0; }
+        if (e->cenc) { MTLCommandEncoder_endEncoding(e->cenc); e->cenc = 0; }
+        if (cdraws && g_capture_on) mad_capture_pass(e, crt, cn, crtp, cdepth, &cdp, cseq, cdraws);   /* ml1098: after the pass, before anything else */
+        if (e->nic) mad_ic_encode(e);   /* madeira-bcd: ind-count, the argument records this encoder consumed */
+        if (ended && g_pps_active) mad_pps_split(e);   /* madeira-doge: perf-pass-split -- this pass gets a command buffer of its own */
+    }
 }
 
 static obj_handle_t mad_capbuf_alloc(struct mad_device *d, UINT64 len, void **cpu) {
@@ -3320,11 +3329,22 @@ static int g_perf_enabled = -1;   /* ml1108 perf-log; declared here for the gpu-
  * On completion the GPU time is charged to that signature; every 5 s the
  * [perf] report prints the heaviest eight as "ms per frame", so a skip-ps /
  * settings decision can be made from numbers instead of guesses. */
-struct mad_cbprof { obj_handle_t cb; char sig[176]; unsigned n; };
+struct mad_cbprof { obj_handle_t cb; char sig[176]; unsigned n; int split; };
 static struct mad_cbprof g_cbprof[64];
 static struct { char sig[176]; double ms; unsigned n; } g_cbprof_tab[96];
 static unsigned g_cbprof_ntab, g_cbprof_lost;
 static LONG g_cbprof_lock;
+/* madeira-doge perf-pass-split = N (default 0 = off; needs perf-log): one frame
+ * in every N presents runs each render pass and each compute pipeline in a
+ * command buffer of its own, so the per-buffer GPU interval (MadeiraCtl op 3)
+ * times a single pass. The [perf] report then lists the heaviest passes of the
+ * sampled frames as ms per sampled frame. The sampled frame itself is slower
+ * (more command buffers, the 16-deep pending list retires synchronously), the
+ * others are untouched. */
+static struct { char sig[176]; double ms; unsigned n; } g_pps_tab[256];
+static unsigned g_pps_ntab, g_pps_cbs, g_pps_frames, g_pps_splits;
+static double g_pps_ms;
+static int g_pps_every = -1;
 static void mad_cbprof_note(obj_handle_t cb, const char *name) {
     unsigned i, slot = 64;
     if (g_perf_enabled <= 0 || !cb || !name || !name[0]) return;
@@ -3335,7 +3355,7 @@ static void mad_cbprof_note(obj_handle_t cb, const char *name) {
     }
     if (slot < 64) {
         struct mad_cbprof *p = &g_cbprof[slot];
-        if (p->cb != cb) { memset(p, 0, sizeof *p); p->cb = cb; p->sig[0] = '|'; p->sig[1] = 0; }
+        if (p->cb != cb) { memset(p, 0, sizeof *p); p->cb = cb; p->sig[0] = '|'; p->sig[1] = 0; p->split = g_pps_active != 0; }
         p->n++;
         if (p->n <= 64) {   /* the signature is "|a|b|c|": the first four distinct names; later passes only count */
             char tok[40]; size_t nl = strlen(name), l = strlen(p->sig); unsigned names = 0; const char *c;
@@ -3359,6 +3379,12 @@ static void mad_cbprof_done(obj_handle_t cb, double ms) {
             for (k = 0; k < g_cbprof_ntab; k++) if (!strcmp(g_cbprof_tab[k].sig, key)) break;
             if (k == g_cbprof_ntab && k < 96) { memcpy(g_cbprof_tab[k].sig, key, sizeof key); g_cbprof_tab[k].ms = 0; g_cbprof_tab[k].n = 0; g_cbprof_ntab++; }
             if (k < 96) { g_cbprof_tab[k].ms += ms; g_cbprof_tab[k].n++; } else g_cbprof_lost++;
+            if (p->split) {   /* madeira-doge perf-pass-split: one pass per command buffer on the sampled frames */
+                for (k = 0; k < g_pps_ntab; k++) if (!strcmp(g_pps_tab[k].sig, key)) break;
+                if (k == g_pps_ntab && k < 256) { memcpy(g_pps_tab[k].sig, key, sizeof key); g_pps_tab[k].ms = 0; g_pps_tab[k].n = 0; g_pps_ntab++; }
+                if (k < 256) { g_pps_tab[k].ms += ms; g_pps_tab[k].n++; }
+                g_pps_ms += ms; g_pps_cbs++;
+            }
         }
         p->cb = 0;
     }
@@ -3382,8 +3408,27 @@ static void mad_cbprof_report(long presents, double gpu_sum_ms) {
     }
     for (j = 0; j < g_cbprof_ntab; j++) { g_cbprof_tab[j].ms = 0; g_cbprof_tab[j].n = 0; }
     g_cbprof_ntab = 0; g_cbprof_lost = 0;
-    InterlockedExchange(&g_cbprof_lock, 0);
-    if (shown) d3d12_log("%s\n", line);
+    {   /* madeira-doge perf-pass-split */
+        char pl[2400]; int pn = 0; unsigned ps = 0, frames = g_pps_frames ? g_pps_frames : 1;
+        if (g_pps_cbs) {
+            pn = snprintf(pl, sizeof pl, "[perf] pass-split %u sampled frame(s), %u command buffers, %.1f ms GPU per sampled frame; ms per frame by pass:",
+                          g_pps_frames, g_pps_cbs, g_pps_ms / frames);
+            while (ps < 20) {
+                int best = -1;
+                for (i = 0; i < g_pps_ntab; i++) if (g_pps_tab[i].n && (best < 0 || g_pps_tab[i].ms > g_pps_tab[best].ms)) best = (int)i;
+                if (best < 0) break;
+                pn += snprintf(pl + pn, sizeof pl - pn, " %.2f=%s(x%.1f)", g_pps_tab[best].ms / frames, g_pps_tab[best].sig, (double)g_pps_tab[best].n / frames);
+                g_pps_tab[best].n = 0; ps++;
+                if (pn > (int)sizeof pl - 260) break;
+            }
+        }
+        for (j = 0; j < g_pps_ntab; j++) { g_pps_tab[j].ms = 0; g_pps_tab[j].n = 0; }
+        g_pps_ntab = 0; g_pps_cbs = 0; g_pps_ms = 0; g_pps_frames = 0;
+        InterlockedExchange(&g_cbprof_lock, 0);
+        if (shown) d3d12_log("%s\n", line);
+        if (ps) d3d12_log("%s\n", pl);
+        return;
+    }
 }
 static struct { obj_handle_t fn; char name[64]; } g_fault_bad[32];
 static volatile LONG g_fault_nbad;
@@ -7698,7 +7743,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         }
     }
     if (mad_fault_skip_pso(e->cpso)) { MAD_SKIP(e); return; }   /* madeira-doge: skips outlive the diagnostics (gpu-fault-settle) */
-    if (g_fault_diag) {   /* madeira-bcd: GPU fault attribution -- one pipeline per compute encoder */
+    if (g_fault_diag || g_pps_active) {   /* madeira-bcd: GPU fault attribution (madeira-doge: and perf-pass-split) -- one pipeline per compute encoder */
         if (e->cenc && e->cenc_pso != e->cpso) exec_end(e);
     }
     if (!e->cenc) {
@@ -8081,21 +8126,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             q->rejected++;
             continue;
         }
-        if (!q->open_cb) {
-            if (q->device->resset && InterlockedExchange(&q->device->resset_dirty, 0))
-                MTLResidencySet_commit(q->device->resset);
-            mad_queue_revive(q->device);   /* ml1067 */
-            q->open_cb = mad_batch_cb(q->device->mtl_queue);   /* madeira-bcd: encoder execution status */
-            if (!q->open_cb) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected++; continue; }
-            /* commandBuffer returns an AUTORELEASED object locally and an interned
-             * one remotely; holding it across calls means taking our own reference. */
-            NSObject_retain(q->open_cb);
-            mad_sparse_cb_wait(q->open_cb);   /* madeira-doge d3d12-sparse: after every tile mapping change so far */
-            if (g_sd_state > 0) {   /* madeira-bcd: sync diagnostics */
-                if (g_fence_strict) mad_strict_cb_wait(q->device, q->open_cb);
-                if (g_upload_guard || g_desc_guard || g_ic_frames) q->open_ticket = mad_ticket_new();
-            }
-        }
+        if (!q->open_cb && !mad_queue_open(q)) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected++; continue; }
         if (l) mad_exec_list(q, l, q->open_cb);
         q->open_lists++;
         q->executed++;
@@ -8247,6 +8278,13 @@ static void mad_perf_present(void) {
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
     mad_perf_lock();
     g_perf_presents++;
+    {   /* madeira-doge perf-pass-split: sample one frame in every N presents */
+        static LONG64 npres;
+        if (g_pps_every < 0) g_pps_every = (int)mad_cfg_int_pe("perf-pass-split", 0);   /* every Nth frame runs one pass per command buffer for per-pass GPU times ([perf] pass-split); 0 = off */
+        npres++;
+        if (g_pps_active) InterlockedExchange(&g_pps_active, 0);
+        else if (g_pps_every > 0 && npres % (g_pps_every < 30 ? 30 : g_pps_every) == 0) { InterlockedExchange(&g_pps_active, 1); g_pps_frames++; }
+    }
     if (!g_perf_t0) { g_perf_t0 = now.QuadPart; mad_perf_unlock(); return; }
     wall = (double)(now.QuadPart - g_perf_t0) / (double)fq.QuadPart;
     if (wall >= 5.0) {
@@ -8411,6 +8449,37 @@ static void mad_queue_flush(struct mad_queue *q) {
         d3d12_log("[madeira-d3d12] batch #%llu committed (%llu lists so far)\n",
                   (unsigned long long)q->batches, (unsigned long long)q->executed);
     LeaveCriticalSection(&q->submit_lock);   /* ml1021 */
+}
+/* Open the queue's next command buffer (submit_lock held). Factored out of
+ * ExecuteCommandLists for madeira-doge perf-pass-split, which opens one per pass. */
+static obj_handle_t mad_queue_open(struct mad_queue *q) {
+    if (q->device->resset && InterlockedExchange(&q->device->resset_dirty, 0))
+        MTLResidencySet_commit(q->device->resset);
+    mad_queue_revive(q->device);   /* ml1067 */
+    q->open_cb = mad_batch_cb(q->device->mtl_queue);   /* madeira-bcd: encoder execution status */
+    if (!q->open_cb) return 0;
+    /* commandBuffer returns an AUTORELEASED object locally and an interned
+     * one remotely; holding it across calls means taking our own reference. */
+    NSObject_retain(q->open_cb);
+    mad_sparse_cb_wait(q->open_cb);   /* madeira-doge d3d12-sparse: after every tile mapping change so far */
+    if (g_sd_state > 0) {   /* madeira-bcd: sync diagnostics */
+        if (g_fence_strict) mad_strict_cb_wait(q->device, q->open_cb);
+        if (g_upload_guard || g_desc_guard || g_ic_frames) q->open_ticket = mad_ticket_new();
+    }
+    return q->open_cb;
+}
+/* madeira-doge perf-pass-split: after a pass ends on a sampled frame, commit
+ * the queue's buffer and continue the list in a fresh one. Encoder ordering
+ * stays with the MTLFence chain (fences hold across buffers of one queue); the
+ * list's ring rewind follows the batch that now holds its newest work. */
+static void mad_pps_split(struct mad_exec *e) {
+    struct mad_queue *q = e->q;
+    if (!q || !e->l || !e->cb || q->open_cb != e->cb) return;
+    mad_queue_flush(q);
+    if (!mad_queue_open(q)) { e->cb = 0; return; }
+    e->cb = q->open_cb;
+    e->l->ring_batch = q->batches + 1;
+    g_pps_splits++;
 }
 static void mad_device_flush_all(struct mad_device *d) {
     /* ml1021: the queue registry was read with no lock while creation and
