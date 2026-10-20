@@ -154,7 +154,10 @@ jobs:
           cd wine
           mkdir -p build-native
           cd build-native
-          ../configure > "$GITHUB_WORKSPACE/wine-native-configure.log" 2>&1 || true
+          # An Intel runner (macos-15-intel) defaults to a 32-bit build and stops
+          # at "Cannot build a 32-bit program"; Apple silicon is 64-bit already.
+          W64=; [ "$(uname -m)" = x86_64 ] && W64=--enable-win64
+          ../configure $W64 > "$GITHUB_WORKSPACE/wine-native-configure.log" 2>&1 || true
           # Only the host tools and the generated headers are used from this
           # tree. A full host build also compiles the iOS-only unix sources
           # for macOS, and one failure there used to stop make before widl.
