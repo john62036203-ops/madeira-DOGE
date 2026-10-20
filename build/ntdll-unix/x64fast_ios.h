@@ -10,6 +10,14 @@
  * safe); larger ones run the native code. SRW: shared acquire/release and
  * exclusive acquire when nobody waits; exclusive release always goes to Wine
  * (it cannot tell whether shared waiters need a wake).
+ * MH Rise (2026-10-19, build 247, x64-fast on, still 1.6 M x64->EC calls/s):
+ * the top target was RtlQueryPerformanceCounter (0.78 M/s), already user-mode
+ * on the EC side (ml1117), so the whole cost was the crossing. Its x64 stub
+ * does the same arithmetic on the same statics with FEX's rdtsc (CNTVCT <<
+ * TSCScale) and leaves every resync to Wine's code. kernel32's
+ * QueryPerformanceCounter is a `jmp [rip+slot]` into ntdll; import slots that
+ * hold it are pointed at ntdll's stub. The x64 calls no longer reach the
+ * ml1131 per-thread gap census ([xp-api-qpc]).
  * Every such call leaves the translated x64 code for native code and comes
  * back. x64 callers reach these through the module's x64 entry (.hexpthk
  * "fast-forward sequence", or a `jmp [rip+slot]` forwarder in kernel32);
@@ -138,9 +146,29 @@ static const unsigned char x64f_mem_set[196] = {
     0x88, 0x14, 0x09, 0xc3
 };
 #define X64F_SPIN_AT 57   /* offset of the spin count imm32 in x64f_cs_enter */
+static const unsigned char x64f_qpc[103] = {
+    0x80, 0x3d, 0x60, 0x00, 0x00, 0x00, 0x00, 0x75, 0x5e, 0x4c, 0x8b, 0x05, 0x58, 0x00, 0x00, 0x00,
+    0x4d, 0x85, 0xc0, 0x74, 0x52, 0x4c, 0x8b, 0x0d, 0x54, 0x00, 0x00, 0x00, 0x4d, 0x85, 0xc9, 0x74,
+    0x46, 0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0x48, 0xc1, 0xe8, 0x06, 0x49, 0x89,
+    0xc3, 0x4c, 0x29, 0xc8, 0x4c, 0x39, 0xc0, 0x73, 0x2e, 0x4c, 0x89, 0xd8, 0x31, 0xd2, 0x49, 0xf7,
+    0xf0, 0x4c, 0x69, 0xd8, 0x80, 0x96, 0x98, 0x00, 0x48, 0x69, 0xc2, 0x80, 0x96, 0x98, 0x00, 0x31,
+    0xd2, 0x49, 0xf7, 0xf0, 0x4c, 0x01, 0xd8, 0x48, 0x03, 0x05, 0x1a, 0x00, 0x00, 0x00, 0x48, 0x89,
+    0x01, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3
+};
+
+/* RtlQueryPerformanceCounter (MH Rise build 247: ntdll+0x71aac, the EC body,
+ * was the top x64->EC target at 0.8 M calls/s). Offsets inside x64f_qpc: the
+ * END of each rip-relative instruction (its displacement is the 4 bytes before
+ * the end; for the cmp the imm8 comes last, so 5 before) and the shift imm8. */
+#define X64F_QPC_DIS_END   7
+#define X64F_QPC_FREQ_END  16
+#define X64F_QPC_LAST_END  28
+#define X64F_QPC_SHIFT_END 46
+#define X64F_QPC_OFF_END   94
+
 
 enum { X64F_ENTER, X64F_LEAVE, X64F_TRY, X64F_LESET, X64F_LEGET, X64F_TLS, X64F_FLS,
-       X64F_SRW_AS, X64F_SRW_RS, X64F_SRW_AX, X64F_MEMCPY, X64F_MEMSET };
+       X64F_SRW_AS, X64F_SRW_RS, X64F_SRW_AX, X64F_MEMCPY, X64F_MEMSET, X64F_QPC };
 
 static const struct { const unsigned char *code; unsigned int len; int needs_fallback; } x64f_stub[] =
 {
@@ -156,6 +184,7 @@ static const struct { const unsigned char *code; unsigned int len; int needs_fal
     { x64f_srw_ax,   sizeof(x64f_srw_ax),   1 },
     { x64f_mem_copy, sizeof(x64f_mem_copy), 1 },
     { x64f_mem_set,  sizeof(x64f_mem_set),  1 },
+    { x64f_qpc,      sizeof(x64f_qpc),      1 },
 };
 
 static const struct { const char *module, *name; int kind; } x64f_targets[] =
@@ -169,6 +198,7 @@ static const struct { const char *module, *name; int kind; } x64f_targets[] =
     { "ntdll.dll",      "RtlAcquireSRWLockShared",    X64F_SRW_AS },
     { "ntdll.dll",      "RtlReleaseSRWLockShared",    X64F_SRW_RS },
     { "ntdll.dll",      "RtlAcquireSRWLockExclusive", X64F_SRW_AX },
+    { "ntdll.dll",      "RtlQueryPerformanceCounter", X64F_QPC },
     { "kernelbase.dll", "TlsGetValue",                X64F_TLS },
     { "kernelbase.dll", "GetLastError",               X64F_LEGET },
     { "kernelbase.dll", "FlsGetValue",                X64F_FLS },
@@ -311,12 +341,97 @@ static int x64f_poke( unsigned char *img, unsigned char *pool_rw, unsigned char 
     return ok;
 }
 
+/* ---- RtlQueryPerformanceCounter ---- */
+
+/* FEX's rdtsc is CNTVCT_EL0 << TSCScale: SmallTSCScale (default on) doubles
+ * CNTFRQ_EL0 until it reaches 1 GHz (FEXCore Core.cpp; hw_registry_ios.h). */
+static unsigned int x64f_tsc_shift( void )
+{
+    unsigned long long f;
+    unsigned int s = 0;
+#if defined(__aarch64__)
+    __asm__ __volatile__( "mrs %0, cntfrq_el0" : "=r"(f) );
+#else
+    f = 24000000;   /* host test */
+#endif
+    if (f && f < 1000000000ull) while (f < 1000000000ull) { f <<= 1; s++; }
+    return s;
+}
+
+static unsigned int x64f_w( const unsigned char *img, unsigned int rva ) { return *(const unsigned int *)(img + rva); }
+
+/* adrp Xd at rva: the page RVA it forms (0 when it is not adrp Xd). */
+static unsigned int x64f_adrp( const unsigned char *img, unsigned int rva, unsigned int rd )
+{
+    unsigned int w = x64f_w( img, rva );
+    int imm;
+    if ((w & 0x9f00001fu) != (0x90000000u | rd)) return 0;
+    imm = (int)(((w >> 29) & 3) | ((w >> 5) & 0x7ffff) << 2);
+    if (imm & 0x100000) imm -= 0x200000;
+    return (rva & ~0xfffu) + (unsigned int)(imm * 4096);
+}
+
+/* ldr Xt / ldrb Wt [Xn, #imm] at rva: its unsigned byte offset, or -1. */
+static int x64f_ldr_off( const unsigned char *img, unsigned int rva, unsigned int rn, int byte )
+{
+    unsigned int w = x64f_w( img, rva );
+    if ((w & 0xffc00000u) != (byte ? 0x39400000u : 0xf9400000u) || ((w >> 5) & 31) != rn) return -1;
+    return (int)((w >> 10) & 0xfff) * (byte ? 1 : 8);
+}
+
+/* The four statics of Wine's iOS RtlQueryPerformanceCounter (dlls/ntdll/time.c
+ * ml1117), read from its ARM64EC body at ec: qpc_disabled (byte), qpc_freq,
+ * qpc_last_sync, qpc_offset. Only the instruction shape of the shipped
+ * ntdll.dll is accepted; anything else leaves the export alone. */
+static int x64f_qpc_statics( const unsigned char *img, size_t size, unsigned int ec, unsigned int v[4] )
+{
+    static const struct { unsigned int at, rd; int byte; } ld[4] =
+        { { 0x10, 8, 1 }, { 0x28, 20, 0 }, { 0x48, 22, 0 }, { 0x6c, 9, 0 } };
+    unsigned int i, ldat[4] = { 0x14, 0x2c, 0x50, 0x70 };
+    if (!x64f_in( size, ec, 0x80 )) return 0;
+    if (x64f_w( img, ec + 0x34 ) != 0xd53be009u ||   /* mrs x9, cntfrq_el0 */
+        x64f_w( img, ec + 0x40 ) != 0xd5033fdfu ||   /* isb */
+        x64f_w( img, ec + 0x44 ) != 0xd53be053u ||   /* mrs x19, cntvct_el0 */
+        x64f_w( img, ec + 0x4c ) != 0x5292d015u ||   /* mov w21, #0x9680 */
+        x64f_w( img, ec + 0x54 ) != 0x72a01315u)     /* movk w21, #0x98, lsl #16: TICKSPERSEC */
+        return 0;
+    for (i = 0; i < 4; i++)
+    {
+        unsigned int page = x64f_adrp( img, ec + ld[i].at, ld[i].rd );
+        int off = x64f_ldr_off( img, ec + ldat[i], ld[i].rd, ld[i].byte );
+        if (!page || off < 0) return 0;
+        v[i] = page + (unsigned int)off;
+        if (!x64f_in( size, v[i], 8 ) || (i && (v[i] & 7))) return 0;
+    }
+    return v[0] != v[1] && v[1] != v[2] && v[2] != v[3];
+}
+
+/* Point the copied stub at blob+at (RVA stub) to the statics. */
+static void x64f_qpc_link( unsigned char *b, unsigned int stub, const unsigned int v[4], unsigned int shift )
+{
+    static const unsigned int end[4] = { X64F_QPC_DIS_END, X64F_QPC_FREQ_END, X64F_QPC_LAST_END, X64F_QPC_OFF_END };
+    unsigned int i;
+    for (i = 0; i < 4; i++)
+    {
+        int disp = (int)(v[i] - (stub + end[i]));
+        memcpy( b + end[i] - (i ? 4 : 5), &disp, 4 );
+    }
+    b[X64F_QPC_SHIFT_END - 1] = (unsigned char)shift;
+}
+
+/* Modules that got stubs, for chasing a `jmp [rip+slot]` forwarder (kernel32's
+ * QueryPerformanceCounter jumps through its own import slot to ntdll's entry). */
+#define X64F_MAX_MODS 64
+static struct { uintptr_t base; size_t size; } x64f_mods[X64F_MAX_MODS];
+static int x64f_nmods;
+
 static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *pool_rw,
                               unsigned char *pool_rx, const char *mn )
 {
     unsigned char blob[0x1000];
     unsigned int lo, hi, used = 0, i, n = 0, want = 0;
     struct { unsigned int entry, stub; } done[32];
+    unsigned int qpc_v[4] = { 0, 0, 0, 0 }, qpc_shift = 0;
 
     if (!mn || !x64f_enabled()) return;
     for (i = 0; i < sizeof(x64f_targets) / sizeof(x64f_targets[0]); i++)
@@ -368,10 +483,21 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
         }
         else continue;   /* not an entry this code knows (already patched, or a new build) */
 
+        if (x64f_targets[i].kind == X64F_QPC)
+        {
+            /* the stub reads ntdll's own statics; only the shipped body's layout is known */
+            if (fall_len != 14 || !x64f_qpc_statics( img, size, e + 14 + *(const int *)(img + e + 10), qpc_v ))
+            {
+                dprintf( 2, "[x64-fast] %s: %s's ARM64EC body is not the known one, left alone\n", mn, x64f_targets[i].name );
+                continue;
+            }
+            qpc_shift = x64f_tsc_shift();
+        }
         need = (len + (x64f_stub[x64f_targets[i].kind].needs_fallback ? fall_len : 0) + 15) & ~15u;
         if (lo + used + need > hi || n >= 32) break;
         memcpy( blob + used, code, len );
         if (x64f_targets[i].kind == X64F_ENTER) memcpy( blob + used + X64F_SPIN_AT, &x64f_spin, 4 );
+        if (x64f_targets[i].kind == X64F_QPC) x64f_qpc_link( blob + used, stub, qpc_v, qpc_shift );
         if (x64f_stub[x64f_targets[i].kind].needs_fallback) memcpy( blob + used + len, fall, fall_len );
         done[n].entry = e;
         done[n].stub = stub;
@@ -393,8 +519,38 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
         x64f_pairs[k].stub = (uintptr_t)img + done[i].stub;
         __atomic_store_n( &x64f_npairs, k + 1, __ATOMIC_RELEASE );
     }
+    {
+        int k = __atomic_load_n( &x64f_nmods, __ATOMIC_ACQUIRE );
+        if (k < X64F_MAX_MODS)
+        {
+            x64f_mods[k].base = (uintptr_t)img;
+            x64f_mods[k].size = size;
+            __atomic_store_n( &x64f_nmods, k + 1, __ATOMIC_RELEASE );
+        }
+    }
     dprintf( 2, "[x64-fast] %s @%p: %u of %u x64 stubs placed (+0x%x, %u bytes, spin %d); x64 modules' import slots are pointed at them\n",
              mn, img, n, want, lo, used, x64f_spin );
+    if (qpc_v[1])
+        dprintf( 2, "[x64-fast] %s: QueryPerformanceCounter in x64 (statics +0x%x/+0x%x/+0x%x/+0x%x, tsc >> %u)\n",
+                 mn, qpc_v[0], qpc_v[1], qpc_v[2], qpc_v[3], qpc_shift );
+}
+
+/* entry is a `jmp [rip+slot]` forwarder inside a module that got stubs, whose
+ * slot holds a placed entry: that entry's stub (calling it is the same call). */
+static uintptr_t x64f_stub_through_forwarder( uintptr_t entry )
+{
+    int i, n = __atomic_load_n( &x64f_nmods, __ATOMIC_ACQUIRE );
+    for (i = 0; i < n; i++)
+    {
+        uintptr_t b = x64f_mods[i].base, slot;
+        size_t sz = x64f_mods[i].size;
+        const unsigned char *p = (const unsigned char *)entry;
+        if (entry < b || entry - b > sz - 6 || p[0] != 0xff || p[1] != 0x25) continue;
+        slot = entry + 6 + *(const int *)(p + 2);
+        if (slot < b || slot - b > sz - 8) return 0;
+        return x64f_stub_for( *(const uintptr_t *)slot );
+    }
+    return 0;
 }
 
 /* A pure x64 image (no .hexpthk): point its import slots that hold a placed
@@ -426,6 +582,7 @@ static void x64f_redirect_iat( unsigned char *img, size_t size, size_t off, size
     for (a = (a + 7) & ~(size_t)7; a + 8 <= b; a += 8)
     {
         uintptr_t stub = x64f_stub_for( *(const uintptr_t *)(img + a) );
+        if (!stub) stub = x64f_stub_through_forwarder( *(const uintptr_t *)(img + a) );
         if (!stub) continue;
         if (x64f_poke_image( img, (unsigned int)a, (const unsigned char *)&stub, 8 )) hits++;
         else fails++;

@@ -14,7 +14,7 @@ D = os.path.join(ROOT, "tests", "host", "x64fast")
 HDR = os.path.join(ROOT, "build", "ntdll-unix", "x64fast_ios.h")
 DLLS = os.path.join(ROOT, "app", "Madeira", "arm64ec-windows")
 STUBS = ["cs_enter", "cs_leave", "cs_try", "le_set", "le_get", "tls_get", "fls_get",
-         "srw_as", "srw_rs", "srw_ax", "mem_copy", "mem_set"]
+         "srw_as", "srw_rs", "srw_ax", "mem_copy", "mem_set", "qpc"]
 
 if not (shutil.which("nasm") and shutil.which("gcc") and platform.machine() in ("x86_64", "AMD64")):
     print("note: nasm/gcc on x86-64 unavailable, x64-fast checks skipped")
@@ -70,5 +70,11 @@ for threads in (4, 8):
     bad += not ok
     for line in (r.stdout.strip() or r.stderr.strip()).splitlines():
         print("ok  " if ok else "FAIL", line)
+run("gcc", "-O2", "-w", "-o", os.path.join(tmp, "qpc"), os.path.join(D, "qpc.c"), os.path.join(tmp, "stubs.o"))
+r = subprocess.run([os.path.join(tmp, "qpc")], capture_output=True, text=True)
+ok = r.returncode == 0 and "PASS" in r.stdout
+bad += not ok
+for line in (r.stdout.strip() or r.stderr.strip()).splitlines():
+    print("ok  " if ok else "FAIL", line)
 print("FAILED" if bad else "PASSED")
 sys.exit(1 if bad else 0)

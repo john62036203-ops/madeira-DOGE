@@ -11,6 +11,7 @@ default rel
 global cs_enter, cs_enter_end, cs_leave, cs_leave_end, cs_try, cs_try_end
 global le_set, le_set_end, le_get, le_get_end, tls_get, tls_get_end, fls_get, fls_get_end
 global srw_as, srw_as_end, srw_rs, srw_rs_end, srw_ax, srw_ax_end, mem_copy, mem_copy_end, mem_set, mem_set_end
+global qpc, qpc_end, qpc_e_dis, qpc_e_freq, qpc_e_last, qpc_e_shift, qpc_e_off
 
 cs_enter:
         mov     rdx, [gs:0x48]
@@ -289,6 +290,56 @@ mem_set:
         mov     [rcx+r9], dl
 .done:  ret
 mem_set_end:
+
+; RtlQueryPerformanceCounter(counter rcx), Wine's iOS user-mode path (ml1117,
+; dlls/ntdll/time.c): ticks(c) + qpc_offset with c = CNTVCT_EL0. FEX's rdtsc
+; is CNTVCT_EL0 << TSCScale (SmallTSCScale), so c = tsc >> TSCScale (imm8 set
+; by the installer). The four rip-relative loads are ntdll's own statics
+; (qpc_disabled, qpc_freq, qpc_last_sync, qpc_offset); the installer points
+; them there. A resync that is due (c - last >= freq, or no sync yet), the
+; disabled path, and a wrong shift (c far outside the window) all run Wine's
+; code, which resyncs exactly as before.
+qpc:
+        cmp     byte [rel qpc_d_dis], 0
+qpc_e_dis:
+        jne     qpc_end
+        mov     r8, [rel qpc_d_freq]
+qpc_e_freq:
+        test    r8, r8
+        jz      qpc_end
+        mov     r9, [rel qpc_d_last]
+qpc_e_last:
+        test    r9, r9
+        jz      qpc_end
+        rdtsc
+        shl     rdx, 32
+        or      rax, rdx
+        shr     rax, 6
+qpc_e_shift:
+        mov     r11, rax
+        sub     rax, r9
+        cmp     rax, r8
+        jae     qpc_end
+        mov     rax, r11
+        xor     edx, edx
+        div     r8
+        imul    r11, rax, 10000000
+        imul    rax, rdx, 10000000
+        xor     edx, edx
+        div     r8
+        add     rax, r11
+        add     rax, [rel qpc_d_off]
+qpc_e_off:
+        mov     [rcx], rax
+        mov     eax, 1
+        ret
+qpc_end:
+; placeholders only (the installer rewrites the four displacements)
+qpc_d_dis:  db 0
+            align 8
+qpc_d_freq: dq 0
+qpc_d_last: dq 0
+qpc_d_off:  dq 0
 
 %ifidn __OUTPUT_FORMAT__, elf64
 section .note.GNU-stack noalloc noexec nowrite progbits

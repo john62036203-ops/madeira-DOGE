@@ -60,12 +60,13 @@ static unsigned char *fake_x64(uint64_t *slots, int n, size_t *size)
 
 int main(int argc, char **argv)
 {
-    int bad = 0; uint64_t slots[64]; int ns = 0;
+    int bad = 0; uint64_t slots[64]; int ns = 0; uintptr_t qpc_entry = 0, qpc_stub = 0; unsigned char *k32 = 0; size_t k32_size = 0;
     for (int a = 1; a < argc; a++) {
         size_t size; unsigned char *img = map_pe(argv[a], &size);
         unsigned char *orig = malloc(size); memcpy(orig, img, size);
         unsigned char *pool = malloc(size); memcpy(pool, img, size);
         const char *mn = strrchr(argv[a], '/') + 1;
+        if (!strcasecmp(mn, "kernel32.dll")) { k32 = img; k32_size = size; }
         x64f_patch_image(img, size, pool, pool, mn);
         if (memcmp(img, pool, size)) { printf("  image and pool differ\n"); bad++; }
         for (unsigned i = 0; i < sizeof(x64f_targets) / sizeof(x64f_targets[0]); i++) {
@@ -78,7 +79,25 @@ int main(int argc, char **argv)
             unsigned stub = (unsigned)(sa - (uintptr_t)img);
             slots[ns++] = (uintptr_t)img + e;
             int k = x64f_targets[i].kind; unsigned len = x64f_stub[k].len;
-            if (memcmp(img + stub, x64f_stub[k].code, k == X64F_ENTER ? X64F_SPIN_AT : len)) { printf("  stub mismatch\n"); bad++; }
+            if (k == X64F_QPC) {
+                /* the four displacements must reach ntdll's statics, the shift is FEX's 24 MHz -> 1.536 GHz */
+                static const unsigned endo[4] = { X64F_QPC_DIS_END, X64F_QPC_FREQ_END, X64F_QPC_LAST_END, X64F_QPC_OFF_END };
+                static const unsigned want_v[4] = { 0xe2a50, 0xe2a58, 0xe2a60, 0xe2a68 };
+                unsigned char tmpl[256]; memcpy(tmpl, img + stub, len);
+                for (int q = 0; q < 4; q++) {
+                    unsigned at = endo[q] - (q ? 4 : 5); int disp; memcpy(&disp, img + stub + at, 4);
+                    unsigned tgt = stub + endo[q] + disp;
+                    printf("  qpc static %d -> 0x%x (want 0x%x) %s\n", q, tgt, want_v[q], tgt == want_v[q] ? "ok" : "WRONG");
+                    if (tgt != want_v[q]) bad++;
+                    memcpy(tmpl + at, x64f_qpc + at, 4);
+                }
+                printf("  qpc tsc shift %u %s\n", img[stub + X64F_QPC_SHIFT_END - 1], img[stub + X64F_QPC_SHIFT_END - 1] == 6 ? "ok" : "WRONG");
+                if (img[stub + X64F_QPC_SHIFT_END - 1] != 6) bad++;
+                tmpl[X64F_QPC_SHIFT_END - 1] = x64f_qpc[X64F_QPC_SHIFT_END - 1];
+                if (memcmp(tmpl, x64f_qpc, len)) { printf("  qpc stub mismatch outside the linked fields\n"); bad++; }
+                qpc_entry = (uintptr_t)img + e; qpc_stub = sa;
+            }
+            else if (memcmp(img + stub, x64f_stub[k].code, k == X64F_ENTER ? X64F_SPIN_AT : len)) { printf("  stub mismatch\n"); bad++; }
             if (k == X64F_ENTER && *(int *)(img + stub + X64F_SPIN_AT) != cfg_spin) { printf("  spin not set\n"); bad++; }
             const char *res = "no fallback";
             char buf[128];
@@ -100,12 +119,25 @@ int main(int argc, char **argv)
         x64f_patch_image(img, size, pool, pool, mn);   /* second run must be a no-op */
         if (x64f_npairs != before) { printf("  second run registered again\n"); bad++; }
     }
+    /* kernel32!QueryPerformanceCounter is `jmp [rip+slot]` through kernel32's own
+     * import slot; bind that slot to ntdll's entry as the loader does, and the
+     * redirect must chase it to ntdll's QPC stub. */
+    uint64_t k32_qpc = 0;
+    if (!qpc_entry || !qpc_stub) { printf("  ntdll QueryPerformanceCounter stub missing\n"); bad++; }
+    else if (k32) {
+        unsigned e = x64f_export(k32, k32_size, "QueryPerformanceCounter");
+        if (!e || k32[e] != 0xff || k32[e + 1] != 0x25) { printf("  kernel32 QueryPerformanceCounter is not a jmp [rip+slot]\n"); bad++; }
+        else { *(uintptr_t *)(k32 + e + 6 + *(int *)(k32 + e + 2)) = qpc_entry; k32_qpc = (uintptr_t)k32 + e; }
+    }
+    int k32_at = ns;
+    if (k32_qpc) slots[ns++] = k32_qpc;
     /* a pure x64 module importing every entry, plus two unrelated slots */
     slots[ns++] = 0x1234; slots[ns++] = 0;
     size_t fsz; unsigned char *fx = fake_x64(slots, ns, &fsz);
     x64f_redirect_iat(fx, fsz, 0x2000, 0x1000);
     for (int i = 0; i < ns; i++) {
         uint64_t v = *(uint64_t *)(fx + 0x2000 + 8 * i), want = x64f_stub_for(slots[i]) ? x64f_stub_for(slots[i]) : slots[i];
+        if (k32_qpc && i == k32_at) { want = qpc_stub; printf("  kernel32 QueryPerformanceCounter slot -> 0x%llx (ntdll's QPC stub 0x%llx) %s\n", (unsigned long long)v, (unsigned long long)qpc_stub, v == want ? "ok" : "WRONG"); }
         if (v != want) { printf("  slot %d = 0x%llx, want 0x%llx\n", i, (unsigned long long)v, (unsigned long long)want); bad++; }
     }
     /* a hybrid module (.hexpthk) is left alone */
