@@ -837,6 +837,7 @@ struct mad_resource {
     unsigned serial;                   /* madeira-bcd: creation number, names a resource in capture / alias logs */
     void *own_mem;                     /* ml1154: our VirtualAlloc'd storage behind a CPU-visible buffer */
     struct mad_memheap *cpu_heap;      /* madeira-doge upload-heap-backing: the UPLOAD/READBACK heap whose storage this buffer is */
+    struct mad_resource *nv12_uv;      /* madeira-doge nv12: plane 1 (R8G8, half size); this resource is plane 0 (R8) */
     unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
     obj_handle_t buffer;
     void *cpu;                 /* NULL for GPU-private */
@@ -3210,6 +3211,11 @@ static UINT64 mad_default_swap_min(void) {
                    d3d12_log("[madeira-d3d12] default-swap from %lld KB (default-swap-mb = %d, default-swap-kb = %d): %s\n", (long long)(min >> 10), mb, kb,
                              min ? "GPU-only buffers from that size live on file-backed storage" : "off: GPU-only buffers are Metal-owned"); }
     return (UINT64)min;
+}
+static int mad_nv12_on(void) {   /* madeira-doge: madeira.cfg d3d12-nv12 (default 1) */
+    static int on = -1;
+    if (on < 0) on = mad_cfg_int_pe("d3d12-nv12", 1) ? 1 : 0;
+    return on;
 }
 static int mad_upload_heap_backing_on(void) {   /* madeira-doge: madeira.cfg upload-heap-backing (default 1) */
     static int on = -1;
@@ -9741,6 +9747,33 @@ static void STDMETHODCALLTYPE device_GetCopyableFootprints(ID3D12Device *This,
     UINT64 offset = base_offset;
     UINT mips = desc->MipLevels ? desc->MipLevels : 1;
     (void)This;
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->Format == DXGI_FORMAT_NV12) {
+        /* madeira-doge nv12: two planes, plane-major subresources; plane 0 is
+         * R8 W x H, plane 1 R8G8 at half width and height (D3D12 reports the
+         * plane formats in the footprints). */
+        UINT per = mips * (desc->DepthOrArraySize ? desc->DepthOrArraySize : 1);
+        for (i = 0; i < count; i++) {
+            UINT s = first + i, plane = s / per, mip = (s % per) % mips;
+            UINT64 w = desc->Width >> mip, h = desc->Height >> mip, rowbytes, pitch;
+            if (!w) w = 1;
+            if (!h) h = 1;
+            if (plane) { w = (w + 1) / 2; h = (h + 1) / 2; }
+            rowbytes = w * (plane ? 2 : 1);
+            pitch = mad_align(rowbytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+            offset = mad_align(offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            if (layouts) {
+                layouts[i].Offset = offset;
+                layouts[i].Footprint.Format = plane ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
+                layouts[i].Footprint.Width = (UINT)w; layouts[i].Footprint.Height = (UINT)h;
+                layouts[i].Footprint.Depth = 1; layouts[i].Footprint.RowPitch = (UINT)pitch;
+            }
+            if (row_count) row_count[i] = (UINT)h;
+            if (row_size) row_size[i] = rowbytes;
+            offset += pitch * h;
+        }
+        if (total_bytes) *total_bytes = offset - base_offset;
+        return;
+    }
     mad_format_info(desc->Format, &bytes, &block);
     for (i = 0; i < count; i++) {
         UINT s = first + i, mip = s % mips;
@@ -9790,6 +9823,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
             struct WMTTextureInfo ti; enum WMTPixelFormat pf; int isd;
             UINT subs = (d->MipLevels ? d->MipLevels : 1) *
                         (d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d->DepthOrArraySize ? d->DepthOrArraySize : 1));
+            if (d->Format == DXGI_FORMAT_NV12) subs *= 2;   /* madeira-doge nv12: both planes */
             device_GetCopyableFootprints(This, d, 0, subs, 0, NULL, NULL, NULL, &bytes);
             if (d->SampleDesc.Count > 1) a = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
             if (mad_texinfo_from_desc(d, &ti, &pf, &isd)) MTLDevice_heapTextureSizeAndAlign(md->mtl_device, &ti, &msz, &mal);   /* ml1145 */
@@ -9828,6 +9862,7 @@ static int mad_restrace(void) {
 static D3D12_RESOURCE_DESC1 * STDMETHODCALLTYPE res_GetDesc1(ID3D12Resource2 *This, D3D12_RESOURCE_DESC1 *ret) {
     memset(ret, 0, sizeof *ret);
     memcpy(ret, &((struct mad_resource *)This)->desc, sizeof(D3D12_RESOURCE_DESC));   /* DESC is a prefix of DESC1 */
+    if (((struct mad_resource *)This)->nv12_uv) ret->Format = DXGI_FORMAT_NV12;   /* madeira-doge nv12 */
     if (mad_restrace())
         d3d12_log("[restrace] %p GetDesc1 dim %u %llux%u fmt %u flags %#x\n", This, (unsigned)ret->Dimension,
                   (unsigned long long)ret->Width, (unsigned)ret->Height, (unsigned)ret->Format, (unsigned)ret->Flags);
@@ -9846,6 +9881,7 @@ static HRESULT STDMETHODCALLTYPE res_GetHeapProperties(ID3D12Resource *This, D3D
 }
 static D3D12_RESOURCE_DESC * STDMETHODCALLTYPE res_GetDesc(ID3D12Resource *This, D3D12_RESOURCE_DESC *ret) {
     *ret = ((struct mad_resource *)This)->desc;
+    if (((struct mad_resource *)This)->nv12_uv) ret->Format = DXGI_FORMAT_NV12;   /* madeira-doge nv12 */
     if (mad_restrace())
         d3d12_log("[restrace] %p GetDesc dim %u %llux%u fmt %u flags %#x\n", This, (unsigned)ret->Dimension,
                   (unsigned long long)ret->Width, (unsigned)ret->Height, (unsigned)ret->Format, (unsigned)ret->Flags);
@@ -10954,6 +10990,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
         if (r->placed_heap) { mad_pl_del(r->placed_heap, r); ID3D12Heap_Release((ID3D12Heap *)r->placed_heap); }   /* ml1145 */
         if (r->cpu_heap) ID3D12Heap_Release((ID3D12Heap *)r->cpu_heap);   /* madeira-doge upload-heap-backing */
+        if (r->nv12_uv) res_Release((ID3D12Resource *)r->nv12_uv);   /* madeira-doge nv12 */
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
             InterlockedExchangeAdd64(&g_upload_swap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_upload_swap_n);
@@ -11758,12 +11795,42 @@ static void mad_zero_init(struct mad_device *d, struct mad_resource *r, const D3
                   r->texture ? "tex" : "buf", (unsigned long long)desc->Width, r->texture ? r->height : 1u, r->texture ? r->tex_depth : 1u,
                   r->placed_heap ? "placed" : "committed", n, g_zero_tex_n, (long long)(g_zero_bytes >> 20));
 }
+/* madeira-doge nv12: Metal has no single NV12 texture, so an NV12 TEXTURE2D
+ * is plane 0, an R8 texture of its size (placed where the application put
+ * it), plus plane 1, a committed R8G8 texture of half width and height.
+ * Copies to subresources of plane 1 and SRVs with PlaneSlice 1 (or format
+ * R8G8) go to plane 1. UE's Electra player decodes into NV12 textures; with
+ * them refused, Dynasty Warriors 3 (builds 299/305, logs 2026-10-21 07:13 and
+ * 07:54) piled decoded frames up until jetsam. */
+static HRESULT mad_create_nv12(struct mad_device *d, D3D12_HEAP_TYPE heap_type, const D3D12_RESOURCE_DESC *desc,
+                               REFIID riid, void **out, struct mad_memheap *ph, UINT64 poff) {
+    D3D12_RESOURCE_DESC d0 = *desc, d1;
+    struct mad_resource *r = NULL, *uv = NULL;
+    HRESULT hr;
+    static LONG said;
+    d0.Format = DXGI_FORMAT_R8_UNORM;
+    hr = mad_create_resource_at(d, heap_type, &d0, &IID_ID3D12Resource, (void **)&r, ph, poff);
+    if (FAILED(hr) || !r) return FAILED(hr) ? hr : E_FAIL;
+    d1 = d0; d1.Format = DXGI_FORMAT_R8G8_UNORM; d1.Alignment = 0;
+    d1.Width = (desc->Width + 1) / 2; d1.Height = (desc->Height + 1) / 2;
+    hr = mad_create_resource(d, D3D12_HEAP_TYPE_DEFAULT, &d1, &IID_ID3D12Resource, (void **)&uv);
+    if (FAILED(hr) || !uv) { res_Release((ID3D12Resource *)r); return FAILED(hr) ? hr : E_FAIL; }
+    r->nv12_uv = uv;
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] nv12: %llux%u texture as R8 r#%u + R8G8 %llux%u r#%u%s\n", (unsigned long long)desc->Width,
+                  (unsigned)desc->Height, r->serial, (unsigned long long)d1.Width, (unsigned)d1.Height, uv->serial, ph ? " (plane 0 placed)" : "");
+    hr = res_QI((ID3D12Resource *)r, riid, out);
+    res_Release((ID3D12Resource *)r);
+    return hr;
+}
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
                                       struct mad_memheap *ph, UINT64 poff) {
     struct mad_resource *r;
     HRESULT hr;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) { mad_refuse_log(desc, heap_type, "dimension UNKNOWN"); return E_INVALIDARG; }
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->Format == DXGI_FORMAT_NV12 && mad_nv12_on())
+        return mad_create_nv12(d, heap_type, desc, riid, out, ph, poff);
 
     r = calloc(1, sizeof *r);
     if (!r) return E_OUTOFMEMORY;
@@ -13174,6 +13241,19 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
     if (!e) return;
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateShaderResourceView");   /* madeira-bcd: desc-guard */
     if (!r) { memset(e, 0, sizeof *e); return; }                                /* a null view */
+    if (r->nv12_uv) {   /* madeira-doge nv12: PlaneSlice 1 / R8G8 -> plane 1, anything else -> plane 0 (R8) */
+        D3D12_SHADER_RESOURCE_VIEW_DESC v;
+        int uvp = 0;
+        if (desc) {
+            v = *desc;
+            if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) { uvp = v.Texture2D.PlaneSlice == 1; v.Texture2D.PlaneSlice = 0; }
+            else if (v.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) { uvp = v.Texture2DArray.PlaneSlice == 1; v.Texture2DArray.PlaneSlice = 0; }
+            if (v.Format == DXGI_FORMAT_R8G8_UNORM) uvp = 1;
+            v.Format = uvp ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
+        }
+        device_CreateShaderResourceView(This, (ID3D12Resource *)(uvp ? r->nv12_uv : r), desc ? &v : NULL, h);
+        return;
+    }
     if (r->buffer) {
         UINT64 stride = 4, first = 0, num = r->size / 4;
         if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
@@ -16843,6 +16923,21 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     if (!dst || !src) return;
     d = (struct mad_resource *)dst->pResource; s = (struct mad_resource *)src->pResource;
     if (!d || !s) return;
+    {   /* madeira-doge nv12: a plane-1 subresource is subresource 0.. of the R8G8 texture */
+        static D3D12_TEXTURE_COPY_LOCATION dummy; D3D12_TEXTURE_COPY_LOCATION dl = dummy, sl = dummy;
+        if (d->nv12_uv && dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+            UINT per = (d->desc.MipLevels ? d->desc.MipLevels : 1) * (d->desc.DepthOrArraySize ? d->desc.DepthOrArraySize : 1);
+            if (dst->SubresourceIndex >= per) { dl = *dst; dl.pResource = (ID3D12Resource *)d->nv12_uv; dl.SubresourceIndex -= per; d = d->nv12_uv; }
+        }
+        if (s->nv12_uv && src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+            UINT per = (s->desc.MipLevels ? s->desc.MipLevels : 1) * (s->desc.DepthOrArraySize ? s->desc.DepthOrArraySize : 1);
+            if (src->SubresourceIndex >= per) { sl = *src; sl.pResource = (ID3D12Resource *)s->nv12_uv; sl.SubresourceIndex -= per; s = s->nv12_uv; }
+        }
+        if (dl.pResource || sl.pResource) {
+            list_CopyTextureRegion(This, dl.pResource ? &dl : dst, x, y, z, sl.pResource ? &sl : src, box);
+            return;
+        }
+    }
     if (d->texture && !s->texture) {           /* upload: buffer -> texture */
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *f = &src->PlacedFootprint;
         UINT w, h, dd;
