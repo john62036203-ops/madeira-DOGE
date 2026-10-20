@@ -162,7 +162,7 @@ srw_ax:
 srw_ax_end:
 
 ; memcpy/memmove(dst rcx, src rdx, n r8) for n <= 128: every load happens
-; before any store, so overlapping buffers copy correctly. Larger n: native.
+; before any store, so overlapping buffers copy correctly. Larger n: see .big.
 mem_copy:
         mov     rax, rcx
         cmp     r8, 16
@@ -186,7 +186,7 @@ mem_copy:
         movdqu  [rcx+r8-16], xmm3
         ret
 .gt64:  cmp     r8, 128
-        ja      mem_copy_end
+        ja      .big
         movdqu  xmm0, [rdx]
         movdqu  xmm1, [rdx+16]
         movdqu  xmm2, [rdx+32]
@@ -236,12 +236,31 @@ mem_copy:
         mov     [rcx+r8-1], r10b
         mov     [rcx+rdx], r11b
 .done:  ret
+; 128 < n <= 32 KB, no forward overlap (dst - src >= n, unsigned): rep movsb,
+; which FEX runs as its own unrolled memcpy loop -- no exit to ARM64EC.
+; Anything else (dst ahead of src inside the buffer, or larger): native.
+.big:   cmp     r8, 32768
+        ja      mem_copy_end
+        mov     rax, rcx
+        sub     rax, rdx
+        cmp     rax, r8
+        jb      mem_copy_end
+        mov     r9, rdi
+        mov     r10, rsi
+        mov     rdi, rcx
+        mov     rsi, rdx
+        mov     rax, rcx
+        mov     rcx, r8
+        rep movsb
+        mov     rdi, r9
+        mov     rsi, r10
+        ret
 mem_copy_end:
 
-; memset(dst rcx, c edx, n r8) for n <= 128. Larger n: native.
+; memset(dst rcx, c edx, n r8) for n <= 128; larger n: see .big.
 mem_set:
         cmp     r8, 128
-        ja      mem_set_end
+        ja      .big
         movzx   edx, dl
         mov     r9, 0x0101010101010101
         imul    rdx, r9
@@ -289,6 +308,18 @@ mem_set:
         mov     [rcx+r8-1], dl
         mov     [rcx+r9], dl
 .done:  ret
+; 128 < n <= 32 KB: rep stosb (FEX's unrolled memset loop). Larger: native.
+.big:   cmp     r8, 32768
+        ja      mem_set_end
+        mov     r9, rdi
+        mov     r10, rcx
+        mov     rdi, rcx
+        movzx   eax, dl
+        mov     rcx, r8
+        rep stosb
+        mov     rdi, r9
+        mov     rax, r10
+        ret
 mem_set_end:
 
 ; RtlQueryPerformanceCounter(counter rcx), Wine's iOS user-mode path (ml1117,

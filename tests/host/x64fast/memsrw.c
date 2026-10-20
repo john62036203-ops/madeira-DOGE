@@ -1,7 +1,9 @@
 /* Native x86-64 check of the memcpy/memmove/memset and SRW lock stubs in
  * tests/host/x64fast/stubs.asm (run by tests/host/check-x64fast.py).
  * mem: every size 0..200 at many offsets, overlapping both ways, against
- * libc memmove/memset; the >128 cases must reach the fallback.
+ * libc memmove/memset; the fallback is reached exactly for n > 32 KB, and for
+ * copies of more than 128 bytes whose destination lies ahead of the source
+ * within the length (dst - src < n, unsigned).
  * SRW: Wine's C code (dlls/ntdll/sync.c, waits as futexes) is the fallback;
  * threads mix stub and C paths on one lock and check mutual exclusion. */
 #define _GNU_SOURCE
@@ -35,10 +37,37 @@ __attribute__((ms_abi)) static void *fb_set(void *d, int c, size_t n) { set_fall
 typedef void *(__attribute__((ms_abi)) *copyfn)(void *, const void *, size_t);
 typedef void *(__attribute__((ms_abi)) *setfn)(void *, int, size_t);
 
+static int copy_falls(const void *d, const void *s, size_t n)
+{
+    return n > 32768 || (n > 128 && (size_t)((const char *)d - (const char *)s) < n);
+}
 static int check_mem(copyfn C, setfn S)
 {
     static unsigned char a[1024], b[1024];
-    int bad = 0; long cases = 0, big = 0;
+    int bad = 0; long cases = 0, want_copy = 0, want_set = 0;
+    static const size_t big_n[] = { 129, 255, 256, 600, 4096, 32767, 32768, 32769, 40000 };
+    static unsigned char *A, *B, *SRC;
+    if (!A) { A = malloc(100000); B = malloc(100000); SRC = malloc(100000); }
+    for (int k = 0; k < (int)(sizeof(big_n) / sizeof(big_n[0])); k++)
+        for (int off = 0; off < 3; off++)
+        {
+            size_t n = big_n[k];
+            for (int i = 0; i < 100000; i++) { A[i] = rand(); B[i] = A[i]; SRC[i] = rand(); }
+            if (C(A + 7 + off, SRC + off, n) != A + 7 + off) bad++;
+            memmove(B + 7 + off, SRC + off, n);
+            want_copy += copy_falls(A + 7 + off, SRC + off, n);
+            /* overlapping: dst behind src (forward-safe) and dst ahead (native) */
+            C(A + 1000, A + 1000 + 33 + off, n); memmove(B + 1000, B + 1000 + 33 + off, n);
+            want_copy += copy_falls(A + 1000, A + 1000 + 33 + off, n);
+            C(A + 1000 + 33 + off, A + 1000, n); memmove(B + 1000 + 33 + off, B + 1000, n);
+            want_copy += copy_falls(A + 1000 + 33 + off, A + 1000, n);
+            int c = rand() | 0x3400;
+            if (S(A + 50000 + off, c, n) != A + 50000 + off) bad++;
+            memset(B + 50000 + off, c, n);
+            want_set += n > 32768;
+            if (memcmp(A, B, 100000)) bad++;
+            cases++;
+        }
     for (size_t n = 0; n <= 200; n++)
         for (int doff = 0; doff < 40; doff += 3)
             for (int soff = 0; soff < 40; soff += 5)
@@ -53,18 +82,19 @@ static int check_mem(copyfn C, setfn S)
                 for (int i = 0; i < 1024; i++) { a[i] = rand(); b[i] = a[i]; }
                 C(a + 200 + doff, a + 200 + soff, n); memmove(b + 200 + doff, b + 200 + soff, n);
                 if (memcmp(a, b, 1024)) bad++;
+                want_copy += copy_falls(a + 100 + doff, src + soff, n) + copy_falls(a + 200 + doff, a + 200 + soff, n);
                 /* memset */
                 for (int i = 0; i < 1024; i++) { a[i] = rand(); b[i] = a[i]; }
                 int c = rand() | 0x1200;   /* only the low byte counts */
                 if (S(a + 300 + doff, c, n) != a + 300 + doff) bad++;
                 memset(b + 300 + doff, c, n);
                 if (memcmp(a, b, 1024)) bad++;
-                cases++; if (n > 128) big++;
+                cases++;
             }
     printf("mem: %ld cases, %d mismatches; fallbacks copy=%ld set=%ld (want %ld and %ld) -> %s\n",
-           cases, bad, copy_fallbacks, set_fallbacks, big * 2, big,
-           !bad && copy_fallbacks == big * 2 && set_fallbacks == big ? "PASS" : "FAIL");
-    return !bad && copy_fallbacks == big * 2 && set_fallbacks == big;
+           cases, bad, copy_fallbacks, set_fallbacks, want_copy, want_set,
+           !bad && copy_fallbacks == want_copy && set_fallbacks == want_set ? "PASS" : "FAIL");
+    return !bad && copy_fallbacks == want_copy && set_fallbacks == want_set;
 }
 
 /* ---- SRW: Wine's code, RtlWaitOnAddress/Wake as futexes ---- */
