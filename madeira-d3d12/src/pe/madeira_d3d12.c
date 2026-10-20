@@ -7380,7 +7380,18 @@ static int exec_clamp_indirect_prep(struct mad_exec *e, const struct mad_cmd *c,
     struct { UINT32 max_count, rec_words, pad0, pad1; } prm;
     UINT64 off, bytes;
     static unsigned said;
-    if (g_ind_clamp < 0) g_ind_clamp = mad_cfg_int_pe("ind-count-clamp", 1) ? 1 : 0;
+    if (g_ind_clamp < 0) { g_ind_clamp = (int)mad_cfg_int_pe("ind-count-clamp", 1);
+        d3d12_log("[madeira-d3d12] ind-count-clamp = %d (%s)\n", g_ind_clamp,
+                  g_ind_clamp >= 2 ? "every ExecuteIndirect with a count buffer" : g_ind_clamp == 1 ? "only when MaxCommandCount > 1" : "off");
+    }
+    /* madeira-doge: with MaxCommandCount 1 the clamp only decides between that one record
+     * and nothing; MHR issues tens of thousands of those a second (shadow / velocity
+     * meshes), and each clamp ends the render pass for a compute encoder: ~2600 encoders
+     * and 2.5 GB of attachment load+store per frame, 60 -> 12 fps (log 2026-10-20 20:47,
+     * build 282; MHR ran fine before 267 without it). Mode 1 (default) clamps only
+     * MaxCommandCount > 1 (RE9's 5-record decode draws, the case it was written for);
+     * 2 = every one, as builds 267-283. */
+    if (g_ind_clamp == 1 && c->u.ind.count <= 1) return 0;
     if (!g_ind_clamp || !c->u.ind.cnt || !c->u.ind.cnt->buffer || !c->u.ind.count || (c->u.ind.stride & 3) || (c->u.ind.off & 3) ||
         (c->u.ind.cnt_off & 3) || c->u.ind.stride > 32 || !mad_kernels_ready(d) || !d->k_clamp_pso || !d->k_ring_res) return 0;
     bytes = (UINT64)c->u.ind.count * c->u.ind.stride;
