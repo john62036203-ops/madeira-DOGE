@@ -143,6 +143,11 @@ enum GuestDisplay {
         setenv("MADEIRA_SCREEN_W", String(mode.w), 1)
         setenv("MADEIRA_SCREEN_H", String(mode.h), 1)
         setenv("MADEIRA_SCREEN_SRC", source, 1)
+        // madeira-doge: the panel's landscape pixel size, the ceiling for
+        // madeira-d3d12's MetalFX output (a scaled picture larger than the
+        // panel is shrunk again by Core Animation: wasted GPU time and power).
+        let px = ResolutionChoices.screen.pixels
+        setenv("MADEIRA_PANEL_PX", "\(Int(px.width))x\(Int(px.height))", 1)
         winios_display_mode_changed(Int32(mode.w), Int32(mode.h))
         return (mode.w, mode.h, source)
     }

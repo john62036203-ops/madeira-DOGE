@@ -2245,6 +2245,7 @@ done:
 static volatile LONG g_fault_diag;   /* madeira-bcd: GPU fault attribution, below */
 static volatile LONG64 g_fault_last_present;   /* madeira-doge: gpu-fault-settle -- present count at the last GPU fault */
 static void mad_fault_label_render(struct mad_exec *e);
+static void mad_cbprof_note(obj_handle_t cb, const char *name);   /* madeira-doge: gpu-cb profile */
 static void exec_end(struct mad_exec *e) {
     struct mad_resource *crt[8]; struct mad_resource *cdepth = NULL; struct mad_rtvp crtp[8], cdp; unsigned cn = 0, cseq = 0, cdraws = 0;   /* ml1098 */
     if (e->renc) exec_fence_render(e, e->renc, 1);     /* ml1091 */
@@ -2257,6 +2258,7 @@ static void exec_end(struct mad_exec *e) {
     }
     e->f7_next_rts = 0;
     if (e->renc && g_fault_diag && e->diag_npso) mad_fault_label_render(e);   /* madeira-bcd */
+    if (e->renc && e->pass_draws) mad_cbprof_note(e->cb, e->pso && e->pso->ps_name[0] ? e->pso->ps_name : (e->pso ? e->pso->vs_name : "-"));   /* madeira-doge: gpu-cb profile */
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
         MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
@@ -3307,6 +3309,81 @@ static void mad_pcc_time_done(obj_handle_t cb, int have, double start, double en
         d3d12_log("[madeira-d3d12] pcc-time tally: %ld command buffers with the culling kernel, %ld failed, %ld completed in 100 ms or more; "
                   "completed ones average %.1f ms, worst %.1f ms\n", (long)k, (long)nfail, (long)nslow,
                   k - nfail > 0 ? sum / (double)(k - nfail) : 0.0, worst);
+}
+static int g_perf_enabled = -1;   /* ml1108 perf-log; declared here for the gpu-cb profile */
+/* madeira-doge gpu-cb profile (on with perf-log, no key of its own). Which
+ * passes cost the GPU time? Per-encoder GPU timestamps are not exposed by
+ * winemetal, but every command buffer's GPU start/end is (MadeiraCtl op 3),
+ * and a frame is ~8 command buffers, each roughly one engine stage. Each
+ * buffer gets a signature: the first four distinct pass names it ran (a
+ * render pass by its last pixel shader, a compute dispatch by its kernel).
+ * On completion the GPU time is charged to that signature; every 5 s the
+ * [perf] report prints the heaviest eight as "ms per frame", so a skip-ps /
+ * settings decision can be made from numbers instead of guesses. */
+struct mad_cbprof { obj_handle_t cb; char sig[176]; unsigned n; };
+static struct mad_cbprof g_cbprof[64];
+static struct { char sig[176]; double ms; unsigned n; } g_cbprof_tab[96];
+static unsigned g_cbprof_ntab, g_cbprof_lost;
+static LONG g_cbprof_lock;
+static void mad_cbprof_note(obj_handle_t cb, const char *name) {
+    unsigned i, slot = 64;
+    if (g_perf_enabled <= 0 || !cb || !name || !name[0]) return;
+    while (InterlockedCompareExchange(&g_cbprof_lock, 1, 0)) YieldProcessor();
+    for (i = 0; i < 64; i++) {
+        if (g_cbprof[i].cb == cb) { slot = i; break; }
+        if (!g_cbprof[i].cb && slot == 64) slot = i;
+    }
+    if (slot < 64) {
+        struct mad_cbprof *p = &g_cbprof[slot];
+        if (p->cb != cb) { memset(p, 0, sizeof *p); p->cb = cb; p->sig[0] = '|'; p->sig[1] = 0; }
+        p->n++;
+        if (p->n <= 64) {   /* the signature is "|a|b|c|": the first four distinct names; later passes only count */
+            char tok[40]; size_t nl = strlen(name), l = strlen(p->sig); unsigned names = 0; const char *c;
+            if (nl > 30) nl = 30;
+            tok[0] = '|'; memcpy(tok + 1, name, nl); tok[nl + 1] = '|'; tok[nl + 2] = 0;
+            for (c = p->sig; *c; c++) names += *c == '|';
+            if (names <= 4 && !strstr(p->sig, tok) && l + nl + 2 < sizeof p->sig) { memcpy(p->sig + l, tok + 1, nl + 1); p->sig[l + nl + 1] = 0; }
+        }
+    }
+    InterlockedExchange(&g_cbprof_lock, 0);
+}
+static void mad_cbprof_done(obj_handle_t cb, double ms) {
+    unsigned i, k;
+    if (g_perf_enabled <= 0 || !cb) return;
+    while (InterlockedCompareExchange(&g_cbprof_lock, 1, 0)) YieldProcessor();
+    for (i = 0; i < 64; i++) if (g_cbprof[i].cb == cb) break;
+    if (i < 64) {
+        struct mad_cbprof *p = &g_cbprof[i];
+        if (ms >= 0) {
+            char key[176]; snprintf(key, sizeof key, "%s", p->sig[1] ? p->sig : "|(no pass)|");
+            for (k = 0; k < g_cbprof_ntab; k++) if (!strcmp(g_cbprof_tab[k].sig, key)) break;
+            if (k == g_cbprof_ntab && k < 96) { memcpy(g_cbprof_tab[k].sig, key, sizeof key); g_cbprof_tab[k].ms = 0; g_cbprof_tab[k].n = 0; g_cbprof_ntab++; }
+            if (k < 96) { g_cbprof_tab[k].ms += ms; g_cbprof_tab[k].n++; } else g_cbprof_lost++;
+        }
+        p->cb = 0;
+    }
+    InterlockedExchange(&g_cbprof_lock, 0);
+}
+static void mad_cbprof_report(long presents, double gpu_sum_ms) {
+    unsigned i, j, shown = 0; char line[1400]; int n;
+    if (g_perf_enabled <= 0) return;
+    while (InterlockedCompareExchange(&g_cbprof_lock, 1, 0)) YieldProcessor();
+    n = snprintf(line, sizeof line, "[perf] gpu-cb ms/frame (%u signatures%s):", g_cbprof_ntab, g_cbprof_lost ? ", table full" : "");
+    while (shown < 8) {
+        int best = -1;
+        for (i = 0; i < g_cbprof_ntab; i++) if (g_cbprof_tab[i].n && (best < 0 || g_cbprof_tab[i].ms > g_cbprof_tab[best].ms)) best = (int)i;
+        if (best < 0) break;
+        n += snprintf(line + n, sizeof line - n, " %.1f=%s(%ucb,%.1fms,%.0f%%)", presents > 0 ? g_cbprof_tab[best].ms / presents : 0.0,
+                      g_cbprof_tab[best].sig, g_cbprof_tab[best].n, g_cbprof_tab[best].n ? g_cbprof_tab[best].ms / g_cbprof_tab[best].n : 0.0,
+                      gpu_sum_ms > 0 ? 100.0 * g_cbprof_tab[best].ms / gpu_sum_ms : 0.0);
+        g_cbprof_tab[best].n = 0;
+        shown++;
+        if (n > (int)sizeof line - 260) break;
+    }
+    for (j = 0; j < g_cbprof_ntab; j++) { g_cbprof_tab[j].ms = 0; g_cbprof_tab[j].n = 0; }
+    g_cbprof_ntab = 0; g_cbprof_lost = 0;
+    InterlockedExchange(&g_cbprof_lock, 0);
+    if (shown) d3d12_log("%s\n", line);
 }
 static struct { obj_handle_t fn; char name[64]; } g_fault_bad[32];
 static volatile LONG g_fault_nbad;
@@ -7661,6 +7738,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         d3d12_log("[dispatch-dump] list#%u '%s' %s %ux%ux%u\n", g_list_seq, e->cpso->vs_name,
                   c->kind == MC_DISPATCH_INDIRECT ? "indirect" : "", c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z);
     }
+    mad_cbprof_note(e->cb, e->cpso->vs_name);   /* madeira-doge: gpu-cb profile */
     if (strstr(e->cpso->vs_name, "ClusterCulling")) {   /* madeira-doge: GPU time of the command buffer this lands in */
         int ind = c->kind == MC_DISPATCH_INDIRECT;
         mad_pcc_time_note(e->cb, e->cpso->vs_name, ind, ind ? 0 : c->u.dispatch.x, ind ? 0 : c->u.dispatch.y, ind ? 0 : c->u.dispatch.z);
@@ -8136,7 +8214,7 @@ static void mad_vis_retire(struct mad_device *d, obj_handle_t cb);
 /* ml1108: where does the frame go? GPU busy (union of command-buffer GPU
  * intervals), CPU time blocked in retire, presents -- logged every 5 s from
  * Present. Off with madeira.cfg perf-log = 0. */
-static LONG g_perf_lock; static int g_perf_enabled = -1;
+static LONG g_perf_lock;
 static double g_perf_gpu_sum, g_perf_gpu_union, g_perf_last_end, g_perf_first_start, g_perf_wait_s;
 static LONG g_perf_cbs, g_perf_presents; static LONGLONG g_perf_t0;
 
@@ -8150,6 +8228,7 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
     memset(&a, 0, sizeof a); a.op = 3; a.ptr = (UINT64)(ULONG_PTR)&t; a.len = sizeof t;
     MadeiraCtl(&a);
     mad_pcc_time_done(cb, a.ret != 0, t.start, t.end, MTLCommandBuffer_status(cb) == WMTCommandBufferStatusError);   /* madeira-doge */
+    mad_cbprof_done(cb, a.ret && t.end > t.start ? (t.end - t.start) * 1000.0 : -1.0);   /* madeira-doge: gpu-cb profile */
     mad_perf_lock();
     g_perf_wait_s += wait_s; g_perf_cbs++;
     if (a.ret && t.end > t.start) {
@@ -8175,6 +8254,7 @@ static void mad_perf_present(void) {
                   wall, g_perf_presents, g_perf_presents / wall, g_perf_cbs, g_perf_gpu_union * 1000, 100.0 * g_perf_gpu_union / wall,
                   g_perf_gpu_sum * 1000, g_perf_wait_s * 1000, 100.0 * g_perf_wait_s / wall,
                   g_perf_presents ? g_perf_gpu_union * 1000 / g_perf_presents : 0.0, g_perf_presents ? g_perf_wait_s * 1000 / g_perf_presents : 0.0);
+        mad_cbprof_report(g_perf_presents, g_perf_gpu_sum * 1000);   /* madeira-doge: gpu-cb profile */
         {   /* ml1116: encoder fence traffic per frame (mode 2 should cut waits well below updates) */
             static LONG lw, lu, lb; LONG cw = g_fence_waits, cu = g_fence_updates, cb = g_barrier_seen;
             d3d12_log("[perf] ml1119 caller thread per frame: ExecuteCommandLists %.2f ms, Present %.2f ms (frame %.1f ms)\n",
@@ -17674,6 +17754,29 @@ static void mad_swap_make_fx(struct mad_swapchain *s) {
     f = strtod(v, NULL);
     if (!(f >= 1.1)) return;
     if (f > 2.0) f = 2.0;   /* as DXMT's D3D11 MetalFX swapchain, which takes 1 to 2 */
+    /* madeira-doge: the panel is the ceiling. The app exports the screen's
+     * landscape pixel size (MADEIRA_PANEL_PX, GuestDisplay.configureSessionDefault);
+     * a scaled picture larger than that is shrunk again by Core Animation, so the
+     * scaler's extra pixels cost GPU time and power for nothing (RE9 demo: 1920x1080
+     * x1.5 = 2880x1620 on a 2868x1320 panel; Fit shows 2347x1320 of it). The factor
+     * is lowered so neither side exceeds the panel. env.MADEIRA_METALFX_NO_PANEL_CLAMP
+     * = 1 keeps the plain factor. */
+    {
+        /* (both names read through variables: app-to-runtime plumbing, not Settings rows, so the catalog generator leaves them out) */
+        static const char k_panel[] = "MADEIRA_PANEL_PX", k_nc[] = "MADEIRA_METALFX_NO_PANEL_CLAMP";
+        char px[32], nc[8]; unsigned pw = 0, ph = 0; double fmax;
+        if (GetEnvironmentVariableA(k_panel, px, sizeof px) && sscanf(px, "%ux%u", &pw, &ph) == 2 && pw && ph &&
+            !(GetEnvironmentVariableA(k_nc, nc, sizeof nc) && nc[0] == '1')) {
+            fmax = (double)pw / s->desc.Width;
+            if ((double)ph / s->desc.Height < fmax) fmax = (double)ph / s->desc.Height;
+            if (fmax < f) {
+                if (InterlockedIncrement(&said) <= 4)
+                    d3d12_log("[madeira-d3d12] metalfx-upscale %s: panel is %ux%u, factor clamped to %.2f (env.MADEIRA_METALFX_NO_PANEL_CLAMP = 1 keeps %s)\n", v, pw, ph, fmax, v);
+                f = fmax;
+                if (f < 1.1) return;   /* the render already fills the panel: Core Animation's copy is enough */
+            }
+        }
+    }
     ow = ((UINT)(s->desc.Width * f + 0.5)) & ~1u;
     oh = ((UINT)(s->desc.Height * f + 0.5)) & ~1u;
     if (ow > 8192 || oh > 8192 || ow <= s->desc.Width) return;
