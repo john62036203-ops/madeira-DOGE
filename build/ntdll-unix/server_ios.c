@@ -1488,6 +1488,131 @@ static int ios_xp_cmp_u64( const void *a, const void *b )
     return x < y ? -1 : x > y;
 }
 
+/* madeira-doge heap-lock watch (diagnostic, always on, ~1 line/s cost of five
+ * reads). RE9 demo build 274 (log 2026-10-20_11-21-30): the game froze 26 s in
+ * with the PROCESS HEAP's critical section held (LockCount 3, Recursion 1,
+ * OwningThread 00c8) while that thread sat in its idle wait and three others
+ * waited on the heap forever. The [hot-lock] dump only shows raw words. This
+ * decodes the cs (heap magic 'HEAP' + 0x10, i.e. heap+0xd0) once a second and,
+ * when the same owner holds it with waiters for 4 reports in a row, names the
+ * owner (mach state + guest frames from its syscall frame) and every thread of
+ * the process whose guest stack holds the cs address (the waiters), each as
+ * module+offset. At most 6 reports per episode. */
+static void ios_xp_addr_name( uint64_t a, char *out, size_t cap )
+{
+    extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+    uint64_t mod = 0, va = ios_jit_reverse_translate( a, &mod );
+    struct ios_xp_mod *m;
+    if (!va) va = a;
+    if ((m = ios_xp_mod_by_addr( va ))) snprintf( out, cap, "%s+0x%llx", m->name, (unsigned long long)(va - m->base) );
+    else snprintf( out, cap, "0x%llx", (unsigned long long)a );
+}
+static void ios_xp_heap_lock_thread( const char *tag, uintptr_t teb, thread_t port, uint64_t cs_addr )
+{
+    uint64_t frame_ptr = 0, regs[4] = { 0, 0, 0, 0 }, tid = 0;
+    arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    struct thread_basic_info bi; mach_msg_type_number_t bcnt = THREAD_BASIC_INFO_COUNT;
+    char line[1200], nm[96]; int n, k, hits = 0;
+    ios_ts_read( teb + 0x48, &tid, 8 );
+    n = snprintf( line, sizeof(line), "[heap-lock]   %s tid=%04llx teb=0x%llx", tag, (unsigned long long)tid, (unsigned long long)teb );
+    if (port && thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&bi, &bcnt ) == KERN_SUCCESS)
+        n += snprintf( line + n, sizeof(line) - n, " run=%d cpu=%d", bi.run_state, bi.cpu_usage );
+    if (port && thread_get_state( port, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS)
+        n += snprintf( line + n, sizeof(line) - n, " native pc=0x%llx lr=0x%llx sp=0x%llx x0=0x%llx x1=0x%llx",
+                       (unsigned long long)arm_thread_state64_get_pc( st ), (unsigned long long)st.__lr,
+                       (unsigned long long)st.__sp, (unsigned long long)st.__x[0], (unsigned long long)st.__x[1] );
+    ios_ts_read( teb + 0x378, &frame_ptr, 8 );
+    if (!frame_ptr || !ios_ts_read( frame_ptr + 0xe8, regs, sizeof(regs) ))
+    {
+        n += snprintf( line + n, sizeof(line) - n, " (no syscall frame: running guest code)" );
+        wine_log_write( "%s", line );
+        return;
+    }
+    ios_xp_addr_name( regs[3], nm, sizeof(nm) );
+    n += snprintf( line + n, sizeof(line) - n, " | guest pc %s", nm );
+    ios_xp_addr_name( regs[1], nm, sizeof(nm) );
+    n += snprintf( line + n, sizeof(line) - n, " lr %s sp=0x%llx", nm, (unsigned long long)regs[2] );
+    wine_log_write( "%s", line );
+    n = snprintf( line, sizeof(line), "[heap-lock]     fp-chain:" );
+    {
+        uint64_t fp = regs[0];
+        for (k = 0; k < 12 && fp > 0x10000; k++)
+        {
+            uint64_t rec[2] = { 0, 0 };
+            if (!ios_ts_read( fp, rec, sizeof(rec) )) break;
+            ios_xp_addr_name( rec[1], nm, sizeof(nm) );
+            n += snprintf( line + n, sizeof(line) - n, " %s", nm );
+            if (rec[0] <= fp) break;
+            fp = rec[0];
+        }
+    }
+    n += snprintf( line + n, sizeof(line) - n, " | stack:" );
+    for (k = 0; k < 512 && regs[2] && hits < 14; k++)
+    {
+        uint64_t slot = 0, mod = 0, va;
+        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+        if (!ios_ts_read( regs[2] + 8ull * k, &slot, 8 )) break;
+        if (slot >= cs_addr - 0x10 && slot < cs_addr + 0x40) { n += snprintf( line + n, sizeof(line) - n, " [+0x%x=cs]", k * 8 ); continue; }
+        va = ios_jit_reverse_translate( slot, &mod );
+        if (!va && !ios_xp_mod_by_addr( slot )) continue;
+        if (va && va == slot) continue;
+        ios_xp_addr_name( slot, nm, sizeof(nm) );
+        n += snprintf( line + n, sizeof(line) - n, " +0x%x=%s", k * 8, nm );
+        hits++;
+        if (n > (int)sizeof(line) - 120) break;
+    }
+    wine_log_write( "%s", line );
+}
+static void ios_xp_heap_lock_watch( const char *wall )
+{
+    extern int ios_thread_registry_count(void);
+    extern uintptr_t ios_thread_registry_teb(int i);
+    extern thread_t ios_thread_registry_mach(int i);
+    static uint64_t prev_owner, cs_addr, cs_heap;
+    static int streak, reports;
+    uint64_t cs[5] = { 0, 0, 0, 0, 0 };
+    int32_t lockcount, recursion; uint64_t owner;
+    int i, count, waiters = 0;
+    if (!ios_xp_heap || !ios_xp_peb) { streak = 0; return; }
+    if (!cs_addr || cs_heap != ios_xp_heap)
+    {
+        uint32_t w[0x60]; int k;
+        cs_addr = 0; cs_heap = ios_xp_heap; reports = 0;
+        if (!ios_ts_read( ios_xp_heap, w, sizeof(w) )) return;
+        for (k = 0; k < 0x60; k++) if (w[k] == 0x50414548) { cs_addr = ios_xp_heap + (uint64_t)k * 4 + 0x10; break; }
+        if (!cs_addr) return;
+    }
+    if (!ios_ts_read( cs_addr, cs, sizeof(cs) )) return;
+    lockcount = (int32_t)(cs[1] & 0xffffffff); recursion = (int32_t)(cs[1] >> 32); owner = cs[2];
+    if (lockcount < 1 || !owner) { streak = 0; prev_owner = 0; reports = 0; return; }   /* free, or held without waiters */
+    if (owner == prev_owner) streak++; else { streak = 1; prev_owner = owner; }
+    if (streak < 4 || reports >= 6) return;
+    reports++;
+    wine_log_write( "[heap-lock] %s process heap 0x%llx cs 0x%llx held %d s with waiters: LockCount=%d (owner + %d waiters) Recursion=%d OwningThread=%04llx LockSemaphore=0x%llx SpinCount=%llu DebugInfo=0x%llx (report %d/6)",
+                    wall, (unsigned long long)ios_xp_heap, (unsigned long long)cs_addr, streak, lockcount, lockcount,
+                    recursion, (unsigned long long)owner, (unsigned long long)cs[3], (unsigned long long)cs[4], (unsigned long long)cs[0], reports );
+    count = ios_thread_registry_count();
+    for (i = 0; i < count; i++)
+    {
+        uintptr_t teb = ios_thread_registry_teb( i ); thread_t port = ios_thread_registry_mach( i );
+        uint64_t peb = 0, tid = 0, frame_ptr = 0, sp = 0, slot;
+        int k, found = 0;
+        if (!teb || !ios_ts_read( teb + 0x60, &peb, 8 ) || peb != ios_xp_peb) continue;
+        ios_ts_read( teb + 0x48, &tid, 8 );
+        if (tid == owner) { ios_xp_heap_lock_thread( "OWNER", teb, port, cs_addr ); continue; }
+        /* a waiter is parked in a syscall from RtlpWaitForCriticalSection, whose frames keep the cs pointer */
+        if (!ios_ts_read( teb + 0x378, &frame_ptr, 8 ) || !frame_ptr || !ios_ts_read( frame_ptr + 0xf8, &sp, 8 ) || !sp) continue;
+        for (k = 0; k < 256 && !found; k++)
+        {
+            if (!ios_ts_read( sp + 8ull * k, &slot, 8 )) break;
+            if (slot >= cs_addr - 0x10 && slot < cs_addr + 0x40) found = 1;
+        }
+        if (found && waiters++ < 8) ios_xp_heap_lock_thread( "waiter", teb, port, cs_addr );
+    }
+    if (reports == 1 && !waiters)
+        wine_log_write( "[heap-lock]   no thread of this process has the cs on its guest stack top (256 slots); owner lookup only" );
+}
+
 static void ios_xp_api_report( const char *wall, double wall_s )
 {
     extern volatile long long ios_xp_set_event, ios_xp_reset_event, ios_xp_pulse_event;
@@ -1703,6 +1828,7 @@ static void ios_xp_api_report( const char *wall, double wall_s )
         if (got_nt) { memcpy( nt_prev, nt, sizeof(*nt) ); have_nt = 1; }
         memcpy( u_prev, u, sizeof(u) ); have_u = 1;
     }
+    ios_xp_heap_lock_watch( wall );
 }
 
 static void ios_xprobe_main( void )
