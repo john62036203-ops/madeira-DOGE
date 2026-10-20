@@ -18911,9 +18911,52 @@ static void mad_load_d3d12core(void) {
     d3d12_log("[madeira-d3d12] d3d12-core-dll: d3d12core.dll loaded, D3D12SDKVersion %u\n", ver ? *ver : 0);
 }
 
+/* madeira-doge: the whole text of an Unreal LowLevelFatalError. The game
+ * raises 0x4000/0x8000 with one parameter pointing at { const WCHAR *msg; ... }.
+ * ntdll's ml812 dump stops at 110 characters, and ntdll.dll is a tracked
+ * binary CI does not rebuild, so tools/patch-wine-fatal-text.py never shipped
+ * (build 299, DW3 log 2026-10-21 06:39). This DLL is built by CI, so the
+ * handler lives here. It only reads and logs; the search continues. */
+static LONG CALLBACK mad_fatal_text_veh(EXCEPTION_POINTERS *ep) {
+    static LONG said;
+    EXCEPTION_RECORD *rec = ep ? ep->ExceptionRecord : NULL;
+    ULONG_PTR msg = 0;
+    SIZE_T got = 0, n, i, o;
+    static WCHAR w[2048];
+    if (!rec || (rec->ExceptionCode != 0x4000 && rec->ExceptionCode != 0x8000) || rec->NumberParameters < 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&said) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    if (!ReadProcessMemory(GetCurrentProcess(), (void *)rec->ExceptionInformation[0], &msg, sizeof msg, &got)
+        || got != sizeof msg || !msg)
+        return EXCEPTION_CONTINUE_SEARCH;
+    got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (void *)msg, w, sizeof w - sizeof(WCHAR), &got) || !got) {
+        got = 0;   /* a page edge: read up to it */
+        ReadProcessMemory(GetCurrentProcess(), (void *)msg, w, 0x1000 - (msg & 0xfff), &got);
+    }
+    n = got / sizeof(WCHAR);
+    for (i = 0; i < n && w[i]; i++) ;
+    n = i;
+    d3d12_log("[fatal-text] code %#lx, %u chars\n", (unsigned long)rec->ExceptionCode, (unsigned)n);
+    for (o = 0; o < n; o += 200) {
+        char line[204];
+        SIZE_T k;
+        for (k = 0; k < 200 && o + k < n; k++) {
+            WCHAR c = w[o + k];
+            line[k] = (c >= 32 && c < 127) ? (char)c : '.';
+        }
+        line[k] = 0;
+        d3d12_log("[fatal-text] +%u: %s\n", (unsigned)o, line);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     (void)inst; (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) { build_vtables(); mad_swap_fill_vtbl(); mad_load_d3d12core(); }
+    if (reason == DLL_PROCESS_ATTACH) {
+        build_vtables(); mad_swap_fill_vtbl(); mad_load_d3d12core();
+        AddVectoredExceptionHandler(1, mad_fatal_text_veh);
+    }
     return TRUE;
 }
 
