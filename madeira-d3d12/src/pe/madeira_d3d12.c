@@ -479,6 +479,8 @@ static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml106
 static volatile LONG64 g_aheap_bytes, g_aheap_peak, g_aheap_freed; static volatile LONG g_aheap_n, g_aheap_made;
 static volatile LONG64 g_dheap_bytes, g_dheap_kept_bytes; static volatile LONG g_dheap_n, g_dheap_kept;
 static volatile LONG g_lheap_n; static volatile LONG64 g_lheap_bytes;   /* madeira-doge: heaps whose Metal backing is still deferred */
+static volatile LONG g_uheap_n, g_uheap_placed; static volatile LONG64 g_uheap_bytes;   /* madeira-doge upload-heap-backing */
+static int mad_upload_heap_backing_on(void);
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
 static UINT64 mad_default_swap_min(void);   /* madeira-doge: used by the census report */
@@ -834,6 +836,7 @@ struct mad_resource {
     UINT64 placed_off, placed_size;    /* madeira-bcd: where in that heap, and how much Metal took */
     unsigned serial;                   /* madeira-bcd: creation number, names a resource in capture / alias logs */
     void *own_mem;                     /* ml1154: our VirtualAlloc'd storage behind a CPU-visible buffer */
+    struct mad_memheap *cpu_heap;      /* madeira-doge upload-heap-backing: the UPLOAD/READBACK heap whose storage this buffer is */
     unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
     obj_handle_t buffer;
     void *cpu;                 /* NULL for GPU-private */
@@ -3207,6 +3210,11 @@ static UINT64 mad_default_swap_min(void) {
                    d3d12_log("[madeira-d3d12] default-swap from %lld KB (default-swap-mb = %d, default-swap-kb = %d): %s\n", (long long)(min >> 10), mb, kb,
                              min ? "GPU-only buffers from that size live on file-backed storage" : "off: GPU-only buffers are Metal-owned"); }
     return (UINT64)min;
+}
+static int mad_upload_heap_backing_on(void) {   /* madeira-doge: madeira.cfg upload-heap-backing (default 1) */
+    static int on = -1;
+    if (on < 0) on = mad_cfg_int_pe("upload-heap-backing", 1) ? 1 : 0;
+    return on;
 }
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
     static int on = -1;
@@ -10945,6 +10953,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
         if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
         if (r->placed_heap) { mad_pl_del(r->placed_heap, r); ID3D12Heap_Release((ID3D12Heap *)r->placed_heap); }   /* ml1145 */
+        if (r->cpu_heap) ID3D12Heap_Release((ID3D12Heap *)r->cpu_heap);   /* madeira-doge upload-heap-backing */
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
             InterlockedExchangeAdd64(&g_upload_swap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_upload_swap_n);
@@ -11129,6 +11138,7 @@ struct mad_memheap {
     D3D12_HEAP_DESC desc;
     obj_handle_t mtl;   /* ml1145: the Metal placement heap, or 0 */
     int lazy;           /* madeira-doge heap-lazy: backing deferred to the first placement; 0 once tried */
+    void *cpu_base; SIZE_T cpu_len;   /* madeira-doge upload-heap-backing: an UPLOAD/READBACK heap's storage */
     SRWLOCK pl_lock; struct mad_resource **pl; unsigned npl, pl_cap; unsigned serial;   /* madeira-bcd: what is placed in it */
 };
 static LONG g_res_serial, g_heap_serial;
@@ -11866,6 +11876,22 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             r->buffer = mad_sparse_new_buffer(d, r, &info);   /* madeira-doge d3d12-sparse; 0 = fully backed as before */
             if (r->buffer && r->sp_map) mad_sp_scratch_all(d, r);
         }
+        /* madeira-doge upload-heap-backing: a buffer placed in an UPLOAD/READBACK
+         * heap is a no-copy Metal buffer over the heap's own storage at the
+         * placement offset, so buffers placed at the same offset share memory as
+         * in D3D12. Each used to get fresh storage of its own: UE's Electra player
+         * places a 5.3 MB frame buffer in one 38 MB upload heap per video frame,
+         * and Dynasty Warriors 3 (build 299, log 2026-10-21 07:13) grew ~100 MB/s
+         * until jetsam. madeira.cfg upload-heap-backing = 0 turns it off. */
+        if (!r->buffer && ph && ph->cpu_base && heap_type != D3D12_HEAP_TYPE_DEFAULT && !(poff & 0x3fff)) {
+            UINT64 want = info.length, len = (info.length + 0x3fff) & ~(UINT64)0x3fff;
+            if (poff + len <= ph->cpu_len) {
+                info.length = len; info.memory.ptr = (char *)ph->cpu_base + poff;
+                r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+                if (r->buffer) { r->cpu_heap = ph; ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_uheap_placed); }
+                else { info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; }
+            }
+        }
         /* ml1154: a large CPU-visible buffer gets storage WE allocate, handed to
          * Metal as a no-copy buffer. A fresh >= 8 MB guest commit is backed by
          * the file tier (ml1077), whose dirty pages iOS writes back and never
@@ -11921,7 +11947,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if (!r->buffer) r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
         if (!r->buffer) { free(r); return mad_creation_failure(d, "newBuffer"); }
         if (!r->placed_heap) {
-            if (!r->sp_map)   /* madeira-doge: a sparse buffer owns no memory; its pool tiles are counted by d3d12-sparse */
+            if (!r->sp_map && !r->cpu_heap)   /* madeira-doge: a sparse buffer owns no memory; its pool tiles are counted by d3d12-sparse; upload-heap-backing: the heap's storage */
                 mad_acct(r, r->own_mem ? MAD_CAT_BUF_OWN : heap_type == D3D12_HEAP_TYPE_DEFAULT ? MAD_CAT_BUF_PRIVATE : MAD_CAT_BUF_SHARED,
                          info.length, +1);   /* ml1057; madeira-doge buf-own */
             mad_resident(d, r->buffer);
@@ -12005,6 +12031,18 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
             if (!queued) { mad_unresident(hd, h->mtl); NSObject_release(h->mtl); }
             mad_mheap_reclaim(hd, 0);
         }
+        if (h->cpu_base) {   /* madeira-doge upload-heap-backing: every buffer in it is gone, but the GPU may still read; free after its serial */
+            struct mad_device *hd = h->device; int queued = 0;
+            InterlockedExchangeAdd64(&g_uheap_bytes, -(LONG64)h->cpu_len); InterlockedDecrement(&g_uheap_n);
+            EnterCriticalSection(&hd->heap_lock);
+            if (mad_grow((void **)&hd->mhret, &hd->mhret_cap, hd->nmhret + 1, sizeof *hd->mhret)) {
+                hd->mhret[hd->nmhret].heap = 0; hd->mhret[hd->nmhret].mem = h->cpu_base;
+                hd->mhret[hd->nmhret].serial = (UINT64)hd->gpu_serial; hd->nmhret++; queued = 1;
+            }
+            LeaveCriticalSection(&hd->heap_lock);
+            if (!queued) { static unsigned said_q; if (said_q++ < 4) d3d12_log("[madeira-d3d12] upload-heap-backing: could not queue heap%u's storage for release; leaked %p\n", h->serial, h->cpu_base); }
+            mad_mheap_reclaim(hd, 0);
+        }
         free(h->pl);   /* madeira-bcd: placed registry (every placed resource is gone by now) */
         free(o);
     }
@@ -12067,6 +12105,18 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
                                          (unsigned)desc->Flags, h->mtl ? "backed by a Metal placement heap" : "COULD NOT be backed; its resources stand alone");
         }
     }
+    if ((desc->Properties.Type == D3D12_HEAP_TYPE_UPLOAD || desc->Properties.Type == D3D12_HEAP_TYPE_READBACK)
+        && desc->SizeInBytes && mad_upload_heap_backing_on()) {   /* madeira-doge upload-heap-backing */
+        SIZE_T len = (SIZE_T)((desc->SizeInBytes + 0xffff) & ~(UINT64)0xffff);
+        static unsigned said_u;
+        h->cpu_base = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (h->cpu_base) { h->cpu_len = len; InterlockedExchangeAdd64(&g_uheap_bytes, (LONG64)len); InterlockedIncrement(&g_uheap_n); }
+        if (said_u++ < 16)
+            d3d12_log("[madeira-d3d12] upload-heap-backing: heap%u %llu KB type %u %s (%ld live, %lld MB)\n", h->serial,
+                      (unsigned long long)(desc->SizeInBytes >> 10), (unsigned)desc->Properties.Type,
+                      h->cpu_base ? "has its own storage; placed buffers alias it" : "COULD NOT get storage; placed buffers stand alone",
+                      (long)g_uheap_n, (long long)(g_uheap_bytes >> 20));
+    }
     if (said < 4096) {   /* ml891: every heap, with its alignment -- the transient allocator lives here */
         said++;
         d3d12_log("[madeira-d3d12] heap: %llu KB, type %u, flags %#x, align %llu -> %p\n",
@@ -12093,7 +12143,7 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(ID3D12Device *This,
             mad_res_short(pr, t, sizeof t);
             d3d12_log("[placed] %s in heap%u (%llu KB, flags %#x) at +%llu, Metal size %llu%s\n", t, h->serial,
                       (unsigned long long)(h->desc.SizeInBytes >> 10), (unsigned)h->desc.Flags, (unsigned long long)offset,
-                      (unsigned long long)pr->placed_size, pr->placed_heap ? "" : " (NOT in the heap: standalone)");
+                      (unsigned long long)pr->placed_size, pr->placed_heap ? "" : pr->cpu_heap ? " (in the upload heap's storage)" : " (NOT in the heap: standalone)");
         }
     }
     /* ml895: every placement inside a TRANSIENT heap (4 MB aligned, NOT_ZEROED)
