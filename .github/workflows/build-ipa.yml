@@ -61,7 +61,7 @@ jobs:
       - name: Check generated settings catalog
         shell: bash
         run: |
-          set -o pipefail
+          set +e -o pipefail
           python3 tests/host/check-config-catalog.py 2>&1 | tee catalog-check.log
           rc=$?
           if [ $rc -ne 0 ]; then
