@@ -4527,6 +4527,14 @@ unsigned ios_fex_branch_history_offset( void )
     return __atomic_load_n( &ios_fex_branch_history_offset_unix, __ATOMIC_ACQUIRE );
 }
 
+/* madeira-doge: guest register trace v1 (tools/patch-fex-ios-reg-trace.py). */
+static unsigned ios_fex_reg_trace_offset_unix;
+
+unsigned ios_fex_reg_trace_offset( void )
+{
+    return __atomic_load_n( &ios_fex_reg_trace_offset_unix, __ATOMIC_ACQUIRE );
+}
+
 /* iOS-Madeira ml613: resolve BOTH FEX exports by walking the already-mapped
  * emulator module. Called at the END of unixcall_ios_push_jit_aliases — the
  * guaranteed initialization path — and RETRYABLE until it succeeds.
@@ -4580,6 +4588,27 @@ void ios_resolve_fex_exports( void )
                 __atomic_store_n( &ios_fex_branch_history_offset_unix, offset, __ATOMIC_RELEASE );
                 dprintf( 2, "[fex-edges] DATA layout v1 frame-offset=%u frame-size=%u history=272 capacity=8\n",
                          offset, (unsigned)(layout[1] >> 32) );
+            }
+        }
+
+        {   /* madeira-doge: guest register trace v1 layout */
+            const void *data = ios_pe_find_export( ios_jit_mappings[i].pe_base, "IosRegTraceLayout" );
+            uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base, address = (uintptr_t)data;
+            size_t image_size = ios_jit_mappings[i].size;
+            uint64_t layout[3] = {0};
+            mach_vm_size_t got = 0;
+            unsigned offset, frame_size;
+            if (data && !ios_fex_reg_trace_offset() && image_size >= sizeof(layout) && address >= base &&
+                address - base <= image_size - sizeof(layout) &&
+                mach_vm_read_overwrite( mach_task_self(), address, sizeof(layout),
+                    (mach_vm_address_t)layout, &got ) == KERN_SUCCESS && got == sizeof(layout) &&
+                layout[0] == UINT64_C(0x3156525445524744) && layout[2] == (192 | (UINT64_C(24) << 32)) &&
+                (offset = (uint32_t)layout[1]) >= 0x5c0 && !(offset & 7) &&
+                (frame_size = (unsigned)(layout[1] >> 32)) <= 32760 && offset <= frame_size - 32)
+            {
+                __atomic_store_n( &ios_fex_reg_trace_offset_unix, offset, __ATOMIC_RELEASE );
+                dprintf( 2, "[reg-trace] DATA layout v1 frame-offset=%u frame-size=%u entry=192\n",
+                         offset, frame_size );
             }
         }
 

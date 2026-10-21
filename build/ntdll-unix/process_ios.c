@@ -3049,6 +3049,177 @@ void ios_guest_branch_history_report( const void *frame, uint64_t fault_rip, voi
     ios_guest_branch_history_dump( frame, fault_rip, owner );
 }
 
+/* madeira-doge: guest register trace v1 (tools/patch-fex-ios-reg-trace.py,
+ * env.MADEIRA_FEX_REG_TRACE = <exe> or 1). FEX stores, at every block exit,
+ * the guest rip pair, rax..r15, NZCV and the block header into a per-thread
+ * ring. At an unhandled fault: print the newest exits, then for each suspect
+ * value (a 64 KB-aligned live register >= 4 GB outside the image, the fault
+ * address minus a live register when that is 64 KB-aligned, and the hex
+ * values in env.MADEIRA_FEX_REG_TRACE_FIND) find where it first appeared in
+ * any register (F = equal, L = its low 32 bits, N = minus its low 32 bits,
+ * zero-extended) and dump the exits around that origin plus the origin block's
+ * guest bytes. Reads only. */
+static const char *const ios_reg_trace_names[16] = {
+    "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi","r8","r9","r10","r11","r12","r13","r14","r15" };
+
+static char ios_reg_trace_match( uint64_t reg, uint64_t v )
+{
+    if (reg == v) return 'F';
+    if ((uint32_t)v && reg == (uint32_t)v) return 'L';
+    if ((uint32_t)v && reg == (uint32_t)(0u - (uint32_t)v)) return 'N';
+    return 0;
+}
+
+static void ios_reg_trace_line( const char *tag, const uint64_t *e, uint64_t age, uint64_t v )
+{
+    char line[900], marks[160];
+    int n = 0, m = 0;
+    unsigned k;
+
+    n += snprintf( line + n, sizeof(line) - n, "[reg-trace] %s t-%llu #%llu src=%llx dst=%llx blk=%llx nzcv=%llx",
+                   tag, (unsigned long long)age, (unsigned long long)e[19], (unsigned long long)e[0],
+                   (unsigned long long)e[1], (unsigned long long)e[20], (unsigned long long)(e[18] >> 28) );
+    marks[0] = 0;
+    for (k = 0; k < 16 && n < (int)sizeof(line) - 32; k++)
+    {
+        char c = v ? ios_reg_trace_match( e[2 + k], v ) : 0;
+        n += snprintf( line + n, sizeof(line) - n, " %s=%llx", ios_reg_trace_names[k], (unsigned long long)e[2 + k] );
+        if (c && m < (int)sizeof(marks) - 12) m += snprintf( marks + m, sizeof(marks) - m, " %s:%c", ios_reg_trace_names[k], c );
+    }
+    dprintf( 2, "%s%s%s\n", line, m ? " |" : "", marks );
+}
+
+void ios_guest_reg_trace_report( const void *frame, const uint64_t *live, uint64_t fault_rip,
+                                 uint64_t fault_addr, void *owner )
+{
+    extern unsigned ios_fex_reg_trace_offset( void );
+    struct { uint64_t magic, serial, mask, base; } hdr;
+    uint64_t address = (uint64_t)(uintptr_t)frame, entries, count, targets[12], *ring, i, t;
+    unsigned offset = ios_fex_reg_trace_offset(), ntargets = 0, k;
+    mach_vm_size_t got = 0;
+    const char *find = getenv( "MADEIRA_FEX_REG_TRACE_FIND" );
+    static int reported;
+
+    if (reported >= 2) return;
+    if (!offset || !address || address > UINT64_MAX - offset - sizeof(hdr) ||
+        mach_vm_read_overwrite( mach_task_self(), address + offset, sizeof(hdr),
+            (mach_vm_address_t)&hdr, &got ) != KERN_SUCCESS || got != sizeof(hdr) ||
+        hdr.magic != UINT64_C(0x3156525445524744))
+    {
+        dprintf( 2, "[reg-trace] unavailable (offset=%u frame=%#llx: DATA layout or frame read)\n",
+                 offset, (unsigned long long)address );
+        return;
+    }
+    entries = hdr.mask + 1;
+    if (!hdr.base || entries < 64 || entries > (UINT64_C(1) << 20) || (entries & hdr.mask))
+    {
+        dprintf( 2, "[reg-trace] bad ring base=%#llx mask=%#llx\n", (unsigned long long)hdr.base,
+                 (unsigned long long)hdr.mask );
+        return;
+    }
+    reported++;
+    count = hdr.serial < entries ? hdr.serial : entries;
+    if (!count || !(ring = malloc( entries * 192 )))
+    {
+        dprintf( 2, "[reg-trace] serial=%llu: nothing recorded or no memory\n", (unsigned long long)hdr.serial );
+        return;
+    }
+    for (i = 0; i < entries * 192; i += got)
+    {
+        mach_vm_size_t chunk = entries * 192 - i;
+        if (chunk > (1u << 20)) chunk = 1u << 20;
+        got = 0;
+        if (mach_vm_read_overwrite( mach_task_self(), hdr.base + i, chunk,
+                (mach_vm_address_t)((char *)ring + i), &got ) != KERN_SUCCESS || !got)
+        {
+            dprintf( 2, "[reg-trace] ring read failed at +%#llx\n", (unsigned long long)i );
+            free( ring );
+            return;
+        }
+    }
+#define REG_TRACE_ENTRY(age) (ring + (((hdr.serial - 1 - (age)) & hdr.mask) * 24))
+    dprintf( 2, "[reg-trace] serial=%llu entries=%llu usable=%llu fault-rip=%#llx fault-addr=%#llx ring=%#llx\n",
+             (unsigned long long)hdr.serial, (unsigned long long)entries, (unsigned long long)count,
+             (unsigned long long)fault_rip, (unsigned long long)fault_addr, (unsigned long long)hdr.base );
+    {
+        char line[400];
+        int n = snprintf( line, sizeof(line), "[reg-trace] live" );
+        for (k = 0; k < 16 && n < (int)sizeof(line) - 28; k++)
+            n += snprintf( line + n, sizeof(line) - n, " %s=%llx", ios_reg_trace_names[k], (unsigned long long)live[k] );
+        dprintf( 2, "%s\n", line );
+    }
+    /* stale entries (serial mismatch) mean the ring was shared or overwritten */
+    for (t = 0; t < count; t++)
+        if (REG_TRACE_ENTRY( t )[19] != hdr.serial - t) break;
+    if (t < count)
+    {
+        dprintf( 2, "[reg-trace] only the newest %llu entries are consistent (shared fallback ring?)\n",
+                 (unsigned long long)t );
+        count = t;
+    }
+    for (t = count < 12 ? count : 12; t-- > 0; )
+        ios_reg_trace_line( "tail", REG_TRACE_ENTRY( t ), t, 0 );
+
+#define REG_TRACE_ADD(x) do { uint64_t _v = (x); unsigned _j; for (_j = 0; _j < ntargets && targets[_j] != _v; _j++); \
+        if (_v && _j == ntargets && ntargets < 12) targets[ntargets++] = _v; } while (0)
+    while (find && *find)
+    {
+        char *end;
+        uint64_t v = strtoull( find, &end, 16 );
+        if (end == find) break;
+        REG_TRACE_ADD( v );
+        find = *end ? end + 1 : end;
+    }
+    for (k = 0; k < 16; k++)
+    {
+        uint64_t v = live[k], d = fault_addr - v;
+        if (k != 4 && v >= 0x100000000ull && !(v & 0xffff) && (v < 0x140000000ull || v >= 0x160000000ull))
+            REG_TRACE_ADD( v );
+        if (fault_addr > v && v && !(d & 0xffff) && d >= 0x100000000ull)
+            REG_TRACE_ADD( d );
+    }
+#undef REG_TRACE_ADD
+    for (k = 0; k < ntargets; k++)
+    {
+        uint64_t v = targets[k], origin = UINT64_MAX, oldest = UINT64_MAX, newest = UINT64_MAX, hits = 0, a;
+        unsigned r;
+        for (t = 0; t < count; t++)
+        {
+            const uint64_t *e = REG_TRACE_ENTRY( t );
+            int hit = 0;
+            for (r = 0; r < 16; r++) if (ios_reg_trace_match( e[2 + r], v )) hit = 1;
+            if (!hit) continue;
+            hits++;
+            if (newest == UINT64_MAX) newest = t;
+            if (origin == UINT64_MAX || t - origin <= 512) origin = t;   /* still the newest run */
+            oldest = t;
+        }
+        dprintf( 2, "[reg-trace] target %#llx (low32 %#x, -low32 %#x): %llu exits hold it; newest t-%lld, run origin t-%lld, oldest t-%lld of %llu%s\n",
+                 (unsigned long long)v, (uint32_t)v, 0u - (uint32_t)v, (unsigned long long)hits,
+                 newest == UINT64_MAX ? -1LL : (long long)newest, origin == UINT64_MAX ? -1LL : (long long)origin,
+                 oldest == UINT64_MAX ? -1LL : (long long)oldest, (unsigned long long)count,
+                 oldest != UINT64_MAX && oldest + 1 >= count ? " -- ORIGIN OLDER THAN THE RING (raise env.MADEIRA_FEX_REG_TRACE_ENTRIES)" : "" );
+        if (origin == UINT64_MAX) continue;
+        for (a = origin + 16 < count ? origin + 16 : count - 1; ; a--)
+        {
+            ios_reg_trace_line( a == origin ? "ORIGIN" : "around", REG_TRACE_ENTRY( a ), a, v );
+            if (a == 0 || a + 3 <= origin) break;
+        }
+        {
+            const uint64_t *e = REG_TRACE_ENTRY( origin );
+            const uint64_t *p = origin + 1 < count ? REG_TRACE_ENTRY( origin + 1 ) : NULL;
+            /* the block that produced it starts at the previous exit's target */
+            if (p) ios_guest_code_pair( "reg-trace-origin-entry", p[1], owner );
+            ios_guest_code_pair( "reg-trace-origin-exit", e[0], owner );
+            ios_guest_block_dump( e[20], e[0], owner, 1 );
+        }
+        if (oldest != origin && oldest != UINT64_MAX)
+            ios_reg_trace_line( "OLDEST", REG_TRACE_ENTRY( oldest ), oldest, v );
+    }
+#undef REG_TRACE_ENTRY
+    free( ring );
+}
+
 /* madeira-doge: the newest executed exit was a call through an import slot
  * (FF 15 / FF 25 disp32) that reached address 0 (MHR Sunbreak demo: a
  * D3D12CreateDevice-shaped call). Show the slot, its neighbours and the module

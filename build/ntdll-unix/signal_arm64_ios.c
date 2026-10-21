@@ -5881,6 +5881,20 @@ skip_reclaim_band: ;
                                     }
                                 }
                             }
+                            {   /* madeira-doge: guest register trace v1 (env.MADEIRA_FEX_REG_TRACE) */
+                                const char *rt = getenv( "MADEIRA_FEX_REG_TRACE" );
+                                if (rt && rt[0] && strcmp( rt, "0" ) && rsp_n <= 2)
+                                {
+                                    extern void ios_guest_reg_trace_report( const void *, const uint64_t *, uint64_t, uint64_t, void * );
+                                    static const int xr[16] = { 8, 0, 1, 27, 23, 29, 25, 26, 2, 3, 4, 5, 19, 20, 21, 22 };
+                                    uint64_t live[16];
+                                    unsigned k;
+                                    for (k = 0; k < 16; k++)
+                                        live[k] = xr[k] == 29 ? (uint64_t)state.__fp : (uint64_t)state.__x[xr[k]];
+                                    ios_guest_reg_trace_report( (const void *)st28, live, cs[0], (uint64_t)fault_addr,
+                                                                ios_jit_current_peb() );
+                                }
+                            }
                             g = 0;
                             if (cs[0] && mach_vm_read_overwrite( mach_task_self(),
                                     (mach_vm_address_t)cs[0], sizeof(code),
