@@ -1802,9 +1802,15 @@ jobs:
         run: |
           IPA="build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa"
           [ -f "$IPA" ] || { echo "::error::$IPA missing; nothing published"; exit 1; }
-          gh release create "build-${{ github.run_number }}" "$IPA" --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "Madeira 0.1.${{ github.run_number }}" \
-            --notes "${NOTES:-Build ${{ github.run_number }}}" >/dev/null
+          # errors go to annotations: this fork's Actions logs are not readable from the
+          # sessions that start these runs, the check-runs annotations are
+          if ! gh release create "build-${{ github.run_number }}" "$IPA" --repo "$GITHUB_REPOSITORY" \
+               --target "$GITHUB_SHA" --title "Madeira 0.1.${{ github.run_number }}" \
+               --notes "${NOTES:-Build ${{ github.run_number }}}" >/dev/null 2>release.err; then
+            echo "::error::release create failed :: $(head -c 1500 release.err | tr '\n' ' ')"
+            gh api "repos/$GITHUB_REPOSITORY" -q '"token check :: permissions \(.permissions // "none")"' 2>&1 | sed 's/^/::notice::/' || true
+            exit 1
+          fi
           echo "::notice::published release build-${{ github.run_number }}"
           # owner's decision (2026-10-21): keep only the newest build-N release; older
           # build-* releases and their tags go (the "packs" release is never touched).
