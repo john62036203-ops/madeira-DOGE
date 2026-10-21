@@ -2373,6 +2373,46 @@ static void redirect_ntdll_functions( HMODULE module )
 #undef REDIRECT
 }
 
+#ifdef WINE_IOS
+/* madeira-doge: ntdll-proton.dll, an opt-in ARM64EC ntdll. tools/build-wine-extra-dlls.sh
+ * builds it next to the shipped ntdll.dll from the same wine source with
+ * tools/patch-wine-ntdll-proton.py, after checking that the unpatched tree rebuilds
+ * ntdll.dll apart from its time stamps: Proton 11's TLS layout (the TLS vector and
+ * each TLS block with Windows' two hidden fields in front, the vector's slot count
+ * at ptr[-2]) and its LFH group retention (only with MADEIRA_HEAP_LFH_KEEP=1).
+ *   env.MADEIRA_NTDLL_PROTON 1           ntdll-proton.dll (when the bundle has it)
+ *                            unset or 0  ntdll.dll, the shipped binary
+ * app/Madeira/WineProcessBridge.m links system32\ntdll.dll to the same file. */
+static char *ios_ec_ntdll_name( const char *dir, const char *pe_dir )
+{
+    static int said;
+    const char *e = getenv( "MADEIRA_NTDLL_PROTON" );
+    char *name = NULL;
+
+    if (e && e[0] == '1' && !e[1] && !strcmp( pe_dir, "/arm64ec-windows" ))
+    {
+        if (asprintf( &name, "%s%s/ntdll-proton.dll", dir, pe_dir ) < 0) name = NULL;
+        if (name && !access( name, R_OK ))
+        {
+            if (!said++) dprintf( 2, "[ntdll-proton] %s (opt-in; unset or 0 maps the shipped ntdll.dll)\n", name );
+            return name;
+        }
+        if (!said++) dprintf( 2, "[ntdll-proton] MADEIRA_NTDLL_PROTON=1 but this build has no ntdll-proton.dll -- the shipped ntdll.dll is mapped\n" );
+        free( name );
+        name = NULL;
+    }
+    if (asprintf( &name, "%s%s/ntdll.dll", dir, pe_dir ) < 0) name = NULL;
+    return name;
+}
+#else
+static char *ios_ec_ntdll_name( const char *dir, const char *pe_dir )
+{
+    char *name = NULL;
+    if (asprintf( &name, "%s%s/ntdll.dll", dir, pe_dir ) < 0) name = NULL;
+    return name;
+}
+#endif
+
 
 #ifdef WINE_IOS
 /***********************************************************************
@@ -2412,7 +2452,7 @@ static int ios_load_child_ec_ntdll( PEB *child_peb )
     InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
 
     if (build_dir) asprintf( &name, "%s%s/ntdll.dll", ntdll_dir, pe_dir );
-    else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
+    else name = ios_ec_ntdll_name( dll_dir, pe_dir );   /* madeira-doge: ntdll-proton.dll */
 
     dprintf(2, "[ec-child-ntdll] loading %s for peb=%p\n", name, (void *)child_peb);
     status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0,
@@ -2606,7 +2646,7 @@ static void load_ntdll(void)
     InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
 
     if (build_dir) asprintf( &name, "%s%s/ntdll.dll", ntdll_dir, pe_dir );
-    else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
+    else name = ios_ec_ntdll_name( dll_dir, pe_dir );   /* madeira-doge: ntdll-proton.dll */
 
     if (is_arm64ec()) machine = main_image_info.Machine;
     status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0, machine, FALSE, 0 );

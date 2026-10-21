@@ -237,4 +237,53 @@ PY
 done
 echo "::notice::built $built extra Wine DLLs for arm64ec${failed:+ (failed:$failed)}"
 [ -n "$failed" ] && grep -m 10 "error" "$B.build.log"
+
+# madeira-doge: ntdll-proton.dll, a new file next to the shipped ntdll.dll (which
+# stays): this tree's ntdll with tools/patch-wine-ntdll-proton.py (Proton 11's TLS
+# vector/block layout, and its LFH group retention behind MADEIRA_HEAP_LFH_KEEP=1).
+# The unix loader maps it only with env.MADEIRA_NTDLL_PROTON = 1
+# (build/ntdll-unix/loader_ios.c). Built only when this tree, unpatched, first
+# rebuilds the shipped ntdll.dll apart from its time stamps -- otherwise a source
+# build could differ from what every game runs in more than the patch. The method
+# (flags, the byte check, strip and pad) follows BCD's ntdll-sync.dll. The tree and
+# the ntdll objects are restored afterwards. MADEIRA_NTDLL_PROTON_BUILD=0 skips it.
+if [ "${MADEIRA_NTDLL_PROTON_BUILD:-1}" != 0 ] && [ -f "$SHIP/ntdll.dll" ] && [ -f "$R/wine/dlls/ntdll/loader.c" ]; then
+    nt="$B/dlls/ntdll/arm64ec-windows/ntdll.dll"
+    ntflags="-g -O2"
+    ntsrc="$(sed -n 's/^srcdir = //p' "$B/Makefile")"
+    case "$ntsrc" in /*) ntflags="$ntflags -ffile-prefix-map=$ntsrc=.. -fno-file-reproducible" ;; esac
+    ntp_make() {
+        rm -f "$nt" "$B"/dlls/ntdll/arm64ec-windows/*.o
+        make -C "$B" -j"$JOBS" arm64ec_CFLAGS="$ntflags" x86_64_CFLAGS="$ntflags" \
+            dlls/ntdll/arm64ec-windows/ntdll.dll >> "$B.ntdll-proton.log" 2>&1 && [ -f "$nt" ]
+    }
+    # stripped and padded to SizeOfImage + 0x50000, as build/wine-pe/build-ntdll.sh does
+    ntp_ship() {
+        cp "$nt" "$1" && "$MINGW/arm64ec-w64-mingw32-strip" "$1" && python3 - "$1" <<'PY'
+import struct, sys
+p = sys.argv[1]; d = open(p, 'rb').read()
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+target = struct.unpack_from('<I', d, pe + 24 + 56)[0] + 0x50000
+if len(d) > target:
+    raise SystemExit("ntdll is larger than SizeOfImage + 0x50000")
+open(p, 'ab').write(b'\0' * (target - len(d)))
+PY
+    }
+    : > "$B.ntdll-proton.log"
+    if ntp_make && ntp_ship "$B/ntdll-stock.dll" &&
+       python3 "$R/tools/patch-wine-ntdll-proton.py" --same-as "$B/ntdll-stock.dll" "$SHIP/ntdll.dll" >> "$B.ntdll-proton.log" 2>&1; then
+        if python3 "$R/tools/patch-wine-ntdll-proton.py" "$R/wine" >> "$B.ntdll-proton.log" 2>&1 &&
+           ntp_make && ntp_ship "$SHIP/ntdll-proton.dll.tmp"; then
+            mv "$SHIP/ntdll-proton.dll.tmp" "$SHIP/ntdll-proton.dll"
+            echo "::notice::ntdll-proton.dll (Proton 11 TLS layout; LFH retention with MADEIRA_HEAP_LFH_KEEP=1): built next to the shipped ntdll.dll, mapped only with env.MADEIRA_NTDLL_PROTON = 1"
+        else
+            rm -f "$SHIP/ntdll-proton.dll.tmp"
+            echo "::warning::ntdll-proton.dll :: did not build; not shipped (games map the shipped ntdll.dll) :: $(grep -m 6 -E 'error|expected' "$B.ntdll-proton.log" | tr '\n' ' ' | cut -c1-900)"
+        fi
+    else
+        echo "::warning::ntdll-proton.dll :: this tree does not rebuild the shipped ntdll.dll apart from time stamps; not shipped :: $(grep -m 4 -E 'same-as|error' "$B.ntdll-proton.log" | tr '\n' ' ' | cut -c1-900)"
+    fi
+    git -C "$R/wine" checkout -- dlls/ntdll/loader.c dlls/ntdll/heap.c dlls/ntdll/ntdll_misc.h
+    rm -f "$nt" "$B"/dlls/ntdll/arm64ec-windows/*.o "$B/ntdll-stock.dll"
+fi
 exit 0

@@ -1721,6 +1721,36 @@ static void *wine_process_thread(void *arg) {
                 }
             }
 
+            /* madeira-doge: env.MADEIRA_NTDLL_PROTON = 1 maps ntdll-proton.dll
+             * (tools/patch-wine-ntdll-proton.py, built by tools/build-wine-extra-dlls.sh
+             * next to the shipped ntdll.dll; Proton 11's TLS layout and, with
+             * MADEIRA_HEAP_LFH_KEEP=1, its LFH group retention) as the ARM64EC ntdll
+             * (build/ntdll-unix/loader_ios.c, ios_ec_ntdll_name). Wine names it
+             * C:\windows\system32\ntdll.dll, so that link (ARM64EC sessions) and
+             * sysx64's (x64 children) name the same file: a program reading
+             * ntdll.dll from disk sees what runs. Unset or 0 keeps the shipped
+             * ntdll.dll; the farms above are relinked from the bundle every session. */
+            {
+                const char *ntProton = getenv("MADEIRA_NTDLL_PROTON");
+                BOOL ntProtonOn = ntProton && ntProton[0] == '1' && !ntProton[1];
+                NSString *protonDll = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"]
+                                       stringByAppendingPathComponent:@"ntdll-proton.dll"];
+                if (ntProtonOn && [fm fileExistsAtPath:protonDll]) {
+                    NSMutableArray *dirs = [NSMutableArray arrayWithObject:
+                        [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];
+                    if (use_arm64ec) [dirs addObject:sys32Dir];
+                    for (NSString *dir in dirs) {
+                        NSString *dst = [dir stringByAppendingPathComponent:@"ntdll.dll"];
+                        [fm removeItemAtPath:dst error:nil];
+                        [fm createSymbolicLinkAtPath:dst withDestinationPath:protonDll error:nil];
+                    }
+                    dprintf(STDERR_FILENO, "[WineProc] MADEIRA_NTDLL_PROTON=1: ntdll.dll -> ntdll-proton.dll (Proton 11 TLS layout; %s)\n",
+                            use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                } else if (ntProtonOn) {
+                    dprintf(STDERR_FILENO, "[WineProc] MADEIRA_NTDLL_PROTON=1 but this build has no ntdll-proton.dll -- the shipped ntdll.dll stays\n");
+                }
+            }
+
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
              * MACHINE's home directory.
              *
@@ -2071,6 +2101,7 @@ static void *wine_process_thread(void *arg) {
         unsetenv("MADEIRA_CPU_COUNT"); unsetenv("DXMT_D9_ANISO_LIMIT");
         unsetenv("FEX_X87REDUCEDPRECISION");   /* ml1184 */
         unsetenv("MADEIRA_DINPUT_PAD");        /* ml1240 */
+        unsetenv("MADEIRA_NTDLL_PROTON"); unsetenv("MADEIRA_HEAP_LFH_KEEP");   /* madeira-doge: a game's switch is its own */
         unsetenv("MADEIRA_FEX_AVX"); unsetenv("MADEIRA_FRAMEGEN");   /* ml1184 */
         unsetenv("DXMT_ENABLE_NVEXT"); unsetenv("DXMT_WSI_MONITOR_IDENTITY"); unsetenv("DXMT_WSI_MODE_TABLE");
         /* madeira-bcd: the server's per-launch switches end with the session */
