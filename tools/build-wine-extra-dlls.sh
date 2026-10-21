@@ -270,6 +270,16 @@ open(p, 'ab').write(b'\0' * (target - len(d)))
 PY
     }
     : > "$B.ntdll-proton.log"
+    # Earlier CI steps patch PE ntdll sources in place (tools/patch-wine-fatal-text.py:
+    # signal_arm64ec.c). Those patches never reach the app -- it ships the committed
+    # ntdll.dll -- but they would make this rebuild differ from it. Set every changed
+    # PE source aside for this build and put it back afterwards (unix/ is not PE code).
+    ntp_saved="$B/ntdll-pe-saved"; rm -rf "$ntp_saved"; mkdir -p "$ntp_saved"
+    ntp_changed="$(git -C "$R/wine" diff --name-only -- dlls/ntdll | grep -v '^dlls/ntdll/unix/' || true)"
+    for f in $ntp_changed; do
+        mkdir -p "$ntp_saved/$(dirname "$f")" && cp "$R/wine/$f" "$ntp_saved/$f" && git -C "$R/wine" checkout -- "$f"
+    done
+    [ -n "$ntp_changed" ] && echo "::notice::ntdll-proton.dll: built from the pinned PE ntdll sources; set aside for it:" $ntp_changed
     if ntp_make && ntp_ship "$B/ntdll-stock.dll" &&
        python3 "$R/tools/patch-wine-ntdll-proton.py" --same-as "$B/ntdll-stock.dll" "$SHIP/ntdll.dll" >> "$B.ntdll-proton.log" 2>&1; then
         if python3 "$R/tools/patch-wine-ntdll-proton.py" "$R/wine" >> "$B.ntdll-proton.log" 2>&1 &&
@@ -285,6 +295,8 @@ PY
         [ -f "$B/ntdll-stock.dll" ] && echo "::warning::ntdll-proton.dll :: $(python3 "$R/tools/patch-wine-ntdll-proton.py" --explain "$B/ntdll-stock.dll" "$SHIP/ntdll.dll" 2>&1 | cut -c1-1500) :: build line: $(grep -m 1 -E 'clang .*-c -o dlls/ntdll/arm64ec-windows/loader.o' "$B.ntdll-proton.log" | cut -c1-600)"
     fi
     git -C "$R/wine" checkout -- dlls/ntdll/loader.c dlls/ntdll/heap.c dlls/ntdll/ntdll_misc.h
+    for f in $ntp_changed; do cp "$ntp_saved/$f" "$R/wine/$f"; done
+    rm -rf "$ntp_saved"
     rm -f "$nt" "$B"/dlls/ntdll/arm64ec-windows/*.o "$B/ntdll-stock.dll"
 fi
 exit 0
