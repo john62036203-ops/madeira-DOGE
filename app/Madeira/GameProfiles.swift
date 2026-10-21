@@ -22,18 +22,56 @@ import SwiftUI
 struct GameProfile {
     let windowsPath: String
 
-    static var directory: URL? {
-        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return nil
+    /// madeira-doge: Documents/GameConfigs, which the Files app shows, so the
+    /// per-game files can be copied out and back into a reinstalled Madeira
+    /// (a SideStore reinstall empties the whole container). The files used to
+    /// live in Application Support/GameConfigs; they are moved over once.
+    static var directory: URL? { storeDirectory }
+
+    private static let storeDirectory: URL? = {
+        let fm = FileManager.default
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let dir = docs.appendingPathComponent("GameConfigs", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        if let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let old = support.appendingPathComponent("GameConfigs", isDirectory: true)
+            for name in (try? fm.contentsOfDirectory(atPath: old.path)) ?? [] where name.hasSuffix(".cfg") {
+                let from = old.appendingPathComponent(name)
+                let hash = name.dropLast(4).suffix(16)
+                let taken = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).contains { $0.hasSuffix("\(hash).cfg") }
+                if taken { continue }
+                // A readable name from the file's own first line ("# Madeira settings for C:\...\Game.exe").
+                var target = name
+                if let text = try? String(contentsOf: from, encoding: .utf8),
+                   let first = text.split(separator: "\n").first, first.hasPrefix("# Madeira settings for ") {
+                    target = fileName(windowsPath: String(first.dropFirst("# Madeira settings for ".count)), hash: String(hash))
+                }
+                try? fm.moveItem(at: from, to: dir.appendingPathComponent(target))
+            }
         }
-        let dir = base.appendingPathComponent("GameConfigs", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }()
+
+    /// "<program>-<hash>.cfg": the program's name so the Files app shows which game
+    /// it is; the hash of its Windows path, which is what Madeira matches on.
+    private static func fileName(windowsPath: String, hash: String) -> String {
+        let program = windowsPath.split(whereSeparator: { $0 == "\\" || $0 == "/" }).last.map(String.init) ?? ""
+        var stem = program.lowercased().hasSuffix(".exe") ? String(program.dropLast(4)) : program
+        stem = String(stem.map { "/:\\?*\"<>|".contains($0) ? "_" : $0 }).trimmingCharacters(in: .whitespaces)
+        return stem.isEmpty ? "\(hash).cfg" : "\(stem)-\(hash).cfg"
     }
 
+    /// The game's file: an existing one whose name ends in its hash (any name
+    /// before it, so a copied or renamed file still matches), else a new one
+    /// named after the program.
     var url: URL? {
-        GameProfile.directory?.appendingPathComponent(
-            String(format: "%016llx.cfg", CoverStore.stableHash(windowsPath.lowercased())))
+        guard let dir = GameProfile.directory else { return nil }
+        let hash = String(format: "%016llx", CoverStore.stableHash(windowsPath.lowercased()))
+        if let found = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .first(where: { $0 == "\(hash).cfg" || $0.hasSuffix("-\(hash).cfg") }) {
+            return dir.appendingPathComponent(found)
+        }
+        return dir.appendingPathComponent(GameProfile.fileName(windowsPath: windowsPath, hash: hash))
     }
 
     /// The whole file ("" when there is none). Setting "" deletes it.
