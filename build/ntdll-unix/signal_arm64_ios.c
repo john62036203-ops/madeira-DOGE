@@ -329,7 +329,8 @@ int madeira_sysring_enabled(void)
     static int on = -1;
     if (on < 0)
     {
-        const char *s = getenv( "MADEIRA_SYSRING" );
+        static const char name[] = "MADEIRA_SYSRING";   /* via a variable: no Settings catalog row for a diagnostic */
+        const char *s = getenv( name );
         on = (s && *s && *s != '0');
         if (on) fprintf( stderr, "[sysring] on: recording syscalls, dump on unhandled exception\n" );
     }
