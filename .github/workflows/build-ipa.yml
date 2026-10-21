@@ -1793,6 +1793,7 @@ jobs:
       # madeira-doge: the IPA as release build-N, which Settings > Updates finds and
       # hands to SideStore. Only when the run was started with publish-release (the
       # owner's decision: the release is public). The release URL is not printed.
+      # Earlier build-* releases are deleted once the new one is up.
       - name: Publish the IPA as release build-${{ github.run_number }}
         if: success() && github.repository_owner == 'john62036203-ops' && inputs.publish-release == true
         env:
@@ -1805,6 +1806,13 @@ jobs:
             --target "$GITHUB_SHA" --title "Madeira 0.1.${{ github.run_number }}" \
             --notes "${NOTES:-Build ${{ github.run_number }}}" >/dev/null
           echo "::notice::published release build-${{ github.run_number }}"
+          # owner's decision (2026-10-21): keep only the newest build-N release; older
+          # build-* releases and their tags go (the "packs" release is never touched).
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName' |
+            grep -E '^build-[0-9]+$' | grep -vx "build-${{ github.run_number }}" |
+            while read -r old; do
+              gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag && echo "removed release $old"
+            done
 
       # Full logs as an artifact -- the annotations above are truncated, and
       # digging them out of the raw job log is painful.
