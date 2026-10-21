@@ -282,6 +282,7 @@ PY
         fi
     else
         echo "::warning::ntdll-proton.dll :: this tree does not rebuild the shipped ntdll.dll apart from time stamps; not shipped :: $(grep -m 4 -E 'same-as|error' "$B.ntdll-proton.log" | tr '\n' ' ' | cut -c1-900)"
+        [ -f "$B/ntdll-stock.dll" ] && echo "::warning::ntdll-proton.dll :: $(python3 "$R/tools/patch-wine-ntdll-proton.py" --explain "$B/ntdll-stock.dll" "$SHIP/ntdll.dll" 2>&1 | cut -c1-1500) :: build line: $(grep -m 1 -E 'clang .*-c -o dlls/ntdll/arm64ec-windows/loader.o' "$B.ntdll-proton.log" | cut -c1-600)"
     fi
     git -C "$R/wine" checkout -- dlls/ntdll/loader.c dlls/ntdll/heap.c dlls/ntdll/ntdll_misc.h
     rm -f "$nt" "$B"/dlls/ntdll/arm64ec-windows/*.o "$B/ntdll-stock.dll"

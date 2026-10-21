@@ -31,6 +31,7 @@ build/ntdll-unix/loader_ios.c maps it only with env.MADEIRA_NTDLL_PROTON = 1.
 
   patch-wine-ntdll-proton.py WINE           patch the wine tree in place
   patch-wine-ntdll-proton.py --same-as A B  A and B are the same image apart from time stamps
+  patch-wine-ntdll-proton.py --explain A B  one line per section: sizes and differing bytes
 """
 import struct
 import sys
@@ -187,8 +188,47 @@ def same_as(a, b):
     print("same-as: %s and %s are identical apart from their time stamps" % (a, b))
 
 
+def sections(data):
+    pe = struct.unpack_from("<I", data, 0x3c)[0]
+    nsec = struct.unpack_from("<H", data, pe + 6)[0]
+    optsz = struct.unpack_from("<H", data, pe + 20)[0]
+    opt = pe + 24
+    out = []
+    for i in range(nsec):
+        s = opt + optsz + 40 * i
+        name = data[s:s + 8].rstrip(b"\0").decode("latin-1")
+        vsz, va, rsz, raw = struct.unpack_from("<IIII", data, s + 8)
+        out.append((name, vsz, va, rsz, raw))
+    return out
+
+
+def explain(a, b):
+    """Why --same-as failed, in one line: each section's virtual size in A/B and
+    how many bytes of its raw data differ (time stamps zeroed)."""
+    da, db = bytearray(open(a, "rb").read()), bytearray(open(b, "rb").read())
+    for path, buf in ((a, da), (b, db)):
+        for o in stamp_offsets(buf, path):
+            buf[o:o + 4] = b"\0\0\0\0"
+    sa, sb = {s[0]: s for s in sections(da)}, {s[0]: s for s in sections(db)}
+    parts = ["len %#x/%#x" % (len(da), len(db))]
+    hdr = min(sections(da)[0][4], sections(db)[0][4])
+    parts.append("headers %d" % sum(1 for x, y in zip(da[:hdr], db[:hdr]) if x != y))
+    for name in list(sa) + [n for n in sb if n not in sa]:
+        if name not in sa or name not in sb:
+            parts.append("%s only in %s" % (name, "A" if name in sa else "B"))
+            continue
+        _, va_sz, _, a_rsz, a_raw = sa[name]
+        _, vb_sz, _, b_rsz, b_raw = sb[name]
+        n = min(a_rsz, b_rsz)
+        diff = sum(1 for x, y in zip(da[a_raw:a_raw + n], db[b_raw:b_raw + n]) if x != y)
+        parts.append("%s vsz %#x/%#x diff %d" % (name, va_sz, vb_sz, diff))
+    print("explain: " + "; ".join(parts))
+
+
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--same-as":
+    if len(sys.argv) == 4 and sys.argv[1] == "--explain":
+        explain(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 4 and sys.argv[1] == "--same-as":
         same_as(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
         patch(sys.argv[1])
