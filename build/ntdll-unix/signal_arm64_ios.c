@@ -370,6 +370,7 @@ static int sysalloc_kind( UINT id )
     if (!strcmp( n, "NtAllocateVirtualMemory" )) return 1;
     if (!strcmp( n, "NtAllocateVirtualMemoryEx" )) return 2;
     if (!strcmp( n, "NtMapViewOfSection" )) return 3;
+    if (!strcmp( n, "NtQueryVirtualMemory" )) return 4;
     return 0;
 }
 
@@ -390,6 +391,13 @@ static void sysring_alloc_call( UINT id, ULONG_PTR *args, ULONG len, const struc
     {
         sysalloc_pend.zbits = 0; sysalloc_pend.size_ptr = args[2];
         sysalloc_pend.type = args[3]; sysalloc_pend.prot = args[4];
+    }
+    else if (kind == 4)  /* process, addr, class, *info, len, *retlen: MemoryBasicInformation only */
+    {
+        if (args[2] != 0 || !args[3]) return;
+        sysalloc_pend.base_ptr = args[3]; sysalloc_pend.hint = args[1];
+        sysalloc_pend.kind = kind;
+        return;
     }
     else                 /* handle, process, *addr, zero_bits, commit, *offset, *size, inherit, type, prot */
     {
@@ -415,16 +423,31 @@ static void sysring_alloc_ret( UINT id, ULONG_PTR retval )
     a->tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
     a->peb = NtCurrentTeb()->Peb;
     a->kind = kind; a->type = (ULONG)sysalloc_pend.type; a->prot = sysalloc_pend.prot;
-    a->base = sysring_peek( sysalloc_pend.base_ptr );
-    a->size = sysring_peek( sysalloc_pend.size_ptr );
-    a->hint = sysalloc_pend.hint; a->zbits = sysalloc_pend.zbits;
+    if (kind == 4)
+    {
+        /* MEMORY_BASIC_INFORMATION: BaseAddress, AllocationBase, AllocationProtect(+pad),
+         * RegionSize, State|Protect, Type; zbits holds AllocationBase, type State, prot Type<<32|Protect */
+        ULONG64 sp = sysring_peek( sysalloc_pend.base_ptr + 0x20 );
+        a->base = sysring_peek( sysalloc_pend.base_ptr );
+        a->zbits = sysring_peek( sysalloc_pend.base_ptr + 8 );
+        a->size = sysring_peek( sysalloc_pend.base_ptr + 0x18 );
+        a->type = (ULONG)sp;
+        a->prot = (sp >> 32) | (sysring_peek( sysalloc_pend.base_ptr + 0x28 ) << 32);
+        a->hint = sysalloc_pend.hint;
+    }
+    else
+    {
+        a->base = sysring_peek( sysalloc_pend.base_ptr );
+        a->size = sysring_peek( sysalloc_pend.size_ptr );
+        a->hint = sysalloc_pend.hint; a->zbits = sysalloc_pend.zbits;
+    }
     a->pc = sysalloc_pend.pc; a->lr = sysalloc_pend.lr; a->sp0 = sysalloc_pend.sp0; a->sp1 = sysalloc_pend.sp1;
     a->seq = seq;
 }
 
 static void sysring_alloc_dump( int max )
 {
-    static const char *kn[] = { "?", "alloc", "allocEx", "mapview" };
+    static const char *kn[] = { "?", "alloc", "allocEx", "mapview", "query", "?", "?", "?" };
     void *peb = NtCurrentTeb()->Peb;
     ULONG last = (ULONG)sysalloc_seq, i, shown = 0, start;
     static ULONG idx[512];
@@ -444,7 +467,7 @@ static void sysring_alloc_dump( int max )
     {
         struct sysalloc_ent *a = &sysalloc[idx[start] & (SYSALLOC_SIZE - 1)];
         fprintf( stderr, "[sysalloc] #%u tid=%04x %-7s base=%llx size=%llx hint=%llx zero_bits=%llx type=%x prot=%llx pc=%llx lr=%llx [sp]=%llx,%llx\n",
-                 a->seq, a->tid, kn[a->kind & 3], (unsigned long long)a->base, (unsigned long long)a->size,
+                 a->seq, a->tid, kn[a->kind & 7], (unsigned long long)a->base, (unsigned long long)a->size,
                  (unsigned long long)a->hint, (unsigned long long)a->zbits, a->type, (unsigned long long)a->prot,
                  (unsigned long long)a->pc, (unsigned long long)a->lr,
                  (unsigned long long)a->sp0, (unsigned long long)a->sp1 );
@@ -491,7 +514,7 @@ void madeira_sysring_ret( UINT id, ULONG_PTR retval )
 /* every allocation of this process whose range holds one of `n` register values */
 void madeira_sysring_find_regs( const ULONG64 *regs, int n )
 {
-    static const char *kn[] = { "?", "alloc", "allocEx", "mapview" };
+    static const char *kn[] = { "?", "alloc", "allocEx", "mapview", "query", "?", "?", "?" };
     void *peb;
     ULONG last, i;
     int r, hits = 0;
@@ -509,15 +532,31 @@ void madeira_sysring_find_regs( const ULONG64 *regs, int n )
             struct sysalloc_ent *a = &sysalloc[s & (SYSALLOC_SIZE - 1)];
             if (!s) break;
             if (a->seq != s || a->peb != peb) continue;
-            if (v < a->base || v >= a->base + (a->size ? a->size : 0x10000)) continue;
+            if (a->kind == 4)
+            {   /* a query result: the register equals the BaseAddress or AllocationBase it returned */
+                if (v != a->base && v != a->zbits) continue;
+            }
+            else if (v < a->base || v >= a->base + (a->size ? a->size : 0x10000)) continue;
             fprintf( stderr, "[sysalloc] reg[%d]=%llx lies in #%u tid=%04x %s base=%llx size=%llx hint=%llx zero_bits=%llx type=%x prot=%llx pc=%llx lr=%llx [sp]=%llx,%llx\n",
-                     r, (unsigned long long)v, a->seq, a->tid, kn[a->kind & 3], (unsigned long long)a->base,
+                     r, (unsigned long long)v, a->seq, a->tid, kn[a->kind & 7], (unsigned long long)a->base,
                      (unsigned long long)a->size, (unsigned long long)a->hint, (unsigned long long)a->zbits,
                      a->type, (unsigned long long)a->prot, (unsigned long long)a->pc, (unsigned long long)a->lr,
                      (unsigned long long)a->sp0, (unsigned long long)a->sp1 );
             hits++;
             break;
         }
+    }
+    {
+        /* madeira-doge: the JIT pool's write mirror exists only on iOS; a guest register
+         * holding an address in it is a Madeira leak (FFRS: Denuvo's VM offset rdx). */
+        extern void *ios_jit_rw_base_global;
+        extern size_t ios_jit_pool_size_global;
+        ULONG64 rw = (ULONG64)(ULONG_PTR)ios_jit_rw_base_global, ps = ios_jit_pool_size_global;
+        for (r = 0; r < n && rw && ps; r++)
+            if (regs[r] >= rw && regs[r] < rw + ps)
+                fprintf( stderr, "[sysalloc] reg[%d]=%llx is inside the JIT pool's WRITE MIRROR (rw %llx + %llx, pool size %llx)\n",
+                         r, (unsigned long long)regs[r], (unsigned long long)rw,
+                         (unsigned long long)(regs[r] - rw), (unsigned long long)ps );
     }
     fprintf( stderr, "[sysalloc] register scan: %d of %d registers point into an allocation this ring saw\n", hits, n );
 }
