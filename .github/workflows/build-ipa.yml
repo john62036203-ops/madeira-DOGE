@@ -1809,6 +1809,11 @@ jobs:
           [ -f "$IPA" ] || { echo "::error::$IPA missing; nothing published"; exit 1; }
           # errors go to annotations: this fork's Actions logs are not readable from the
           # sessions that start these runs, the check-runs annotations are
+          # SideStore's install?url= takes the bundle identifier the downloaded IPA must
+          # have from the URL's file name ("Madeira-0.1.331-unsigned" failed against
+          # com.willfaust.mythicemu, 2026-10-21), so the asset is named after the bundle id.
+          BID="$(unzip -p "$IPA" 'Payload/*.app/Info.plist' > info.plist && plutil -extract CFBundleIdentifier raw -o - info.plist || true)"
+          if [ -n "$BID" ]; then cp "$IPA" "$BID.ipa"; IPA="$BID.ipa"; echo "::notice::release asset named $IPA (SideStore matches the file name)"; fi
           if ! gh release create "build-${{ github.run_number }}" "$IPA" --repo "$GITHUB_REPOSITORY" \
                --target "$GITHUB_SHA" --title "Madeira 0.1.${{ github.run_number }}" \
                --notes "${NOTES:-Build ${{ github.run_number }}}" >/dev/null 2>release.err; then
