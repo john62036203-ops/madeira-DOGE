@@ -144,6 +144,8 @@ fi
 #  - patch-fex-ios-alias-retire-jit.py: a new image copy on a reused JIT range
 #    retires the dead entry that still covers it (reverse translation walks
 #    oldest-first and found the dead image).
+#  - patch-fex-ios-cpu-brand.py: MADEIRA_FEX_CPU_BRAND=1 gives the CPUID brand
+#    leaves an Intel string that matches the reported family/model.
 #  - patch-fex-ios-avx.py: AVX/AVX2 only when MADEIRA_FEX_AVX=1 at launch, so
 #    the same module serves both; xtajit64-avx.dll is kept as a copy for the
 #    bridge's existing switch.
@@ -153,6 +155,7 @@ python3 "$R/tools/patch-fex-ios-intervals-reentry.py" "$R/FEX/Source/Windows/Com
 python3 "$R/tools/patch-fex-ios-ircap-tls.py" "$R/FEX/FEXCore/Source/Interface/IR/PassManager.cpp"
 python3 "$R/tools/patch-fex-ios-teb-tsd.py" "$R/FEX/Source/Windows/Common/Priv.h"
 python3 "$R/tools/patch-fex-ios-cpuid-index.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUID.cpp"
+python3 "$R/tools/patch-fex-ios-cpu-brand.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUID.cpp"
 python3 "$R/tools/patch-fex-ios-avx.py" "$R/FEX/$CPUF"
 python3 "$R/tools/patch-fex-ios-alias-full-quiet.py" "$R/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp"
 python3 "$R/tools/patch-fex-ios-pool-null.py" "$R/FEX/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h"
