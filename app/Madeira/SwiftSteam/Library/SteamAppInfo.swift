@@ -12,6 +12,9 @@ import Foundation
 struct SteamAppInfo {
     let appID: UInt32
     var name: String = ""
+    /// madeira-doge: `common.name_localized` (Steam language name -> title), e.g.
+    /// "tchinese" -> "魔物獵人 崛起"; empty when the publisher set none.
+    var localizedNames: [String: String] = [:]
     var type: AppType = .game
     var installDir: String = ""
     var oslist: String = ""         // "macos", "windows", "macos,windows", etc.
@@ -272,6 +275,11 @@ struct SteamAppInfo {
         // Common section
         if let common = appInfo["common"] as? [String: Any] {
             info.name = common["name"] as? String ?? ""
+            if let names = common["name_localized"] as? [String: Any] {
+                for (language, value) in names {
+                    if let title = value as? String, !title.isEmpty { info.localizedNames[language.lowercased()] = title }
+                }
+            }
             info.type = AppType(pics: common["type"] as? String ?? "")
             info.oslist = common["oslist"] as? String ?? ""
             info.freeToDownload = (common["freetodownload"] as? String) == "1"

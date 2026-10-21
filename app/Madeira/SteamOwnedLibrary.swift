@@ -47,7 +47,7 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
 
     init(_ info: SteamAppInfo) {
         id = Int(info.appID)
-        name = info.name
+        name = Self.displayName(info)
         installDir = info.installDir
         buildID = Int(info.buildID)
         libraryCapsule = info.libraryCapsule; libraryHero = info.libraryHero; headerImage = info.headerImage
@@ -59,6 +59,21 @@ struct SteamOwnedGame: Codable, Identifiable, Hashable, Sendable {
     }
 
     var folderName: String { SteamInstallFiles.safeFolderName(installDir.isEmpty ? "app_\(id)" : installDir) }
+
+    /// madeira-doge: the title in the device's language when Steam has one
+    /// (common.name_localized), else Steam's default name. For Chinese, the other
+    /// Chinese script is the next choice, so the list does not mix in English titles
+    /// where only simplified (or only traditional) exists.
+    static func displayName(_ info: SteamAppInfo) -> String {
+        let language = SteamLanguage.current
+        var order = [language]
+        if language == "tchinese" { order.append("schinese") }
+        if language == "schinese" { order.append("tchinese") }
+        for key in order {
+            if let title = info.localizedNames[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty { return title }
+        }
+        return info.name
+    }
 }
 
 // MARK: - Playtime
