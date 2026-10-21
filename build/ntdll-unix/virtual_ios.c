@@ -20622,7 +20622,10 @@ static uint64_t ios_swap_cap, ios_swap_bump;
  * decommit inside it punches the file in place (ml1257). key: the size asked for
  * (reservation or commit), the churn filter's unit; born: ns when it was backed
  * (ml1258). */
-static struct { char *va; size_t len; uint64_t off; int resv; size_t key; uint64_t born; } ios_swap_ext[16384];
+/* madeira-doge: 65536 extents (was 16384). Dynasty Warriors 3 with swap-min 64 KB
+ * (build 311, log 2026-10-21 10:05) filled all 16384 in the battle, 30024 backings
+ * were refused, the rest stayed anonymous and the footprint reached the limit. */
+static struct { char *va; size_t len; uint64_t off; int resv; size_t key; uint64_t born; } ios_swap_ext[65536];
 static unsigned ios_swap_n;
 static struct { uint64_t off, len; } ios_swap_free[8192];
 static unsigned ios_swap_nfree;
@@ -21155,7 +21158,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     char *he = (char *)(((uintptr_t)base + size) & ~(uintptr_t)host_page_mask);
     size_t len; uint64_t off; void *p;
     if (he <= hs) return IOS_SW_SMALL;
-    if (ios_swap_n >= 16384) { if (ios_swap_v2) ios_swap_refused++; return IOS_SW_REFUSED; }
+    if (ios_swap_n >= sizeof ios_swap_ext / sizeof ios_swap_ext[0]) { if (ios_swap_v2) ios_swap_refused++; return IOS_SW_REFUSED; }
     /* ml1257: in broad the cap is the disk the sparse file really occupies */
     if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
     len = he - hs;
@@ -21313,7 +21316,7 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
             }
             if (oa == a) { ios_swap_ext[i].va = ob; ios_swap_ext[i].off += olen; ios_swap_ext[i].len -= olen; i++; continue; }
             if (ob == b) { ios_swap_ext[i].len = oa - a; i++; continue; }
-            if (ios_swap_n < 16384)
+            if (ios_swap_n < sizeof ios_swap_ext / sizeof ios_swap_ext[0])
             {
                 ios_swap_ext[ios_swap_n] = ios_swap_ext[i];   /* resv, key, born carry over */
                 ios_swap_ext[ios_swap_n].va = ob; ios_swap_ext[ios_swap_n].off = ios_swap_ext[i].off + (ob - a);
