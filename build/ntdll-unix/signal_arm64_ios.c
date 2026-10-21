@@ -356,7 +356,7 @@ void madeira_sysring_call( UINT id, ULONG_PTR *args, ULONG len )
         e->seq = 0;
         e->tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
         e->id = id; e->kind = 0;
-        for (i = 0; i < 4; i++) e->a[i] = i < n || i < 4 ? args[i] : 0;   /* x0-x3 always saved */
+        for (i = 0; i < 4; i++) e->a[i] = args[i];   /* x0-x3 always saved */
         e->pc = frame ? frame->pc : 0; e->lr = frame ? frame->lr : 0;
         e->sp0 = frame ? sysring_peek( frame->sp ) : 0;
         e->sp1 = frame ? sysring_peek( frame->sp + 8 ) : 0;
