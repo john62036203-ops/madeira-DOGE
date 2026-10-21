@@ -26,6 +26,7 @@
 
 import Foundation
 import SwiftUI
+import UIKit
 import Compression
 import CryptoKit
 import UniformTypeIdentifiers
@@ -488,12 +489,32 @@ struct ZipArchive {
 /// Settings > Updates.
 struct UpdatesSection: View {
     @ObservedObject private var packs = UpdatePacks.shared
+    @ObservedObject private var app = AppUpdater.shared
     @State private var importing = false
 
     var body: some View {
         Section {
             LabeledContent("App build", value: "\(AppBuild.version) · ABI \(AppBuild.nativeABI ?? "none")")
                 .font(.footnote)
+            // madeira-doge: a newer IPA of this fork, installed through SideStore
+            Button { app.refresh() } label: {
+                HStack {
+                    Label("Check for a new app build", systemImage: "arrow.down.app")
+                    if app.busy { Spacer(); ProgressView() }
+                }
+            }
+            .disabled(app.busy)
+            if let r = app.newer {
+                Button { app.install(r) } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label("Install app build 0.1.\(r.build) with SideStore", systemImage: "arrow.down.circle.fill")
+                        if let n = r.notes, !n.isEmpty { Text(n).font(.caption).foregroundStyle(.secondary).lineLimit(3) }
+                    }
+                }
+            }
+            if let m = app.message {
+                Text(m).font(.caption).foregroundStyle(.secondary)
+            }
             if let p = packs.installed {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Pack \(p.build) · \(p.shortCommit)").font(.subheadline.weight(.semibold))
@@ -559,13 +580,15 @@ struct UpdatesSection: View {
         } header: {
             Text("Updates")
         } footer: {
-            Text("Update packs replace the Windows-side DLLs (the D3D12 runtime) without reinstalling Madeira. "
+            Text("A new app build is installed through SideStore, which keeps madeira.cfg and your games. "
+                 + "Update packs replace the Windows-side DLLs (the D3D12 runtime) without reinstalling Madeira. "
                  + "A pack only installs over the app build it was made for; changes to the app itself still "
                  + "need a new IPA. The artifact zip from a pack build can be installed from Files as well.")
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.zip, .data]) { result in
             if case .success(let url) = result { packs.importFile(url) }
         }
+        .onAppear { if app.newer == nil { app.refresh(silent: true) } }
     }
 
     private static func menuLabel(_ p: PackManifest) -> String {
@@ -602,6 +625,97 @@ struct UpdateBanner: View {
             Label(m, systemImage: "checkmark.circle.fill")
                 .font(.caption)
                 .foregroundStyle(.green)
+        }
+    }
+}
+
+// MARK: - App update (madeira-doge)
+
+/// madeira-doge: newer IPAs of this fork. build-ipa.yml publishes one as a GitHub
+/// release tagged "build-N" (asset Madeira-0.1.N-unsigned.ipa) only when the run is
+/// started with publish-release. iOS lets no app replace itself, so the install is
+/// handed to SideStore (sidestore://install?url=, then AltStore's altstore://), which
+/// signs it with the user's Apple ID and installs it over this copy, keeping
+/// Documents (madeira.cfg, game cfgs, prefixes).
+struct AppRelease: Equatable {
+    let build: Int
+    let ipa: URL
+    let page: URL?
+    let notes: String?
+}
+
+final class AppUpdater: ObservableObject {
+    static let shared = AppUpdater()
+
+    @Published private(set) var newer: AppRelease?
+    @Published private(set) var busy = false
+    @Published var message: String?
+
+    private var releasesURL: URL? {
+        URL(string: "https://api.github.com/repos/\(AppBuild.repo)/releases?per_page=30")
+    }
+
+    private struct Asset: Decodable { let name: String; let browser_download_url: String }
+    private struct Release: Decodable {
+        let tag_name: String
+        let draft: Bool
+        let html_url: String?
+        let body: String?
+        let assets: [Asset]
+    }
+
+    func refresh(silent: Bool = false) {
+        guard !busy, let url = releasesURL else { return }
+        busy = true
+        if !silent { message = nil }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        req.setValue("Madeira/\(AppBuild.version)", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        let current = AppBuild.number
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            var best: AppRelease?
+            var problem: String?
+            if let error { problem = error.localizedDescription }
+            else if status != 200 { problem = "GitHub answered HTTP \(status)." }
+            else if let data, let releases = try? JSONDecoder().decode([Release].self, from: data) {
+                for r in releases where !r.draft && r.tag_name.hasPrefix("build-") {
+                    guard let n = Int(r.tag_name.dropFirst("build-".count)), n > current, n > (best?.build ?? 0),
+                          let a = r.assets.first(where: { $0.name.hasSuffix(".ipa") }),
+                          let ipa = URL(string: a.browser_download_url) else { continue }
+                    best = AppRelease(build: n, ipa: ipa, page: r.html_url.flatMap { URL(string: $0) }, notes: r.body)
+                }
+            } else { problem = "The release list could not be read." }
+            DispatchQueue.main.async {
+                self.busy = false
+                self.newer = best
+                if !silent {
+                    if let problem { self.message = "App update: \(problem)" }
+                    else if let b = best { self.message = "App build 0.1.\(b.build) is available." }
+                    else { self.message = "The app is up to date (build \(current))." }
+                }
+            }
+        }.resume()
+    }
+
+    /// Hands the IPA to SideStore (or AltStore); without either, opens the release page.
+    func install(_ r: AppRelease) {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let encoded = r.ipa.absoluteString.addingPercentEncoding(withAllowedCharacters: allowed) ?? r.ipa.absoluteString
+        let targets = ["sidestore://install?url=\(encoded)", "altstore://install?url=\(encoded)"].compactMap { URL(string: $0) }
+        message = "Opening SideStore to install build 0.1.\(r.build)…"
+        open(targets, fallback: r.page ?? r.ipa)
+    }
+
+    private func open(_ urls: [URL], fallback: URL) {
+        guard let first = urls.first else {
+            message = "SideStore did not open; the release page is opened instead (download the IPA and add it in SideStore)."
+            UIApplication.shared.open(fallback)
+            return
+        }
+        UIApplication.shared.open(first, options: [:]) { ok in
+            if !ok { DispatchQueue.main.async { self.open(Array(urls.dropFirst()), fallback: fallback) } }
         }
     }
 }

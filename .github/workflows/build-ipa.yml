@@ -7,6 +7,15 @@ on:
         description: "Runner label (macos-15 = Apple silicon; macos-15-intel when arm64 runners are not available)"
         required: false
         default: macos-15
+      publish-release:
+        description: "madeira-doge: also publish the IPA as a public release build-N (Settings > Updates installs it through SideStore)"
+        type: boolean
+        required: false
+        default: false
+      release-notes:
+        description: "Text shown with that release in Settings > Updates"
+        required: false
+        default: ""
   push:
     branches: [main]
     paths: [".github/workflows/build-ipa.yml"]
@@ -27,7 +36,8 @@ jobs:
     runs-on: ${{ inputs.runner || 'macos-15' }}
     # contents: write only so the token can see DRAFT releases, which is where
     # the Metal Shader Converter installer is kept (drafts are not public).
-    # Nothing in this job creates, edits or pushes anything.
+    # Nothing in this job creates, edits or pushes anything, except the
+    # madeira-doge release step at the end, which runs only with publish-release.
     permissions:
       contents: write
       actions: read
@@ -1779,6 +1789,22 @@ jobs:
           name: madeira-0.1.${{ github.run_number }}-unsigned-ipa
           path: build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa
           if-no-files-found: ignore
+
+      # madeira-doge: the IPA as release build-N, which Settings > Updates finds and
+      # hands to SideStore. Only when the run was started with publish-release (the
+      # owner's decision: the release is public). The release URL is not printed.
+      - name: Publish the IPA as release build-${{ github.run_number }}
+        if: success() && github.repository_owner == 'john62036203-ops' && inputs.publish-release == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES: ${{ inputs.release-notes }}
+        run: |
+          IPA="build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa"
+          [ -f "$IPA" ] || { echo "::error::$IPA missing; nothing published"; exit 1; }
+          gh release create "build-${{ github.run_number }}" "$IPA" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Madeira 0.1.${{ github.run_number }}" \
+            --notes "${NOTES:-Build ${{ github.run_number }}}" >/dev/null
+          echo "::notice::published release build-${{ github.run_number }}"
 
       # Full logs as an artifact -- the annotations above are truncated, and
       # digging them out of the raw job log is painful.
