@@ -3089,6 +3089,62 @@ static void ios_reg_trace_line( const char *tag, const uint64_t *e, uint64_t age
     dprintf( 2, "%s%s%s\n", line, m ? " |" : "", marks );
 }
 
+/* Guest bytes of the block that first produced a suspect value, read from the
+ * running process (the FFRS exe runs at its PE VA), 32 bytes per line. */
+static void ios_reg_trace_bytes( uint64_t start, uint64_t end )
+{
+    unsigned char buf[32];
+    uint64_t a;
+    if (end <= start || end - start > 4096) end = start + 1024;
+    for (a = start; a < end; a += 32)
+    {
+        mach_vm_size_t got = 0;
+        char line[32 * 3 + 1];
+        unsigned i;
+        if (mach_vm_read_overwrite( mach_task_self(), a, 32, (mach_vm_address_t)buf, &got ) != KERN_SUCCESS || got != 32)
+        {
+            dprintf( 2, "[reg-trace] bytes %llx: unreadable\n", (unsigned long long)a );
+            return;
+        }
+        for (i = 0; i < 32; i++) snprintf( line + i * 3, 4, "%02x ", buf[i] );
+        dprintf( 2, "[reg-trace] bytes %llx: %s\n", (unsigned long long)a, line );
+    }
+}
+
+/* Where in memory does the value sit now? qword == v, or an aligned dword ==
+ * low32(v) / -low32(v). Reads page by page; unreadable pages are skipped. */
+static unsigned ios_reg_trace_scan( const char *what, uint64_t start, uint64_t end, uint64_t v, unsigned budget )
+{
+    static unsigned char page[16384];
+    uint32_t lo = (uint32_t)v, nlo = 0u - (uint32_t)v;
+    uint64_t a;
+    unsigned hits = 0;
+    start &= ~UINT64_C(0x3fff);
+    for (a = start; a < end && hits < budget; a += sizeof(page))
+    {
+        mach_vm_size_t got = 0;
+        unsigned i;
+        if (mach_vm_read_overwrite( mach_task_self(), a, sizeof(page), (mach_vm_address_t)page, &got ) != KERN_SUCCESS ||
+            got != sizeof(page)) continue;
+        for (i = 0; i + 8 <= sizeof(page) && hits < budget; i += 4)
+        {
+            uint64_t q; uint32_t d;
+            memcpy( &d, page + i, 4 );
+            if (!(i & 7)) { memcpy( &q, page + i, 8 ); if (q == v) { hits++;
+                dprintf( 2, "[reg-trace] found %s qword %llx at %llx\n", what, (unsigned long long)v, (unsigned long long)(a + i) ); continue; } }
+            if (lo && (d == lo || d == nlo))
+            {
+                uint64_t around;
+                memcpy( &around, page + (i & ~7u), 8 );
+                hits++;
+                dprintf( 2, "[reg-trace] found %s dword %s%x at %llx (aligned qword there %llx)\n", what,
+                         d == lo ? "" : "-", lo, (unsigned long long)(a + i), (unsigned long long)around );
+            }
+        }
+    }
+    return hits;
+}
+
 void ios_guest_reg_trace_report( const void *frame, const uint64_t *live, uint64_t fault_rip,
                                  uint64_t fault_addr, void *owner )
 {
@@ -3100,7 +3156,7 @@ void ios_guest_reg_trace_report( const void *frame, const uint64_t *live, uint64
     const char *find = getenv( "MADEIRA_FEX_REG_TRACE_FIND" );
     static int reported;
 
-    if (reported >= 2) return;
+    if (reported >= 1) return;
     if (!offset || !address || address > UINT64_MAX - offset - sizeof(hdr) ||
         mach_vm_read_overwrite( mach_task_self(), address + offset, sizeof(hdr),
             (mach_vm_address_t)&hdr, &got ) != KERN_SUCCESS || got != sizeof(hdr) ||
@@ -3212,6 +3268,26 @@ void ios_guest_reg_trace_report( const void *frame, const uint64_t *live, uint64
             if (p) ios_guest_code_pair( "reg-trace-origin-entry", p[1], owner );
             ios_guest_code_pair( "reg-trace-origin-exit", e[0], owner );
             ios_guest_block_dump( e[20], e[0], owner, 1 );
+            /* madeira-doge v2: the producing block's guest bytes and where the value sits in memory */
+            if (p && p[1] && e[0] >= p[1])
+            {
+                unsigned budget = 48, r2;
+                dprintf( 2, "[reg-trace] origin block guest bytes %llx..%llx (entry = previous exit's target, last opcode = this exit's source)\n",
+                         (unsigned long long)p[1], (unsigned long long)e[0] + 16 );
+                ios_reg_trace_bytes( p[1], e[0] + 16 );
+                budget -= ios_reg_trace_scan( "stack", e[2 + 4] - 0x40000, e[2 + 4] + 0x10000, v, budget );
+                for (r2 = 0; r2 < 16 && budget; r2++)
+                {
+                    uint64_t q = p[2 + r2];
+                    char what[24];
+                    if (r2 == 4 || q < 0x10000000ull || q > 0x7fffffffffffull) continue;
+                    snprintf( what, sizeof(what), "near-in-%s", ios_reg_trace_names[r2] );
+                    budget -= ios_reg_trace_scan( what, q > 0x8000 ? q - 0x8000 : 0, q + 0x8000, v, budget );
+                }
+                if (budget && live[16]) budget -= ios_reg_trace_scan( "teb", live[16], live[16] + 0x4000, v, budget );
+                if (budget) budget -= ios_reg_trace_scan( "exe-image", 0x140000000ull, 0x15da1c000ull, v, budget );
+                dprintf( 2, "[reg-trace] memory scan for %llx done (%u hits shown)\n", (unsigned long long)v, 48 - budget );
+            }
         }
         if (oldest != origin && oldest != UINT64_MAX)
             ios_reg_trace_line( "OLDEST", REG_TRACE_ENTRY( oldest ), oldest, v );

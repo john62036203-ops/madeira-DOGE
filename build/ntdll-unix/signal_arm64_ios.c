@@ -5887,10 +5887,11 @@ skip_reclaim_band: ;
                                 {
                                     extern void ios_guest_reg_trace_report( const void *, const uint64_t *, uint64_t, uint64_t, void * );
                                     static const int xr[16] = { 8, 0, 1, 27, 23, 29, 25, 26, 2, 3, 4, 5, 19, 20, 21, 22 };
-                                    uint64_t live[16];
+                                    uint64_t live[17];
                                     unsigned k;
                                     for (k = 0; k < 16; k++)
                                         live[k] = xr[k] == 29 ? (uint64_t)state.__fp : (uint64_t)state.__x[xr[k]];
+                                    live[16] = (uint64_t)state.__x[18];   /* TEB */
                                     ios_guest_reg_trace_report( (const void *)st28, live, cs[0], (uint64_t)fault_addr,
                                                                 ios_jit_current_peb() );
                                 }
