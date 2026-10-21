@@ -2611,6 +2611,8 @@ struct LibraryView: View {
                 NoDesktopSettings()
             }
             if settingsShow(".NET", "Mono", "Wine Mono", "framework", "download") { WineMonoSettingsSection() }
+            // madeira-doge: app updates (a newer IPA through SideStore) and update packs
+            if settingsShow("update", "updates", "new build", "app build", "SideStore", "version", "pack") { UpdatesSection() }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
