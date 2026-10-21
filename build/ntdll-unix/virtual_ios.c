@@ -13052,6 +13052,32 @@ static int ios_skip_occupied( void *addr, size_t size, size_t align_mask,
     if (mach_vm_region( mach_task_self(), &rbase, &rsize, VM_REGION_BASIC_INFO_64,
                         (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
         return 0;
+    if (rbase > a && rsize && rbase < a + size)
+    {
+        /* madeira-doge (NutsEmu Wine 0135): addr itself is free but a region begins
+         * inside [addr, addr+size), so every start up to that region's end (bottom-up)
+         * or above its base - size (top-down) overlaps it. Jump straight there instead
+         * of one align step at a time: a large allocation otherwise pays size/64 KB
+         * failed mmaps per obstacle, all under virtual_mutex. MADEIRA_VA_SKIP_AHEAD=1. */
+        static int ahead = -1;
+        if (ahead < 0) { const char *e = getenv( "MADEIRA_VA_SKIP_AHEAD" ); ahead = e && e[0] == '1'; }
+        if (ahead)
+        {
+            static unsigned int logged;
+            if (logged++ < 4)
+                dprintf( 2, "[va-scan] skip-ahead: %s scan at %p size=%p jumps region [%p,%p)\n",
+                         top_down ? "top-down" : "bottom-up", addr, (void *)size,
+                         (void *)(uintptr_t)rbase, (void *)(uintptr_t)(rbase + rsize) );
+            if (top_down)
+            {
+                if (rbase < (mach_vm_address_t)size) return 0;
+                *out = ROUND_ADDR( (char *)(uintptr_t)rbase - size, align_mask );
+            }
+            else
+                *out = (void *)(uintptr_t)((rbase + rsize + align_mask) & ~(mach_vm_address_t)align_mask);
+            return 1;
+        }
+    }
     if (rbase > a || !rsize)
         return 0;         /* addr is in a free hole: mmap failed for some other reason
                              (iOS refuses certain addresses), so stepping is correct */
