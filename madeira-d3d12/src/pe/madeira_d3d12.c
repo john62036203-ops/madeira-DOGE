@@ -13273,7 +13273,10 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
     if (!e) return;
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateShaderResourceView");   /* madeira-bcd: desc-guard */
     if (!r) { memset(e, 0, sizeof *e); return; }                                /* a null view */
-    if (r->nv12_uv) {   /* madeira-doge nv12: PlaneSlice 1 / R8G8 -> plane 1, anything else -> plane 0 (R8) */
+    D3D12_SHADER_RESOURCE_VIEW_DESC nv12_v;
+    if (r->nv12_uv) {   /* madeira-doge nv12: PlaneSlice 1 / R8G8 -> plane 1, anything else -> plane 0 (R8).
+                         * Falls through with the plane's resource; recursing here overflowed the
+                         * stack for plane 0, which is this same resource (build 307, log 08:56). */
         D3D12_SHADER_RESOURCE_VIEW_DESC v;
         int uvp = 0;
         if (desc) {
@@ -13283,8 +13286,8 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
             if (v.Format == DXGI_FORMAT_R8G8_UNORM) uvp = 1;
             v.Format = uvp ? DXGI_FORMAT_R8G8_UNORM : DXGI_FORMAT_R8_UNORM;
         }
-        device_CreateShaderResourceView(This, (ID3D12Resource *)(uvp ? r->nv12_uv : r), desc ? &v : NULL, h);
-        return;
+        if (desc) { nv12_v = v; desc = &nv12_v; }
+        if (uvp) { r = r->nv12_uv; res = (ID3D12Resource *)r; }
     }
     if (r->buffer) {
         UINT64 stride = 4, first = 0, num = r->size / 4;
