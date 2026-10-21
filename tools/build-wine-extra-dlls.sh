@@ -107,6 +107,22 @@ if [ "${MADEIRA_MF_READER_BUILD:-1}" != 0 ] && [ -f "$R/wine/dlls/mfreadwrite/re
         echo "::warning::mfreadwrite allocator patch did not apply; shipped mfreadwrite.dll kept"
     fi
 fi
+# madeira-doge: the third exception. windows.gaming.input is rebuilt with
+# tools/patch-wine-wgi-host-pads.patch (willfaust/wine e656d1e8): with
+# MADEIRA_WGI_HOST_PADS=1 each connected XInput slot is also a
+# Windows.Gaming.Input Gamepad, for games that read pads only through WGI
+# (Horizon Zero Dawn). Off by default. A failed patch or build keeps the shipped
+# copy. MADEIRA_WGI_BUILD=0 skips it.
+WGI=0
+if [ "${MADEIRA_WGI_BUILD:-1}" != 0 ] && [ -f "$R/wine/dlls/windows.gaming.input/provider.c" ]; then
+    if git -C "$R/wine" apply "$R/tools/patch-wine-wgi-host-pads.patch"; then
+        WGI=1
+        rm -f "$B/dlls/windows.gaming.input/arm64ec-windows/windows.gaming.input.dll" "$B/dlls/windows.gaming.input"/arm64ec-windows/*.o
+        targets="$targets dlls/windows.gaming.input/arm64ec-windows/windows.gaming.input.dll"
+    else
+        echo "::warning::windows.gaming.input host-pads patch did not apply; shipped copy kept"
+    fi
+fi
 xi_patched=0
 if [ -n "$XI" ]; then
     python3 "$R/tools/patch-wine-xinput-vibration.py" "$R/wine/dlls/xinput1_3/main.c" && xi_patched=1
@@ -137,6 +153,27 @@ done
 make -C "$B" -k -j"$JOBS" $targets > "$B.build.log" 2>&1
 git -C "$R/wine" checkout -- dlls/msvcrt/main.c dlls/xinput1_3/main.c dlls/d2d1/dc_render_target.c
 git -C "$R/wine" checkout -- dlls/mfreadwrite/reader.c dlls/mfreadwrite/Makefile.in
+git -C "$R/wine" checkout -- dlls/windows.gaming.input/main.c dlls/windows.gaming.input/provider.c
+if [ "$WGI" = 1 ]; then
+    f="$B/dlls/windows.gaming.input/arm64ec-windows/windows.gaming.input.dll"
+    if [ -f "$f" ]; then
+        cp "$f" "$SHIP/windows.gaming.input.dll.tmp"
+        "$MINGW/llvm-strip" "$SHIP/windows.gaming.input.dll.tmp"
+        python3 - "$SHIP/windows.gaming.input.dll.tmp" <<'PY'
+import struct, sys
+p = sys.argv[1]; d = open(p, 'rb').read()
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+target = struct.unpack_from('<I', d, pe + 24 + 56)[0] + 0x10000
+if len(d) < target:
+    open(p, 'ab').write(b'\0' * (target - len(d)))
+PY
+        mv "$SHIP/windows.gaming.input.dll.tmp" "$SHIP/windows.gaming.input.dll"
+        echo "::notice::windows.gaming.input with host pads (MADEIRA_WGI_HOST_PADS): shipped DLL replaced"
+    else
+        echo "::warning::windows.gaming.input did not build; shipped copy kept"
+        grep -m 10 "windows.gaming.input.*error\|error.*windows.gaming.input" "$B.build.log"
+    fi
+fi
 if [ "$MFR" = 1 ]; then
     f="$B/dlls/mfreadwrite/arm64ec-windows/mfreadwrite.dll"
     if [ -f "$f" ]; then

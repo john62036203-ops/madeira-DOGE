@@ -34710,3 +34710,27 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
     /* not traced: the emulator flushes after every block it compiles (build 151: all 96 lines) */
     return ios_na_inner_NtFlushInstructionCache( handle, addr, size );
 }
+
+/* madeira-doge: avail-phys (madeira.cfg or the game's cfg, avail-phys = 1; default off).
+ * Called from get_performance_info() in wine's system.c (tools/patch-wine-avail-phys.py):
+ * GlobalMemoryStatusEx's ullAvailPhys becomes what remains before this app's own
+ * memory limit (os_proc_available_memory) when that is less than the phone's free
+ * memory, so programs that size caches or pick a memory-pressure level from it
+ * (Chromium helpers) see the limit iOS will actually enforce. */
+unsigned long long ios_avail_phys( unsigned long long host_free )
+{
+    extern size_t os_proc_available_memory( void );
+    static int on = -1;
+    static unsigned int logged;
+    unsigned long long left;
+
+    if (on < 0) on = madeira_cfg_bool( "avail-phys", 0 );
+    if (!on) return host_free;
+    left = (unsigned long long)os_proc_available_memory();
+    if (!left || left >= host_free) return host_free;
+    if (logged < 8 || (logged % 1000) == 0)
+        dprintf( 2, "[avail-phys] reporting %llu MB available (app limit) instead of %llu MB (phone free)\n",
+                 left >> 20, host_free >> 20 );
+    logged++;
+    return left;
+}

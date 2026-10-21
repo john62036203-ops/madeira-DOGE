@@ -497,6 +497,11 @@ jobs:
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 
+      # Opt-in (madeira.cfg avail-phys = 1): GlobalMemoryStatusEx reports what is
+      # left before the app's own memory limit (ios_avail_phys in virtual_ios.c).
+      - name: Patch wine with avail-phys
+        run: python3 tools/patch-wine-avail-phys.py wine/dlls/ntdll/unix/system.c
+
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and
         # LLVM). "Verify all linked archives exist" still fails the job before
