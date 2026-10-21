@@ -1814,6 +1814,26 @@ jobs:
           # com.willfaust.mythicemu, 2026-10-21), so the asset is named after the bundle id.
           BID="$(unzip -p "$IPA" 'Payload/*.app/Info.plist' > info.plist && plutil -extract CFBundleIdentifier raw -o - info.plist || true)"
           if [ -n "$BID" ]; then cp "$IPA" "$BID.ipa"; IPA="$BID.ipa"; echo "::notice::release asset named $IPA (SideStore matches the file name)"; fi
+          # madeira-doge: the release asset leaves out Payload/*.app/PlugIns (MadeiraJITHelper,
+          # MadeiraMemoryHost). A free Apple ID installs Madeira without them (SideStore's
+          # "Remove App Extensions"), so its account has no App IDs for them; install?url=
+          # does not offer that choice and failed with 0xe8008015 "A valid provisioning
+          # profile for this executable was not found" (owner, 2026-10-22). The artifact
+          # above keeps them.
+          python3 - "$IPA" <<'PY'
+          import os, sys, zipfile
+          src = sys.argv[1]; tmp = src + ".noext"
+          dropped = 0
+          with zipfile.ZipFile(src) as zin, zipfile.ZipFile(tmp, "w") as zout:
+              for item in zin.infolist():
+                  parts = item.filename.split("/")
+                  if len(parts) > 3 and parts[0] == "Payload" and parts[1].endswith(".app") and parts[2] == "PlugIns":
+                      dropped += 1
+                      continue
+                  zout.writestr(item, zin.read(item), compress_type=item.compress_type)
+          os.replace(tmp, src)
+          print("::notice::release asset without app extensions (%d PlugIns entries left out)" % dropped)
+          PY
           if ! gh release create "build-${{ github.run_number }}" "$IPA" --repo "$GITHUB_REPOSITORY" \
                --target "$GITHUB_SHA" --title "Madeira 0.1.${{ github.run_number }}" \
                --notes "${NOTES:-Build ${{ github.run_number }}}" >/dev/null 2>release.err; then
