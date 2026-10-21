@@ -938,10 +938,22 @@ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
             if ((f = fopen(path, "r"))) {
                 unsigned long mb = 0;
                 if (fscanf(f, "%lu", &mb) == 1 && mb > 128 && mb <= 1024) {
-                    a = win;
-                    if (vm_allocate(mach_task_self(), &a, mb << 20, VM_FLAGS_FIXED) == KERN_SUCCESS && a == win) {
-                        vm_deallocate(mach_task_self(), a, mb << 20);
-                        winsz = mb << 20;
+                    /* madeira-doge: when the whole run is not free (a runtime mapping
+                     * already sits inside it), keep the largest free prefix in 16MB
+                     * steps instead of dropping to 128MB, so an executable that still
+                     * fits can load (FFRS 21:23: 349MB were free below a malloc
+                     * region at 0x155d00000). */
+                    unsigned long try_mb;
+                    for (try_mb = mb; try_mb > 128; try_mb = try_mb > 144 ? try_mb - 16 : 128) {
+                        a = win;
+                        if (vm_allocate(mach_task_self(), &a, try_mb << 20, VM_FLAGS_FIXED) == KERN_SUCCESS) {
+                            if (a == win) {
+                                vm_deallocate(mach_task_self(), a, try_mb << 20);
+                                winsz = try_mb << 20;
+                                break;
+                            }
+                            vm_deallocate(mach_task_self(), a, try_mb << 20);
+                        }
                     }
                 }
                 fclose(f);

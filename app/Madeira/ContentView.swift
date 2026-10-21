@@ -2813,6 +2813,7 @@ struct ContentView: View {
             LogStore.shared.log("[session-once] launch held: \(LibraryModel.sessionsThisRun) session(s) already ran in this app run")
             library.restartNotice = LibraryModel.restartMessage; return
         }
+        if let notice = LibraryModel.exeWindowShortMessage() { library.restartNotice = notice; return }
         // The same precondition runWineFullSequence checks: the JIT pool is
         // taken at launch, through the debugger. Without it, Play enables JIT and
         // continues from here once it is on.
@@ -3659,6 +3660,7 @@ struct ContentView: View {
             library.restartNotice = LibraryModel.restartMessage
             return
         }
+        if inLibrary, let notice = LibraryModel.exeWindowShortMessage() { library.restartNotice = notice; return }
         func fail(_ error: Error) {
             MadeiraDock.cleanup()
             SteamOwnedLibrary.shared.dockEnded()

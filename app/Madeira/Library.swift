@@ -966,6 +966,22 @@ final class LibraryModel: ObservableObject {
     /// a restart instead. MADEIRA_ONE_SESSION_PER_RUN=0 lets the launch go ahead.
     static var sessionsThisRun = 0
     static let restartMessage = "Restart Madeira to start another game: swipe Madeira away in the app switcher, then open it again."
+    /// madeira-doge: "Room for a large game executable" is on, but at this app start
+    /// the 512 MB at 0x140000000 was not free (JITAllocator.c held only 128 MB), so a
+    /// large executable that cannot be relocated fails with c0000018 (FFRS demo,
+    /// 2026-10-21 21:23). Said once per app run, before the first game starts;
+    /// Play again starts anyway.
+    static var exeWindowWarned = false
+    static func exeWindowShortMessage() -> String? {
+        guard NoDesktopSettings.bigExeWindow, !exeWindowWarned else { return nil }
+        let held: UInt = madeira_early_window_base == 0x140000000 ? UInt(madeira_early_window_size) : 0
+        guard held < 512 << 20 else { return nil }
+        exeWindowWarned = true
+        LogStore.shared.log("[exe-window] madeira-doge: launch held once: only \(held >> 20)MB of the 512MB window is held in this app run", level: .error)
+        return "Madeira could not keep 512 MB for a large game executable at this start (only \(held >> 20) MB). "
+            + "A game with a large executable that cannot be moved will not start. "
+            + "Close Madeira and open it again, or tap Play again to start anyway."
+    }
     @Published var restartNotice: String?
     /// CS_DEBUGGED is set but no debugger is attached (JIT was enabled outside
     /// Madeira): the text of the alert that offers Madeira's own Enable JIT.
