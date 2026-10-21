@@ -2135,6 +2135,8 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
         ERR_(seh)("Unhandled exception code %x flags %x addr %p\n",
                   rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress );
     { extern void madeira_sysring_dump( int max ); madeira_sysring_dump( 256 ); }
+    { extern void madeira_sysring_find_regs( const ULONG64 *regs, int n );
+      madeira_sysring_find_regs( (const ULONG64 *)&context->X0, 31 ); }
 
     /* madeira-doge [delay-load]: a failed delay-load (0xc06d007e module not
      * found, 0xc06d007f procedure not found) carries a DelayLoadInfo naming
