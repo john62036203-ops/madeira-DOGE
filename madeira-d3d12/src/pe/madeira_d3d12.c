@@ -11177,7 +11177,39 @@ struct mad_memheap {
     int lazy;           /* madeira-doge heap-lazy: backing deferred to the first placement; 0 once tried */
     void *cpu_base; SIZE_T cpu_len;   /* madeira-doge upload-heap-backing: an UPLOAD/READBACK heap's storage */
     SRWLOCK pl_lock; struct mad_resource **pl; unsigned npl, pl_cap; unsigned serial;   /* madeira-bcd: what is placed in it */
+    UINT64 pad;         /* madeira-doge heap-va-align: Metal offset of the application's offset 0 */
 };
+/* madeira-doge heap-va-align: D3D12 heaps start on a 64 KB GPU address; Metal
+ * placement heaps start on a page. UE5's transient allocator aligns GPU
+ * ADDRESSES inside its heaps, so an allocation as large as the heap (Nanite's
+ * 128 MB MainAndPostCandidateClustersBuffer in a 128 MB heap) needed a pad at
+ * offset 0 and failed: "Transient allocator failed to allocate Buffer ...
+ * Size: 134217728 ... Alignment 65536" (Dynasty Warriors 3, build 307, log
+ * 2026-10-21 08:38; intermittent because the heap's base address varies).
+ * The Metal heap gets 64 KB more, and every placement is shifted by the pad
+ * that puts the application's offset 0 on a 64 KB GPU address.
+ * madeira.cfg heap-va-align = 0 turns it off. */
+static obj_handle_t mad_mheap_new(struct mad_device *hd, struct mad_memheap *h) {
+    static int on = -1; static unsigned said;
+    obj_handle_t heap;
+    if (on < 0) on = mad_cfg_int_pe("heap-va-align", 1) ? 1 : 0;
+    h->pad = 0;
+    heap = MTLDevice_newPlacementHeap(hd->mtl_device, h->desc.SizeInBytes + (on ? 65536 : 0), WMTResourceStorageModePrivate);
+    if (heap && on) {
+        struct WMTBufferInfo bi; obj_handle_t probe;
+        memset(&bi, 0, sizeof bi);
+        bi.length = 65536; bi.options = WMTResourceStorageModePrivate;
+        probe = MTLHeap_newBufferAtOffset(heap, &bi, 0);
+        if (probe) {
+            h->pad = (65536 - (bi.gpu_address & 0xffff)) & 0xffff;
+            NSObject_release(probe);
+        }
+        if (said++ < 16)
+            d3d12_log("[madeira-d3d12] heap-va-align: heap%u base %#llx -> pad %llu%s\n", h->serial,
+                      (unsigned long long)bi.gpu_address, (unsigned long long)h->pad, probe ? "" : " (probe failed)");
+    }
+    return heap;
+}
 static LONG g_res_serial, g_heap_serial;
 /* madeira-doge: madeira.cfg heap-lazy = 1 (default). A DEFAULT heap gets its
  * Metal placement heap at its FIRST placed resource, not at CreateHeap. A Metal
@@ -11193,7 +11225,7 @@ static void mad_memheap_back(struct mad_memheap *h) {
     if (!h->lazy) return;
     EnterCriticalSection(&hd->heap_lock);
     if (h->lazy) {
-        h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, h->desc.SizeInBytes, WMTResourceStorageModePrivate);
+        h->mtl = mad_mheap_new(hd, h);   /* madeira-doge heap-va-align */
         h->lazy = 0;
         InterlockedDecrement(&g_lheap_n); InterlockedExchangeAdd64(&g_lheap_bytes, -(LONG64)h->desc.SizeInBytes);
         if (h->mtl) {
@@ -11866,8 +11898,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if (ph && ph->mtl) {   /* ml1145: inside the application's heap, at its offset */
             UINT64 psz = 0, pal = 0;
             MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
-            if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes)
-                r->texture = MTLHeap_newTextureAtOffset(ph->mtl, &ti, poff);
+            if (psz && pal && !((poff + ph->pad) % pal) && poff + psz <= ph->desc.SizeInBytes)
+                r->texture = MTLHeap_newTextureAtOffset(ph->mtl, &ti, poff + ph->pad);
             if (r->texture) { r->placed_heap = ph; r->placed_off = poff; r->placed_size = psz; mad_pl_add(ph, r); ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
             else mad_placed_fallback(ph, desc, poff, psz, pal);
         }
@@ -11933,8 +11965,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if (ph && ph->mtl && heap_type == D3D12_HEAP_TYPE_DEFAULT) {   /* ml1145: inside the application's heap */
             UINT64 psz = 0, pal = 0;
             MTLDevice_heapBufferSizeAndAlign(d->mtl_device, info.length, info.options, &psz, &pal);
-            if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes)
-                r->buffer = MTLHeap_newBufferAtOffset(ph->mtl, &info, poff);
+            if (psz && pal && !((poff + ph->pad) % pal) && poff + psz <= ph->desc.SizeInBytes)
+                r->buffer = MTLHeap_newBufferAtOffset(ph->mtl, &info, poff + ph->pad);
             if (r->buffer) { r->placed_heap = ph; r->placed_off = poff; r->placed_size = psz; mad_pl_add(ph, r); ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
             else { mad_placed_fallback(ph, desc, poff, psz, pal); info.memory.ptr = NULL; info.gpu_address = 0; }
         }
@@ -12161,7 +12193,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
             if (said_l++ < 32) d3d12_log("[madeira-d3d12] heap-lazy: heap%u %llu KB flags %#x will be backed at its first placement (%ld heaps, %lld MB unbacked)\n",
                                          h->serial, (unsigned long long)(desc->SizeInBytes >> 10), (unsigned)desc->Flags, (long)g_lheap_n, (long long)(g_lheap_bytes >> 20));
         } else if (backing && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {
-            h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, desc->SizeInBytes, WMTResourceStorageModePrivate);
+            h->mtl = mad_mheap_new(hd, h);   /* madeira-doge heap-va-align */
             if (h->mtl) {
                 LONG64 now = InterlockedExchangeAdd64(&g_aheap_bytes, (LONG64)desc->SizeInBytes) + (LONG64)desc->SizeInBytes;   /* madeira-doge */
                 if (now > g_aheap_peak) g_aheap_peak = now;
