@@ -305,6 +305,116 @@ struct syscall_frame
 
 C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 
+/* madeira-doge [sysring] (env.MADEIRA_SYSRING = 1; default off): record every
+ * syscall (thread, name, first args, caller, return value) in a process-wide
+ * ring and print the faulting thread's last entries when an exception goes
+ * unhandled.  For protectors that compute pointers from syscall answers
+ * (FINAL FANTASY RESONANCE demo dies inside its .didata code).  Rides on the
+ * dispatcher's syscall_trace path, so it costs nothing when off. */
+struct sysring_ent
+{
+    ULONG   seq, tid, id, kind;      /* kind 0 = call, 1 = return */
+    ULONG64 a[4];                    /* call: args 0-3 / ret: retval in a[0] */
+    ULONG64 pc, lr, sp0, sp1;        /* call: frame pc/lr, two qwords at frame->sp */
+};
+#define SYSRING_SIZE 8192
+static struct sysring_ent sysring[SYSRING_SIZE];
+static volatile LONG sysring_seq;
+extern void trace_syscall( UINT id, ULONG_PTR *args, ULONG len );
+extern void trace_sysret( UINT id, ULONG_PTR retval );
+extern const char *ntdll_syscall_name( UINT id );
+
+int madeira_sysring_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *s = getenv( "MADEIRA_SYSRING" );
+        on = (s && *s && *s != '0');
+        if (on) fprintf( stderr, "[sysring] on: recording syscalls, dump on unhandled exception\n" );
+    }
+    return on;
+}
+
+static ULONG64 sysring_peek( ULONG64 addr )
+{
+    vm_size_t got = 0; ULONG64 v = 0;
+    if (!addr || (addr & 7)) return 0;
+    if (vm_read_overwrite( mach_task_self(), addr, 8, (vm_address_t)&v, &got ) != KERN_SUCCESS) return 0;
+    return v;
+}
+
+void madeira_sysring_call( UINT id, ULONG_PTR *args, ULONG len )
+{
+    if (madeira_sysring_enabled())
+    {
+        struct syscall_frame *frame = ntdll_get_thread_data()->syscall_frame;
+        LONG seq = InterlockedIncrement( &sysring_seq );
+        struct sysring_ent *e = &sysring[seq & (SYSRING_SIZE - 1)];
+        ULONG i;
+        e->seq = 0;
+        e->tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+        e->id = id; e->kind = 0;
+        for (i = 0; i < 4; i++) e->a[i] = i < n || i < 4 ? args[i] : 0;   /* x0-x3 always saved */
+        e->pc = frame ? frame->pc : 0; e->lr = frame ? frame->lr : 0;
+        e->sp0 = frame ? sysring_peek( frame->sp ) : 0;
+        e->sp1 = frame ? sysring_peek( frame->sp + 8 ) : 0;
+        e->seq = seq;
+    }
+    trace_syscall( id, args, len );
+}
+
+void madeira_sysring_ret( UINT id, ULONG_PTR retval )
+{
+    if (madeira_sysring_enabled())
+    {
+        LONG seq = InterlockedIncrement( &sysring_seq );
+        struct sysring_ent *e = &sysring[seq & (SYSRING_SIZE - 1)];
+        e->seq = 0;
+        e->tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+        e->id = id; e->kind = 1; e->a[0] = retval;
+        e->a[1] = e->a[2] = e->a[3] = e->pc = e->lr = e->sp0 = e->sp1 = 0;
+        e->seq = seq;
+    }
+    trace_sysret( id, retval );
+}
+
+/* print the last `max` entries of the current thread, oldest first */
+void madeira_sysring_dump( int max )
+{
+    ULONG tid, last, i, found = 0, start;
+    static ULONG idx[256];
+
+    if (!madeira_sysring_enabled()) return;
+    tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+    last = (ULONG)sysring_seq;
+    if (max > 256) max = 256;
+    for (i = 0; i < SYSRING_SIZE && found < (ULONG)max; i++)
+    {
+        ULONG s = last - i;
+        struct sysring_ent *e = &sysring[s & (SYSRING_SIZE - 1)];
+        if (!s) break;
+        if (e->seq != s || e->tid != tid) continue;
+        idx[found++] = s;
+    }
+    fprintf( stderr, "[sysring] thread %04x: last %u syscalls (oldest first, total %u in process)\n", tid, found, last );
+    for (start = found; start-- > 0;)
+    {
+        struct sysring_ent *e = &sysring[idx[start] & (SYSRING_SIZE - 1)];
+        const char *name = ntdll_syscall_name( e->id );
+        char num[16];
+        if (!name) { snprintf( num, sizeof(num), "%04x", e->id ); name = num; }
+        if (e->kind)
+            fprintf( stderr, "[sysring] #%u   ret %s = %08llx\n", e->seq, name, (unsigned long long)e->a[0] );
+        else
+            fprintf( stderr, "[sysring] #%u call %s(%llx,%llx,%llx,%llx) pc=%llx lr=%llx [sp]=%llx,%llx\n",
+                     e->seq, name, (unsigned long long)e->a[0], (unsigned long long)e->a[1],
+                     (unsigned long long)e->a[2], (unsigned long long)e->a[3],
+                     (unsigned long long)e->pc, (unsigned long long)e->lr,
+                     (unsigned long long)e->sp0, (unsigned long long)e->sp1 );
+    }
+}
+
 #ifdef WINE_IOS
 /* Written by __wine_syscall_dispatcher at entry to capture the actual x18 value.
  * Read by the watchdog to verify whether x18 is TEB or 0. */
@@ -15415,7 +15525,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "mov x1, sp\n\t"             /* args */
                    "ldr x16, [x21, #24]\n\t"    /* table->ArgumentTable */
                    "ldrb w2, [x16, x20]\n\t"    /* len */
-                   "bl " __ASM_NAME("trace_syscall") "\n\t"
+                   "bl " __ASM_NAME("madeira_sysring_call") "\n\t"
                    "ldp x2, x3, [sp, #0x10]\n\t"
                    "ldp x4, x5, [sp, #0x20]\n\t"
                    "ldp x6, x7, [sp, #0x30]\n\t"
@@ -15427,7 +15537,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "mov x21, x0\n\t"            /* retval */
                    "ldr w0, [sp, #0x120]\n\t"   /* frame->syscall_id */
                    "mov x1, x21\n\t"            /* retval */
-                   "bl " __ASM_NAME("trace_sysret") "\n\t"
+                   "bl " __ASM_NAME("madeira_sysring_ret") "\n\t"
                    "mov x0, x21\n\t"            /* retval */
                    "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n"
 

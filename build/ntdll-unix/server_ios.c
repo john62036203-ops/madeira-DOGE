@@ -5155,7 +5155,8 @@ void server_init_process_done(void)
      * is sent by init_process_done */
     signal_init_process();
     thread_data->syscall_table = KeServiceDescriptorTable;
-    thread_data->syscall_trace = TRACE_ON(syscall);
+    { extern int madeira_sysring_enabled(void);
+      thread_data->syscall_trace = TRACE_ON(syscall) || madeira_sysring_enabled(); }
 
     /* always send the native TEB */
     if (!(teb = NtCurrentTeb64())) teb = NtCurrentTeb();

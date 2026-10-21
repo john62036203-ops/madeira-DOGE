@@ -1336,7 +1336,8 @@ static void start_thread( TEB *teb )
     }
 
     thread_data->syscall_table = KeServiceDescriptorTable;
-    thread_data->syscall_trace = TRACE_ON(syscall);
+    { extern int madeira_sysring_enabled(void);
+      thread_data->syscall_trace = TRACE_ON(syscall) || madeira_sysring_enabled(); }
     thread_data->pthread_id = pthread_self();
     pthread_setspecific( teb_key, teb );
     /* iOS: publish the TEB through our own pthread key so the x18
@@ -2133,6 +2134,7 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
     else
         ERR_(seh)("Unhandled exception code %x flags %x addr %p\n",
                   rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress );
+    { extern void madeira_sysring_dump( int max ); madeira_sysring_dump( 256 ); }
 
     /* madeira-doge [delay-load]: a failed delay-load (0xc06d007e module not
      * found, 0xc06d007f procedure not found) carries a DelayLoadInfo naming
