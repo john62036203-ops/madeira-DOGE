@@ -74,6 +74,14 @@ enum BCDLaunch {
     /// native side names that log after the program Valve's client starts
     /// (process_ios.c, madeira_steam_session_log).
     static func applyLibrary(_ entry: LibraryEntry, sessionLog: Bool = true) {
+        // madeira-doge: a session that starts in the Wine desktop runs explorer (64-bit)
+        // first, so win32u initialises before any 32-bit program arms the session and keeps
+        // the GDI handle table in private host memory; a 32-bit program started on that
+        // desktop then truncates the table's address and faults in gdi32's
+        // get_gdi_client_ptr (Flash Player 30 projector, 2026-10-21 23:14). Same remedy as
+        // the Dock path (ContentView.startDock). Set before the madeira.cfg export, so
+        // env.MADEIRA_GDI_SHARED_SECTION = 0 there still wins.
+        if entry.desktop == true || entry.runsInDesktop { setenv("MADEIRA_GDI_SHARED_SECTION", "1", 1) }
         ExperimentalSettings.exportToEnvironment()
         if entry.desktop == true {
             applyExtras(avx: false, wineVCRT: false, nvidia: false, profile: nil)
