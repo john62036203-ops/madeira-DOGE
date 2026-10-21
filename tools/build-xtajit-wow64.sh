@@ -22,8 +22,9 @@ JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 
 git -C FEX diff --name-only | while read -r f; do git -C FEX checkout -- "$f"; done
 python3 "$R/tools/patch-fex-ios-cpuid-index.py" "$R/FEX/$CPUIDF"
+python3 "$R/tools/patch-fex-ios-cpuid-mask.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUID.h"
 python3 "$R/tools/patch-fex-ios-teb-tsd.py" "$R/FEX/Source/Windows/Common/Priv.h"
-restore() { git -C "$R/FEX" checkout -- "$CPUIDF" Source/Windows/Common/Priv.h; }
+restore() { git -C "$R/FEX" checkout -- "$CPUIDF" FEXCore/Source/Interface/Core/CPUID.h Source/Windows/Common/Priv.h; }
 trap restore EXIT
 
 # A cached tree configured on another runner (Apple silicon vs Intel: ninja in

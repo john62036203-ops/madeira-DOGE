@@ -156,6 +156,7 @@ python3 "$R/tools/patch-fex-ios-ircap-tls.py" "$R/FEX/FEXCore/Source/Interface/I
 python3 "$R/tools/patch-fex-ios-teb-tsd.py" "$R/FEX/Source/Windows/Common/Priv.h"
 python3 "$R/tools/patch-fex-ios-cpuid-index.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUID.cpp"
 python3 "$R/tools/patch-fex-ios-cpu-brand.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUID.cpp"
+python3 "$R/tools/patch-fex-ios-cpuid-mask.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUID.h"
 python3 "$R/tools/patch-fex-ios-avx.py" "$R/FEX/$CPUF"
 python3 "$R/tools/patch-fex-ios-alias-full-quiet.py" "$R/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp"
 python3 "$R/tools/patch-fex-ios-pool-null.py" "$R/FEX/FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h"
