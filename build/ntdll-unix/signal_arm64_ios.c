@@ -7659,6 +7659,37 @@ static void ios_install_task_exception_port(void)
     }
 }
 
+/* madeira-doge: an exiting Wine thread releases its registry entry and its
+ * trampoline slot, so a session that keeps creating threads does not run out.
+ * Both used to be handed out for the life of the app: Dynasty Warriors Origins
+ * demo (build 338, logs 2026-10-22 00:58 and 01:02) filled all 512 registry
+ * entries in ~2 min; Mach events on later threads resolved to slot 0 -- the
+ * first process (dockhost) -- whose message loop then branched to garbage and
+ * took the session down. Called from pthread_exit_wrapper (thread_ios.c). */
+void ios_thread_registry_release_self(void)
+{
+    extern void ios_jit_free_trampoline_slot(int slot);
+    thread_t me = mach_thread_self();
+    int i, count = ios_thread_registry_count();
+    for (i = 0; i < count; i++)
+        if (ios_thread_registry[i].mach_thread == me)
+        {
+            ios_thread_registry[i].mach_thread = 0;
+            __sync_synchronize();
+            ios_thread_registry[i].trampoline = NULL;
+            ios_thread_registry[i].teb = 0;
+            break;
+        }
+    mach_port_deallocate( mach_task_self(), me );
+    if (ios_my_slot > 0)
+    {
+        int slot = ios_my_slot;
+        ios_my_trampoline = NULL;
+        ios_my_slot = -1;
+        ios_jit_free_trampoline_slot( slot );
+    }
+}
+
 /* Register a Wine "process" thread with the shared Mach exception handler.
  * First call creates the shared port and handler thread.
  * Every call registers the thread and sets its exception ports. */
@@ -7716,6 +7747,13 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
     if (reg_count > IOS_MAX_WINE_THREADS) reg_count = IOS_MAX_WINE_THREADS;
     for (idx = 0; idx < reg_count; idx++)
         if (ios_thread_registry[idx].mach_thread == pe_thread) break;
+    if (idx == reg_count)
+    {   /* madeira-doge: reuse a slot an exited thread released (ios_thread_registry_release_self) */
+        for (idx = 0; idx < reg_count; idx++)
+            if (!ios_thread_registry[idx].mach_thread && !ios_thread_registry[idx].teb &&
+                __sync_bool_compare_and_swap(&ios_thread_registry[idx].teb, (uintptr_t)0, teb))
+                break;
+    }
     if (idx == reg_count)
     {
         idx = __sync_fetch_and_add(&ios_thread_count, 1);

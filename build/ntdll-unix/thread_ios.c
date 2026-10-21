@@ -1242,6 +1242,10 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
             extern void ios_thread_died( unsigned tid );
             ios_thread_died( (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
         }
+        {   /* madeira-doge: give back the Mach registry entry and trampoline slot */
+            extern void ios_thread_registry_release_self(void);
+            ios_thread_registry_release_self();
+        }
     }
     pthread_exit( UIntToPtr(status) );
 }

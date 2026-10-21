@@ -4071,12 +4071,25 @@ void *ios_jit_teb_trampoline = NULL;  /* RX address of slot 0 trampoline (offset
  * whose trampoline may still be referenced. */
 #define IOS_JIT_MAX_SLOTS (0x4000 / IOS_JIT_TRAMPOLINE_SIZE)
 static volatile int32_t ios_jit_next_slot = 0;  /* Next slot to allocate */
+/* madeira-doge: slots of exited threads (ios_jit_free_trampoline_slot, from the
+ * thread exit path) are reused once the page is used up. Dynasty Warriors
+ * Origins demo (build 338, log 2026-10-22 01:02) creates short-lived threads
+ * all the time: all 1024 slots were gone in ~2 min and every later thread
+ * shared slot 0, the first process's TEB. */
+static volatile int32_t ios_jit_slot_freed[IOS_JIT_MAX_SLOTS];
 
 /* Allocate a per-thread trampoline slot. Returns slot index (0-based). */
 int ios_jit_alloc_trampoline_slot(void)
 {
     int slot = __sync_fetch_and_add(&ios_jit_next_slot, 1);
-    if (slot >= IOS_JIT_MAX_SLOTS) return 0;  /* fallback to slot 0 */
+    if (slot >= IOS_JIT_MAX_SLOTS)
+    {
+        int i;
+        slot = 0;
+        for (i = 1; i < IOS_JIT_MAX_SLOTS; i++)
+            if (ios_jit_slot_freed[i] && __sync_bool_compare_and_swap(&ios_jit_slot_freed[i], 1, 0)) { slot = i; break; }
+        if (!slot) return 0;  /* fallback to slot 0 */
+    }
 
     /* Write trampoline code to this slot's RW view */
     if (ios_jit_rw_base_global)
@@ -4089,6 +4102,12 @@ int ios_jit_alloc_trampoline_slot(void)
             sys_icache_invalidate((char *)ios_jit_rx_base_global + slot * 16 + 8, 8);
     }
     return slot;
+}
+
+/* madeira-doge: an exiting thread hands its slot back (never slot 0). */
+void ios_jit_free_trampoline_slot(int slot)
+{
+    if (slot > 0 && slot < IOS_JIT_MAX_SLOTS) __sync_bool_compare_and_swap(&ios_jit_slot_freed[slot], 0, 1);
 }
 
 /* Write TEB address to a specific trampoline slot */

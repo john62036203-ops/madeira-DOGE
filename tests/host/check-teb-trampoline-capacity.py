@@ -38,6 +38,7 @@ harness = r'''
 #include <pthread.h>
 static void *ios_jit_rw_base_global, *ios_jit_rx_base_global;
 static volatile int32_t ios_jit_next_slot;
+static volatile int32_t ios_jit_slot_freed[0x4000 / 16];
 static unsigned cache_calls;
 static _Alignas(16) unsigned char backing[0x4000 + 64];
 static void sys_icache_invalidate(void *p, size_t size)
