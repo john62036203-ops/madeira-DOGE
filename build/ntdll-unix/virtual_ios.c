@@ -14071,6 +14071,9 @@ static void ios_vh_dump( const void *addr )
  *
  * Deletes a view. virtual_mutex must be held by caller.
  */
+#ifdef WINE_IOS
+static void ios_jit_purge_window( ULONG_PTR base, ULONG_PTR size );
+#endif
 static void delete_view( struct file_view *view ) /* [in] View */
 {
     ios_vh_note( 'd', view );   /* madeira-bcd: view history */
@@ -14124,6 +14127,25 @@ static void delete_view( struct file_view *view ) /* [in] View */
                      ios_pe_module_name( view->base, view->size ), view->base, (unsigned long)view->size );
     }
     else if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
+#ifdef WINE_IOS
+    /* madeira-doge: a released allocation takes its anon-RWX JIT alias with it. Only
+     * the WoW64 window release purged aliases; a 64-bit guest that freed its RWX
+     * memory left the alias registered, and the next allocation at that address was
+     * treated as alias-owned: RESIDENT EVIL requiem (2026-10-22 22:06) put a 4.4 MB RW
+     * buffer over a freed 1 MB RWX block, its writes were forced through the old
+     * alias and through 1234 write-fault heals, and the game died on one.
+     * MADEIRA_ANON_ALIAS_RELEASE=0 keeps the old behaviour. */
+    if (!(view->protect & (SEC_IMAGE | VPROT_INPOOL | VPROT_SYSTEM)))
+    {
+        static int on = -1;
+        if (on < 0)
+        {
+            const char *e = getenv( "MADEIRA_ANON_ALIAS_RELEASE" );   /* 0: freed RWX memory keeps its JIT alias registered (before 2026-10-22) */
+            on = !(e && e[0] == '0');
+        }
+        if (on) ios_jit_purge_window( (ULONG_PTR)view->base, view->size );
+    }
+#endif
     if (ios_retire_trace_armed) ios_retire_mark( "D1u\n" );   /* unmap_area done */
     set_page_vprot( view->base, view->size, 0 );
     if (ios_retire_trace_armed) ios_retire_mark( "D2v\n" );   /* vprot cleared */
@@ -14263,8 +14285,9 @@ static void ios_jit_purge_window( ULONG_PTR base, ULONG_PTR size )
         aliases++;
     }
     pthread_mutex_unlock( &ios_pool_lock );
-    dprintf( 2, "[jit-pool] window purge B=%p: %d image mapping(s), %d anon alias(es)\n",
-             (void *)base, maps, aliases );
+    if (maps || aliases || size == IOS_WOW_WINDOW_SIZE)   /* every freed view comes through here now */
+        dprintf( 2, "[jit-pool] window purge B=%p: %d image mapping(s), %d anon alias(es)\n",
+                 (void *)base, maps, aliases );
 }
 
 
@@ -19429,18 +19452,28 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
     if ((vprot & VPROT_WRITE) && !(vprot & VPROT_GUARD))
     {
         uintptr_t ov_b = 0, ov_e = 0;
+        uintptr_t cur = (uintptr_t)base, end = (uintptr_t)base + size;
         extern int ios_jit_anon_alias_overlaps(void *, size_t, uintptr_t *, uintptr_t *);
-        if (ios_jit_anon_alias_overlaps( base, size, &ov_b, &ov_e ))
+        /* madeira-doge: only the pages that overlap an alias. The whole request used to
+         * be forced R+X: RESIDENT EVIL requiem (2026-10-22 22:06) made a 4.4 MB RW buffer
+         * 0x72b7740000+0x470000 that covers a 1 MB alias at +0x200000, every
+         * NtProtectVirtualMemory on it took write permission from all 4.4 MB, 1234
+         * write faults were healed one 16 KB page at a time, and one that was not ended
+         * the game (unhandled write at +0xc, outside the alias). */
+        while (cur < end && ios_jit_anon_alias_overlaps( (void *)cur, end - cur, &ov_b, &ov_e ))
         {
+            uintptr_t ib = ov_b > cur ? ov_b : cur, ie = ov_e < end ? ov_e : end;
             int keep_exec = (vprot & VPROT_EXEC) || 1;   /* alias pages are executable by construction */
             int pr = PROT_READ | (keep_exec ? PROT_EXEC : 0);
-            int rc = mprotect( base, size, pr );
+            int rc = ie > ib ? mprotect( (void *)ib, ie - ib, pr ) : 0;
             static int ab_n;
             if (ab_n < 24)
                 dprintf(2, "[alias-prot] ml638 #%d %p+0x%lx requested prot=0x%x (vprot=0x%x) — logical kept, "
-                           "PHYSICAL forced R%s (mprotect rc=%d) alias=[%p,%p)\n",
+                           "PHYSICAL forced R%s on the overlap %p+0x%lx only (mprotect rc=%d) alias=[%p,%p)\n",
                         ++ab_n, base, (unsigned long)size, (unsigned)protect, vprot,
-                        keep_exec ? "X" : "", rc, (void *)ov_b, (void *)ov_e);
+                        keep_exec ? "X" : "", (void *)ib, (unsigned long)(ie - ib), rc, (void *)ov_b, (void *)ov_e);
+            if (ov_e <= cur) break;   /* no progress: never loop */
+            cur = ov_e;
         }
     }
 
