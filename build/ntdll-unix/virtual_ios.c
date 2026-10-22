@@ -9411,6 +9411,11 @@ static void ios_exe_win_init( void )
  * that falls inside the window. */
 static __thread int ios_exe_win_stripped_request;
 
+/* madeira-doge: MADEIRA_EXE_WINDOW_SMALL_FIXED=2 also hands the window to a RELOCATABLE
+ * image under 64 MB (EXVS2 IB: a 48 MB exe relocated into the crowded low band left its
+ * hooking DLL no free pages within 2 GB for trampolines). Read with the switch below. */
+static int ios_exe_win_small_mode = 1;
+
 static int ios_exe_win_small_fixed(void)
 {
     static int enabled = -1;
@@ -9421,6 +9426,7 @@ static int ios_exe_win_small_fixed(void)
          * than 64 MB, as before; such a program then fails to start. */
         const char *e = getenv( "MADEIRA_EXE_WINDOW_SMALL_FIXED" );
         enabled = !(e && e[0] == '0');
+        ios_exe_win_small_mode = (e && e[0] == '2') ? 2 : enabled;
     }
     return enabled;
 }
@@ -9435,7 +9441,8 @@ static int ios_exe_win_claim( const void *addr, size_t size )
      * a released window still has to answer a matching request. */
     if (!ios_exe_win_base) return 0;
     if (a < ios_exe_win_base || a + size > ios_exe_win_base + ios_exe_win_size) return 0;
-    if (size < 64u * 1024u * 1024u && ios_exe_win_stripped_request && ios_exe_win_small_fixed())
+    if (size < 64u * 1024u * 1024u && ios_exe_win_small_fixed() &&
+        (ios_exe_win_stripped_request || ios_exe_win_small_mode == 2))
     {
         static int fixed_n;
         if (fixed_n++ < 8)
