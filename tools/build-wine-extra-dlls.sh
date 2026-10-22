@@ -361,6 +361,16 @@ PY
     else
         echo "::warning::mmdevapi.dll :: this tree does not rebuild the shipped mmdevapi.dll apart from time stamps; shipped copy kept :: $(grep -m 4 -E 'same-as|error' "$B.mmdevapi.log" | tr '\n' ' ' | cut -c1-900)"
         [ -f "$B/mmdevapi-stock.dll" ] && echo "::warning::mmdevapi.dll :: $(python3 "$R/tools/patch-wine-ntdll-proton.py" --explain "$B/mmdevapi-stock.dll" "$SHIP/mmdevapi.dll" 2>&1 | cut -c1-1500)"
+        # Fallback (tools/patch-mmdevapi-spatial-bin.py): with the same .pdata the
+        # functions sit at the same RVAs, so the two stubs are patched straight into
+        # the shipped DLL, located through the rebuilt DLL's DWARF.
+        if [ -f "$md" ] && python3 "$R/tools/patch-mmdevapi-spatial-bin.py" "$md" "$SHIP/mmdevapi.dll" "$SHIP/mmdevapi.dll.tmp" "$MINGW/llvm-symbolizer" >> "$B.mmdevapi.log" 2>&1; then
+            mv "$SHIP/mmdevapi.dll.tmp" "$SHIP/mmdevapi.dll"
+            echo "::notice::mmdevapi.dll: spatial-audio SetEndOfStream/IsActive patched into the shipped DLL :: $(grep 'patch-mmdevapi-spatial-bin' "$B.mmdevapi.log" | tr '\n' ' ' | cut -c1-600)"
+        else
+            rm -f "$SHIP/mmdevapi.dll.tmp"
+            echo "::warning::mmdevapi.dll binary patch not applied; shipped copy kept :: $(grep -E 'patch-mmdevapi-spatial-bin|Error|error' "$B.mmdevapi.log" | tail -3 | tr '\n' ' ' | cut -c1-600)"
+        fi
     fi
     git -C "$R/wine" checkout -- dlls/mmdevapi/spatialaudio.c
     rm -f "$md" "$B"/dlls/mmdevapi/arm64ec-windows/*.o "$B/mmdevapi-stock.dll"
