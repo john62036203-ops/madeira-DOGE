@@ -5596,6 +5596,11 @@ int ios_iat_sync_pick_mapping( uintptr_t rgn_start, uintptr_t rgn_end, void *peb
         uintptr_t pe_end = pe_start + ios_jit_mappings[i].size;
 
         if (!(rgn_start >= pe_start && rgn_end <= pe_end)) continue;
+        /* madeira-doge: a copy whose image was unmapped no longer describes this
+         * range -- a later DLL can sit inside it (EXVS2: bngrw_orig.dll loaded at
+         * 0x71fa3a0000 inside unloaded uxtheme.dll's 0x71fa330000+0xb0000), and the
+         * sync then read the dead image's headers and faulted in NtProtect. */
+        if (ios_jit_mappings[i].unmapped) continue;
         if (first < 0) first = i;
         if (!ios_iat_sync_owner_aware()) break;
         if (peb && ios_jit_mappings[i].owner_peb == peb) return i;
@@ -32021,6 +32026,7 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
         for (mi = 0; mi < ios_jit_mapping_count; mi++)
         {
             uintptr_t ps = (uintptr_t)ios_jit_mappings[mi].pe_base;
+            if (ios_jit_mappings[mi].unmapped) continue;   /* madeira-doge: dead image range */
             if ((uintptr_t)base >= ps && (uintptr_t)base + size <= ps + ios_jit_mappings[mi].size)
             {
                 in_pool_image = 1;
