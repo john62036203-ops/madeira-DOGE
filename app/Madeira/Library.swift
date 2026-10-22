@@ -975,10 +975,10 @@ final class LibraryModel: ObservableObject {
     static func exeWindowShortMessage() -> String? {
         guard NoDesktopSettings.bigExeWindow, !exeWindowWarned else { return nil }
         let held: UInt = madeira_early_window_base == 0x140000000 ? UInt(madeira_early_window_size) : 0
-        guard held < 512 << 20 else { return nil }
+        guard held < UInt(NoDesktopSettings.bigExeWindowMB) << 20 else { return nil }
         exeWindowWarned = true
-        LogStore.shared.log("[exe-window] madeira-doge: launch held once: only \(held >> 20)MB of the 512MB window is held in this app run", level: .error)
-        return "Madeira could not keep 512 MB for a large game executable at this start (only \(held >> 20) MB). "
+        LogStore.shared.log("[exe-window] madeira-doge: launch held once: only \(held >> 20)MB of the \(NoDesktopSettings.bigExeWindowMB)MB window is held in this app run", level: .error)
+        return "Madeira could not keep \(NoDesktopSettings.bigExeWindowMB) MB for a large game executable at this start (only \(held >> 20) MB). "
             + "A game with a large executable that cannot be moved will not start. "
             + "Close Madeira and open it again, or tap Play again to start anyway."
     }
@@ -4687,11 +4687,23 @@ struct NoDesktopSettings: View {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
             .appendingPathComponent("madeira-exe-window-mb")
     }
+    /// madeira-doge: 640 MB since build 37x (was 512): RESIDENT EVIL requiem's re9.exe
+    /// is 575 MB with no relocations (2026-10-22 log: pool exhausted, c0000017).
+    static let bigExeWindowMB = 640
     static var bigExeWindow: Bool {
-        get { bigExeWindowFile.map { FileManager.default.fileExists(atPath: $0.path) } ?? false }
+        get {
+            guard let url = bigExeWindowFile, FileManager.default.fileExists(atPath: url.path) else { return false }
+            // a file written by an older build (512) is raised to the current size;
+            // JITAllocator.c reads it at the next app start
+            if let t = try? String(contentsOf: url, encoding: .utf8),
+               let mb = Int(t.trimmingCharacters(in: .whitespacesAndNewlines)), mb < bigExeWindowMB {
+                try? Data("\(bigExeWindowMB)\n".utf8).write(to: url, options: .atomic)
+            }
+            return true
+        }
         set {
             guard let url = bigExeWindowFile else { return }
-            if newValue { try? Data("512\n".utf8).write(to: url, options: .atomic) }
+            if newValue { try? Data("\(bigExeWindowMB)\n".utf8).write(to: url, options: .atomic) }
             else { try? FileManager.default.removeItem(at: url) }
         }
     }
@@ -4701,7 +4713,7 @@ struct NoDesktopSettings: View {
             Toggle("Room for a large game executable", isOn: $bigExe)
                 .onChange(of: bigExe) { _, on in NoDesktopSettings.bigExeWindow = on }
         } header: { Text("Steam games") } footer: {
-            Text("No virtual desktop: starts the game directly instead of on a Windows desktop. A game with one-time installers still to run starts on the desktop.\n\nLarge executable: keeps 512 MB at the fixed address some big games (Unreal Engine) must load at, for a game that ends right at its start. It applies to all games and takes effect after Madeira is fully closed and reopened.")
+            Text("No virtual desktop: starts the game directly instead of on a Windows desktop. A game with one-time installers still to run starts on the desktop.\n\nLarge executable: keeps 640 MB at the fixed address some big games (Unreal Engine) must load at, for a game that ends right at its start. It applies to all games and takes effect after Madeira is fully closed and reopened.")
         }
     }
 }

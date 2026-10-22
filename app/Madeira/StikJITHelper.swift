@@ -373,8 +373,8 @@ enum StikJITHelper {
             LogStore.shared.log("ml1040: executable window [0x140000000,+\(exeWinSize >> 20)MB) held since image load", level: .success)
             // madeira-doge: P3R (363MB exe, no relocations) died with c0000018 while the
             // large-executable setting may or may not have been on; say which it was.
-            if NoDesktopSettings.bigExeWindow && (exeWinSize >> 20) < 512 {
-                LogStore.shared.log("[exe-window] madeira-doge: the 512MB window was asked for but that space was not free at this app start; only \(exeWinSize >> 20)MB is held. Close Madeira completely and open it again.", level: .error)
+            if NoDesktopSettings.bigExeWindow && (exeWinSize >> 20) < UInt(NoDesktopSettings.bigExeWindowMB) {
+                LogStore.shared.log("[exe-window] madeira-doge: the \(NoDesktopSettings.bigExeWindowMB)MB window was asked for but that space was not free at this app start; only \(exeWinSize >> 20)MB is held. Close Madeira completely and open it again.", level: .error)
             } else if !NoDesktopSettings.bigExeWindow {
                 LogStore.shared.log("[exe-window] madeira-doge: \"Room for a large game executable\" is off (Settings, Steam games); a game whose main executable is over 128MB and cannot be relocated will not start.", level: .info)
             }
