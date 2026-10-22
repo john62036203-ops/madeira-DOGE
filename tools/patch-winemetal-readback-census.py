@@ -78,7 +78,7 @@ static void madeira_rb_tex(id<MTLTexture> src, unsigned level, unsigned w, unsig
       const uint8_t *base = (const uint8_t *)[prev contents];
       if (base && prev_off + 16 <= [prev length] && madeira_rb_due(&last)) {
         float f[4]; uint32_t u[4];
-        memcpy(f, base + prev_off, 16); memcpy(u, base + prev_off, 16);
+        madeira_probe_copy(f, base + prev_off, 16); memcpy(u, f, 16);
         fprintf(stderr, "[rb-tex] madeira-bcd value fmt %lu %ux%u L%u -> %g %g %g %g | %08x %08x %08x %08x\n",
                 prev_key.fmt, prev_key.w, prev_key.h, prev_key.level, f[0], f[1], f[2], f[3], u[0], u[1], u[2], u[3]);
       }
@@ -107,7 +107,7 @@ static void madeira_rb_buf(id<MTLBuffer> dst, uint64_t offset, uint64_t length) 
     const uint8_t *base = (const uint8_t *)[prev contents];
     if (base && prev_off + 32 <= [prev length] && madeira_rb_due(&last)) {
       float f[8];
-      memcpy(f, base + prev_off, 32);
+      madeira_probe_copy(f, base + prev_off, 32);
       fprintf(stderr, "[rb-buf] madeira-bcd value %llu bytes -> %g %g %g %g %g %g %g %g\n",
               (unsigned long long)prev_len, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
     }

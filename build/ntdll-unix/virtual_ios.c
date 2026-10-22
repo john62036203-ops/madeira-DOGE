@@ -454,6 +454,45 @@ static void ios_pool_tail_unreserve( volatile size_t *reserved, size_t mine, siz
     else __sync_bool_compare_and_swap( reserved, mine, mine - added );
 }
 
+/* madeira-doge (from BCD 0.1.579's tail-carve exec check): is any page of the
+ * pool range [off, off + min(size, limit)) without EXECUTE in its MAX protection,
+ * i.e. lost for code for good? Returns 1 with the offset and protections of the
+ * first such page; 0 when every mapped page there can still execute. */
+static int ios_pool_range_first_nonexec( size_t off, size_t size, size_t limit,
+                                         size_t *bad_at, unsigned int *cur_out, unsigned int *max_out )
+{
+    extern void *ios_jit_rx_base_global;
+    mach_vm_address_t base, a, end;
+
+    if (!ios_jit_rx_base_global || !size) return 0;
+    if (size > limit) size = limit;
+    base = (mach_vm_address_t)(uintptr_t)((char *)ios_jit_rx_base_global + off);
+    end  = base + size;
+    for (a = base; a < end; )
+    {
+        mach_vm_address_t q = a;
+        mach_vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        if (mach_vm_region( mach_task_self(), &q, &sz, VM_REGION_BASIC_INFO_64,
+                            (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS) return 0;
+        if (q >= end) break;
+        if (q > a) { a = q; continue; }   /* a hole: go on at the next mapped region */
+        if (!sz) break;
+        if (!(info.max_protection & VM_PROT_EXECUTE))
+        {
+            if (bad_at) *bad_at = (size_t)(a - base);
+            if (cur_out) *cur_out = (unsigned int)info.protection;
+            if (max_out) *max_out = (unsigned int)info.max_protection;
+            return 1;
+        }
+        a = q + sz;
+    }
+    return 0;
+}
+
 /* ---- Pool reclamation (task #25) ----------------------------------------
  * The bump allocator never freed anything: 8 pseudo-processes consumed
  * 368.9/384MB (2026-07-07) and the 9th BUS-loop-locked the session. Every
@@ -25620,10 +25659,18 @@ NTSTATUS WINAPI NtSetLdtEntries( ULONG sel1, ULONG entry1_low, ULONG entry1_high
 /***********************************************************************
  *           virtual_clear_tls_index
  */
+#include "ios_tls_clear.h"   /* madeira-doge: from BCD 0.1.579 (MADEIRA_TLS_CLEAR_OWN_PROCESS) */
 NTSTATUS virtual_clear_tls_index( ULONG index )
 {
     struct ntdll_thread_data *thread_data;
     sigset_t sigset;
+    /* ajan7-arkham: teb_list holds the threads of EVERY pseudo-process, not only the caller's (see ios_tls_clear.h). The default
+     * clears the cell in all of them, as before; MADEIRA_TLS_CLEAR_OWN_PROCESS=1 spares the other processes' threads. A live
+     * value cleared (or spared) in another process's thread is logged as [tls-cross-clear]. */
+    TEB *caller_teb = NtCurrentTeb();
+    void *caller_peb = caller_teb ? caller_teb->Peb : NULL;
+    unsigned caller_tid = caller_teb ? HandleToULong( caller_teb->ClientId.UniqueThread ) : 0;
+    int own_only = ios_tls_clear_own_process_only();
 
     if (index < TLS_MINIMUM_AVAILABLE)
     {
@@ -25631,10 +25678,27 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+            int foreign = ios_tls_clear_is_foreign( teb->Peb, caller_peb );
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
+            if (foreign)
+            {
+                ULONG_PTR old = wow_teb ? wow_teb->TlsSlots[index] : (ULONG_PTR)teb->TlsSlots[index];
+
+                if (old) ios_tls_clear_note( own_only, index, caller_tid, caller_peb, HandleToULong( teb->ClientId.UniqueThread ),
+                                             teb->Peb, wow_teb != NULL, old );
+                if (own_only) continue;
+            }
             if (wow_teb) wow_teb->TlsSlots[index] = 0;
             else
+#else
+            if (foreign)
+            {
+                if (teb->TlsSlots[index]) ios_tls_clear_note( own_only, index, caller_tid, caller_peb,
+                                                              HandleToULong( teb->ClientId.UniqueThread ), teb->Peb, 1,
+                                                              (ULONG_PTR)teb->TlsSlots[index] );
+                if (own_only) continue;
+            }
 #endif
             teb->TlsSlots[index] = 0;
         }
@@ -25649,6 +25713,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+            int foreign = ios_tls_clear_is_foreign( teb->Peb, caller_peb );
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
             if (wow_teb)
@@ -25662,12 +25727,29 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
                         (ULONG_PTR)teb & ~(IOS_WOW_WINDOW_SIZE - 1) );
                     if (slot) slots += slot->base;
 #endif
+                    if (foreign)
+                    {
+                        if (((ULONG *)slots)[index]) ios_tls_clear_note( own_only, index + TLS_MINIMUM_AVAILABLE, caller_tid, caller_peb,
+                                                                         HandleToULong( teb->ClientId.UniqueThread ), teb->Peb, 1,
+                                                                         ((ULONG *)slots)[index] );
+                        if (own_only) continue;
+                    }
                     ((ULONG *)slots)[index] = 0;
                 }
             }
             else
 #endif
-            if (teb->TlsExpansionSlots) teb->TlsExpansionSlots[index] = 0;
+            if (teb->TlsExpansionSlots)
+            {
+                if (foreign)
+                {
+                    if (teb->TlsExpansionSlots[index]) ios_tls_clear_note( own_only, index + TLS_MINIMUM_AVAILABLE, caller_tid, caller_peb,
+                                                                           HandleToULong( teb->ClientId.UniqueThread ), teb->Peb,
+                                                                           0, (ULONG_PTR)teb->TlsExpansionSlots[index] );
+                    if (own_only) continue;
+                }
+                teb->TlsExpansionSlots[index] = 0;
+            }
         }
         server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     }
@@ -30631,6 +30713,37 @@ retry_code_carve_reuse:
         {
             void *jit_rx = (char *)ios_jit_rx_base_global + pool_tail_off;
             void *jit_rw = (char *)ios_jit_rw_base_global + pool_tail_off;
+
+            /* madeira-doge (BCD 0.1.579, MADEIRA_TAIL_CARVE_EXEC_CHECK): refuse a code buffer whose
+             * first 2 MB hold a pool page that lost EXECUTE for good. FEX writes its first blocks
+             * there and runs them at once; on such a page every block faults and the process ends
+             * (BCD: Dead Space, Star Wars: The Force Unleashed, after a 32-bit image copy left
+             * non-exec pool pages). Refused like an exhausted tail: FEX's CodeBuffer halves the
+             * request, and the next carve lands elsewhere. A buffer whose first 2 MB can execute is
+             * granted exactly as before. env.MADEIRA_TAIL_CARVE_EXEC_CHECK = 0 turns it off. */
+            {
+                enum { CARVE_EXEC_PREFIX = 0x200000 };
+                size_t bad_at = 0;
+                unsigned int bcur = 0, bmax = 0;
+                static int carve_check = -1;
+                if (carve_check < 0)
+                {
+                    const char *e = getenv( "MADEIRA_TAIL_CARVE_EXEC_CHECK" );
+                    carve_check = !(e && e[0] == '0');
+                }
+                if (carve_check &&
+                    ios_pool_range_first_nonexec( pool_tail_off, alloc_size, CARVE_EXEC_PREFIX, &bad_at, &bcur, &bmax ))
+                {
+                    static unsigned int refused;
+                    ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,
+                                             ios_jit_hole_end > ios_jit_hole_off );
+                    if (refused++ < 16)
+                        dprintf( 2, "[jit-pool] tail carve NOT EXECUTABLE: want=0x%lx at rx=%p: +0x%lx prot=%x max=%x "
+                                    "(EXEC gone for good) -- refused so FEX halves down (MADEIRA_TAIL_CARVE_EXEC_CHECK)\n",
+                                 (unsigned long)alloc_size, jit_rx, (unsigned long)bad_at, bcur, bmax );
+                    return STATUS_NO_MEMORY;
+                }
+            }
             *ret = jit_rx;
             *size_ptr = alloc_size;
             /* iOS-Madeira: pre-fill the buffer with NOPs (0xd503201f) via the RW

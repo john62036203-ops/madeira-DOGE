@@ -37,6 +37,25 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
      """/* madeira-bcd: luminance probe (tools/patch-winemetal-lum-probe.py) */
 #include <pthread.h>
 #include <time.h>
+#include <math.h>
+#include <mach/mach.h>
+/* madeira-doge: the probes keep the previous readback's MTLBuffer and read it when the
+ * next readback comes, but holding the buffer object does not keep its memory: a
+ * staging buffer can sit on the game's own memory, which the game may have unmapped by
+ * then, and a plain read faulted the whole game (BCD 0.1.576 found this on 32-bit games;
+ * the fork's probes are on by default). Copy through the kernel instead: a page that is
+ * gone returns an error, the values become NaN, the line says so, and the game goes on. */
+static int madeira_probe_copy(void *dst, const void *src, size_t len) {
+  vm_size_t got = 0;
+  if (vm_read_overwrite(mach_task_self(), (vm_address_t)src, (vm_size_t)len,
+                        (vm_address_t)dst, &got) == KERN_SUCCESS && got == len)
+    return 1;
+  static int said;
+  if (said++ < 8)
+    fprintf(stderr, "[rb-probe] madeira-doge: readback memory is gone (the game freed it); value not read\\n");
+  for (size_t i = 0; i < len / sizeof(float); i++) ((float *)dst)[i] = NAN;
+  return 0;
+}
 static int madeira_lum_probe_on(void) {
   static int on = -1;
   if (on < 0) {
@@ -66,7 +85,7 @@ static void madeira_lum_note_copy(id<MTLTexture> src, id<MTLBuffer> dst, uint64_
     n++;
     if (base && prev_off + 16 <= [prev_buf length] && (dt >= 0.5 || n <= 4)) {
       float v[4];
-      memcpy(v, base + prev_off, sizeof v);
+      madeira_probe_copy(v, base + prev_off, sizeof v);
       unsigned comps = prev_pf == MTLPixelFormatR32Float ? 1 : prev_pf == MTLPixelFormatRG32Float ? 2 : 4;
       fprintf(stderr, "[lum-readback] madeira-bcd #%u fmt %lu level %u %ux%u -> %g %g %g %g (%u comps)\\n",
               n, (unsigned long)prev_pf, prev_level, prev_w, prev_h, v[0], v[1], v[2], v[3], comps);
