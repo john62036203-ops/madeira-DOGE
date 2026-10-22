@@ -284,3 +284,188 @@ edit("d3d11.cpp", [
      "  }\n\n"
      "  if (!devFeatureLevel) {\n    Logger::err(str::format(\"Minimum required feature level \", minFeatureLevel,\n"),
 ])
+
+
+# --- ID3D11VideoContext on the immediate context (stub mode) -----------------
+# Build 364 log 13:50 (stub): the game takes the ID3D11VideoDevice, then asks
+# the immediate context for ID3D11VideoContext ({61f21c45-...}), gets
+# E_NOINTERFACE and destroys the device again (150 rounds).
+VCTX_HEADER = r'''#pragma once
+/* madeira-doge: d3d11 video device -- ID3D11VideoContext stub for the
+ * immediate context (env.MADEIRA_D3D11_VIDEO=stub). Generated from
+ * llvm-mingw 20260421's d3d11.h by tools/patch-dxmt-video-device.py's author;
+ * no video processor or decoder can exist, so every call is a no-op/E_NOTIMPL. */
+#include "d3d11_4.h"
+#include "log/log.hpp"
+#include "util_string.hpp"
+#include <atomic>
+
+namespace dxmt {
+
+inline void madeira_vctx_log(const char *what) {
+  static std::atomic<uint32_t> n{0};
+  if (n.fetch_add(1) < 200)
+    Logger::info(str::format("[d3d11-video] VideoContext::", what));
+}
+
+class MadeiraVideoContext final : public ID3D11VideoContext {
+public:
+  MadeiraVideoContext(ID3D11DeviceContext *container) : container_(container) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
+    return container_->QueryInterface(riid, ppvObject);
+  }
+  ULONG STDMETHODCALLTYPE AddRef() final { return container_->AddRef(); }
+  ULONG STDMETHODCALLTYPE Release() final { return container_->Release(); }
+
+  void STDMETHODCALLTYPE GetDevice(ID3D11Device **ppDevice) final { container_->GetDevice(ppDevice); }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT *pDataSize, void *pData) final {
+    return container_->GetPrivateData(guid, pDataSize, pData);
+  }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT DataSize, const void *pData) final {
+    return container_->SetPrivateData(guid, DataSize, pData);
+  }
+  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown *pData) final {
+    return container_->SetPrivateDataInterface(guid, pData);
+  }
+
+  HRESULT STDMETHODCALLTYPE GetDecoderBuffer(ID3D11VideoDecoder *decoder, D3D11_VIDEO_DECODER_BUFFER_TYPE type, UINT *buffer_size, void **buffer) final {
+    madeira_vctx_log("GetDecoderBuffer -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE ReleaseDecoderBuffer(ID3D11VideoDecoder *decoder, D3D11_VIDEO_DECODER_BUFFER_TYPE type) final {
+    madeira_vctx_log("ReleaseDecoderBuffer -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE DecoderBeginFrame(ID3D11VideoDecoder *decoder, ID3D11VideoDecoderOutputView *view, UINT key_size, const void *key) final {
+    madeira_vctx_log("DecoderBeginFrame -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE DecoderEndFrame(ID3D11VideoDecoder *decoder) final {
+    madeira_vctx_log("DecoderEndFrame -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE SubmitDecoderBuffers(ID3D11VideoDecoder *decoder, UINT buffers_count, const D3D11_VIDEO_DECODER_BUFFER_DESC *buffer_desc) final {
+    madeira_vctx_log("SubmitDecoderBuffers -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE DecoderExtension(ID3D11VideoDecoder *decoder, const D3D11_VIDEO_DECODER_EXTENSION *extension) final {
+    madeira_vctx_log("DecoderExtension -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  void STDMETHODCALLTYPE VideoProcessorSetOutputTargetRect(ID3D11VideoProcessor *processor, WINBOOL enable, const RECT *rect) final { madeira_vctx_log("VideoProcessorSetOutputTargetRect"); }
+  void STDMETHODCALLTYPE VideoProcessorSetOutputBackgroundColor(ID3D11VideoProcessor *processor, WINBOOL y_cb_cr, const D3D11_VIDEO_COLOR *color) final { madeira_vctx_log("VideoProcessorSetOutputBackgroundColor"); }
+  void STDMETHODCALLTYPE VideoProcessorSetOutputColorSpace(ID3D11VideoProcessor *processor, const D3D11_VIDEO_PROCESSOR_COLOR_SPACE *color_space) final { madeira_vctx_log("VideoProcessorSetOutputColorSpace"); }
+  void STDMETHODCALLTYPE VideoProcessorSetOutputAlphaFillMode(ID3D11VideoProcessor *processor, D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE alpha_fill_mode, UINT stream_idx) final { madeira_vctx_log("VideoProcessorSetOutputAlphaFillMode"); }
+  void STDMETHODCALLTYPE VideoProcessorSetOutputConstriction(ID3D11VideoProcessor *processor, WINBOOL enable, SIZE size) final { madeira_vctx_log("VideoProcessorSetOutputConstriction"); }
+  void STDMETHODCALLTYPE VideoProcessorSetOutputStereoMode(ID3D11VideoProcessor *processor, WINBOOL enable) final { madeira_vctx_log("VideoProcessorSetOutputStereoMode"); }
+  HRESULT STDMETHODCALLTYPE VideoProcessorSetOutputExtension(ID3D11VideoProcessor *processor, const GUID *guid, UINT data_size, void *data) final {
+    madeira_vctx_log("VideoProcessorSetOutputExtension -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  void STDMETHODCALLTYPE VideoProcessorGetOutputTargetRect(ID3D11VideoProcessor *processor, WINBOOL *enabled, RECT *rect) final { madeira_vctx_log("VideoProcessorGetOutputTargetRect"); }
+  void STDMETHODCALLTYPE VideoProcessorGetOutputBackgroundColor(ID3D11VideoProcessor *processor, WINBOOL *y_cb_cr, D3D11_VIDEO_COLOR *color) final { madeira_vctx_log("VideoProcessorGetOutputBackgroundColor"); }
+  void STDMETHODCALLTYPE VideoProcessorGetOutputColorSpace(ID3D11VideoProcessor *processor, D3D11_VIDEO_PROCESSOR_COLOR_SPACE *color_space) final { madeira_vctx_log("VideoProcessorGetOutputColorSpace"); }
+  void STDMETHODCALLTYPE VideoProcessorGetOutputAlphaFillMode(ID3D11VideoProcessor *processor, D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE *alpha_fill_mode, UINT *stream_idx) final { madeira_vctx_log("VideoProcessorGetOutputAlphaFillMode"); }
+  void STDMETHODCALLTYPE VideoProcessorGetOutputConstriction(ID3D11VideoProcessor *processor, WINBOOL *enabled, SIZE *size) final { madeira_vctx_log("VideoProcessorGetOutputConstriction"); }
+  void STDMETHODCALLTYPE VideoProcessorGetOutputStereoMode(ID3D11VideoProcessor *processor, WINBOOL *enabled) final { madeira_vctx_log("VideoProcessorGetOutputStereoMode"); }
+  HRESULT STDMETHODCALLTYPE VideoProcessorGetOutputExtension(ID3D11VideoProcessor *processor, const GUID *guid, UINT data_size, void *data) final {
+    madeira_vctx_log("VideoProcessorGetOutputExtension -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamFrameFormat(ID3D11VideoProcessor *processor, UINT stream_idx, D3D11_VIDEO_FRAME_FORMAT format) final { madeira_vctx_log("VideoProcessorSetStreamFrameFormat"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamColorSpace(ID3D11VideoProcessor *processor, UINT stream_idx, const D3D11_VIDEO_PROCESSOR_COLOR_SPACE *color_space) final { madeira_vctx_log("VideoProcessorSetStreamColorSpace"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamOutputRate(ID3D11VideoProcessor *processor, UINT stream_idx, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE rate, WINBOOL repeat, const DXGI_RATIONAL *custom_rate) final { madeira_vctx_log("VideoProcessorSetStreamOutputRate"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamSourceRect(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL enable, const RECT *rect) final { madeira_vctx_log("VideoProcessorSetStreamSourceRect"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamDestRect(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL enable, const RECT *rect) final { madeira_vctx_log("VideoProcessorSetStreamDestRect"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamAlpha(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL enable, float alpha) final { madeira_vctx_log("VideoProcessorSetStreamAlpha"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamPalette(ID3D11VideoProcessor *processor, UINT stream_idx, UINT entry_count, const UINT *entries) final { madeira_vctx_log("VideoProcessorSetStreamPalette"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamPixelAspectRatio(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL enable, const DXGI_RATIONAL *src_aspect_ratio, const DXGI_RATIONAL *dst_aspect_ratio) final { madeira_vctx_log("VideoProcessorSetStreamPixelAspectRatio"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamLumaKey(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL enable, float lower, float upper) final { madeira_vctx_log("VideoProcessorSetStreamLumaKey"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamStereoFormat(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL enable, D3D11_VIDEO_PROCESSOR_STEREO_FORMAT format, WINBOOL left_view_frame0, WINBOOL base_view_frame0, D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE flip_mode, int mono_offset) final { madeira_vctx_log("VideoProcessorSetStreamStereoFormat"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamAutoProcessingMode(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL enable) final { madeira_vctx_log("VideoProcessorSetStreamAutoProcessingMode"); }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamFilter(ID3D11VideoProcessor *processor, UINT stream_idx, D3D11_VIDEO_PROCESSOR_FILTER filter, WINBOOL enable, int level) final { madeira_vctx_log("VideoProcessorSetStreamFilter"); }
+  HRESULT STDMETHODCALLTYPE VideoProcessorSetStreamExtension(ID3D11VideoProcessor *processor, UINT stream_idx, const GUID *guid, UINT data_size, void *data) final {
+    madeira_vctx_log("VideoProcessorSetStreamExtension -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamFrameFormat(ID3D11VideoProcessor *processor, UINT stream_idx, D3D11_VIDEO_FRAME_FORMAT *format) final { madeira_vctx_log("VideoProcessorGetStreamFrameFormat"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamColorSpace(ID3D11VideoProcessor *processor, UINT stream_idx, D3D11_VIDEO_PROCESSOR_COLOR_SPACE *color_space) final { madeira_vctx_log("VideoProcessorGetStreamColorSpace"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamOutputRate(ID3D11VideoProcessor *processor, UINT stream_idx, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE *rate, WINBOOL *repeat, DXGI_RATIONAL *custom_rate) final { madeira_vctx_log("VideoProcessorGetStreamOutputRate"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamSourceRect(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL *enabled, RECT *rect) final { madeira_vctx_log("VideoProcessorGetStreamSourceRect"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamDestRect(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL *enabled, RECT *rect) final { madeira_vctx_log("VideoProcessorGetStreamDestRect"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamAlpha(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL *enabled, float *alpha) final { madeira_vctx_log("VideoProcessorGetStreamAlpha"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamPalette(ID3D11VideoProcessor *processor, UINT stream_idx, UINT entry_count, UINT *entries) final { madeira_vctx_log("VideoProcessorGetStreamPalette"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamPixelAspectRatio(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL *enabled, DXGI_RATIONAL *src_aspect_ratio, DXGI_RATIONAL *dst_aspect_ratio) final { madeira_vctx_log("VideoProcessorGetStreamPixelAspectRatio"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamLumaKey(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL *enabled, float *lower, float *upper) final { madeira_vctx_log("VideoProcessorGetStreamLumaKey"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamStereoFormat(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL *enabled, D3D11_VIDEO_PROCESSOR_STEREO_FORMAT *format, WINBOOL *left_view_frame0, WINBOOL *base_view_frame0, D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE *flip_mode, int *mono_offset) final { madeira_vctx_log("VideoProcessorGetStreamStereoFormat"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamAutoProcessingMode(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL *enabled) final { madeira_vctx_log("VideoProcessorGetStreamAutoProcessingMode"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamFilter(ID3D11VideoProcessor *processor, UINT stream_idx, D3D11_VIDEO_PROCESSOR_FILTER filter, WINBOOL *enabled, int *level) final { madeira_vctx_log("VideoProcessorGetStreamFilter"); }
+  HRESULT STDMETHODCALLTYPE VideoProcessorGetStreamExtension(ID3D11VideoProcessor *processor, UINT stream_idx, const GUID *guid, UINT data_size, void *data) final {
+    madeira_vctx_log("VideoProcessorGetStreamExtension -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE VideoProcessorBlt(ID3D11VideoProcessor *processor, ID3D11VideoProcessorOutputView *view, UINT frame_idx, UINT stream_count, const D3D11_VIDEO_PROCESSOR_STREAM *streams) final {
+    madeira_vctx_log("VideoProcessorBlt -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE NegotiateCryptoSessionKeyExchange(ID3D11CryptoSession *session, UINT data_size, void *data) final {
+    madeira_vctx_log("NegotiateCryptoSessionKeyExchange -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  void STDMETHODCALLTYPE EncryptionBlt(ID3D11CryptoSession *session, ID3D11Texture2D *src_surface, ID3D11Texture2D *dst_surface, UINT iv_size, void *iv) final { madeira_vctx_log("EncryptionBlt"); }
+  void STDMETHODCALLTYPE DecryptionBlt(ID3D11CryptoSession *session, ID3D11Texture2D *src_surface, ID3D11Texture2D *dst_surface, D3D11_ENCRYPTED_BLOCK_INFO *block_info, UINT key_size, const void *key, UINT iv_size, void *iv) final { madeira_vctx_log("DecryptionBlt"); }
+  void STDMETHODCALLTYPE StartSessionKeyRefresh(ID3D11CryptoSession *session, UINT random_number_size, void *random_number) final { madeira_vctx_log("StartSessionKeyRefresh"); }
+  void STDMETHODCALLTYPE FinishSessionKeyRefresh(ID3D11CryptoSession *session) final { madeira_vctx_log("FinishSessionKeyRefresh"); }
+  HRESULT STDMETHODCALLTYPE GetEncryptionBltKey(ID3D11CryptoSession *session, UINT key_size, void *key) final {
+    madeira_vctx_log("GetEncryptionBltKey -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE NegotiateAuthenticatedChannelKeyExchange(ID3D11AuthenticatedChannel *channel, UINT data_size, void *data) final {
+    madeira_vctx_log("NegotiateAuthenticatedChannelKeyExchange -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE QueryAuthenticatedChannel(ID3D11AuthenticatedChannel *channel, UINT input_size, const void *input, UINT output_size, void *output) final {
+    madeira_vctx_log("QueryAuthenticatedChannel -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  HRESULT STDMETHODCALLTYPE ConfigureAuthenticatedChannel(ID3D11AuthenticatedChannel *channel, UINT input_size, const void *input, D3D11_AUTHENTICATED_CONFIGURE_OUTPUT *output) final {
+    madeira_vctx_log("ConfigureAuthenticatedChannel -> E_NOTIMPL");
+    return E_NOTIMPL;
+  }
+  void STDMETHODCALLTYPE VideoProcessorSetStreamRotation(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL enable, D3D11_VIDEO_PROCESSOR_ROTATION rotation) final { madeira_vctx_log("VideoProcessorSetStreamRotation"); }
+  void STDMETHODCALLTYPE VideoProcessorGetStreamRotation(ID3D11VideoProcessor *processor, UINT stream_idx, WINBOOL *enable, D3D11_VIDEO_PROCESSOR_ROTATION *rotation) final { madeira_vctx_log("VideoProcessorGetStreamRotation"); }
+
+private:
+  ID3D11DeviceContext *container_;
+};
+
+} // namespace dxmt
+
+'''
+hp = ROOT / "d3d11_video_context_stub.hpp"
+if not hp.exists() or MARKER not in hp.read_text():
+    hp.write_text(VCTX_HEADER)
+    print("d3d11_video_context_stub.hpp: written")
+
+edit("d3d11_context_imm.cpp", [
+    ("class MTLD3D11ImmediateContext : public ImmediateContextBase {\n",
+     "} // namespace dxmt\n"
+     "/* madeira-doge: d3d11 video device -- VideoContext stub */\n"
+     "#include \"d3d11_video_context_stub.hpp\"\n"
+     "namespace dxmt {\n"
+     "int madeira_d3d11_video_mode();\n\n"
+     "class MTLD3D11ImmediateContext : public ImmediateContextBase {\n"),
+    ("    if (riid == __uuidof(ID3D11Multithread)) {\n      *ppvObject = ref(&d3dmt_);\n      return S_OK;\n    }\n",
+     "    if (riid == __uuidof(ID3D11Multithread)) {\n      *ppvObject = ref(&d3dmt_);\n      return S_OK;\n    }\n\n"
+     "    if (riid == __uuidof(ID3D11VideoContext) && madeira_d3d11_video_mode() == 1) {\n"
+     "      madeira_vctx_log(\"QueryInterface ID3D11VideoContext -> stub\");\n"
+     "      vctx_.AddRef();\n"
+     "      *ppvObject = static_cast<ID3D11VideoContext *>(&vctx_);\n"
+     "      return S_OK;\n"
+     "    }\n"),
+    ("  D3D11Multithread d3dmt_;\n  bool ignore_map_flag_no_wait_;\n",
+     "  D3D11Multithread d3dmt_;\n"
+     "  MadeiraVideoContext vctx_{static_cast<ID3D11DeviceContext *>(this)};\n"
+     "  bool ignore_map_flag_no_wait_;\n"),
+])
