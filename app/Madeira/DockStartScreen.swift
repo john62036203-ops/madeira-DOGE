@@ -251,6 +251,16 @@ enum DockStartStatus {
         guard let result, launching || result != 0 else { return nil }
         return words ?? "Madeira Dock exited before a game window appeared. Export the diagnostic log."
     }
+
+    /// A child process (`image`: its Windows path) ended with a Windows error
+    /// before the game's window appeared. nil for the Steam client's and
+    /// Windows' own programs, classed by folder: the start goes on without them.
+    static func gameExit(status: UInt32, image: String, places: SteamLaunchScene.Places) -> String? {
+        guard status >= 0xC000_0000, SteamLaunchScene.owner(image, places: places) == .other else { return nil }
+        let name = image.split(whereSeparator: { $0 == "\\" || $0 == "/" }).last.map(String.init) ?? image
+        let kind = status == 0xC000_0005 ? " (memory access violation)" : status == 0xC000_0017 ? " (out of memory)" : ""
+        return "\(name) stopped with Windows error 0x\(String(status, radix: 16, uppercase: true))\(kind) before its window appeared. Export the diagnostic log to report it."
+    }
 }
 
 // MARK: - Model
@@ -313,10 +323,27 @@ final class DockStartScreen: ObservableObject {
         if !exitObserved && MadeiraConfig.flag("MADEIRA_DOCK_STATUS") {   // 0: the starting screen does not watch the host's result
             let current = MainActor.assumeIsolated { MadeiraDock.pollReport() }
             report = current
+            // madeira-doge: the game Steam started ended with a Windows error while the
+            // starting screen is up. The host only reports after it gives up waiting
+            // for the game (10-15 s later), so say so now (MADEIRA_DOCK_GAME_EXIT=0: wait
+            // for the host as before). Only a program outside Windows' and the Steam
+            // client's folders counts (SteamLaunchScene.owner), as for windows.
+            if failure == nil, current.result == nil, model.launching, current.fields["launch-client-error"] == "0",
+               MadeiraConfig.flag("MADEIRA_DOCK_GAME_EXIT") {
+                var status: UInt32 = 0
+                var name = [CChar](repeating: 0, count: 520)
+                if wine_child_crash_exit(&status, &name, name.count) != 0 {
+                    let image = name.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+                    if let words = DockStartStatus.gameExit(status: status, image: image, places: places) {
+                        failure = words
+                        LogStore.shared.log("[dock-status] game-exit image=\(image) status=0x\(String(status, radix: 16))", level: .error)
+                    }
+                }
+            }
             if current.result != nil {
                 exitObserved = true
                 if let words = DockStartStatus.failure(result: current.result, words: current.failure, launching: model.launching) {
-                    failure = words
+                    if failure == nil { failure = words }   // a game exit found above stays: it says more
                     LogStore.shared.log("[dock-status] host-ended result=\(current.result ?? 0) starting=\(model.launching ? 1 : 0)", level: .error)
                     MainActor.assumeIsolated { MadeiraDock.cleanup() }
                 }

@@ -21,7 +21,12 @@ int wine_process_is_running(void);
 // (0xC...) since the last reset.
 void wine_launched_process_did_exit(int status);
 int wine_crash_exit_status(uint32_t *status);
-// Forget the recorded status; called when a session begins.
+// The last child process that ended with an NTSTATUS error (0xC...): returns
+// a sequence number (0: none since the last reset) and fills *status and the
+// image's Windows path. ntdll calls wine_child_process_did_exit() for it.
+void wine_child_process_did_exit(int status, const char *name);
+uint32_t wine_child_crash_exit(uint32_t *status, char *name, size_t name_len);
+// Forget the recorded statuses; called when a session begins.
 void wine_exit_status_reset(void);
 
 // Steam S0 net-test VPN gate: write C:\madeira-continue.flag into the

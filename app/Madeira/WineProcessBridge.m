@@ -314,8 +314,31 @@ void wine_launched_process_did_exit(int status) {
     if ((uint32_t)status >= 0xC0000000u)
         __atomic_store_n(&g_launch_exit, (UINT64_C(1) << 32) | (uint32_t)status, __ATOMIC_RELEASE);
 }
+/* madeira-doge: the last child process (a game a Madeira Dock host started,
+ * any helper) that ended with an NTSTATUS error, with its image's Windows path.
+ * ntdll (server_ios.c, process_exit_wrapper) calls the hook only for 0xC...
+ * statuses. The sequence number lets a reader tell a new exit from one it saw. */
+static char g_child_exit_name[520];
+static uint32_t g_child_exit_status = 0;
+static uint32_t g_child_exit_seq = 0;
+void wine_child_process_did_exit(int status, const char *name) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    snprintf(g_child_exit_name, sizeof(g_child_exit_name), "%s", name ? name : "");
+    g_child_exit_status = (uint32_t)status;
+    __atomic_add_fetch(&g_child_exit_seq, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&lock);
+}
+uint32_t wine_child_crash_exit(uint32_t *status, char *name, size_t name_len) {
+    uint32_t seq = __atomic_load_n(&g_child_exit_seq, __ATOMIC_ACQUIRE);
+    if (!seq) return 0;
+    if (status) *status = g_child_exit_status;
+    if (name && name_len) snprintf(name, name_len, "%s", g_child_exit_name);
+    return seq;
+}
 void wine_exit_status_reset(void) {
     __atomic_store_n(&g_launch_exit, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_child_exit_seq, 0, __ATOMIC_RELEASE);
 }
 int wine_crash_exit_status(uint32_t *status) {
     uint64_t value = __atomic_load_n(&g_launch_exit, __ATOMIC_ACQUIRE);

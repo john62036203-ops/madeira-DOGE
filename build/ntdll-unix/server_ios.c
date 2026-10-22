@@ -4430,6 +4430,31 @@ void process_exit_wrapper( int status )
         void *dead_peb = ios_proc_sockets[i].peb;
         wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
                        status, ios_proc_sockets[i].fd);
+        /* madeira-doge: a child that ends with an NTSTATUS error (0xC...) is
+         * reported to the app with its image's path, so a Madeira Dock
+         * start can say that the game stopped instead of waiting until the
+         * host gives up (DockStartScreen.swift, MADEIRA_DOCK_GAME_EXIT). A weak
+         * hook; the path is copied into a stack buffer, ASCII only, no
+         * allocation. Read while the PEB is still mapped. */
+        if ((unsigned int)status >= 0xC0000000u)
+        {
+            extern void wine_child_process_did_exit( int status, const char *name ) __attribute__((weak));
+            if (wine_child_process_did_exit)
+            {
+                char name[520] = "";
+                const PEB *dead = dead_peb;
+                const RTL_USER_PROCESS_PARAMETERS *params = dead ? dead->ProcessParameters : NULL;
+                if (params && params->ImagePathName.Buffer)
+                {
+                    const WCHAR *path = params->ImagePathName.Buffer;
+                    size_t len = params->ImagePathName.Length / sizeof(WCHAR), n = 0, k;
+                    for (k = 0; k < len && n < sizeof(name) - 1; k++)
+                        name[n++] = (path[k] >= 0x20 && path[k] < 0x7f) ? (char)path[k] : '?';
+                    name[n] = 0;
+                }
+                wine_child_process_did_exit( status, name );
+            }
+        }
         /* ml987: hand back the fixed-base main image BEFORE the socket closes.
          * NtUnmapViewOfSection needs a live server connection, and this is the
          * last moment we have one while still on the owning process's thread. */
