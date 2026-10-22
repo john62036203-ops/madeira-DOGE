@@ -88,7 +88,8 @@ assert warmer.count('if (IOS_POOL_IN_HOLE(o)) continue;') == 4, 'all four warmer
 
 tail = native[native.index('size_t reserve_offset, tail_added, tail_skipped = 0;'):][:12000]
 assert 'ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,' in tail
-assert tail.count('ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,') == 2
+# three rollbacks: tail exhausted, and (madeira-doge, MADEIRA_TAIL_CARVE_EXEC_CHECK) a carve that cannot execute
+assert tail.count('ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,') == 3
 assert '__sync_fetch_and_sub(&ios_jit_tail_reserved' not in tail, 'every rollback goes through ios_pool_tail_unreserve'
 assert 'ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end_eff;' in tail
 assert 'ios_jit_hole_off_eff, ios_jit_hole_end_eff );' in tail, 'the tail jumps either slot placement with the hole'
