@@ -78,6 +78,10 @@ python3 "$R/tools/patch-dxgi-x64-entry.py" "$OUT/src/dxgi_factory.cpp" || fail "
 # The adapter with the D3DKMT UMD version (run-time switch MADEIRA_KMT_ADAPTER), also on a copy.
 cp "$G/dxgi_adapter.cpp" "$OUT/src/dxgi_adapter.cpp"
 python3 "$R/tools/patch-dxgi-umd-version.py" "$OUT/src/dxgi_adapter.cpp" || fail "tools/patch-dxgi-umd-version.py did not apply"
+# The output with a real WaitForVBlank (60 Hz tick), also on a copy: EXVS2's
+# vblank-counting thread spun its 32-bit counter over in ~97 s without it.
+cp "$G/dxgi_output.cpp" "$OUT/src/dxgi_output.cpp"
+python3 "$R/tools/patch-dxgi-vblank.py" "$OUT/src/dxgi_output.cpp" || fail "tools/patch-dxgi-vblank.py did not apply"
 
 # DXMT's meson.build: compiler_args, the project defines, buildtype=release
 # (-O3, b_ndebug=if-release -> NDEBUG), C++20, the include paths of dxgi's
@@ -121,9 +125,11 @@ done
 compile "$D/src/dxmt/dxmt_format.cpp" "$OUT/obj/dxmt_format.o"
 "$AR" csrDT "$OUT/libdxmt.a" "$OUT/obj/dxmt_format.o"
 
-for s in dxgi_output dxgi_options dxgi; do
+for s in dxgi_options dxgi; do
     compile "$G/$s.cpp" "$OUT/obj/$s.o"
 done
+compile "$G/dxgi_output.cpp" "$OUT/obj/dxgi_output_plain.o"
+compile "$OUT/src/dxgi_output.cpp" "$OUT/obj/dxgi_output.o"
 compile "$G/dxgi_adapter.cpp" "$OUT/obj/dxgi_adapter_plain.o"
 compile "$OUT/src/dxgi_adapter.cpp" "$OUT/obj/dxgi_adapter.o"
 compile "$G/dxgi_factory.cpp" "$OUT/obj/dxgi_factory_plain.o"
@@ -134,17 +140,17 @@ compile "$OUT/src/dxgi_factory.cpp" "$OUT/obj/dxgi_factory.o" "-DMADEIRA_DXGI_SR
 # dependency archives, -static (libc++ in, UCRT through api-ms-win-crt-*), file
 # alignment 4096, util_dep's -lntdll and meson's default Windows libraries
 # (cpp_winlibs; gdi32 has D3DKMTOpenAdapterFromLuid).
-link_dll() {  # link_dll <factory object> <output> <adapter object>
+link_dll() {  # link_dll <factory object> <output> <adapter object> <output object>
     "$CXX" -shared -o "$2" \
-        "$3" "$1" "$OUT/obj/dxgi_output.o" "$OUT/obj/dxgi_options.o" "$OUT/obj/dxgi.o" \
+        "$3" "$1" "$4" "$OUT/obj/dxgi_options.o" "$OUT/obj/dxgi.o" \
         "$OUT/obj/version.o" "$G/dxgi.def" \
         "$OUT/libdxmt.a" "$OUT/libutil.a" -L"$OUT" -lwinemetal -lntdll \
         -static -Wl,--file-alignment=4096 -Wl,--section-alignment=16384 \
         -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 \
         2>> "$OUT/build.err" || { grep -m 20 "error" "$OUT/build.err"; fail "linking $(basename "$2") failed"; }
 }
-link_dll "$OUT/obj/dxgi_factory_plain.o" "$OUT/plain/dxgi.dll" "$OUT/obj/dxgi_adapter_plain.o"
-link_dll "$OUT/obj/dxgi_factory.o" "$OUT/dxgi.dll" "$OUT/obj/dxgi_adapter.o"
+link_dll "$OUT/obj/dxgi_factory_plain.o" "$OUT/plain/dxgi.dll" "$OUT/obj/dxgi_adapter_plain.o" "$OUT/obj/dxgi_output_plain.o"
+link_dll "$OUT/obj/dxgi_factory.o" "$OUT/dxgi.dll" "$OUT/obj/dxgi_adapter.o" "$OUT/obj/dxgi_output.o"
 
 # The new DLL must export exactly what upstream's does: Wine and every game
 # bind to these names (DXMT's d3d11 and our nvapi64 import them too).
