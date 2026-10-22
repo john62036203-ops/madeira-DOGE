@@ -169,6 +169,8 @@ cp -R "$D/src/d3d11" "$D/src/d3d10" "$OUT/tree/src/"
 python3 "$R/tools/patch-dxmt-context-state-swap.py" "$OUT/tree/src/d3d11" || fail "tools/patch-dxmt-context-state-swap.py did not apply"
 # madeira-doge: env.MADEIRA_D3D11_VIDEO (stub ID3D11VideoDevice / fail VIDEO_SUPPORT devices), opt-in.
 python3 "$R/tools/patch-dxmt-video-device.py" "$OUT/tree/src/d3d11" || fail "tools/patch-dxmt-video-device.py did not apply"
+# madeira-doge: [d3d11-share] trace of shared textures, failed 2D textures, video-format support queries.
+python3 "$R/tools/patch-dxmt-share-trace.py" "$OUT/tree/src/d3d11" || fail "tools/patch-dxmt-share-trace.py did not apply"
 # madeira-doge: DXMT_DYN_TRIM switch, on a copy of the one dxmt source it touches;
 # the object is linked into the shipped DLL ahead of libdxmt.a (the plain link
 # and the archive keep the pristine file).
