@@ -310,9 +310,19 @@ fi
 if [ "${MADEIRA_SPATIAL_EOS_BUILD:-1}" != 0 ] && [ -f "$SHIP/mmdevapi.dll" ] && [ -f "$R/wine/dlls/mmdevapi/spatialaudio.c" ]; then
     md="$B/dlls/mmdevapi/arm64ec-windows/mmdevapi.dll"
     : > "$B.mmdevapi.log"
+    # The shipped builtins were built like BCD's ntdll-sync.dll: -g -O2 with the
+    # source prefix mapped (a plain rebuild matched section sizes but not bytes,
+    # build 353). Both flag sets are tried below.
+    mdsrc="$(sed -n 's/^srcdir = //p' "$B/Makefile")"
+    md_flags=""
     md_make() {
         rm -f "$md" "$B"/dlls/mmdevapi/arm64ec-windows/*.o
-        make -C "$B" -j"$JOBS" dlls/mmdevapi/arm64ec-windows/mmdevapi.dll >> "$B.mmdevapi.log" 2>&1 && [ -f "$md" ]
+        if [ -n "$md_flags" ]; then
+            make -C "$B" -j"$JOBS" arm64ec_CFLAGS="$md_flags" x86_64_CFLAGS="$md_flags" \
+                dlls/mmdevapi/arm64ec-windows/mmdevapi.dll >> "$B.mmdevapi.log" 2>&1 && [ -f "$md" ]
+        else
+            make -C "$B" -j"$JOBS" dlls/mmdevapi/arm64ec-windows/mmdevapi.dll >> "$B.mmdevapi.log" 2>&1 && [ -f "$md" ]
+        fi
     }
     md_ship() {   # $1 = output, $2 = pad past SizeOfImage
         cp "$md" "$1" && "$MINGW/llvm-strip" "$1" && python3 - "$1" "$2" <<'PY'
@@ -325,19 +335,25 @@ if len(d) < target:
 PY
     }
     md_pad=""
-    if md_make; then
-        for pad in 0x10000 0x20000; do
-            if md_ship "$B/mmdevapi-stock.dll" $pad &&
-               python3 "$R/tools/patch-wine-ntdll-proton.py" --same-as "$B/mmdevapi-stock.dll" "$SHIP/mmdevapi.dll" >> "$B.mmdevapi.log" 2>&1; then
-                md_pad=$pad; break
-            fi
-        done
-    fi
+    for fl in "" "-g -O2" "-g -O2 -ffile-prefix-map=$mdsrc=.. -fno-file-reproducible"; do
+        case "$fl" in *prefix-map=..*) case "$mdsrc" in /*) ;; *) continue ;; esac ;; esac
+        md_flags="$fl"
+        if md_make; then
+            for pad in 0x10000 0x20000; do
+                if md_ship "$B/mmdevapi-stock.dll" $pad &&
+                   python3 "$R/tools/patch-wine-ntdll-proton.py" --same-as "$B/mmdevapi-stock.dll" "$SHIP/mmdevapi.dll" >> "$B.mmdevapi.log" 2>&1; then
+                    md_pad=$pad; break
+                fi
+            done
+        fi
+        [ -n "$md_pad" ] && break
+        echo "::notice::mmdevapi.dll stock rebuild with flags '${fl:-default}': $(python3 "$R/tools/patch-wine-ntdll-proton.py" --explain "$B/mmdevapi-stock.dll" "$SHIP/mmdevapi.dll" 2>&1 | cut -c1-400)"
+    done
     if [ -n "$md_pad" ]; then
         if python3 "$R/tools/patch-wine-spatialaudio-eos.py" "$R/wine/dlls/mmdevapi/spatialaudio.c" >> "$B.mmdevapi.log" 2>&1 &&
            md_make && md_ship "$SHIP/mmdevapi.dll.tmp" $md_pad; then
             mv "$SHIP/mmdevapi.dll.tmp" "$SHIP/mmdevapi.dll"
-            echo "::notice::mmdevapi.dll with spatial-audio SetEndOfStream/IsActive: shipped DLL replaced (stock rebuild matched, pad $md_pad)"
+            echo "::notice::mmdevapi.dll with spatial-audio SetEndOfStream/IsActive: shipped DLL replaced (stock rebuild matched, pad $md_pad, flags '${md_flags:-default}')"
         else
             rm -f "$SHIP/mmdevapi.dll.tmp"
             echo "::warning::mmdevapi.dll spatial-audio patch did not build; shipped copy kept :: $(grep -m 6 -E 'error|anchor' "$B.mmdevapi.log" | tr '\n' ' ' | cut -c1-900)"
