@@ -36,10 +36,12 @@ jobs:
       - name: Commit results to nuts-diff-out
         run: |
           cd out
+          gzip -9 full.diff && split -b 40m full.diff.gz full.diff.gz.part && rm full.diff.gz
+          echo "::notice::$(ls -la | tr '\n' ' ')"
           git init -q -b nuts-diff-out
           git config user.name github-actions; git config user.email actions@github.com
           git add -A && git commit -qm "NutsEmu $OLD vs $NEW diff"
-          git push -f https://x-access-token:${{ github.token }}@github.com/${{ github.repository }} nuts-diff-out
+          git push -f https://x-access-token:${{ github.token }}@github.com/${{ github.repository }} nuts-diff-out 2>&1 | tail -5 | while read l; do echo "::notice::$l"; done
         env:
           OLD: "1552"
           NEW: "1596"
