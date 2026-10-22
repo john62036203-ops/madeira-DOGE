@@ -15252,6 +15252,26 @@ static int mad_map_rtv_format(DXGI_FORMAT f, enum WMTPixelFormat *out) {
 }
 
 /* ---- pipeline state (ml859) --------------------------------------------- */
+/* madeira-doge: integer render-target formats, which Metal cannot blend. */
+static int mad_format_is_integer(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32A32_SINT:
+    case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R32G32B32_SINT:
+    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
+    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SINT:
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SINT:
+    case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SINT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static enum WMTBlendFactor mad_blend_factor(D3D12_BLEND b) {
     switch (b) {
     case D3D12_BLEND_ZERO: return WMTBlendFactorZero;
@@ -16203,6 +16223,16 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         }
         rp.colors[i].pixel_format = pf;
         rp.colors[i].blending_enabled = b->BlendEnable != 0;
+        if (b->BlendEnable && mad_format_is_integer(desc->RTVFormats[i])) {
+            /* madeira-doge: D3D12 ignores blending on an integer target; Metal aborts the
+             * process ("pixelformat MTLPixelFormatRGBA32Uint for this render target is not
+             * blendable"). RESIDENT EVIL requiem, 2026-10-23 00:35, RT5 of a G-buffer PSO. */
+            static unsigned said;
+            rp.colors[i].blending_enabled = false;
+            if (said++ < 8)
+                d3d12_log("[madeira-d3d12] render target %u format %u is an integer format: its blending is "
+                          "turned off (Metal cannot blend it)\n", i, (unsigned)desc->RTVFormats[i]);
+        }
         rp.colors[i].rgb_blend_operation = mad_blend_op(b->BlendOp);
         rp.colors[i].alpha_blend_operation = mad_blend_op(b->BlendOpAlpha);
         rp.colors[i].src_rgb_blend_factor = mad_blend_factor(b->SrcBlend);
