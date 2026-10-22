@@ -32749,6 +32749,23 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
 
         info->AllocationBase = alloc_base;
         info->RegionSize = get_committed_size( view, base, ~(size_t)0, &vprot, ~VPROT_WRITEWATCH );
+        if (!info->RegionSize)
+        {
+            /* madeira-doge: a SEC_RESERVE view whose get_mapping_committed_range request
+             * fails (seen in child processes: EXVS2 IB's LM and game spawned by a launcher)
+             * reported RegionSize 0, and FEX's InvalidateContainingSection walk
+             * (SectionSize += RegionSize while AllocationBase matches) then spun forever on
+             * the same address. Report the rest of the view instead: never a zero region. */
+            static int zero_n;
+            SIZE_T rest = (char *)view->base + view->size - base;
+            if ((char *)alloc_end > base && (SIZE_T)((char *)alloc_end - base) < rest) rest = (char *)alloc_end - base;
+            if (!rest) rest = page_mask + 1;
+            if (zero_n++ < 8)
+                dprintf( 2, "[vquery-zero] madeira-doge %p in view %p+%#lx (protect %#x): committed range "
+                         "size 0 -> reporting %#lx\n", base, view->base, (unsigned long)view->size,
+                         (unsigned)view->protect, (unsigned long)rest );
+            info->RegionSize = rest;
+        }
         info->State = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
         info->Protect = (vprot & VPROT_COMMITTED) ? get_win32_prot( vprot, view->protect ) : 0;
         info->AllocationProtect = get_win32_prot( view->protect, view->protect );
