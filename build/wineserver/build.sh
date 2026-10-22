@@ -105,7 +105,9 @@ PATCHED_FILES=(
     # lost) that every rebuild silently preserved — the #79 TCP-table
     # forensics were reading three-week-old mystery code. The submodule
     # copy adds the [srv-conn]/[tcp-state]/[tcp-enum] probes.
-    "sock:$WINE_SRC/server/sock.c:sock.o"
+    # madeira-doge: + Windows wildcard/specific UDP bind (tools/patch-sock-bind-reuse.py),
+    # compiled from a patched copy so the submodule stays untouched.
+    "sock:$OBJ_DIR/sock_patched.c:sock.o"
     # ml2101: the opt-in HID controller (MADEIRA_PAD_MODE = hid) and Wine's
     # hidparse.sys parser it builds its preparsed data with. New objects, not
     # replacements: both lists, as for every entry here.
@@ -124,6 +126,10 @@ if xcrun -sdk iphoneos clang "${KILL_FLAGS[@]}" -c "$BUILD_DIR/wineserver_ios_ki
 else
     echo "FAILED"; cat "$OBJ_DIR/err-kill.txt"; exit 1
 fi
+
+mkdir -p "$OBJ_DIR"
+python3 "$REPO_ROOT/tools/patch-sock-bind-reuse.py" "$WINE_SRC/server/sock.c" "$OBJ_DIR/sock_patched.c" \
+    || { echo "patch-sock-bind-reuse failed"; exit 1; }
 
 case "${1:-all}" in
     all)
