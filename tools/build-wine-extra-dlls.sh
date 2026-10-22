@@ -299,4 +299,54 @@ PY
     rm -rf "$ntp_saved"
     rm -f "$nt" "$B"/dlls/ntdll/arm64ec-windows/*.o "$B/ntdll-stock.dll"
 fi
+
+# madeira-doge: mmdevapi.dll with tools/patch-wine-spatialaudio-eos.py
+# (ISpatialAudioObject::SetEndOfStream / IsActive instead of E_NOTIMPL stubs; the
+# DYNASTY WARRIORS: ORIGINS demo polls IsActive forever). It REPLACES the shipped
+# mmdevapi.dll, so it is built only when this tree, unpatched, first rebuilds the
+# shipped one apart from its time stamps (same check as ntdll-proton.dll; two pad
+# sizes are tried, the shipped builtins use 64 or 128 KB past SizeOfImage).
+# MADEIRA_SPATIAL_EOS_BUILD=0 skips it.
+if [ "${MADEIRA_SPATIAL_EOS_BUILD:-1}" != 0 ] && [ -f "$SHIP/mmdevapi.dll" ] && [ -f "$R/wine/dlls/mmdevapi/spatialaudio.c" ]; then
+    md="$B/dlls/mmdevapi/arm64ec-windows/mmdevapi.dll"
+    : > "$B.mmdevapi.log"
+    md_make() {
+        rm -f "$md" "$B"/dlls/mmdevapi/arm64ec-windows/*.o
+        make -C "$B" -j"$JOBS" dlls/mmdevapi/arm64ec-windows/mmdevapi.dll >> "$B.mmdevapi.log" 2>&1 && [ -f "$md" ]
+    }
+    md_ship() {   # $1 = output, $2 = pad past SizeOfImage
+        cp "$md" "$1" && "$MINGW/llvm-strip" "$1" && python3 - "$1" "$2" <<'PY'
+import struct, sys
+p = sys.argv[1]; d = open(p, 'rb').read()
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+target = struct.unpack_from('<I', d, pe + 24 + 56)[0] + int(sys.argv[2], 0)
+if len(d) < target:
+    open(p, 'ab').write(b'\0' * (target - len(d)))
+PY
+    }
+    md_pad=""
+    if md_make; then
+        for pad in 0x10000 0x20000; do
+            if md_ship "$B/mmdevapi-stock.dll" $pad &&
+               python3 "$R/tools/patch-wine-ntdll-proton.py" --same-as "$B/mmdevapi-stock.dll" "$SHIP/mmdevapi.dll" >> "$B.mmdevapi.log" 2>&1; then
+                md_pad=$pad; break
+            fi
+        done
+    fi
+    if [ -n "$md_pad" ]; then
+        if python3 "$R/tools/patch-wine-spatialaudio-eos.py" "$R/wine/dlls/mmdevapi/spatialaudio.c" >> "$B.mmdevapi.log" 2>&1 &&
+           md_make && md_ship "$SHIP/mmdevapi.dll.tmp" $md_pad; then
+            mv "$SHIP/mmdevapi.dll.tmp" "$SHIP/mmdevapi.dll"
+            echo "::notice::mmdevapi.dll with spatial-audio SetEndOfStream/IsActive: shipped DLL replaced (stock rebuild matched, pad $md_pad)"
+        else
+            rm -f "$SHIP/mmdevapi.dll.tmp"
+            echo "::warning::mmdevapi.dll spatial-audio patch did not build; shipped copy kept :: $(grep -m 6 -E 'error|anchor' "$B.mmdevapi.log" | tr '\n' ' ' | cut -c1-900)"
+        fi
+    else
+        echo "::warning::mmdevapi.dll :: this tree does not rebuild the shipped mmdevapi.dll apart from time stamps; shipped copy kept :: $(grep -m 4 -E 'same-as|error' "$B.mmdevapi.log" | tr '\n' ' ' | cut -c1-900)"
+        [ -f "$B/mmdevapi-stock.dll" ] && echo "::warning::mmdevapi.dll :: $(python3 "$R/tools/patch-wine-ntdll-proton.py" --explain "$B/mmdevapi-stock.dll" "$SHIP/mmdevapi.dll" 2>&1 | cut -c1-1500)"
+    fi
+    git -C "$R/wine" checkout -- dlls/mmdevapi/spatialaudio.c
+    rm -f "$md" "$B"/dlls/mmdevapi/arm64ec-windows/*.o "$B/mmdevapi-stock.dll"
+fi
 exit 0
