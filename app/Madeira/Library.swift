@@ -4687,16 +4687,18 @@ struct NoDesktopSettings: View {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
             .appendingPathComponent("madeira-exe-window-mb")
     }
-    /// madeira-doge: 640 MB since build 37x (was 512): RESIDENT EVIL requiem's re9.exe
-    /// is 575 MB with no relocations (2026-10-22 log: pool exhausted, c0000017).
-    static let bigExeWindowMB = 640
+    /// madeira-doge: 576 MB (was 512, then 640 in build 370): RESIDENT EVIL requiem's
+    /// re9.exe is 575 MB with no relocations. 640 left only a 112 MB run between the
+    /// window and the next mapping, too small for pool-split's region A, and the JIT
+    /// pool shrank to 256-320 MB (2026-10-22 21:10 log); 576 leaves ~176 MB there.
+    static let bigExeWindowMB = 576
     static var bigExeWindow: Bool {
         get {
             guard let url = bigExeWindowFile, FileManager.default.fileExists(atPath: url.path) else { return false }
-            // a file written by an older build (512) is raised to the current size;
+            // a file written by an older build (512 or 640) is set to the current size;
             // JITAllocator.c reads it at the next app start
             if let t = try? String(contentsOf: url, encoding: .utf8),
-               let mb = Int(t.trimmingCharacters(in: .whitespacesAndNewlines)), mb < bigExeWindowMB {
+               let mb = Int(t.trimmingCharacters(in: .whitespacesAndNewlines)), mb != bigExeWindowMB {
                 try? Data("\(bigExeWindowMB)\n".utf8).write(to: url, options: .atomic)
             }
             return true
@@ -4713,7 +4715,7 @@ struct NoDesktopSettings: View {
             Toggle("Room for a large game executable", isOn: $bigExe)
                 .onChange(of: bigExe) { _, on in NoDesktopSettings.bigExeWindow = on }
         } header: { Text("Steam games") } footer: {
-            Text("No virtual desktop: starts the game directly instead of on a Windows desktop. A game with one-time installers still to run starts on the desktop.\n\nLarge executable: keeps 640 MB at the fixed address some big games (Unreal Engine) must load at, for a game that ends right at its start. It applies to all games and takes effect after Madeira is fully closed and reopened.")
+            Text("No virtual desktop: starts the game directly instead of on a Windows desktop. A game with one-time installers still to run starts on the desktop.\n\nLarge executable: keeps 576 MB at the fixed address some big games (Unreal Engine) must load at, for a game that ends right at its start. It applies to all games and takes effect after Madeira is fully closed and reopened.")
         }
     }
 }

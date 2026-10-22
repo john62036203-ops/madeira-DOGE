@@ -600,7 +600,10 @@ enum StikJITHelper {
                     for run in holes where run.base >= exeWinBase + exeWinSize && run.base < ceiling {
                         let aFit = min(poolRunSize(available: min(run.size, ceiling - run.base),
                                                   wanted: vm_address_t(poolSize), pageFit: pageFit), vm_address_t(poolSize))
-                        guard aFit >= 128 << 20, aFit < vm_address_t(poolSize) else { continue }
+                        // madeira-doge: 96 MB (was 128): with the large-executable window the run
+                        // right above it can be 100-180 MB, and a small A with a large B still
+                        // beats a single shrunken pool (re9.exe, 2026-10-22).
+                        guard aFit >= 96 << 20, aFit < vm_address_t(poolSize) else { continue }
                         // B as takeSecondRegion picks it: the largest run in [A's end, ceiling),
                         // the rest of A's own run included.
                         let aEnd = run.base + aFit
