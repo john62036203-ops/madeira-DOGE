@@ -100,6 +100,9 @@ MFR=0
 if [ "${MADEIRA_MF_READER_BUILD:-1}" != 0 ] && [ -f "$R/wine/dlls/mfreadwrite/reader.c" ] && shipped mf; then
     if python3 "$R/tools/patch-wine-mf-reader-allocator.py" "$R/wine/dlls/mfreadwrite/reader.c"; then
         MFR=1
+        # madeira-doge: [mf-trace] lines for every source reader call (MADEIRA_MF_TRACE=0 = off)
+        python3 "$R/tools/patch-wine-mf-reader-trace.py" "$R/wine/dlls/mfreadwrite/reader.c" \
+            || echo "::warning::mfreadwrite mf-trace patch did not apply (allocator fix still built)"
         sed -i.bak -e '/^DELAYIMPORTS[[:space:]]*=/d' -e 's/^\(IMPORTS[[:space:]]*=.*\)$/\1 mf/' "$R/wine/dlls/mfreadwrite/Makefile.in" && rm -f "$R/wine/dlls/mfreadwrite/Makefile.in.bak"
         rm -f "$B/dlls/mfreadwrite/arm64ec-windows/mfreadwrite.dll" "$B/dlls/mfreadwrite"/arm64ec-windows/*.o
         targets="$targets dlls/mfreadwrite/arm64ec-windows/mfreadwrite.dll"
