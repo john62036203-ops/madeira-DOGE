@@ -12,6 +12,8 @@
 #     MFT/DMO (wmav1, wmav2, wmapro, wmalossless, xma1, xma2), which FAudio
 #     uses for xWMA/XMA voices; MPEG-1 layer I/II/III and plain PCM decoders
 #     for the wg_parser.
+#   - madeira-doge: matroska (WebM) and ivf demuxers, vp8/vp9/opus/vorbis
+#     decoders (software; VideoToolbox has no VP9 for apps on iOS).
 #   - libavformat: the wg_parser's demuxers -- mp3, wav and mov (MP4/MOV/M4A)
 #     -- and the mpegaudio parser the mp3 demuxer selects. No protocols: the
 #     parser reads through its own AVIOContext (the PE read thread's pull
@@ -113,6 +115,10 @@ CONFIG_ARGS=(
     --enable-decoder=mp1,mp2,mp3
     --enable-decoder=pcm_u8,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le
     --enable-demuxer=mp3,wav,mov
+    # madeira-doge: WebM/Matroska and IVF with VP8/VP9 video and Opus/Vorbis
+    # audio, all decoded by libavcodec (LGPL); DYNASTY WARRIORS: ORIGINS' movies.
+    --enable-demuxer=matroska,ivf
+    --enable-decoder=vp8,vp9,opus,vorbis
     --enable-parser=mpegaudio
     --disable-programs
     --disable-doc
