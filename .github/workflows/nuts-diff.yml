@@ -2,6 +2,8 @@ name: NutsEmu source diff
 on:
   push:
     branches: [nuts-diff]
+permissions:
+  contents: write
 jobs:
   diff:
     runs-on: ubuntu-latest
@@ -31,7 +33,13 @@ jobs:
           wc -l out/full.diff out/filelist.diff
           diff -ruNq src/$OLD src/$NEW | head -400 > out/changed-files.txt || true
           cp dl/$OLD/sums.txt out/sums-$OLD.txt || true; cp dl/$NEW/sums.txt out/sums-$NEW.txt || true
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nuts-diff
-          path: out/
+      - name: Commit results to nuts-diff-out
+        run: |
+          cd out
+          git init -q -b nuts-diff-out
+          git config user.name github-actions; git config user.email actions@github.com
+          git add -A && git commit -qm "NutsEmu $OLD vs $NEW diff"
+          git push -f https://x-access-token:${{ github.token }}@github.com/${{ github.repository }} nuts-diff-out
+        env:
+          OLD: "1552"
+          NEW: "1596"
