@@ -2876,6 +2876,45 @@ static void mad_capture_rs_tables(struct mad_exec *e, obj_handle_t benc, unsigne
 static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
                            const UINT32 (*consts)[64], const struct madeira_ir_air_range *rg,
                            unsigned vis_mask, struct mad_descriptor *desc, UINT64 *direct_va, const char **why);
+/* madeira-doge: trace-ps = <ps entry>[,...] (madeira.cfg / game cfg): during a CAP frame, ONE log
+ * line per draw with that pixel shader -- the pixel stage's t0..t3 (view id, texture, size, format,
+ * view format/swizzle, mips, whether the texture is a placed/own allocation), s0..s7 (sampler id,
+ * filter, address, compare), the vertex buffer offset, blend and stencil state. No pass split, no
+ * blit: the frame renders as it normally would (capture-ps splits the pass around each captured
+ * draw and those draws came out blank on EXVS2). Up to 256 lines per frame. */
+static char g_trace_ps[512]; static int g_trace_ps_loaded, g_trace_ps_n;
+static void mad_trace_draw(struct mad_exec *e) {
+    char line[1400]; int n; unsigned k; struct mad_device *d = e->q->device;
+    if (!g_trace_ps_loaded) { g_trace_ps_loaded = 1; mad_cfg_str_pe("trace-ps", g_trace_ps, sizeof g_trace_ps); }
+    if (!g_trace_ps[0] || !(mad_name_in_list(g_trace_ps, e->pso->ps_name) || mad_vs_in_list(g_trace_ps, e->pso->vs_name))) return;
+    if (g_trace_ps_n++ >= 256) return;
+    n = snprintf(line, sizeof line, "[trace-ps] enc#%u draw %d vs '%s' ps '%s' vb0 off %llu st=%u/func%u/ref%u blend='%s'", e->renc_seq, g_trace_ps_n,
+                 e->pso->vs_name, e->pso->ps_name, (unsigned long long)(e->vb[0].res ? e->vb[0].off : 0ull),
+                 e->pso->dbg_senable, e->pso->dbg_sfunc, (unsigned)e->stencil_ref, e->pso->blend[0] ? e->pso->blend : "-");
+    for (k = 0; k < e->pso->ps_nair && n < (int)sizeof line - 200; k++) {
+        const struct madeira_ir_air_range *rg = &e->pso->ps_air[k]; struct mad_descriptor de; UINT64 direct = 0; const char *why = "?";
+        struct mad_resource *r; int xv = -1; struct mad_smpdesc sd;
+        if (rg->type != MADEIRA_IR_AIR_SRV && rg->type != MADEIRA_IR_AIR_SAMPLER) continue;
+        if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg,
+                             (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_PIXEL), &de, &direct, &why)) {
+            n += snprintf(line + n, sizeof line - n, " %c%u:UNRESOLVED(%s)", rg->type == MADEIRA_IR_AIR_SRV ? 't' : 's', rg->lower_bound, why ? why : "?"); continue; }
+        if (rg->type == MADEIRA_IR_AIR_SAMPLER) {
+            if (mad_smpdesc_get(de.gpu_va, &sd))
+                n += snprintf(line + n, sizeof line - n, " s%u:id%#llx f%#x a%u/%u/%u cmp%u", rg->lower_bound, (unsigned long long)de.gpu_va, sd.filter, sd.au, sd.av, sd.aw, sd.cmp);
+            else n += snprintf(line + n, sizeof line - n, " s%u:id%#llx(?)", rg->lower_bound, (unsigned long long)de.gpu_va);
+            continue;
+        }
+        if (!(rg->flags & MADEIRA_IR_AIR_F_TEXTURE) || (de.metadata & (1ull << 63))) { n += snprintf(line + n, sizeof line - n, " t%u:buffer va%#llx", rg->lower_bound, (unsigned long long)de.gpu_va); continue; }
+        r = mad_texture_of_view(d, de.texture_view_id, &xv);
+        if (!r) { n += snprintf(line + n, sizeof line - n, " t%u:view%llu NO-TEXTURE", rg->lower_bound, (unsigned long long)de.texture_view_id); continue; }
+        n += snprintf(line + n, sizeof line - n, " t%u:view%llu=r#%u %s %ux%u x%u pf%u dx%u mips%u(drop%u) %s%s", rg->lower_bound, (unsigned long long)de.texture_view_id,
+                      r->serial, r->name ? r->name : "?", r->width, r->height, r->tex_layers, (unsigned)r->tex_pf, (unsigned)r->desc.Format, r->tex_mips, r->mip_drop,
+                      r->placed_heap ? "placed" : "own", r->texture ? "" : " NO-MTLTEXTURE");
+        if (xv >= 0) n += snprintf(line + n, sizeof line - n, " VIEW(type%u pf%u swz%08x l%u+%u s%u+%u)", r->xview[xv].type, r->xview[xv].pf, r->xview[xv].swz,
+                                   r->xview[xv].lvl0, r->xview[xv].nlvl, r->xview[xv].sl0, r->xview[xv].nsl);
+    }
+    d3d12_log("%s\n", line);
+}
 /* ml1106: everything the matched draw will read, copied out BEFORE it runs
  * (after its producers: the blit is in the fence chain). */
 static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c) {
@@ -6739,6 +6778,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
     if (g_skip_ps_state && mad_skip_ps_match(e->pso)) { MAD_SKIP(e); return; }   /* madeira-bcd: diagnostic, off unless skip-ps is set */
     g_dump_tables = 0;
+    if (g_capture_on) mad_trace_draw(e);   /* madeira-doge: trace-ps, one line per draw, no pass split */
     if (g_capture_on && g_capture_ps[0] && (mad_name_in_list(g_capture_ps, e->pso->ps_name) || mad_vs_in_list(g_capture_ps, e->pso->vs_name)) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots; madeira-bcd: exact names (a substring match let ps_SetColor eat the shots meant for ps_SetColor_MultiLight) */
         g_capture_ps_shots++;
         mad_capture_draw_inputs(e, c);
@@ -19074,6 +19114,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                 g_capture_ps_loaded = 1; mad_cfg_str_pe("capture-ps", g_capture_ps, sizeof g_capture_ps);
                 if (g_capture_ps[0]) d3d12_log("[capture] ml1106 targeted draw capture for ps='%s'\n", g_capture_ps); }
             g_capture_ps_shots = 0;
+            g_trace_ps_n = 0;   /* madeira-doge: trace-ps */
             {   /* ml1141: re-read every CAP, so the target can change between captures of one run */
                 mad_cfg_str_pe("capture-cs", g_capture_cs, sizeof g_capture_cs);
                 g_capture_cs_ind = mad_cfg_int_pe("capture-cs-indirect", 0) ? 1 : 0;
