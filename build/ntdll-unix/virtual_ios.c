@@ -22289,6 +22289,38 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
         if ((UINT_PTR)base & host_page_mask ||
             ((size & host_page_mask) && base + size != (char *)view->base + view->size))
         {
+#ifdef WINE_IOS
+            /* madeira-doge: a FREE placeholder split at 4 KB on the 16 KB host.
+             * .NET's loader (PEImageLayout, LoadImageByMappingParts) reserves one
+             * placeholder for an assembly and carves it section by section with
+             * VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) at the PE's
+             * 4 KB section boundaries, then MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)
+             * into each piece. Both halves stay free placeholders (PROT_NONE
+             * already), so the split is bookkeeping only: no host mapping changes
+             * hands, and the later map of a piece takes the unaligned read()
+             * path of map_file_into_view. Server-Infinite (EXVS2 card server)
+             * failed to load System.Private.CoreLib.dll (0x800701E7) here. */
+            if ((view->protect & VPROT_FREE_PLACEHOLDER) && !((UINT_PTR)base & page_mask) && !(size & page_mask))
+            {
+                struct file_view *piece;
+                static int said;
+                status = remove_pages_from_view( view, base, size );
+                if (status) return status;
+                if (!(piece = alloc_view())) return STATUS_NO_MEMORY;
+                piece->base = base; piece->size = size;
+                piece->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER;
+                piece->madeira_creator_tid = 0; piece->madeira_parked = 0;
+                piece->madeira_rw_base = NULL; piece->madeira_rw_size = 0;
+                set_page_vprot( base, size, 0 );
+                register_view( piece );
+                ios_vh_note( 'c', piece );
+                if (said++ < 4)
+                    dprintf( 2, "[placeholder] madeira-doge: free placeholder split at 4 KB: %p+%#lx out of %p+%#lx "
+                             "(bookkeeping only on the 16 KB host)\n", base, (unsigned long)size,
+                             view->base, (unsigned long)view->size );
+                return STATUS_SUCCESS;
+            }
+#endif
             ERR( "unaligned partial free %p-%p\n", base, base + size );
             return STATUS_CONFLICTING_ADDRESSES;
         }
