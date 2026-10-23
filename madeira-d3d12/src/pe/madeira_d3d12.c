@@ -894,6 +894,7 @@ struct mad_resource {
      * (type, levels, slices). */
     enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips, tex_layers; UINT tex_depth;   /* ml924: 3D depth */
     UINT mip_drop;   /* madeira-doge: tex-mip-drop -- the application's mip N is Metal's mip N - mip_drop; the first mip_drop do not exist */
+    float rts_x, rts_y;   /* madeira-doge rt-scale: Metal size / application size (0 = not scaled) */
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
     struct mad_u10 *u10;   /* madeira-doge: unpacked copies of R10G10B10A2_UINT vertex elements */
     unsigned nxview, xview_cap;
@@ -6836,7 +6837,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_render_draw_indirect c_di;
     struct wmtcmd_render_setblendcolor c_bl;
     struct wmtcmd_render_draw_indexed_indirect c_dii;
-    struct wmtcmd_render_setviewport c_vp;
+    struct wmtcmd_render_setviewport c_vp; float rts_x = 1.0f, rts_y = 1.0f;   /* madeira-doge rt-scale */
     struct wmtcmd_render_setscissorrect c_sc;
     struct wmtcmd_render_setbuffer sb[6 + 16 + 2 + 4];
     obj_handle_t u10buf[4] = {0};   /* madeira-doge */
@@ -6955,10 +6956,15 @@ tess_go:
     }
     tail = (struct wmtcmd_base *)&c_pso;
 #define MAD_APPEND(node) do { tail->next.ptr = (node); tail = (struct wmtcmd_base *)(node); } while (0)
+    {   /* madeira-doge rt-scale: a pass into a scaled target scales its viewport and scissor */
+        const struct mad_resource *att = e->enc_nrt && e->enc_rt[0] ? e->enc_rt[0] : e->enc_depth;
+        rts_x = att && att->rts_x > 0.0f ? att->rts_x : 1.0f;
+        rts_y = att && att->rts_y > 0.0f ? att->rts_y : 1.0f;
+    }
     if (e->has_vp) {
         memset(&c_vp, 0, sizeof c_vp); c_vp.type = WMTRenderCommandSetViewport;
-        c_vp.viewport.originX = e->vp.TopLeftX; c_vp.viewport.originY = e->vp.TopLeftY;
-        c_vp.viewport.width = e->vp.Width; c_vp.viewport.height = e->vp.Height;
+        c_vp.viewport.originX = e->vp.TopLeftX * rts_x; c_vp.viewport.originY = e->vp.TopLeftY * rts_y;
+        c_vp.viewport.width = e->vp.Width * rts_x; c_vp.viewport.height = e->vp.Height * rts_y;
         c_vp.viewport.znear = e->vp.MinDepth; c_vp.viewport.zfar = e->vp.MaxDepth;
         MAD_APPEND(&c_vp);
     }
@@ -6968,6 +6974,10 @@ tess_go:
         UINT th = e->enc_nrt && e->enc_rt[0] ? e->enc_rt[0]->height : (e->enc_depth ? e->enc_depth->height : 0);
         LONG x0 = e->sc.left < 0 ? 0 : e->sc.left, y0 = e->sc.top < 0 ? 0 : e->sc.top;
         LONG x1 = e->sc.right, y1 = e->sc.bottom;
+        if (rts_x != 1.0f || rts_y != 1.0f) {   /* madeira-doge rt-scale */
+            x0 = (LONG)((float)x0 * rts_x); y0 = (LONG)((float)y0 * rts_y);
+            x1 = (LONG)((float)x1 * rts_x + 0.5f); y1 = (LONG)((float)y1 * rts_y + 0.5f);
+        }
         if (tw && x1 > (LONG)tw) x1 = (LONG)tw;
         if (th && y1 > (LONG)th) y1 = (LONG)th;
         if (x1 > x0 && y1 > y0) {
@@ -7421,6 +7431,20 @@ static UINT mad_aspect_bpp(const struct mad_resource *r, UINT plane) {
     mad_format_info(r->desc.Format, &bytes, &block);
     return block == 1 ? bytes : 0;
 }
+/* madeira-doge rt-scale: a buffer copy into or out of a scaled target keeps the
+ * application's texel positions (the data is not resampled) and is clipped to the
+ * smaller Metal texture; the rest of the rows are not transferred. Logged once each way. */
+static int mad_rts_clip_bt(const struct mad_resource *r, UINT level, uint64_t *x, uint64_t *y, uint64_t *w, uint64_t *h, const char *what) {
+    UINT tw = (r->width >> level) ? (r->width >> level) : 1, th = (r->height >> level) ? (r->height >> level) : 1;
+    static LONG said;
+    if (*x >= tw || *y >= th) return 0;
+    if (*x + *w > tw) *w = tw - *x;
+    if (*y + *h > th) *h = th - *y;
+    if (InterlockedIncrement(&said) <= 4)
+        d3d12_log("[madeira-d3d12] rt-scale: %s of scaled %s r#%u clipped to %llux%llu (the application copies %ux%u texels)\n",
+                  what, r->name ? r->name : "?", r->serial, (unsigned long long)*w, (unsigned long long)*h, (unsigned)r->desc.Width, r->desc.Height);
+    return *w && *h;
+}
 static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     const struct mad_resource *s = c->u.tt.src, *d = c->u.tt.dst;
     struct mad_device *dev = e->q->device;
@@ -7525,6 +7549,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.dst = c->u.bt.tex->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
         k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
         k.reserved[0] = (uint16_t)mad_aspect_opt(c->u.bt.tex, c->u.bt.plane);   /* the MTLBlitOption, see exec_copy_aspect */
+        if (c->u.bt.tex->rts_x > 0.0f && !mad_rts_clip_bt(c->u.bt.tex, c->u.bt.level, &k.origin.x, &k.origin.y, &k.size.width, &k.size.height, "upload")) { MAD_SKIP(e); return; }   /* madeira-doge rt-scale */
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
         return;
     }
@@ -7563,6 +7588,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.src = c->u.bt.tex->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
         k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
         k.size.width = c->u.bt.w; k.size.height = c->u.bt.h; k.size.depth = c->u.bt.d;
+        if (c->u.bt.tex->rts_x > 0.0f && !mad_rts_clip_bt(c->u.bt.tex, c->u.bt.level, &k.origin.x, &k.origin.y, &k.size.width, &k.size.height, "readback")) { MAD_SKIP(e); return; }   /* madeira-doge rt-scale */
         k.dst = c->u.bt.buf->buffer; k.offset = c->u.bt.off;
         k.bytes_per_row = c->u.bt.row; k.bytes_per_image = c->u.bt.row * c->u.bt.rows;
         k.options = mad_aspect_opt(c->u.bt.tex, c->u.bt.plane);
@@ -7584,6 +7610,23 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.src_size.width = c->u.tt.w; k.src_size.height = c->u.tt.h; k.src_size.depth = c->u.tt.d;
         k.dst = c->u.tt.dst->texture; k.dst_slice = c->u.tt.dslice; k.dst_level = c->u.tt.dlevel;
         k.dst_origin.x = c->u.tt.dx; k.dst_origin.y = c->u.tt.dy; k.dst_origin.z = c->u.tt.dz;
+        if (c->u.tt.src->rts_x > 0.0f || c->u.tt.dst->rts_x > 0.0f) {   /* madeira-doge rt-scale: both sides in their own Metal pixels, the extent clamped to both */
+            const struct mad_resource *sr = c->u.tt.src, *dr = c->u.tt.dst;
+            float sx = sr->rts_x > 0.0f ? sr->rts_x : 1.0f, sy = sr->rts_y > 0.0f ? sr->rts_y : 1.0f;
+            float dx = dr->rts_x > 0.0f ? dr->rts_x : 1.0f, dy = dr->rts_y > 0.0f ? dr->rts_y : 1.0f;
+            UINT sw = (sr->width >> c->u.tt.slevel) ? (sr->width >> c->u.tt.slevel) : 1, sh = (sr->height >> c->u.tt.slevel) ? (sr->height >> c->u.tt.slevel) : 1;
+            UINT dw = (dr->width >> c->u.tt.dlevel) ? (dr->width >> c->u.tt.dlevel) : 1, dh = (dr->height >> c->u.tt.dlevel) ? (dr->height >> c->u.tt.dlevel) : 1;
+            UINT w = (UINT)((float)c->u.tt.w * (sx < dx ? sx : dx) + 0.5f), h = (UINT)((float)c->u.tt.h * (sy < dy ? sy : dy) + 0.5f);
+            k.src_origin.x = (UINT)((float)c->u.tt.sx * sx); k.src_origin.y = (UINT)((float)c->u.tt.sy * sy);
+            k.dst_origin.x = (UINT)((float)c->u.tt.dx * dx); k.dst_origin.y = (UINT)((float)c->u.tt.dy * dy);
+            if (k.src_origin.x >= sw || k.src_origin.y >= sh || k.dst_origin.x >= dw || k.dst_origin.y >= dh) { MAD_SKIP(e); return; }
+            if (k.src_origin.x + w > sw) w = sw - (UINT)k.src_origin.x;
+            if (k.dst_origin.x + w > dw) w = dw - (UINT)k.dst_origin.x;
+            if (k.src_origin.y + h > sh) h = sh - (UINT)k.src_origin.y;
+            if (k.dst_origin.y + h > dh) h = dh - (UINT)k.dst_origin.y;
+            if (!w || !h) { MAD_SKIP(e); return; }
+            k.src_size.width = w; k.src_size.height = h;
+        }
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
         return;
     }
@@ -11742,16 +11785,57 @@ static void mad_placed_fallback(const struct mad_memheap *h, const D3D12_RESOURC
                   desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? "buffer" : "texture", (unsigned long long)desc->Width, desc->Height,
                   (unsigned long long)off, (unsigned long long)(h->desc.SizeInBytes >> 10), (unsigned long long)msz, (unsigned long long)mal);
 }
+/* madeira-doge: rt-scale = WxH:wxh[,WxH:wxh ...] (madeira.cfg / game cfg; off by default).
+ * A 2D RENDER TARGET or DEPTH-STENCIL resource of exactly WxH is created as a wxh
+ * Metal texture; viewports and scissors of passes that draw into it, and copies
+ * between such textures, are scaled the same way. Everything the shaders do with
+ * normalised coordinates keeps working; a pass that reads such a texture by integer
+ * texel position, or a compute kernel that derives its texel from a constant
+ * 1920x1080, sees a smaller picture (a game-by-game experiment, not a general
+ * setting). EXVS2 renders its whole scene at 1920x1080 for a 1280x720 output on a
+ * GPU that needs 55 ms per 1080p frame; 1920x1080:1280x720 is 2.25x fewer pixels. */
+#define MAD_RTS_MAX 8
+static struct { UINT w, h, sw, sh; } g_rts[MAD_RTS_MAX];
+static int g_rts_n = -1;
+static void mad_rts_load(void) {
+    char list[256], *p; int n = 0;
+    if (g_rts_n >= 0) return;
+    g_rts_n = 0;
+    if (!mad_cfg_str_pe("rt-scale", list, sizeof list)) return;
+    for (p = list; *p && n < MAD_RTS_MAX; ) {
+        unsigned w = 0, h = 0, sw = 0, sh = 0; int used = 0;
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        if (sscanf(p, "%ux%u:%ux%u%n", &w, &h, &sw, &sh, &used) == 4 && w && h && sw && sh && sw <= w && sh <= h) {
+            g_rts[n].w = w; g_rts[n].h = h; g_rts[n].sw = sw; g_rts[n].sh = sh; n++;
+            d3d12_log("[madeira-d3d12] rt-scale: render targets of %ux%u are made %ux%u (madeira-doge experiment)\n", w, h, sw, sh);
+        }
+        while (*p && *p != ',') p++;
+    }
+    g_rts_n = n;
+}
+static int mad_rts_for(const D3D12_RESOURCE_DESC *desc, UINT *sw, UINT *sh) {
+    int i;
+    if (g_rts_n < 0) mad_rts_load();
+    if (!g_rts_n || desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return 0;
+    if (!(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) return 0;
+    if ((desc->MipLevels ? desc->MipLevels : 1) != 1 || (desc->SampleDesc.Count ? desc->SampleDesc.Count : 1) != 1) return 0;
+    for (i = 0; i < g_rts_n; i++)
+        if (g_rts[i].w == (UINT)desc->Width && g_rts[i].h == desc->Height) { *sw = g_rts[i].sw; *sh = g_rts[i].sh; return 1; }
+    return 0;
+}
 /* ml1145: the Metal texture description a D3D12 resource gets. ONE builder for
  * creation and for GetResourceAllocationInfo, so the size the application
  * plans its heap with is the size the placement really takes. */
 static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth) {
     UINT layers = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
+    UINT rsw, rsh;
     if (!mad_map_texture_format(desc->Format, desc->Flags, pf, is_depth)) return 0;
     memset(ti, 0, sizeof *ti);
     ti->pixel_format = *pf;
     ti->width = (uint32_t)desc->Width;
     ti->height = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1 : desc->Height;
+    if (mad_rts_for(desc, &rsw, &rsh)) { ti->width = rsw; ti->height = rsh; }   /* madeira-doge rt-scale */
     ti->depth = 1;
     ti->array_length = 1;
     ti->mipmap_level_count = desc->MipLevels ? desc->MipLevels : 1;
@@ -12380,6 +12464,10 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if (!r->texture) { free(r); return mad_creation_failure(d, "newTexture"); }
         if (!r->hp_used && !r->placed_heap) mad_resident(d, r->texture);   /* ml1145: a placed one is resident through its heap */
         r->width = ti.width; r->height = ti.height;
+        {   /* madeira-doge rt-scale */
+            UINT rsw, rsh;
+            if (mad_rts_for(desc, &rsw, &rsh)) { r->rts_x = (float)rsw / (float)desc->Width; r->rts_y = (float)rsh / (float)desc->Height; }
+        }
         r->gpu_resource_id = ti.gpu_resource_id;
         r->tex_type = ti.type; r->tex_pf = pf; r->tex_mips = ti.mipmap_level_count;   /* ml913 */
         r->tex_layers = ti.type == WMTTextureType3D ? 1 : ti.array_length;
@@ -16875,6 +16963,7 @@ static void mad_subresource_plane(const struct mad_resource *r, UINT sub, UINT *
 static void mad_mip_dims(const struct mad_resource *r, UINT level, UINT *w, UINT *h, UINT *d) {
     *w = (UINT)(r->desc.Width >> level); if (!*w) *w = 1;
     *h = r->desc.Height >> level; if (!*h) *h = 1;
+    if (r->rts_x > 0.0f) { *w = r->width >> level; *h = r->height >> level; if (!*w) *w = 1; if (!*h) *h = 1; }   /* madeira-doge rt-scale: the Metal texture's size */
     *d = (r->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? (r->desc.DepthOrArraySize >> level) : 1;
     if (!*d) *d = 1;
 }
