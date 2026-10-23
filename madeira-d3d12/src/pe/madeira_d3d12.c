@@ -1901,6 +1901,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
 /* ---- execution: replaying a list into Metal encoders -------------------- */
 struct mad_exec {
     int fence_needed;
+    obj_handle_t air_use[16]; unsigned n_air_use;   /* madeira-doge: dxbc-tex-use -- textures the trace-ps shaders sample, useResource'd per draw */
     obj_handle_t tind_buf; UINT64 tind_off;   /* madeira-bcd: this indirect tessellation draw's mesh dispatch arguments */
     struct mad_resource *wr[64]; unsigned nwr; int wr_all;   /* ml1116: written since the last fence wait (mode 3) */   /* ml1111: fence-chain = 2: a barrier (or list start) was seen since the last wait */
     struct mad_queue *q;
@@ -6085,6 +6086,12 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                         }
                     }
                     if (d->probe_state > 0) { tab[off + 0] = d->probe_tex_id; tab[off + 1] = 0; }
+                    else if (e->n_air_use < 16) {   /* madeira-doge: dxbc-tex-use = 1, explicit residency for these textures */
+                        static int use_on = -1; int xv = -1; struct mad_resource *tr;
+                        if (use_on < 0) use_on = mad_cfg_int_pe("dxbc-tex-use", 0) ? 1 : 0;
+                        if (use_on && (tr = mad_texture_of_view(d, de.texture_view_id, &xv)) != NULL && tr->texture)
+                            e->air_use[e->n_air_use++] = xv >= 0 ? tr->xview[xv].tex : tr->texture;
+                    }
                 }
             }
         } else {
@@ -7069,6 +7076,7 @@ tess_go:
 #define MAD_USE(h) MAD_USE_U(h, WMTResourceUsageRead)
     if (e->srv) MAD_USE(e->srv->buffer);
     if (e->smp) MAD_USE(e->smp->buffer);
+    { unsigned au; for (au = 0; au < e->n_air_use; au++) MAD_USE(e->air_use[au]); e->n_air_use = 0; }   /* madeira-doge: dxbc-tex-use */
     if (gsemu || tv || e->pso->backend == MADEIRA_IR_BACKEND_AIRCONV) {   /* ml927: the object stage reads vertices and indices through the tables, not encoder bindings; ml1105: so does the DXBC vertex stage */
         for (i = 0; i < 16; i++) if (e->vb[i].res) MAD_USE(e->vb[i].res->buffer);
         if (e->ib) MAD_USE(e->ib->buffer);
