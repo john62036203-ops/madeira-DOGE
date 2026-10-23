@@ -7847,9 +7847,23 @@ static int mad_cs_match1(const struct mad_pso *p, const char *want) {
  * the game creates its ~5000 menu pipelines (4-5 fps) and flickers as soon as
  * it is done; which passes start only then? One line per pipeline, the first
  * time a replayed list binds it. */
+static volatile LONG g_capture_auto;   /* madeira-doge capture-on-pso: a listed pipeline was just first bound; the next present captures */
 static void mad_pso_first(struct mad_pso *p) {
     LONG n;
     if (InterlockedExchange(&p->first_used, 1)) return;
+    {   /* madeira-doge: capture-on-pso = <names> (ps names, or vs:<name>): the first bind of a listed
+         * graphics pipeline requests a frame capture by itself, as a CAP tap would (capture-frames
+         * applies, capture-ps picks the draws). EXVS2's beam shot lasts a few frames and the tap
+         * always came too late. At most 3 per run. */
+        static char want[512]; static int loaded; static LONG fired;
+        if (!loaded) { loaded = 1; mad_cfg_str_pe("capture-on-pso", want, sizeof want); }
+        if (want[0] && !p->is_compute && (mad_name_in_list(want, p->ps_name) || mad_vs_in_list(want, p->vs_name)) &&
+            InterlockedIncrement(&fired) <= 3) {
+            InterlockedExchange(&g_capture_auto, 1);
+            d3d12_log("[capture] capture-on-pso: vs '%s' ps '%s' first bound at present #%lld -- the next frame is captured\n",
+                      p->vs_name, p->ps_name, (long long)g_presents_now);
+        }
+    }
     n = InterlockedIncrement(&g_sd_pso_first);
     if (n > 30000) return;
     if (p->is_compute)
@@ -19216,6 +19230,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
         memset(&a, 0, sizeof a); a.op = 0;
         if (!s->offscreen) MadeiraCtl(&a);
+        if (!s->offscreen && !a.ret && InterlockedExchange(&g_capture_auto, 0)) a.ret = 1;   /* madeira-doge capture-on-pso */
         if (a.ret) {   /* madeira-doge: capture-frames = N (2..8) turns one CAP tap into N consecutive frames, to diff a good frame against a flickering one */
             long long nf = mad_cfg_int_pe("capture-frames", 1);
             if (nf >= 2 && nf <= 8 && a.ret == 1) a.ret = (unsigned)nf;
