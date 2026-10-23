@@ -11992,10 +11992,14 @@ static UINT mad_mip_drop_for(const D3D12_RESOURCE_DESC *desc, D3D12_HEAP_TYPE he
     }
     if (!k) return 0;
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || heap_type != D3D12_HEAP_TYPE_DEFAULT) return mad_mip_drop_why(desc, MDW_KIND, 0);
-    if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
-                       D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) return mad_mip_drop_why(desc, MDW_FLAGS, 0);
-    if (ti->sample_count > 1 || ti->type == WMTTextureType3D) return mad_mip_drop_why(desc, MDW_MSAA3D, 0);
     mad_format_info(desc->Format, &bytes, &block);
+    /* madeira-doge: EXVS2 creates 4995 of its 5000 textures with ALLOW_SIMULTANEOUS_ACCESS
+     * (or UAV), 2.6 GB, so nothing was ever reduced. A block-compressed texture cannot
+     * be a render target or a UAV in D3D12 whatever its flags say, and simultaneous
+     * access changes nothing about its mips: only RT/DS flags keep a BC texture whole. */
+    if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return mad_mip_drop_why(desc, MDW_FLAGS, 0);
+    if ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && block != 4) return mad_mip_drop_why(desc, MDW_FLAGS, 0);
+    if (ti->sample_count > 1 || ti->type == WMTTextureType3D) return mad_mip_drop_why(desc, MDW_MSAA3D, 0);
     if (block != 4) return mad_mip_drop_why(desc, MDW_FORMAT, 0);
     mips = desc->MipLevels; w = (UINT)desc->Width; h = desc->Height;
     lng = w > h ? w : h; sht = w > h ? h : w;
