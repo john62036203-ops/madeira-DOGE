@@ -11814,11 +11814,10 @@ static void mad_rts_load(void) {
     }
     g_rts_n = n;
 }
-static volatile LONG g_rts_bypass;   /* > 0 while the swapchain makes its back buffers: those keep the application's size */
 static int mad_rts_for(const D3D12_RESOURCE_DESC *desc, UINT *sw, UINT *sh) {
     int i;
     if (g_rts_n < 0) mad_rts_load();
-    if (!g_rts_n || g_rts_bypass || desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return 0;
+    if (!g_rts_n || desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return 0;
     if (!(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) return 0;
     if ((desc->MipLevels ? desc->MipLevels : 1) != 1 || (desc->SampleDesc.Count ? desc->SampleDesc.Count : 1) != 1) return 0;
     for (i = 0; i < g_rts_n; i++)
@@ -18838,9 +18837,18 @@ static void mad_swap_make_fx(struct mad_swapchain *s) {
     char v[32]; double f; UINT i, ow, oh;
     struct WMTFXSpatialScalerInfo si; struct WMTTextureInfo ti; struct WMTTextureSwizzleChannels sw;
     static LONG said;
-    if (!mad_cfg_str_pe("metalfx-upscale", v, sizeof v) || !v[0]) return;
-    f = strtod(v, NULL);
-    if (!(f >= 1.1)) return;
+    /* madeira-doge rt-scale: when the back buffers were made smaller than the
+     * application's size (build 410), the scaler brings them back to that size
+     * on Present without being asked; build 411 kept them full-size instead and
+     * their passes then mixed a full-size colour target with a scaled depth
+     * target (the picture came out at twice the size). */
+    UINT iw = s->nbuf && s->buffers[0] ? s->buffers[0]->width : s->desc.Width;
+    UINT ih = s->nbuf && s->buffers[0] ? s->buffers[0]->height : s->desc.Height;
+    int shrunk = iw < s->desc.Width || ih < s->desc.Height;
+    v[0] = 0;
+    mad_cfg_str_pe("metalfx-upscale", v, sizeof v);
+    f = v[0] ? strtod(v, NULL) : 0.0;
+    if (!(f >= 1.1)) { if (!shrunk) return; f = 1.0; }
     if (f > 2.0) f = 2.0;   /* as DXMT's D3D11 MetalFX swapchain, which takes 1 to 2 */
     /* madeira-doge: the panel is the ceiling. The app exports the screen's
      * landscape pixel size (MADEIRA_PANEL_PX, GuestDisplay.configureSessionDefault);
@@ -18861,13 +18869,14 @@ static void mad_swap_make_fx(struct mad_swapchain *s) {
                 if (InterlockedIncrement(&said) <= 4)
                     d3d12_log("[madeira-d3d12] metalfx-upscale %s: panel is %ux%u, factor clamped to %.2f (env.MADEIRA_METALFX_NO_PANEL_CLAMP = 1 keeps %s)\n", v, pw, ph, fmax, v);
                 f = fmax;
-                if (f < 1.1) return;   /* the render already fills the panel: Core Animation's copy is enough */
+                if (f < 1.1 && !shrunk) return;   /* the render already fills the panel: Core Animation's copy is enough */
+                if (f < 1.0) f = 1.0;
             }
         }
     }
     ow = ((UINT)(s->desc.Width * f + 0.5)) & ~1u;
     oh = ((UINT)(s->desc.Height * f + 0.5)) & ~1u;
-    if (ow > 8192 || oh > 8192 || ow <= s->desc.Width) return;
+    if (ow > 8192 || oh > 8192 || ow <= iw || oh <= ih) return;
     if (!MTLDevice_supportsFXSpatialScaler(s->dev->mtl_device)) {
         if (InterlockedIncrement(&said) <= 2) d3d12_log("[madeira-d3d12] metalfx-upscale: this GPU has no MetalFX spatial scaler\n");
         return;
@@ -18880,7 +18889,7 @@ static void mad_swap_make_fx(struct mad_swapchain *s) {
     s->fx_out = MTLDevice_newTexture(s->dev->mtl_device, &ti);
     memset(&si, 0, sizeof si);
     si.color_format = s->pf; si.output_format = s->pf;
-    si.input_width = s->desc.Width; si.input_height = s->desc.Height;
+    si.input_width = iw; si.input_height = ih;   /* madeira-doge rt-scale: the back buffers' real size */
     si.output_width = ow; si.output_height = oh;
     if (s->fx_out) s->fx_scaler = MTLDevice_newSpatialScaler(s->dev->mtl_device, &si);
     memset(&sw, 0, sizeof sw);
@@ -18897,7 +18906,8 @@ static void mad_swap_make_fx(struct mad_swapchain *s) {
         return;
     }
     s->fx_w = ow; s->fx_h = oh;
-    d3d12_log("[madeira-d3d12] metalfx-upscale %s: %ux%u -> %ux%u (MetalFX spatial)\n", v, s->desc.Width, s->desc.Height, ow, oh);
+    d3d12_log("[madeira-d3d12] metalfx-upscale %s: %ux%u -> %ux%u (MetalFX spatial%s)\n", v[0] ? v : "(rt-scale)", iw, ih, ow, oh,
+              shrunk ? "; the back buffers are rt-scale'd, the drawable keeps the application's size" : "");
 }
 
 static void mad_swap_release_buffers(struct mad_swapchain *s) {
@@ -18954,15 +18964,16 @@ static HRESULT mad_swap_make_buffers(struct mad_swapchain *s) {
     rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (s->desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    InterlockedIncrement(&g_rts_bypass);   /* madeira-doge rt-scale: back buffers are never scaled (build 410 shrank them with the scene) */
+    /* madeira-doge rt-scale: the back buffers follow the scale like every other
+     * target of that size (their depth buffers do), and mad_swap_make_fx brings
+     * the picture back to the application's size on Present. */
     for (i = 0; i < n; i++) {
         void *out = NULL;
         HRESULT hr = mad_create_resource(s->dev, D3D12_HEAP_TYPE_DEFAULT, &rd, &IID_ID3D12Resource, &out);
-        if (FAILED(hr)) { InterlockedDecrement(&g_rts_bypass); s->nbuf = i; mad_swap_release_buffers(s); return hr; }
+        if (FAILED(hr)) { s->nbuf = i; mad_swap_release_buffers(s); return hr; }
         s->buffers[i] = (struct mad_resource *)out;
         s->buffers[i]->name = "Backbuffer";
     }
-    InterlockedDecrement(&g_rts_bypass);
     s->nbuf = n;
     s->index = 0;
     mad_swap_make_fx(s);   /* optional MetalFX upscaling: the drawable takes its output size */
