@@ -2933,7 +2933,12 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
         const struct madeira_ir_air_range *rg = &e->pso->ps_air[k]; struct mad_descriptor de; UINT64 direct = 0; const char *why = "?";
         struct mad_resource *r; int xv = -1;
         if (rg->type != MADEIRA_IR_AIR_SRV && rg->type != MADEIRA_IR_AIR_CBV) continue;
-        if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg, ~0u, &de, &direct, &why)) {
+        /* madeira-doge: resolve with the PIXEL stage's visibility, as the draw does
+         * (EXVS2 declares every table five times, once per stage; with ~0u the
+         * first match was the vertex copy, NULL for t0, and no texture was dumped) */
+        if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg,
+                             (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_PIXEL), &de, &direct, &why) &&
+            !mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg, ~0u, &de, &direct, &why)) {
             /* madeira-doge: say so -- an input that does not resolve is the answer to "why is this draw black" */
             d3d12_log("[capture-draw] %s%u space %u flags %#x: NOT RESOLVED (%s)\n", rg->type == MADEIRA_IR_AIR_CBV ? "b" : "t",
                       rg->lower_bound, rg->space, (unsigned)rg->flags, why ? why : "?");
@@ -16129,6 +16134,22 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         mad_dxil_dump_one("ds", en, desc->DS.pShaderBytecode, desc->DS.BytecodeLength);
         mad_dxil_dump_one("gs", en, desc->GS.pShaderBytecode, desc->GS.BytecodeLength);
         mad_dxil_dump_one("ps", en, desc->PS.pShaderBytecode, desc->PS.BytecodeLength);
+        {   /* madeira-doge: the input layout the vertex stage fetches with, element by element
+             * (EXVS2's sprite pass: positions arrive, colours/uvs seem not to) */
+            UINT q;
+            d3d12_log("[dxil-dump] input layout of '%s': %u element(s), vb_mask %#x, backend %s\n", en, desc->InputLayout.NumElements,
+                      p->vb_mask, p->backend == MADEIRA_IR_BACKEND_AIRCONV ? "sm5/dxbc" : "dxil");
+            for (q = 0; q < desc->InputLayout.NumElements && q < 31; q++) {
+                const D3D12_INPUT_ELEMENT_DESC *el = &desc->InputLayout.pInputElementDescs[q];
+                d3d12_log("[dxil-dump]   element %u: %s%u dxgi fmt %u slot %u offset %s%u %s step %u -> attr format %u, slot stride %u\n", q,
+                          el->SemanticName ? el->SemanticName : "?", el->SemanticIndex, (unsigned)el->Format, el->InputSlot,
+                          el->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? "append+" : "", el->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? 0u : el->AlignedByteOffset,
+                          el->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA ? "per-instance" : "per-vertex", el->InstanceDataStepRate,
+                          (unsigned)mad_attr_format(el->Format), el->InputSlot < 16 ? p->vb_stride[el->InputSlot] : 0u);
+            }
+            for (q = 0; q < nvsin && q < 32; q++)
+                d3d12_log("[dxil-dump]   VS input %u: '%s' -> attribute %u\n", q, vsin[q].name, vsin[q].attribute);
+        }
     }
     if (!(p->vs_fn || p->vs_def) || (desc->PS.pShaderBytecode && !(p->ps_fn || p->ps_def))) { pso_Release((ID3D12PipelineState *)p); return E_FAIL; }
 
