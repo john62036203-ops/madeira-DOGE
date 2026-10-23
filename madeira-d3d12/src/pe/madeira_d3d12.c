@@ -11814,10 +11814,11 @@ static void mad_rts_load(void) {
     }
     g_rts_n = n;
 }
+static volatile LONG g_rts_bypass;   /* > 0 while the swapchain makes its back buffers: those keep the application's size */
 static int mad_rts_for(const D3D12_RESOURCE_DESC *desc, UINT *sw, UINT *sh) {
     int i;
     if (g_rts_n < 0) mad_rts_load();
-    if (!g_rts_n || desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return 0;
+    if (!g_rts_n || g_rts_bypass || desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return 0;
     if (!(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) return 0;
     if ((desc->MipLevels ? desc->MipLevels : 1) != 1 || (desc->SampleDesc.Count ? desc->SampleDesc.Count : 1) != 1) return 0;
     for (i = 0; i < g_rts_n; i++)
@@ -18953,13 +18954,15 @@ static HRESULT mad_swap_make_buffers(struct mad_swapchain *s) {
     rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (s->desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    InterlockedIncrement(&g_rts_bypass);   /* madeira-doge rt-scale: back buffers are never scaled (build 410 shrank them with the scene) */
     for (i = 0; i < n; i++) {
         void *out = NULL;
         HRESULT hr = mad_create_resource(s->dev, D3D12_HEAP_TYPE_DEFAULT, &rd, &IID_ID3D12Resource, &out);
-        if (FAILED(hr)) { s->nbuf = i; mad_swap_release_buffers(s); return hr; }
+        if (FAILED(hr)) { InterlockedDecrement(&g_rts_bypass); s->nbuf = i; mad_swap_release_buffers(s); return hr; }
         s->buffers[i] = (struct mad_resource *)out;
         s->buffers[i]->name = "Backbuffer";
     }
+    InterlockedDecrement(&g_rts_bypass);
     s->nbuf = n;
     s->index = 0;
     mad_swap_make_fx(s);   /* optional MetalFX upscaling: the drawable takes its output size */
