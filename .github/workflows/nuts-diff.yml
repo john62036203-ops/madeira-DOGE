@@ -1,47 +1,26 @@
-name: NutsEmu source diff
+name: NutsEmu source list
 on:
   push:
     branches: [nuts-diff]
 permissions:
   contents: write
 jobs:
-  diff:
+  list:
     runs-on: ubuntu-latest
     steps:
-      - name: Download and diff NutsEmu builds
-        env:
-          OLD: "1552"
-          NEW: "1596"
+      - name: Fetch the NutsEmu source index
         run: |
           set -e
-          B=https://nutsdeveloping.com/source/downloads
-          for v in $OLD $NEW; do
-            mkdir -p dl/$v src/$v
-            for p in 1 2 3; do curl -fsSL -o dl/$v/w.part$p $B/wine-11.18-nutsemu-$v.tar.xz.part$p; done
-            cat dl/$v/w.part1 dl/$v/w.part2 dl/$v/w.part3 > dl/$v/wine.tar.xz
-            curl -fsSL -o dl/$v/build.tar.xz $B/nutsemu-lgpl-build-$v.tar.xz
-            curl -fsSL -o dl/$v/sums.txt $B/SHA256SUMS-nutsemu-$v.txt || true
-            tar -C src/$v -xJf dl/$v/wine.tar.xz
-            mkdir -p src/$v/_build && tar -C src/$v/_build -xJf dl/$v/build.tar.xz
-          done
           mkdir -p out
-          for v in $OLD $NEW; do (cd src/$v && find . -type f | sort > ../../out/files-$v.txt); done
-          diff out/files-$OLD.txt out/files-$NEW.txt > out/filelist.diff || true
-          # top-level layout, to find patch dirs
-          for v in $OLD $NEW; do (cd src/$v && find . -maxdepth 3 -type d | sort) > out/dirs-$v.txt; done
-          diff -ruN --exclude='*.png' --exclude='*.ico' --exclude='*.ttf' src/$OLD src/$NEW > out/full.diff || true
-          wc -l out/full.diff out/filelist.diff
-          diff -ruNq src/$OLD src/$NEW | head -400 > out/changed-files.txt || true
-          cp dl/$OLD/sums.txt out/sums-$OLD.txt || true; cp dl/$NEW/sums.txt out/sums-$NEW.txt || true
+          curl -fsSL -A "Mozilla/5.0" -o out/source-index.html https://nutsdeveloping.com/source/
+          curl -fsSL -A "Mozilla/5.0" -o out/downloads-index.html https://nutsdeveloping.com/source/downloads/ || true
+          grep -oiE 'href="[^"]+"' out/source-index.html out/downloads-index.html | sort -u > out/links.txt || true
+          grep -oE 'nutsemu-[0-9]+|SHA256SUMS-nutsemu-[0-9]+\.txt' out/links.txt | sort -u > out/builds.txt || true
+          wc -l out/*
       - name: Commit results to nuts-diff-out
         run: |
           cd out
-          gzip -9 full.diff && split -b 40m full.diff.gz full.diff.gz.part && rm full.diff.gz
-          echo "::notice::$(ls -la | tr '\n' ' ')"
           git init -q -b nuts-diff-out
           git config user.name github-actions; git config user.email actions@github.com
-          git add -A && git commit -qm "NutsEmu $OLD vs $NEW diff"
-          git push -f https://x-access-token:${{ github.token }}@github.com/${{ github.repository }} nuts-diff-out 2>&1 | tail -5 | while read l; do echo "::notice::$l"; done
-        env:
-          OLD: "1552"
-          NEW: "1596"
+          git add -A && git commit -qm "NutsEmu source index $(date -u +%F)"
+          git push -f https://x-access-token:${{ github.token }}@github.com/${{ github.repository }} nuts-diff-out 2>&1 | tail -3
