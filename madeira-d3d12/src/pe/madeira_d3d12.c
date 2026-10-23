@@ -36,6 +36,7 @@
 #include "madeira_d3d12_stubs.h"
 #include "madeira_ir_abi.h"
 #include "madeira_graphics_entry.h"
+#include "madeira_shared_tex.h"   /* madeira-doge shared-tex */
 
 /* madeira-bcd: MAD_PACK_ID names the CI run that built this DLL ("ipa 215" or
  * "pack 7 (abc1234)"), so a log says which runtime ran -- the IPA's own or one
@@ -12387,6 +12388,67 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
     return hr;
 }
 
+/* madeira-doge shared-tex: a D3D11 shared texture of this process (see
+ * madeira-d3d12/src/madeira_shared_tex.h), opened as a D3D12 resource over a
+ * view of the same Metal texture. Other handles stay unimplemented. */
+static HRESULT STDMETHODCALLTYPE device_OpenSharedHandle(ID3D12Device10 *This, HANDLE handle, REFIID riid, void **out) {
+    struct mad_device *d = (struct mad_device *)This;
+    struct madeira_stx_entry e;
+    struct WMTTextureSwizzleChannels sw;
+    struct mad_resource *r;
+    enum WMTPixelFormat pf;
+    uint64_t id = 0;
+    HRESULT hr;
+    static LONG said;
+    if (out) *out = NULL;
+    if (!out) return E_POINTER;
+    if (!madeira_stx_lookup((UINT64)(ULONG_PTR)handle, &e)) {
+        if (InterlockedIncrement(&said) <= 16)
+            d3d12_log("[madeira-d3d12] shared-tex: OpenSharedHandle %p is not a D3D11 texture of this process -> E_INVALIDARG\n", handle);
+        return E_INVALIDARG;
+    }
+    pf = MTLTexture_pixelFormat((obj_handle_t)e.texture);
+    r = calloc(1, sizeof *r);
+    if (!r) return E_OUTOFMEMORY;
+    r->vtbl = &g_res_vtbl; r->refs = 1; r->iid = &IID_ID3D12Resource; r->name = "SharedTexture";
+    r->serial = (unsigned)InterlockedIncrement(&g_res_serial);
+    r->heap = D3D12_HEAP_TYPE_DEFAULT;
+    r->owner = d;
+    memset(&r->desc, 0, sizeof r->desc);
+    r->desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    r->desc.Width = e.width; r->desc.Height = e.height;
+    r->desc.DepthOrArraySize = (UINT16)(e.array ? e.array : 1);
+    r->desc.MipLevels = (UINT16)(e.mips ? e.mips : 1);
+    r->desc.Format = (DXGI_FORMAT)e.format;
+    r->desc.SampleDesc.Count = 1;
+    r->size = e.width;
+    sw.r = (enum WMTTextureSwizzle)2; sw.g = (enum WMTTextureSwizzle)3;   /* identity */
+    sw.b = (enum WMTTextureSwizzle)4; sw.a = (enum WMTTextureSwizzle)5;
+    r->texture = MTLTexture_newTextureView((obj_handle_t)e.texture, pf,
+                                           r->desc.DepthOrArraySize > 1 ? WMTTextureType2DArray : WMTTextureType2D,
+                                           0, (uint16_t)r->desc.MipLevels, 0, (uint16_t)r->desc.DepthOrArraySize, sw, &id);
+    if (!r->texture) {
+        free(r);
+        d3d12_log("[madeira-d3d12] shared-tex: no view of the D3D11 texture (handle %p, format %u) -> E_FAIL\n", handle, e.format);
+        return E_FAIL;
+    }
+    mad_resident(d, r->texture);
+    r->width = e.width; r->height = e.height;
+    r->gpu_resource_id = id;
+    r->tex_type = r->desc.DepthOrArraySize > 1 ? WMTTextureType2DArray : WMTTextureType2D;
+    r->tex_pf = pf; r->tex_mips = r->desc.MipLevels; r->tex_layers = r->desc.DepthOrArraySize; r->tex_depth = 1;
+    r->samples = 1;
+    EnterCriticalSection(&d->view_lock);
+    mad_vmap_put_locked(d, r->gpu_resource_id, r->tex_layers ? r->tex_layers : 1, 0);
+    LeaveCriticalSection(&d->view_lock);
+    if (InterlockedIncrement(&said) <= 16)
+        d3d12_log("[madeira-d3d12] shared-tex: OpenSharedHandle %p -> r#%u %ux%u format %u (Metal %u), a view of the D3D11 texture\n",
+                  handle, r->serial, e.width, e.height, e.format, (unsigned)pf);
+    hr = res_QI((ID3D12Resource *)r, riid, out);
+    res_Release((ID3D12Resource *)r);
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(ID3D12Device *This,
         const D3D12_HEAP_PROPERTIES *heap, D3D12_HEAP_FLAGS heap_flags,
         const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state,
@@ -18256,6 +18318,7 @@ static void build_vtables(void) {
     g_device_vtbl.GetDescriptorHandleIncrementSize = (void *)device_GetDescriptorHandleIncrementSize;
     g_device_vtbl.CreateGraphicsPipelineState = (void *)device_CreateGraphicsPipelineState;
     g_device_vtbl.CheckFeatureSupport = (void *)device_CheckFeatureSupport_logged;
+    g_device_vtbl.OpenSharedHandle = (void *)device_OpenSharedHandle;   /* madeira-doge shared-tex */
 
     madeira_fill_ID3D12CommandQueue(&g_queue_vtbl);
     g_queue_vtbl.GetDevice = queue_GetDevice;
