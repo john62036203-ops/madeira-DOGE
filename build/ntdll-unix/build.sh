@@ -208,6 +208,22 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
             fi
             compile_one "$OBJ_DIR/sync_ios.c" "sync"
             ;;
+        system)
+            # madeira-doge: Wine's SystemLeapSecondInformation stub answers Enabled = TRUE,
+            # and .NET's DateTime.UtcNow then takes its leap-second-aware path, which ends
+            # in "DateTimeOffset.ToLocalTime: Specified argument was out of the range"
+            # at Server-Infinite's first log line (EXVS2 card server on the phone). Say
+            # leap seconds are off, as a Windows 10 without the policy does, unless
+            # env.MADEIRA_LEAP_SECONDS = 1. The copy is compiled from obj/, so its
+            # relative madeira_cfg.h include is made absolute, as sync's is.
+            perl -0pe 's/leap->Enabled = TRUE;/leap->Enabled = (getenv("MADEIRA_LEAP_SECONDS") \&\& getenv("MADEIRA_LEAP_SECONDS")[0] == \x271\x27);   \/* madeira-doge *\//;
+                       s{"\.\./\.\./\.\./\.\./build/madeira_cfg\.h"}{"'"$REPO_ROOT"'/build/madeira_cfg.h"}' \
+                "$src" > "$OBJ_DIR/system_ios.c"
+            if [ "$(grep -c 'MADEIRA_LEAP_SECONDS' "$OBJ_DIR/system_ios.c")" != 1 ]; then
+                echo "  system: leap-second patch did not apply"; exit 1
+            fi
+            compile_one "$OBJ_DIR/system_ios.c" "system"
+            ;;
         *)
             compile_one "$src" "$name"
             ;;
