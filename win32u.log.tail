@@ -1,0 +1,55 @@
+=== Building win32u unix (iOS) ===
+  bitblt... OK
+  bitmap... OK
+  brush... OK
+  class... OK
+  clipboard... OK
+  clipping... OK
+  cursoricon... OK
+  d3dkmt... OK
+  dc... OK
+  dce... OK
+  defwnd... OK
+  dib... OK
+  driver... OK
+  emfdrv... OK
+  font... OK
+  freetype... OK
+  gdiobj... OK
+  hook... OK
+  imm... OK
+  input... OK
+  mapping... OK
+  menu... OK
+  message... OK
+  opengl... OK
+  opentype... OK
+  painting... OK
+  palette... OK
+  path... OK
+  pen... OK
+  printdrv... OK
+  rawinput... OK
+  region... OK
+  scroll... OK
+  spy... OK
+  syscall... OK
+  sysparams... OK
+  systray... OK
+  vertical... OK
+  vulkan... OK
+  window... OK
+  winstation... OK
+  dibdrv_bitblt... OK
+  dibdrv_dc... OK
+  dibdrv_graphics... OK
+  dibdrv_objects... OK
+  dibdrv_primitives... OK
+
+Results: 46 succeeded, 0 failed
+
+=== Building libwin32u_unix.a ===
+merged libfreetype.a
+Copying to app...
+libwin32u_unix.a: 3535128 bytes
+Done!

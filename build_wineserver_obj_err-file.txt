@@ -1,0 +1,89 @@
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:246:27: error: incompatible integer to pointer conversion initializing 'const struct sid *' with an expression of type 'int' [-Wint-conversion]
+  246 |         const struct sid *owner = sd_get_owner( sd );
+      |                           ^       ~~~~~~~~~~~~~~~~~~
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:248:19: error: incompatible integer to pointer conversion assigning to 'const struct sid *' from 'int' [-Wint-conversion]
+  248 |             owner = token_get_owner( current->process->token );
+      |                   ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:318:39: error: invalid application of 'sizeof' to an incomplete type 'struct ace'
+  318 |     dacl_size = sizeof(*dacl) + sizeof(*ace) + sid_len( &local_system_sid );
+      |                                       ^~~~~~
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:318:58: error: use of undeclared identifier 'local_system_sid'
+  318 |     dacl_size = sizeof(*dacl) + sizeof(*ace) + sid_len( &local_system_sid );
+      |                                                          ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:319:44: error: invalid application of 'sizeof' to an incomplete type 'struct ace'
+  319 |     if (mode & S_IRWXU) dacl_size += sizeof(*ace) + sid_len( user );
+      |                                            ^~~~~~
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:323:28: error: invalid application of 'sizeof' to an incomplete type 'struct ace'
+  323 |         dacl_size += sizeof(*ace) + sid_len( user );
+      |                            ^~~~~~
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:324:44: error: invalid application of 'sizeof' to an incomplete type 'struct ace'
+  324 |     if (mode & S_IRWXO) dacl_size += sizeof(*ace) + sid_len( &world_sid );
+      |                                            ^~~~~~
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:324:63: error: use of undeclared identifier 'world_sid'
+  324 |     if (mode & S_IRWXO) dacl_size += sizeof(*ace) + sid_len( &world_sid );
+      |                                                               ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:325:44: error: invalid application of 'sizeof' to an incomplete type 'struct ace'
+  325 |     if (mode & S_IROTH) dacl_size += sizeof(*ace) + sid_len( &builtin_users_sid );  /* madeira-doge: tools/patch-server-file-dacl.py */
+      |                                            ^~~~~~
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:325:63: error: use of undeclared identifier 'builtin_users_sid'
+  325 |     if (mode & S_IROTH) dacl_size += sizeof(*ace) + sid_len( &builtin_users_sid );  /* madeira-doge: tools/patch-server-file-dacl.py */
+      |                                                               ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:356:47: error: use of undeclared identifier 'local_system_sid'
+  356 |     ace = set_ace( (struct ace *)(dacl + 1), &local_system_sid,
+      |                                               ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:362:13: error: incompatible integer to pointer conversion assigning to 'struct ace *' from 'int' [-Wint-conversion]
+  362 |         ace = set_ace( ace_next( ace ), user, ACCESS_ALLOWED_ACE_TYPE, flags, WRITE_DAC | WRITE_OWNER );
+      |             ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:363:32: error: incomplete definition of type 'struct ace'
+  363 |         if (mode & S_IRUSR) ace->mask |= FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+      |                             ~~~^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:364:32: error: incomplete definition of type 'struct ace'
+  364 |         if (mode & S_IWUSR) ace->mask |= FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
+      |                             ~~~^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:371:13: error: incompatible integer to pointer conversion assigning to 'struct ace *' from 'int' [-Wint-conversion]
+  371 |         ace = set_ace( ace_next( ace ), user, ACCESS_DENIED_ACE_TYPE, flags, 0 );
+      |             ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:373:16: error: incomplete definition of type 'struct ace'
+  373 |             ace->mask |= FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+      |             ~~~^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:375:16: error: incomplete definition of type 'struct ace'
+  375 |             ace->mask |= FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
+      |             ~~~^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:376:12: error: incomplete definition of type 'struct ace'
+  376 |         ace->mask &= ~STANDARD_RIGHTS_ALL; /* never deny standard rights */
+      |         ~~~^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:314:12: note: forward declaration of 'struct ace'
+  314 |     struct ace *ace;
+      |            ^
+/Users/runner/work/madeira-DOGE/madeira-DOGE/build/wineserver/obj/file_patched.c:381:42: error: use of undeclared identifier 'world_sid'
+  381 |         ace = set_ace( ace_next( ace ), &world_sid, ACCESS_ALLOWED_ACE_TYPE, flags, 0 );
+      |                                          ^
+fatal error: too many errors emitted, stopping now [-ferror-limit=]
+20 errors generated.

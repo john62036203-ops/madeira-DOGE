@@ -1,0 +1,46 @@
+=== Building ntdll unix (iOS) ===
+  audio_null_ios... OK
+  madsync... OK
+=== Building crypto/network unixlibs ===
+  gnutls_symtab_ios... OK
+  ws2_32_unixlib... OK
+  bcrypt_unixlib... OK
+  secur32_unixlib... OK
+  dwrite_unixlib... OK
+  crypt32_unixlib... OK
+  nsi_unixlib_ios... OK
+  nsi_network_ios... OK
+  nsi_ndis... OK
+  nsi_ip... OK
+  dnsapi_unixlib... OK
+  winegstreamer_unixlib... OK
+  wg_parser_apple_ios... OK
+  cdrom... OK
+  debug... OK
+  env... OK
+  file... OK
+  loader... OK
+  loadorder... OK
+  process... OK
+  registry... OK
+  security... OK
+  serial... OK
+  server... OK
+  signal_arm... OK
+  signal_arm64... OK
+  signal_i386... OK
+  signal_x86_64... OK
+  socket... OK
+  sync... OK
+  syscall... OK
+  system... OK
+  tape... OK
+  thread... OK
+  virtual... OK
+
+Results: 37 succeeded, 0 failed
+
+=== Building libntdll_unix.a ===
+Copying to app...
+libntdll_unix.a: 2511936 bytes
+Done!
