@@ -494,6 +494,12 @@ jobs:
       - name: Patch wine with the DNS trace
         run: python3 tools/patch-wine-dns-trace.py wine/dlls/ws2_32/unixlib.c
 
+      # [sock-bcast]: iOS rejects IPv4 broadcast sends; try_send delivers them
+      # as unicast to 127.0.0.1 and every local IPv4 address on the same port
+      # (EXVS2 cabinet + LM discovery on 49000..49015 / 48011).
+      - name: Patch wine so UDP broadcasts fan out to local sockets
+        run: python3 tools/patch-wine-sock-bcast.py wine/dlls/ntdll/unix/socket.c
+
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 
