@@ -1874,3 +1874,22 @@ jobs:
               fi
             done
           fi
+
+      # madeira-doge: annotations are capped at 50 per job and the log/artifact
+      # downloads are blocked from the assistant's sessions, so the compile
+      # errors and log tails are also pushed to the orphan branch ci-logs
+      # (one commit per failed run, force-pushed: small, no history).
+      - name: Push build errors to the ci-logs branch (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          D=$(mktemp -d)
+          for L in ntdll wineserver win32u; do [ -f "$L.log" ] && tail -n 400 "$L.log" > "$D/$L.log.tail"; done
+          for f in $(grep -rl "error:" build --include="*.err" --include="err-*.txt" 2>/dev/null | head -12); do
+            cp "$f" "$D/$(echo "$f" | tr '/' '_')"
+          done
+          echo "run ${{ github.run_number }} (${{ github.run_id }}) $(git rev-parse --short HEAD) $(date -u +%FT%TZ)" > "$D/RUN.txt"
+          cd "$D" && git init -q -b ci-logs && git config user.name github-actions && git config user.email actions@github.com
+          git add -A && git commit -qm "build ${{ github.run_number }} errors" && \
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" ci-logs 2>&1 | tail -2
