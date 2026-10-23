@@ -18503,6 +18503,7 @@ struct mad_swapchain {
     UINT max_latency;
     HANDLE latency_event;
     UINT64 present_serial[8];   /* ml1070: GPU serial the frame presented N ago must have passed */
+    int offscreen;   /* madeira-doge swap-offscreen-skip: the window is hidden or off the desktop, its frames are not shown */
     /* MetalFX spatial upscaling of the presented image (madeira.cfg metalfx-upscale) */
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
@@ -18776,6 +18777,82 @@ static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UIN
     if (g_xp.fps_cap && !(flags & DXGI_PRESENT_TEST)) mad_fps_cap_pace((struct mad_swapchain *)T, t1.QuadPart);   /* madeira-bcd fps-gov */
     return hr;
 }
+/* madeira-doge swap-offscreen-skip (EXVS2, 2026-10-23). In game mode every
+ * swapchain of every guest process presents into the SAME fullscreen
+ * CAMetalLayer. EXVS2 runs two processes: the cabinet (1280x720) and the LM
+ * (256x144, its window moved to -20000,-20000 by the launcher). The LM's
+ * swapchain set the shared layer to a 256x144 drawable and both presented
+ * into it in turn: the screen flashed between the LM's dark frame and a
+ * 256x144 corner of the cabinet's frame stretched over the screen -- only
+ * colours, no picture. The g_layer_cfg_owner guard cannot see this, it is
+ * per process.
+ *  1. A swapchain whose window is hidden or lies wholly outside the virtual
+ *     desktop does not present (checked every 30 presents; the frame is
+ *     dropped, the application sees S_OK).
+ *  2. A presenting swapchain re-reads the layer's drawable size and format
+ *     every 30 presents and applies its own again when another process
+ *     changed them.
+ * MADEIRA_SWAP_OFFSCREEN_SKIP=0 turns both off. user32 is looked up, not
+ * imported (see mad_swap_fit_client). */
+static int mad_swap_offscreen_check(struct mad_swapchain *s) {
+    static int on = -1;
+    static BOOL (WINAPI *p_rect)(HWND, RECT *);
+    static BOOL (WINAPI *p_vis)(HWND);
+    static BOOL (WINAPI *p_iswin)(HWND);
+    static int (WINAPI *p_metric)(int);
+    if (on < 0) {
+        static const char n[] = "MADEIRA_SWAP_OFFSCREEN_SKIP";
+        char v[8];
+        on = !(GetEnvironmentVariableA(n, v, sizeof v) && v[0] == '0');
+        if (on) {
+            HMODULE u32 = GetModuleHandleW(L"user32.dll");
+            if (u32) {
+                p_rect = (BOOL (WINAPI *)(HWND, RECT *))(void *)GetProcAddress(u32, "GetWindowRect");
+                p_vis = (BOOL (WINAPI *)(HWND))(void *)GetProcAddress(u32, "IsWindowVisible");
+                p_iswin = (BOOL (WINAPI *)(HWND))(void *)GetProcAddress(u32, "IsWindow");
+                p_metric = (int (WINAPI *)(int))(void *)GetProcAddress(u32, "GetSystemMetrics");
+            }
+            if (!p_rect || !p_vis || !p_iswin || !p_metric) on = 0;
+        }
+        d3d12_log("[madeira-d3d12] swap-offscreen-skip %s (madeira-doge; MADEIRA_SWAP_OFFSCREEN_SKIP=0 turns it off)\n", on ? "on" : "off");
+    }
+    if (!on || !s->hwnd) return 0;
+    if ((s->presents % 30) == 0) {
+        int off = 0;
+        RECT r;
+        if (p_iswin(s->hwnd)) {
+            if (!p_vis(s->hwnd)) off = 1;
+            else if (p_rect(s->hwnd, &r)) {
+                int vx = p_metric(SM_XVIRTUALSCREEN), vy = p_metric(SM_YVIRTUALSCREEN);
+                int vw = p_metric(SM_CXVIRTUALSCREEN), vh = p_metric(SM_CYVIRTUALSCREEN);
+                if (vw <= 0 || vh <= 0) { vx = vy = 0; vw = p_metric(SM_CXSCREEN); vh = p_metric(SM_CYSCREEN); }
+                if (vw > 0 && vh > 0 && (r.right <= vx || r.bottom <= vy || r.left >= vx + vw || r.top >= vy + vh)) off = 1;
+            }
+        }
+        if (off != s->offscreen) {
+            d3d12_log("[madeira-d3d12] swap-offscreen-skip: swapchain %ux%u hwnd %p %s at present #%llu\n",
+                      s->desc.Width, s->desc.Height, (void *)s->hwnd,
+                      off ? "is hidden or off the desktop -- its frames are NOT shown" : "is on the desktop again -- presenting",
+                      (unsigned long long)s->presents);
+            s->offscreen = off;
+            if (!off) g_layer_cfg_owner = NULL;   /* take the shared layer back below */
+        }
+        if (!off && s->layer && g_layer_cfg_owner == s) {   /* another PROCESS may have reconfigured the shared layer */
+            struct WMTLayerProps props;
+            UINT want_w = s->fx_w ? s->fx_w : s->desc.Width, want_h = s->fx_h ? s->fx_h : s->desc.Height;
+            memset(&props, 0, sizeof props);
+            MetalLayer_getProps(s->layer, &props);
+            if ((UINT)props.drawable_width != want_w || (UINT)props.drawable_height != want_h || props.pixel_format != s->pf) {
+                static LONG said;
+                if (InterlockedIncrement(&said) <= 8)
+                    d3d12_log("[madeira-d3d12] swap-offscreen-skip: the shared layer is %ux%u (another process set it), swapchain %ux%u hwnd %p takes it back at present #%llu\n",
+                              (UINT)props.drawable_width, (UINT)props.drawable_height, want_w, want_h, (void *)s->hwnd, (unsigned long long)s->presents);
+                mad_swap_apply_layer(s);
+            }
+        }
+    }
+    return s->offscreen;
+}
 static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags) {
     obj_handle_t pool = NSAutoreleasePool_alloc_init();
     HRESULT hr = swap_Present_inner(T, sync, flags);
@@ -18819,7 +18896,8 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     {   /* ml1098: manual frame capture -- finish the frame that just ended, then see whether the UI asked for another */
         struct madeira_ctl_args a;
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
-        memset(&a, 0, sizeof a); a.op = 0; MadeiraCtl(&a);
+        memset(&a, 0, sizeof a); a.op = 0;
+        if (!s->offscreen) MadeiraCtl(&a);   /* madeira-doge: an off-screen swapchain (EXVS2 LM) leaves CAP to the one on screen */
         if (a.ret) {   /* madeira-doge: capture-frames = N (2..8) turns one CAP tap into N consecutive frames, to diff a good frame against a flickering one */
             long long nf = mad_cfg_int_pe("capture-frames", 1);
             if (nf >= 2 && nf <= 8 && a.ret == 1) a.ret = (unsigned)nf;
@@ -18923,6 +19001,10 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
             last = GetTickCount();
         }
         if ((s->presents % 300) == 299) mad_sd_report(s->presents + 1);
+    }
+    if (mad_swap_offscreen_check(s)) {   /* madeira-doge: a window off the desktop does not take the shared layer */
+        s->presents++;
+        return;
     }
     if (g_layer_cfg_layer == s->layer && g_layer_cfg_owner != s) {   /* madeira-bcd: shared layer taken over, see mad_swap_apply_layer */
         static LONG said;
