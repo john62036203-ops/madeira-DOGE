@@ -2872,6 +2872,8 @@ static void mad_capture_buffer(struct mad_exec *e, obj_handle_t benc, struct mad
 }
 static struct mad_resource *mad_texture_of_view(struct mad_device *d, UINT64 id, int *xv);
 static struct mad_resource *mad_resolve_address(struct mad_device *d, UINT64 addr, UINT64 *off);
+static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, enum WMTTextureType want,
+                                  UINT lvl0, UINT nlvl, UINT sl0, UINT nsl, enum WMTPixelFormat pf, UINT swz);   /* madeira-doge: dxbc-tex-2d */
 static void mad_capture_rs_tables(struct mad_exec *e, obj_handle_t benc, unsigned seq, const struct mad_rootsig *rs,
                                   const UINT64 *root, const UINT32 (*consts)[64], const char *tag);   /* madeira-bcd */
 static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
@@ -6054,8 +6056,42 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                 tab[off + 0] = de.texture_view_id;
                 tab[off + 1] = ((UINT64)count << 32) | (UINT64)first;
             } else {
-                tab[off + 0] = de.texture_view_id;
-                tab[off + 1] = ((UINT64)mad_air_array_len(d, de.texture_view_id) << 32)
+                UINT64 bind_id = de.texture_view_id;
+                /* madeira-doge: THE DXBC BACKEND SAMPLES NON-ARRAY TEXTURES. ml932 allocates every 1D/2D
+                 * texture as a 2D ARRAY (and views cubes as cube arrays) because the DXIL converter runs
+                 * with IRCompatibilityFlagForceTextureArray, so those shaders declare texture2d_array.
+                 * airconv (the SM5/DXBC backend) has no such flag: a Texture2D is a plain texture2d, a
+                 * TextureCube a texturecube. Metal gives undefined results when the object's type and
+                 * the shader's differ -- EXVS2's whole sprite UI sampled as (red, 0, 0, ~1) / alpha 0 and
+                 * discarded, while a runtime-made TYPE-2D white texture sampled correctly (build 405).
+                 * A range the shader declares without the ARRAY flag gets a non-array VIEW of the same
+                 * texture (cached in xview like every other view). dxbc-tex-2d = 0 turns it off. */
+                if (!(rg->flags & MADEIRA_IR_AIR_F_TEXTURE_ARRAY) && pso->backend == MADEIRA_IR_BACKEND_AIRCONV) {
+                    static int t2d = -1; static LONG said_t2d; int xv = -1; struct mad_resource *tr;
+                    if (t2d < 0) t2d = mad_cfg_int_pe("dxbc-tex-2d", 1) ? 1 : 0;
+                    if (t2d && (tr = mad_texture_of_view(d, de.texture_view_id, &xv)) != NULL && tr->texture) {
+                        UINT type = xv >= 0 ? tr->xview[xv].type : (UINT)tr->tex_type; enum WMTTextureType want = (enum WMTTextureType)0;
+                        if (type == (UINT)WMTTextureType2DArray) want = WMTTextureType2D;
+                        else if (type == (UINT)WMTTextureTypeCubeArray) want = WMTTextureTypeCube;
+                        else if (type == (UINT)WMTTextureType2DMultisampleArray) want = WMTTextureType2DMultisample;
+                        if (want) {
+                            UINT lvl0 = xv >= 0 ? tr->xview[xv].lvl0 + tr->mip_drop : 0, nlvl = xv >= 0 ? tr->xview[xv].nlvl : 0;
+                            UINT sl0 = xv >= 0 ? tr->xview[xv].sl0 : 0, nsl = want == WMTTextureTypeCube ? 6u : 1u;
+                            enum WMTPixelFormat vpf = xv >= 0 ? (enum WMTPixelFormat)tr->xview[xv].pf : (enum WMTPixelFormat)0;
+                            UINT vswz = xv >= 0 ? tr->xview[xv].swz : 0;
+                            UINT64 id2 = mad_texture_view_id(d, tr, want, lvl0, nlvl, sl0, nsl, vpf, vswz);
+                            if (id2) {
+                                bind_id = id2;
+                                if (InterlockedIncrement(&said_t2d) <= 6)
+                                    d3d12_log("[madeira-d3d12] dxbc-tex-2d: %c%u of '%s' is a non-array texture in the shader; %s r#%u %ux%u type %u -> view type %u (id %#llx -> %#llx)\n",
+                                              rg->type == MADEIRA_IR_AIR_SRV ? 't' : 'u', rg->lower_bound, pso->ps_name, tr->name ? tr->name : "?", tr->serial,
+                                              tr->width, tr->height, type, (unsigned)want, (unsigned long long)de.texture_view_id, (unsigned long long)id2);
+                            }
+                        }
+                    }
+                }
+                tab[off + 0] = bind_id;
+                tab[off + 1] = ((UINT64)mad_air_array_len(d, bind_id) << 32)
                              | (de.metadata & 0xffffffffull);     /* min LOD clamp */
                 /* madeira-doge: dxbc-tex-probe = 1 (madeira.cfg / game cfg): every texture the
                  * trace-ps pixel shaders sample is replaced by a 4x4 opaque WHITE RGBA8 texture
@@ -6089,7 +6125,7 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                     else if (e->n_air_use < 16) {   /* madeira-doge: dxbc-tex-use = 1, explicit residency for these textures */
                         static int use_on = -1; int xv = -1; struct mad_resource *tr;
                         if (use_on < 0) use_on = mad_cfg_int_pe("dxbc-tex-use", 0) ? 1 : 0;
-                        if (use_on && (tr = mad_texture_of_view(d, de.texture_view_id, &xv)) != NULL && tr->texture)
+                        if (use_on && (tr = mad_texture_of_view(d, bind_id, &xv)) != NULL && tr->texture)
                             e->air_use[e->n_air_use++] = xv >= 0 ? tr->xview[xv].tex : tr->texture;
                     }
                 }
