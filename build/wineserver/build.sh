@@ -108,6 +108,8 @@ PATCHED_FILES=(
     # madeira-doge: + Windows wildcard/specific UDP bind (tools/patch-sock-bind-reuse.py),
     # compiled from a patched copy so the submodule stays untouched.
     "sock:$OBJ_DIR/sock_patched.c:sock.o"
+    # madeira-doge: console output copied into the session log (tools/patch-console-log.py).
+    "console:$OBJ_DIR/console_patched.c:console.o"
     # ml2101: the opt-in HID controller (MADEIRA_PAD_MODE = hid) and Wine's
     # hidparse.sys parser it builds its preparsed data with. New objects, not
     # replacements: both lists, as for every entry here.
@@ -130,6 +132,8 @@ fi
 mkdir -p "$OBJ_DIR"
 python3 "$REPO_ROOT/tools/patch-sock-bind-reuse.py" "$WINE_SRC/server/sock.c" "$OBJ_DIR/sock_patched.c" \
     || { echo "patch-sock-bind-reuse failed"; exit 1; }
+python3 "$REPO_ROOT/tools/patch-console-log.py" "$WINE_SRC/server/console.c" "$OBJ_DIR/console_patched.c" \
+    || { echo "patch-console-log failed"; exit 1; }
 
 case "${1:-all}" in
     all)
@@ -183,6 +187,7 @@ REPLACEMENTS=(
     "winstation.o:winstation.o"
     "thread.o:thread.o"
     "sock.o:sock.o"
+    "console.o:console.o"
     "object.o:object.o"
     "async.o:async.o"
     # ml805: BOTH lists matter. PATCHED_FILES only compiles; REPLACEMENTS is what
