@@ -364,6 +364,7 @@ struct mad_device {
      * which was a GPU page fault that killed the whole queue. They now point
      * at 64 KB of zeros instead. */
     obj_handle_t null_buffer; UINT64 null_gpu;
+    obj_handle_t probe_buf, probe_tex; UINT64 probe_tex_id; int probe_state;   /* madeira-doge: dxbc-tex-probe */
     struct mad_queue *queues[16]; unsigned nqueues;   /* ml884: every live queue, for flush-all */
     /* ml910: GPU-ordered capture of what a draw actually receives. Blits run
      * in the same command buffer right before the draw, so they see the
@@ -6055,6 +6056,36 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                 tab[off + 0] = de.texture_view_id;
                 tab[off + 1] = ((UINT64)mad_air_array_len(d, de.texture_view_id) << 32)
                              | (de.metadata & 0xffffffffull);     /* min LOD clamp */
+                /* madeira-doge: dxbc-tex-probe = 1 (madeira.cfg / game cfg): every texture the
+                 * trace-ps pixel shaders sample is replaced by a 4x4 opaque WHITE RGBA8 texture
+                 * of the runtime's own, so the quads come out in their vertex colour. EXVS2's
+                 * sprite pass binds the right textures (trace-ps) yet nothing it draws is visible;
+                 * if the quads appear with this on, the game's texture objects are what fails;
+                 * if not, the pixel stage itself (sampler, table, compiled shader) is. */
+                if (!g_trace_ps_loaded) { g_trace_ps_loaded = 1; mad_cfg_str_pe("trace-ps", g_trace_ps, sizeof g_trace_ps); }
+                if (d->probe_state >= 0 && g_trace_ps[0] && e->pso && !pso->is_compute &&
+                    (mad_name_in_list(g_trace_ps, e->pso->ps_name) || mad_vs_in_list(g_trace_ps, e->pso->vs_name))) {
+                    if (!d->probe_state) {
+                        d->probe_state = mad_cfg_int_pe("dxbc-tex-probe", 0) ? 1 : -1;
+                        if (d->probe_state > 0) {
+                            struct WMTBufferInfo bi; struct WMTTextureInfo ti;
+                            memset(&bi, 0, sizeof bi); bi.length = 256; bi.options = WMTResourceStorageModeShared;
+                            d->probe_buf = MTLDevice_newBuffer(d->mtl_device, &bi);
+                            if (d->probe_buf && bi.memory.ptr) memset(bi.memory.ptr, 0xff, 256);
+                            memset(&ti, 0, sizeof ti);
+                            ti.pixel_format = WMTPixelFormatRGBA8Unorm; ti.width = 4; ti.height = 4; ti.depth = 1; ti.array_length = 1;
+                            ti.type = WMTTextureType2D; ti.mipmap_level_count = 1; ti.sample_count = 1;
+                            ti.usage = WMTTextureUsageShaderRead; ti.options = WMTResourceStorageModeShared;
+                            d->probe_tex = d->probe_buf ? MTLBuffer_newTexture(d->probe_buf, &ti, 0, 16) : 0;
+                            d->probe_tex_id = d->probe_tex ? ti.gpu_resource_id : 0;
+                            if (d->probe_tex) mad_resident(d, d->probe_buf);
+                            d3d12_log("[madeira-d3d12] dxbc-tex-probe: 4x4 white texture %s (id %#llx); the trace-ps shaders sample it instead of the game's textures\n",
+                                      d->probe_tex_id ? "ready" : "FAILED", (unsigned long long)d->probe_tex_id);
+                            if (!d->probe_tex_id) d->probe_state = -1;
+                        }
+                    }
+                    if (d->probe_state > 0) { tab[off + 0] = d->probe_tex_id; tab[off + 1] = 0; }
+                }
             }
         } else {
             why = "range has neither the buffer nor the texture flag"; goto bad;
