@@ -19230,7 +19230,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
         memset(&a, 0, sizeof a); a.op = 0;
         if (!s->offscreen) MadeiraCtl(&a);
-        if (!s->offscreen && !a.ret && InterlockedExchange(&g_capture_auto, 0)) a.ret = 1;   /* madeira-doge capture-on-pso */
+        if (!s->offscreen && !a.ret && InterlockedExchange(&g_capture_auto, 0)) a.ret = 1;
         if (a.ret) {   /* madeira-doge: capture-frames = N (2..8) turns one CAP tap into N consecutive frames, to diff a good frame against a flickering one */
             long long nf = mad_cfg_int_pe("capture-frames", 1);
             if (nf >= 2 && nf <= 8 && a.ret == 1) a.ret = (unsigned)nf;
