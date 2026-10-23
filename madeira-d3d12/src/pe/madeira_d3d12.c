@@ -19114,7 +19114,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                 g_capture_ps_loaded = 1; mad_cfg_str_pe("capture-ps", g_capture_ps, sizeof g_capture_ps);
                 if (g_capture_ps[0]) d3d12_log("[capture] ml1106 targeted draw capture for ps='%s'\n", g_capture_ps); }
             g_capture_ps_shots = 0;
-            g_trace_ps_n = 0;   /* madeira-doge: trace-ps */
+            g_trace_ps_n = 0;
             {   /* ml1141: re-read every CAP, so the target can change between captures of one run */
                 mad_cfg_str_pe("capture-cs", g_capture_cs, sizeof g_capture_cs);
                 g_capture_cs_ind = mad_cfg_int_pe("capture-cs-indirect", 0) ? 1 : 0;
