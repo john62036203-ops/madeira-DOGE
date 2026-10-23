@@ -185,6 +185,9 @@ static unsigned g_enc_seq, g_list_seq, g_dump_draws;
  * attachment traffic each pass boundary implies. */
 static volatile LONG g_pass_begun, g_pass_end_rts, g_pass_end_clear, g_pass_end_dispatch, g_pass_end_blit, g_pass_end_list,
                      g_pass_end_attachless, g_pass_clear_only, g_pass_reused;
+static volatile LONG g_pass_rts_null_kept, g_blit_barrier_kept;   /* madeira-doge: rts-null-lazy, barrier-blit-open */
+static int g_rts_null_lazy = -1, g_barrier_blit_open = -1;        /* madeira-doge */
+static const char *g_enc_why;   /* madeira-doge enc-timeline: why the encoder being ended ends (set right before exec_end) */
 static volatile LONG64 g_pass_attach_bytes;
 static int g_census_on;   /* ml899: one frame at presents 1500,1700,...,2800 */
 /* ml1098: MANUAL FRAME CAPTURE. The UI asks (MadeiraCtl op 0); the next frame
@@ -2348,6 +2351,16 @@ static void mad_pps_split(struct mad_exec *e);
 static void exec_end(struct mad_exec *e) {
     struct mad_resource *crt[8]; struct mad_resource *cdepth = NULL; struct mad_rtvp crtp[8], cdp; unsigned cn = 0, cseq = 0, cdraws = 0;   /* ml1098 */
     int pps_render;
+    if (g_capture_on && (e->renc || e->benc || e->cenc)) {   /* madeira-doge enc-timeline: one line per encoder of a captured frame */
+        char tg[160] = ""; unsigned k, n = 0;
+        if (e->renc) {
+            for (k = 0; k < e->enc_nrt && n < sizeof tg - 24; k++) if (e->enc_rt[k]) n += (unsigned)snprintf(tg + n, sizeof tg - n, " rt%u=r#%u", k, e->enc_rt[k]->serial);
+            if (e->enc_depth && n < sizeof tg - 24) n += (unsigned)snprintf(tg + n, sizeof tg - n, " ds=r#%u", e->enc_depth->serial);
+        }
+        d3d12_log("[enc-timeline] list#%u enc#%u %s draws=%u ended-by=%s%s\n", g_list_seq, e->renc ? e->renc_seq : g_enc_seq,
+                  e->renc ? "render" : e->benc ? "blit" : "compute", e->pass_draws, g_enc_why ? g_enc_why : "?", tg);
+    }
+    g_enc_why = NULL;
     if (e->renc) exec_fence_render(e, e->renc, 1);     /* ml1091 */
     if (e->benc) exec_fence_blit(e, e->benc, 1);
     if (e->cenc) exec_fence_compute(e, e->cenc, 1);
@@ -3487,6 +3500,7 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
     if (i < 0 || !e->pend[i].res || !e->pend[i].res->texture) { exec_drop_pending(e, i); return; }
     if (e->renc) InterlockedIncrement(&g_pass_end_clear);
     InterlockedIncrement(&g_pass_clear_only);
+    g_enc_why = "clear-flush";
     exec_end(e);
     memset(&rpi, 0, sizeof rpi);
     if (e->pend[i].v.layers > 1) rpi.render_target_array_length = e->pend[i].v.layers;   /* ml925 */
@@ -3526,7 +3540,7 @@ static void exec_add_clear(struct mad_exec *e, struct mad_resource *r, const str
     if (!r) return;
     /* A clear ends the pass in progress so the next one can load it as a
      * clear; a clear mid-pass would otherwise be lost. */
-    if (e->renc) { InterlockedIncrement(&g_pass_end_clear); exec_end(e); }
+    if (e->renc) { InterlockedIncrement(&g_pass_end_clear); g_enc_why = "clear"; exec_end(e); }
     i = exec_pending_index(e, r, v);
     if (i >= 0 && is_depth && e->pend[i].is_depth && e->pend[i].flags) {
         /* ml904: a second clear of the other aspect merges; the values of the
@@ -4107,6 +4121,7 @@ static int exec_begin_render(struct mad_exec *e) {
     if (exec_same_targets(e)) { InterlockedIncrement(&g_pass_reused); return 1; }
     if (e->renc) InterlockedIncrement(&g_pass_end_rts);
     e->f7_next_rts = 1;   /* ml1137: the pass being closed hands over to the targets bound now */
+    g_enc_why = e->renc ? "targets" : "pass";
     exec_end(e);
     /* ml934: a render pass with NO colour target AND no depth is legal in
      * D3D12, and it is exactly what Nanite's hardware rasteriser uses: it
@@ -4215,6 +4230,7 @@ static int exec_begin_render(struct mad_exec *e) {
 static int exec_begin_blit(struct mad_exec *e) {
     if (e->benc) return 1;
     if (e->renc) InterlockedIncrement(&g_pass_end_blit);
+    g_enc_why = "copy";
     exec_end(e);
     e->benc = MTLCommandBuffer_blitCommandEncoder(e->cb); if (e->benc) g_enc_seq++;
     if (g_enc_labels) mad_label(e->benc, "B#%u copy", g_enc_seq);   /* ml1142 */
@@ -7696,6 +7712,7 @@ static void exec_indirect_probe(struct mad_exec *e, const struct mad_cmd *c) {
     memset(d->k_ring_cpu + off, 0xff, 32);   /* 0xffffffff = never written */
     if (!e->cenc) {
         if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
+        g_enc_why = "dispatch";
         exec_end(e);
         e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false);
         if (!e->cenc) return;
@@ -7885,6 +7902,7 @@ static int exec_tess_indirect_prep(struct mad_exec *e, const struct mad_cmd *c, 
     off = mad_kring_alloc(d, (UINT64)c->u.ind.count * 16);
     if (off == ~(UINT64)0) return 0;
     if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
+    g_enc_why = "dispatch";
     exec_end(e);
     e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false);
     if (!e->cenc) return 0;
@@ -7940,6 +7958,7 @@ static int exec_clamp_indirect_prep(struct mad_exec *e, const struct mad_cmd *c,
     off = mad_kring_alloc(d, bytes);
     if (off == ~(UINT64)0) return 0;
     if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
+    g_enc_why = "dispatch";
     exec_end(e);
     e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false);
     if (!e->cenc) return 0;
@@ -8322,6 +8341,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     }
     if (!e->cenc) {
         if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
+        g_enc_why = "dispatch";
         exec_end(e);
         e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false); if (e->cenc) g_enc_seq++;
         e->cenc_pso = e->cpso; e->cenc_seq = g_enc_seq;
@@ -8511,9 +8531,21 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
              * differently every frame, which is what made parts of the geometry
              * blink in and out. Close the encoder whenever either side of the
              * boundary is attachment-less. */
+            /* madeira-doge rts-null-lazy (default 1): EXVS2 unbinds its targets
+             * (OMSetRenderTargets(0, NULL)) after nearly every pass and binds the
+             * same ones again a few commands later -- 961 of 1041 passes per 600
+             * lists ended here, each a store and a reload of its attachments. An
+             * open pass is kept across the unbind; it is closed when something is
+             * actually drawn with no attachments (exec_begin_render does that, as
+             * the targets differ then), so the ml934d race stays covered. */
+            if (g_rts_null_lazy < 0) g_rts_null_lazy = mad_cfg_int_pe("rts-null-lazy", 1) ? 1 : 0;   /* 1: an OMSetRenderTargets with no targets leaves the open pass alone until something is drawn without targets */
             if (e.renc && ((!c->u.rts.n && !c->u.rts.depth) || (!e.enc_nrt && !e.enc_depth))) {
-                InterlockedIncrement(&g_pass_end_attachless);
-                exec_end(&e);
+                if (g_rts_null_lazy && !c->u.rts.n && !c->u.rts.depth && (e.enc_nrt || e.enc_depth)) {
+                    InterlockedIncrement(&g_pass_rts_null_kept);
+                } else {
+                    InterlockedIncrement(&g_pass_end_attachless);
+                    g_enc_why = "attachless"; exec_end(&e);
+                }
             }
             memcpy(e.rt, c->u.rts.rt, sizeof e.rt); e.nrt = c->u.rts.n; e.depth = c->u.rts.depth;
             memcpy(e.rtp, c->u.rts.v, sizeof e.rtp); e.dp = c->u.rts.dv;   /* ml925 */
@@ -8550,8 +8582,10 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
+                if (g_barrier_blit_open < 0) g_barrier_blit_open = mad_cfg_int_pe("barrier-blit-open", 1) ? 1 : 0;   /* 1: a ResourceBarrier leaves an open blit encoder open (its copies run in order); EXVS2's particle lists alternate copy / barrier / copy, one encoder per copy */
                 if (e.cenc && e.f6_enc_synced && g_f6_compute_open) InterlockedIncrement(&g_f6_kept_open);
-                else if (e.cenc || e.benc) exec_end(&e);
+                else if (e.benc && !e.cenc && e.f6_enc_synced && g_barrier_blit_open) InterlockedIncrement(&g_blit_barrier_kept);   /* madeira-doge */
+                else if (e.cenc || e.benc) { g_enc_why = "barrier"; exec_end(&e); }
                 if (e.renc && (!e.f6_enc_synced || g_barrier_render)) {
                     InterlockedIncrement(&g_barrier_renc_closed);
                     if (!e.f6_enc_synced) InterlockedIncrement(&g_f6_rclose);   /* costs a store + reload of its attachments */
@@ -8613,6 +8647,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         }
     }
     if (e.renc) InterlockedIncrement(&g_pass_end_list);
+    g_enc_why = "list-end";
     exec_end(&e);
     while (e.npend) exec_flush_clear(&e, 0);
     /* ml1042: a PERIODIC summary. Every per-list line is rate-limited to the first
@@ -8637,6 +8672,8 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                       InterlockedExchange(&g_pass_end_clear, 0), InterlockedExchange(&g_pass_end_dispatch, 0), InterlockedExchange(&g_pass_end_blit, 0),
                       InterlockedExchange(&g_pass_end_list, 0), InterlockedExchange(&g_pass_end_attachless, 0), InterlockedExchange(&g_pass_clear_only, 0),
                       (long long)(InterlockedExchange64(&g_pass_attach_bytes, 0) >> 20));
+            d3d12_log("[madeira-d3d12] madeira-doge pass merging in those lists: %ld null-target unbinds kept the pass open (rts-null-lazy), %ld blit encoders kept open at a barrier (barrier-blit-open)\n",
+                      InterlockedExchange(&g_pass_rts_null_kept, 0), InterlockedExchange(&g_blit_barrier_kept, 0));
             if (g_ind_clamp_n)
                 d3d12_log("[madeira-d3d12] ind-count-clamp: %ld ExecuteIndirect(s) with a count buffer clamped, %ld records, in those lists\n",
                           InterlockedExchange(&g_ind_clamp_n, 0), InterlockedExchange(&g_ind_clamp_recs, 0));
