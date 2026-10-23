@@ -18,13 +18,19 @@ import sys
 OLD = """        if (bind( unix_fd, &bind_addr.addr, unix_len ) < 0)
         {
             if (errno == EADDRINUSE && sock->reuseaddr)"""
-NEW = """        if (bind( unix_fd, &bind_addr.addr, unix_len ) < 0
-            /* madeira-doge: Windows wildcard/specific UDP bind (tools/patch-sock-bind-reuse.py) */
+NEW = """        /* madeira-doge: Windows wildcard/specific UDP bind (tools/patch-sock-bind-reuse.py v2).
+         * Darwin's in_pcbbind refuses 0.0.0.0:P next to 192.168.x.y:P unless BOTH sockets have
+         * SO_REUSEPORT (127.0.0.1 happened to pass with SO_REUSEADDR alone). Exact duplicates are
+         * still refused by check_addr_usage above, which keeps Windows semantics for those. */
+        if (sock->type == WS_SOCK_DGRAM && !sock->exclusiveaddruse)
+            setsockopt( unix_fd, SOL_SOCKET, SO_REUSEPORT, &(int){1}, sizeof(int) );
+        if (bind( unix_fd, &bind_addr.addr, unix_len ) < 0
             && !(errno == EADDRINUSE && sock->type == WS_SOCK_DGRAM && !sock->exclusiveaddruse
                  && !setsockopt( unix_fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int) )
                  && (fprintf( stderr, "[sock-bind] madeira-doge: UDP port in use by another address; "
-                              "retrying with SO_REUSEADDR (Windows semantics)\\n" ), 1)
-                 && !bind( unix_fd, &bind_addr.addr, unix_len )))
+                              "retrying with SO_REUSEADDR+SO_REUSEPORT (Windows semantics)\\n" ), 1)
+                 && (!bind( unix_fd, &bind_addr.addr, unix_len )
+                     || ({ int e_ = errno; fprintf( stderr, "[sock-bind] madeira-doge: retry failed, errno %d\\n", e_ ); errno = e_; 0; }))))
         {
             if (errno == EADDRINUSE && sock->reuseaddr)"""
 
