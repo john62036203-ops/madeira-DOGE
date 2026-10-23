@@ -2256,7 +2256,8 @@ static void queue_rawinput_message( struct desktop *desktop, struct process *pro
     if (!device) return;
 
     if (raw_msg->message == WM_INPUT_DEVICE_CHANGE && !(device->flags & RIDEV_DEVNOTIFY)) return;
-    if (process != raw_msg->foreground->process)
+    /* madeira-doge: no foreground thread (pad reports from hidpad_ios.c) counts as background */
+    if (!raw_msg->foreground || process != raw_msg->foreground->process)
     {
         if (raw_msg->message == WM_INPUT && !(device->flags & RIDEV_INPUTSINK)) return;
         wparam = RIM_INPUTSINK;
@@ -3132,6 +3133,54 @@ void set_rawinput_process( struct process *process, int enable )
     list_remove( &process->rawinput_entry ); /* remove it first, it might already be in the list */
     if (!process->rawinput_device_count || !enable) list_init( &process->rawinput_entry );
     else list_add_tail( &rawinput_processes, &process->rawinput_entry );
+}
+
+/* madeira-doge: WM_INPUT for the HID pad (hidpad_ios.c). Does any process take
+ * raw input for this usage (MAKELONG(usage, page))? */
+int madeira_rawinput_wanted( unsigned int usage )
+{
+    struct process *process;
+
+    LIST_FOR_EACH_ENTRY( process, &rawinput_processes, struct process, rawinput_entry )
+        if (find_rawinput_device( process, usage )) return 1;
+    return 0;
+}
+
+/* Queue one HID input report as WM_INPUT (RIM_TYPEHID) to every process that
+ * registered the usage, as winebus/hidclass do through NtUserSendHardwareInput.
+ * Returns how many processes took it. */
+unsigned int madeira_rawinput_hid_report( unsigned int handle, unsigned int usage,
+                                          const void *report, unsigned int len )
+{
+    struct hw_msg_source source = { IMDT_UNAVAILABLE, IMO_HARDWARE };
+    struct rawinput_message raw_msg = {0};
+    struct winstation *winstation;
+    struct desktop *desktop;
+    struct process *process;
+    unsigned int count = 0;
+
+    if (!(winstation = get_visible_winstation()) || !(desktop = get_input_desktop( winstation ))) return 0;
+    raw_msg.foreground = get_foreground_thread( desktop, 0 );
+    raw_msg.source     = source;
+    raw_msg.time       = get_tick_count();
+    raw_msg.message    = WM_INPUT;
+    raw_msg.hid_report = report;
+    raw_msg.rawinput.type   = RIM_TYPEHID;
+    raw_msg.rawinput.device = handle;
+    raw_msg.rawinput.wparam = 0;
+    raw_msg.rawinput.usage  = usage;
+    raw_msg.data.hid.dwCount   = 1;
+    raw_msg.data.hid.dwSizeHid = len;
+
+    LIST_FOR_EACH_ENTRY( process, &rawinput_processes, struct process, rawinput_entry )
+    {
+        if (!find_rawinput_device( process, usage )) continue;
+        queue_rawinput_message( desktop, process, &raw_msg );
+        count++;
+    }
+    if (raw_msg.foreground) release_object( raw_msg.foreground );
+    release_object( desktop );
+    return count;
 }
 
 
@@ -4272,6 +4321,8 @@ DECL_HANDLER(get_rawinput_buffer)
     }
 }
 
+extern void madeira_hidpad_rawinput_update( void );   /* hidpad_ios.c */
+
 DECL_HANDLER(update_rawinput_devices)
 {
     const struct rawinput_device *tmp, *devices = get_req_data();
@@ -4312,6 +4363,7 @@ DECL_HANDLER(update_rawinput_devices)
 
         release_object( desktop );
     }
+    madeira_hidpad_rawinput_update();   /* madeira-doge: WM_INPUT for the HID pad */
 }
 
 DECL_HANDLER(set_keyboard_repeat)

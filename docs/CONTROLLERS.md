@@ -213,8 +213,12 @@ What the game gets, with `hid`:
 
 Readers: hid.dll and setupapi (HidD_*/HidP_*, ReadFile/WriteFile, feature
 reports), DirectInput 8 through Wine's HID joystick, windows.gaming.input's
-raw game controllers, and the raw input device list. Not yet: WM_INPUT for
-the pad (no raw input reports are generated).
+raw game controllers, the raw input device list, and WM_INPUT: while a
+window has registered raw input for the pad's usage (Generic Desktop / Game
+Pad), every change of the pad (touch controls included) and a repeat every
+100 ms arrive as RIM_TYPEHID reports, the same bytes ReadFile returns, with
+the device list's handle; RIDEV_INPUTSINK windows get them in the background
+too. The session log shows `[rawinput] madeira-doge WM_INPUT hid report n=..`.
 
 XInput in HID mode: player 1 leaves XInput, as a DualSense on Windows is not
 an XInput pad (without Steam Input), so a game that reads both APIs -- God of

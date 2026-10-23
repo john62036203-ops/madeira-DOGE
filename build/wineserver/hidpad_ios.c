@@ -639,6 +639,80 @@ static void hidpad_product_name( struct hidpad_device *device )
     if (!len) snprintf( device->product, sizeof(device->product), "%s", device->id->product );
 }
 
+/* madeira-doge: WM_INPUT for the pad. Games that read controllers only
+ * through Raw Input (EXVS2: RegisterRawInputDevices page 1 usage 4 + 5,
+ * RIDEV_INPUTSINK) got nothing: on Windows hidclass hands every input report
+ * to win32k as WM_INPUT (RIM_TYPEHID). While some process has registered the
+ * pad's top-level usage, a 4 ms clock polls the app's snapshot and queues a
+ * report through queue_ios.c when the pad changed, plus one every 100 ms so a
+ * game that missed a report still converges. The clock stops once no process
+ * wants the usage; update_rawinput_devices restarts it. */
+extern int madeira_rawinput_wanted( unsigned int usage );
+extern unsigned int madeira_rawinput_hid_report( unsigned int handle, unsigned int usage,
+                                                 const void *report, unsigned int len );
+
+#define HIDPAD_RAW_REPEAT (TICKS_PER_SEC / 10)
+
+static struct hidpad_device *hidpad_raw_device;
+static struct timeout_user *hidpad_raw_clock;
+static unsigned int hidpad_raw_usage, hidpad_raw_packet, hidpad_raw_count;
+static timeout_t hidpad_raw_last;
+
+static void hidpad_raw_tick( void *private )
+{
+    struct hidpad_device *device = hidpad_raw_device;
+    unsigned char report[HIDPAD_DUALSENSE_INPUT_LEN];
+    struct winios_hidpad pad;
+    unsigned int len, taken;
+
+    hidpad_raw_clock = NULL;
+    if (!device || !madeira_rawinput_wanted( hidpad_raw_usage )) return;
+
+    winios_hidpad_get_state( &pad );
+    if (!hidpad_raw_last || pad.packet != hidpad_raw_packet ||
+        monotonic_time - hidpad_raw_last >= HIDPAD_RAW_REPEAT)
+    {
+        len = hidpad_input_report( device->id, &pad, &device->state, monotonic_time / 10, report );
+        taken = madeira_rawinput_hid_report( HIDPAD_RAWINPUT_HANDLE, hidpad_raw_usage, report, len );
+        hidpad_raw_count++;
+        if (hidpad_raw_count <= 32 || !(hidpad_raw_count % 1000))
+            fprintf( stderr, "[rawinput] madeira-doge WM_INPUT hid report n=%u len=%u usage=%04x:%04x "
+                     "processes=%u packet=%u %s\n", hidpad_raw_count, len, HIWORD(hidpad_raw_usage),
+                     LOWORD(hidpad_raw_usage), taken, pad.packet, pad.connected ? "connected" : "at rest" );
+        hidpad_raw_last = monotonic_time;
+        hidpad_raw_packet = pad.packet;
+    }
+    hidpad_raw_clock = add_timeout_user( -HIDPAD_TICK, hidpad_raw_tick, NULL );
+}
+
+/* Called by update_rawinput_devices (queue_ios.c) after a process changed its registrations. */
+void madeira_hidpad_rawinput_update( void )
+{
+    if (!hidpad_raw_device || hidpad_raw_clock) return;
+    if (!madeira_rawinput_wanted( hidpad_raw_usage )) return;
+    fprintf( stderr, "[rawinput] madeira-doge pad raw input on: usage %04x:%04x handle %#x\n",
+             HIWORD(hidpad_raw_usage), LOWORD(hidpad_raw_usage), HIDPAD_RAWINPUT_HANDLE );
+    hidpad_raw_last = 0;
+    hidpad_raw_tick( NULL );
+}
+
+/* The descriptor's first Usage Page / Usage items: the top-level collection
+ * win32u's device list reports (both pads: Generic Desktop / Game Pad). */
+static unsigned int hidpad_top_usage( const unsigned char *desc, unsigned int len )
+{
+    unsigned int i, page = 0, usage = 0;
+
+    for (i = 0; i + 1 < len && (!page || !usage); )
+    {
+        unsigned char item = desc[i], size = item & 3;
+        if (size == 3) size = 4;
+        if (item == 0x05 && !page) page = desc[i + 1];
+        else if (item == 0x09 && !usage) usage = desc[i + 1];
+        i += 1 + size;
+    }
+    return MAKELONG( usage ? usage : 0x05, page ? page : 0x01 );
+}
+
 /***********************************************************************
  *           madeira_hidpad_init
  *
@@ -707,6 +781,8 @@ void madeira_hidpad_init( void )
         return;
     }
     release_object( symlink );
+    hidpad_raw_device = device;   /* madeira-doge: WM_INPUT */
+    hidpad_raw_usage = hidpad_top_usage( desc, desc_len );
 
     fprintf( stderr, "[hid-pad] ml2101 device %s %04x:%04x \"%s\" input %u output %u feature %u bytes, "
              "preparsed %u bytes, \\??\\%s\n", id->env, id->vid, id->pid, device->product,
