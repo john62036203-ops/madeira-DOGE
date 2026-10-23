@@ -103,7 +103,7 @@
 
 /* madeira-doge: MADEIRA_FAULT_GUARD_RATE helpers (see the ml461 redelivery guard). The
  * present counter lives in winemetal's unix side; weak, so a build without it only rates. */
-#include <mach/mach_time.h>
+extern uint64_t mach_absolute_time(void);
 extern uint64_t madeira_get_present_count(void) __attribute__((weak_import));
 static uint64_t ios_fgr_presents(void)
 {
@@ -111,9 +111,12 @@ static uint64_t ios_fgr_presents(void)
 }
 static uint64_t ios_fgr_ms( uint64_t t0, uint64_t t1 )
 {
-    static mach_timebase_info_data_t tb;
+    /* mach_timebase_info_data_t is not visible in this TU's header set (see ml680 below):
+     * two uint32s, taken by pointer */
+    static struct { unsigned int numer, denom; } tb;
+    extern int mach_timebase_info(void *);
     if (!tb.denom) mach_timebase_info( &tb );
-    return (t1 - t0) * tb.numer / tb.denom / 1000000ull;
+    return tb.denom ? (t1 - t0) * tb.numer / tb.denom / 1000000ull : (t1 - t0) / 1000000ull;
 }
 /* a storm: 2000 deliveries inside 0.5 s, or no frame progress (under 3 presents) meanwhile */
 static int ios_fgr_is_storm( uint64_t t0, uint64_t presents0 )
