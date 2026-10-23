@@ -18792,7 +18792,7 @@ static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UIN
  *  2. A presenting swapchain re-reads the layer's drawable size and format
  *     every 30 presents and applies its own again when another process
  *     changed them.
- * MADEIRA_SWAP_OFFSCREEN_SKIP=0 turns both off. user32 is looked up, not
+ * The env switch (name in n[] below) = 0 turns both off. user32 is looked up, not
  * imported (see mad_swap_fit_client). */
 static int mad_swap_offscreen_check(struct mad_swapchain *s) {
     static int on = -1;
@@ -18800,8 +18800,8 @@ static int mad_swap_offscreen_check(struct mad_swapchain *s) {
     static BOOL (WINAPI *p_vis)(HWND);
     static BOOL (WINAPI *p_iswin)(HWND);
     static int (WINAPI *p_metric)(int);
+    static const char n[] = "MADEIRA_SWAP_OFFSCREEN_SKIP";
     if (on < 0) {
-        static const char n[] = "MADEIRA_SWAP_OFFSCREEN_SKIP";
         char v[8];
         on = !(GetEnvironmentVariableA(n, v, sizeof v) && v[0] == '0');
         if (on) {
@@ -18814,7 +18814,7 @@ static int mad_swap_offscreen_check(struct mad_swapchain *s) {
             }
             if (!p_rect || !p_vis || !p_iswin || !p_metric) on = 0;
         }
-        d3d12_log("[madeira-d3d12] swap-offscreen-skip %s (madeira-doge; MADEIRA_SWAP_OFFSCREEN_SKIP=0 turns it off)\n", on ? "on" : "off");
+        d3d12_log("[madeira-d3d12] swap-offscreen-skip %s (madeira-doge; %s=0 turns it off)\n", on ? "on" : "off", n);
     }
     if (!on || !s->hwnd) return 0;
     if ((s->presents % 30) == 0) {
@@ -18897,7 +18897,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         struct madeira_ctl_args a;
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
         memset(&a, 0, sizeof a); a.op = 0;
-        if (!s->offscreen) MadeiraCtl(&a);   /* madeira-doge: an off-screen swapchain (EXVS2 LM) leaves CAP to the one on screen */
+        if (!s->offscreen) MadeiraCtl(&a);
         if (a.ret) {   /* madeira-doge: capture-frames = N (2..8) turns one CAP tap into N consecutive frames, to diff a good frame against a flickering one */
             long long nf = mad_cfg_int_pe("capture-frames", 1);
             if (nf >= 2 && nf <= 8 && a.ret == 1) a.ret = (unsigned)nf;
