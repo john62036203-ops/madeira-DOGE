@@ -76,6 +76,10 @@ jobs:
           rc=$?
           if [ $rc -ne 0 ]; then
             grep -vE "^ok " catalog-check.log | tail -20 | while IFS= read -r l; do echo "::error::catalog: $l"; done
+            # madeira-doge: say WHAT is stale (the generated file cannot be reproduced from a plain clone)
+            python3 build/tools/gen-config-catalog.py >/dev/null 2>&1 || true
+            git diff --no-color -U0 -- app/Madeira/ConfigCatalog.generated.swift | grep -E "^[-+] " | cut -c1-240 | head -30 | while IFS= read -r l; do echo "::error::catalog-diff: $l"; done
+            git checkout -- app/Madeira/ConfigCatalog.generated.swift
           fi
           exit $rc
 
