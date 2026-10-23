@@ -12159,6 +12159,14 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
     struct mad_resource *r;
     HRESULT hr;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) { mad_refuse_log(desc, heap_type, "dimension UNKNOWN"); return E_INVALIDARG; }
+    /* madeira-doge (after BCD 0.1.580): a texture with a zero width, height or depth went to
+     * Metal, which aborted the process ("MTLTextureDescriptor has width of zero", Marvel's
+     * Spider-Man). D3D12 itself refuses it with E_INVALIDARG. */
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        && (!desc->Width || !desc->Height || !desc->DepthOrArraySize)) {
+        mad_refuse_log(desc, heap_type, "zero-size texture");
+        return E_INVALIDARG;
+    }
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->Format == DXGI_FORMAT_NV12 && mad_nv12_on())
         return mad_create_nv12(d, heap_type, desc, riid, out, ph, poff);
 

@@ -14203,7 +14203,19 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     {
         TRACE( "overlapping view %p-%p for %p-%p\n",
                view->base, (char *)view->base + view->size, base, (char *)base + size );
-        assert( view->protect & VPROT_SYSTEM );
+        if (!(view->protect & VPROT_SYSTEM))
+        {
+            /* madeira-doge (after BCD 0.1.591 "create-view"): a live non-system view under a
+             * new mapping used to assert and end the process (Fallout 4, FEX asking 16 MB at
+             * an address a view already held). The caller gets the conflict instead. */
+            static int n;
+            if (n++ < 8)
+                dprintf( 2, "[create-view] madeira-doge: %p+0x%lx (vprot 0x%x) would overlap the live view %p+0x%lx (vprot 0x%x) "
+                            "tid=%04x — STATUS_CONFLICTING_ADDRESSES (used to assert)\n",
+                         base, (unsigned long)size, vprot, view->base, (unsigned long)view->size, view->protect,
+                         (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
+            return STATUS_CONFLICTING_ADDRESSES;
+        }
         delete_view( view );
     }
 

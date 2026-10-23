@@ -194,6 +194,13 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
         thread)
             compile_one "$BUILD_DIR/thread_ios.c" "thread"
             ;;
+        file)
+            # madeira-doge: file information queries list a file's extended attributes
+            # once; size queries take fstat alone (NutsEmu 0148, tools/patch-wine-file-xattr.py).
+            python3 "$REPO_ROOT/tools/patch-wine-file-xattr.py" "$src" "$OBJ_DIR/file_patched.c" \
+                || { echo "  file: patch-wine-file-xattr did not apply"; exit 1; }
+            compile_one "$OBJ_DIR/file_patched.c" "file"
+            ;;
         sync)
             # madeira-bcd: a NULL keyed-event handle resolves per guest process
             # (ios_default_keyed_event, loader_ios.c), not to the first process's

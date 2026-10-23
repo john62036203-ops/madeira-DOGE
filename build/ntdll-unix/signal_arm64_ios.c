@@ -100,6 +100,28 @@
 #include "winternl.h"
 #include "wine/asm.h"
 #include "unix_private.h"
+
+/* madeira-doge: MADEIRA_FAULT_GUARD_RATE helpers (see the ml461 redelivery guard). The
+ * present counter lives in winemetal's unix side; weak, so a build without it only rates. */
+#include <mach/mach_time.h>
+extern uint64_t madeira_get_present_count(void) __attribute__((weak_import));
+static uint64_t ios_fgr_presents(void)
+{
+    return madeira_get_present_count ? madeira_get_present_count() : 0;
+}
+static uint64_t ios_fgr_ms( uint64_t t0, uint64_t t1 )
+{
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info( &tb );
+    return (t1 - t0) * tb.numer / tb.denom / 1000000ull;
+}
+/* a storm: 2000 deliveries inside 0.5 s, or no frame progress (under 3 presents) meanwhile */
+static int ios_fgr_is_storm( uint64_t t0, uint64_t presents0 )
+{
+    if (ios_fgr_ms( t0, mach_absolute_time() ) < 500) return 1;
+    if (madeira_get_present_count && madeira_get_present_count() - presents0 < 3) return 1;
+    return 0;
+}
 #include "ios_wow.h"
 #include "wine/debug.h"
 
@@ -9426,8 +9448,21 @@ dispatch:
          * ~35 s and this guard killed a healthy game. A real storm refaults the
          * same instruction back to back on one thread, so the slot is chosen by
          * thread and any other fault on that thread restarts the run. */
-        static struct { uint64_t thread, key; uint32_t n; } redeliv[16];
+        static struct { uint64_t thread, key; uint32_t n; uint64_t t0, presents0; } redeliv[16];
         static volatile int ios_redeliv_terminating;
+        /* madeira-doge (after BCD 0.1.591 MADEIRA_FAULT_GUARD_RATE): with the switch on, 2000
+         * identical deliveries end the process only when they are a storm — all within 0.5 s,
+         * or with no frame presented meanwhile (fewer than 3 presents). Mono's null-check traps
+         * and other per-frame handled faults of a live game then no longer count as one
+         * (BCD saw SpiderHeck, ROUNDS, PlateUp and RDR2 killed by the old rule); a real storm
+         * refaults tens of thousands of times a second and still ends as before. Off by
+         * default: the old rule. */
+        static int fgr = -1;
+        if (fgr < 0)
+        {
+            const char *e = getenv( "MADEIRA_FAULT_GUARD_RATE" );   /* 1: the 2000-identical-redelivery kill needs them within 0.5 s or without frame progress (BCD 591) */
+            fgr = e && e[0] && e[0] != '0';
+        }
         uint64_t rkey = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
         int rslot = (int)(((uint64_t)thread * 0x9E3779B97F4A7C15ull) >> 60);
         if (redeliv[rslot].thread != (uint64_t)thread || redeliv[rslot].key != rkey)
@@ -9435,10 +9470,32 @@ dispatch:
             redeliv[rslot].thread = (uint64_t)thread;
             redeliv[rslot].key = rkey;
             redeliv[rslot].n = 1;
+            if (fgr)
+            {
+                redeliv[rslot].t0 = mach_absolute_time();
+                redeliv[rslot].presents0 = ios_fgr_presents();
+            }
         }
         else if (++redeliv[rslot].n == 256)
             dprintf( 2, "[redeliv] 256 identical redeliveries pc=0x%llx addr=0x%llx — storm forming rev=ml461\n",
                      (unsigned long long)pc, (unsigned long long)fault_addr );
+        else if (redeliv[rslot].n >= 2000 && fgr && !ios_redeliv_terminating
+                 && !ios_fgr_is_storm( redeliv[rslot].t0, redeliv[rslot].presents0 ))
+        {
+            /* not a storm: the run took over 0.5 s and frames were presented. Start a new
+             * window so a later real storm is still caught. */
+            static int said;
+            uint64_t now = mach_absolute_time();
+            if (said++ < 8)
+                dprintf( 2, "[redeliv] 2000 identical redeliveries pc=0x%llx addr=0x%llx over %llu ms with %llu presents — "
+                            "a live game, not a storm (MADEIRA_FAULT_GUARD_RATE); counting again\n",
+                         (unsigned long long)pc, (unsigned long long)fault_addr,
+                         (unsigned long long)ios_fgr_ms( redeliv[rslot].t0, now ),
+                         (unsigned long long)(ios_fgr_presents() - redeliv[rslot].presents0) );
+            redeliv[rslot].n = 1;
+            redeliv[rslot].t0 = now;
+            redeliv[rslot].presents0 = ios_fgr_presents();
+        }
         else if (redeliv[rslot].n >= 2000 && !ios_redeliv_terminating)
         {
             /* ml463: was `== 2000` + exit(76) — one shot, and exit() on iOS is
