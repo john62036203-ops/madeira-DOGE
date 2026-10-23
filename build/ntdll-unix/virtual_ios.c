@@ -32371,6 +32371,52 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
                         if (overlap_end < size)
                             memcpy(jit_rw_dest + overlap_end, (char *)base + overlap_end, size - overlap_end);
 
+                        /* madeira-doge: a guest inline hook on an x64 thunk INSIDE .text.
+                         * Wine's ARM64EC kernel32 keeps its x64 forwarders (CreateFileW:
+                         * "jmp [rip+X]") in .text, so a hook written there (Gundam EXVS2's
+                         * bngrw.dll hooks kernel32!CreateFileW/A, ReadFile, WriteFile,
+                         * GetDriveTypeA ... to map the cabinet's G:\ and F:\ to the game
+                         * folder) stayed in the PE view while callers ran the unhooked pool
+                         * copy. .hexpthk hooks were never affected (no .text overlap).
+                         * Copy only a jump that replaced an x64 thunk start in the pool
+                         * copy ("ff 25" jmp [rip] or "48 8b c4" mov rax,rsp); everything
+                         * else in .text keeps the pool copy's own bytes.
+                         * MADEIRA_EC_HOOK_SYNC=0 turns this off. */
+                        {
+                            static int hook_sync = -1;
+                            static unsigned hook_sync_logged;
+                            if (hook_sync < 0)
+                            {
+                                static const char hs_name[] = "MADEIRA_EC_HOOK_SYNC";
+                                const char *e = getenv( hs_name );
+                                hook_sync = !(e && *e == '0');
+                            }
+                            if (hook_sync)
+                            {
+                                const unsigned char *pe_b = (const unsigned char *)base;
+                                unsigned char *pool_b = (unsigned char *)jit_rw_dest;
+                                size_t i;
+                                for (i = overlap_start; i + 6 <= overlap_end; i++)
+                                {
+                                    unsigned long long tgt = 0;
+                                    size_t jl;
+                                    if (pe_b[i] == pool_b[i]) continue;
+                                    if (!((pool_b[i] == 0xff && pool_b[i + 1] == 0x25) ||
+                                          (pool_b[i] == 0x48 && pool_b[i + 1] == 0x8b && pool_b[i + 2] == 0xc4)))
+                                        continue;
+                                    jl = ios_ec_hook_jump_target( pe_b + i, overlap_end - i, (uintptr_t)base + i, &tgt );
+                                    if (!jl || i + jl > overlap_end) continue;
+                                    memcpy( pool_b + i, pe_b + i, jl );
+                                    if (hook_sync_logged < 64)
+                                        dprintf( 2, "[ec-hook-sync] madeira-doge #%u %p+%#lx (image %p rva %#lx): guest hook "
+                                                    "jump (%lu bytes -> %#llx) copied into the pool copy\n",
+                                                 ++hook_sync_logged, (char *)base + i, (unsigned long)jl, (void *)pe_start,
+                                                 (unsigned long)((uintptr_t)base + i - pe_start), (unsigned long)jl, tgt );
+                                    i += jl - 1;
+                                }
+                            }
+                        }
+
                         ERR("iOS JIT IAT sync: partial copy %p+0x%lx → JIT (skipping text [0x%lx-0x%lx])\n",
                             base, (unsigned long)size,
                             (unsigned long)overlap_start, (unsigned long)overlap_end);
