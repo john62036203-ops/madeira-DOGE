@@ -10830,12 +10830,37 @@ static void STDMETHODCALLTYPE list_ResolveQueryData(ID3D12GraphicsCommandList *T
         if (c) { c->u.query.heap = (struct mad_queryheap *)heap; c->u.query.type = type; c->u.query.index = start; c->u.query.count = count; c->u.query.dst = r; c->u.query.off = offset; }
         return;
     }
-    if (!said++) d3d12_log("[madeira-d3d12] ResolveQueryData: non-occlusion queries resolve to zero (not measured yet)\n");
-    /* Written immediately rather than at execution: a constant is the same
-     * value whenever it lands, and the destination is a readback buffer the
-     * CPU owns. */
-    if (r->cpu && offset + (UINT64)count * each <= r->size)
-        memset((char *)r->cpu + offset, 0, (size_t)(count * each));
+    /* Written immediately rather than at execution: the destination is a
+     * readback buffer the CPU owns.
+     * madeira-doge: timestamps are no longer all zero. Gundam EXVS2 IB (nu
+     * engine) creates TIMESTAMP and PIPELINE_STATISTICS heaps and resolves them
+     * every frame; with every timestamp 0 its GPU interval is always 0 and with
+     * every statistic 0 nothing ever "drew". Timestamps now carry the CPU clock
+     * in nanoseconds (the unit GetTimestampFrequency reports), increasing by 1 ns
+     * per query so begin < end; pipeline statistics report 1 for every counter.
+     * env.MADEIRA_QUERY_ZERO=1 restores the zeros. */
+    {
+        static int zero = -1;
+        if (zero < 0) { static const char qz_name[] = "MADEIRA_QUERY_ZERO"; char v[8]; zero = GetEnvironmentVariableA(qz_name, v, sizeof v) && v[0] == '1'; }
+        if (!said++) d3d12_log("[madeira-d3d12] ResolveQueryData: non-occlusion queries resolve to %s (madeira-doge)\n",
+                               zero ? "zero" : "CPU-clock timestamps / pipeline statistics of 1");
+        if (r->cpu && offset + (UINT64)count * each <= r->size) {
+            char *p = (char *)r->cpu + offset;
+            UINT i;
+            if (zero || (type != D3D12_QUERY_TYPE_TIMESTAMP && type != D3D12_QUERY_TYPE_PIPELINE_STATISTICS)) {
+                memset(p, 0, (size_t)(count * each));
+            } else if (type == D3D12_QUERY_TYPE_TIMESTAMP) {
+                static LONG64 freq;
+                LARGE_INTEGER t; UINT64 ns;
+                if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 1; }
+                QueryPerformanceCounter(&t);
+                ns = (UINT64)((double)t.QuadPart * (1e9 / (double)freq));
+                for (i = 0; i < count; i++) { UINT64 v = ns + start + i; memcpy(p + (size_t)i * 8, &v, 8); }
+            } else {
+                for (i = 0; i < count * (UINT)(each / 8); i++) { UINT64 one = 1; memcpy(p + (size_t)i * 8, &one, 8); }
+            }
+        }
+    }
 }
 
 /* ml1088: the batch-side machinery. */
