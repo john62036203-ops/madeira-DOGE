@@ -2932,6 +2932,19 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
     for (k = 0; k < e->pso->ps_nair; k++) {
         const struct madeira_ir_air_range *rg = &e->pso->ps_air[k]; struct mad_descriptor de; UINT64 direct = 0; const char *why = "?";
         struct mad_resource *r; int xv = -1;
+        if (rg->type == MADEIRA_IR_AIR_SAMPLER) {   /* madeira-doge: the sampler's real state (EXVS2's sprite pass uses two) */
+            struct mad_smpdesc sd; float bias; UINT32 bb;
+            if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg,
+                                 (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_PIXEL), &de, &direct, &why)) {
+                d3d12_log("[capture-draw] s%u space %u: NOT RESOLVED (%s)\n", rg->lower_bound, rg->space, why ? why : "?"); continue; }
+            bb = (UINT32)de.metadata; memcpy(&bias, &bb, sizeof bias);
+            if (mad_smpdesc_get(de.gpu_va, &sd))
+                d3d12_log("[capture-draw] s%u -> sampler id %#llx: filter 0x%x address %u/%u/%u LOD %.2f..%.2f bias %.3f aniso %u compare %u border %u\n",
+                          rg->lower_bound, (unsigned long long)de.gpu_va, sd.filter, sd.au, sd.av, sd.aw, (double)sd.minlod, (double)sd.maxlod,
+                          (double)bias, sd.aniso, sd.cmp, sd.border);
+            else d3d12_log("[capture-draw] s%u -> sampler id %#llx: state unknown (bias %.3f)\n", rg->lower_bound, (unsigned long long)de.gpu_va, (double)bias);
+            continue;
+        }
         if (rg->type != MADEIRA_IR_AIR_SRV && rg->type != MADEIRA_IR_AIR_CBV) continue;
         /* madeira-doge: resolve with the PIXEL stage's visibility, as the draw does
          * (EXVS2 declares every table five times, once per stage; with ~0u the
@@ -16463,6 +16476,22 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
                      desc->DepthStencilState.StencilReadMask, desc->DepthStencilState.StencilWriteMask);
     mad_stencil_face(&dsi.back_stencil, &desc->DepthStencilState.BackFace, desc->DepthStencilState.StencilEnable,
                      desc->DepthStencilState.StencilReadMask, desc->DepthStencilState.StencilWriteMask);
+    {   /* madeira-doge: madeira.cfg stencil-always = 1, a diagnostic: every stencil COMPARE becomes ALWAYS
+         * (the ops and masks stay, so masks are still written). EXVS2's sprite pass writes a stencil mask
+         * (func ALWAYS, ref 255) and then draws its sprites with func EQUAL; the sprites leave no pixels.
+         * If they appear with this on, the EQUAL test is what fails. 0 = as the game asks, the default. */
+        static int sa = -1; static LONG said;
+        if (sa < 0) sa = mad_cfg_int_pe("stencil-always", 0) ? 1 : 0;
+        if (sa && desc->DepthStencilState.StencilEnable &&
+            (desc->DepthStencilState.FrontFace.StencilFunc != D3D12_COMPARISON_FUNC_ALWAYS ||
+             desc->DepthStencilState.BackFace.StencilFunc != D3D12_COMPARISON_FUNC_ALWAYS)) {
+            dsi.front_stencil.stencil_compare_function = WMTCompareFunctionAlways;
+            dsi.back_stencil.stencil_compare_function = WMTCompareFunctionAlways;
+            if (InterlockedIncrement(&said) <= 8)
+                d3d12_log("[madeira-d3d12] stencil-always: pipeline vs '%s' ps '%s' (stencil func %u/%u) compares ALWAYS\n",
+                          p->vs_name, p->ps_name, (unsigned)desc->DepthStencilState.FrontFace.StencilFunc, (unsigned)desc->DepthStencilState.BackFace.StencilFunc);
+        }
+    }
     p->dsso = MTLDevice_newDepthStencilState(d->mtl_device, &dsi);
 
     memset(&p->raster, 0, sizeof p->raster);
