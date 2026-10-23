@@ -1125,6 +1125,12 @@ jobs:
       - name: Patch airconv lean SM50 shaders
         run: python3 tools/patch-airconv-sm50-lean.py
 
+      # SM50GetRangeInfo also says whether a texture argument is 1D / 3D / cube /
+      # multisampled (Flags bits 7/8/9/12), so madeira-d3d12 can bind a view of
+      # the type the DXBC shader declared (EXVS2: dxbc-tex-2d).
+      - name: Patch airconv range dimension flags
+        run: python3 tools/patch-airconv-range-dim.py
+
       # iOS cannot bootstrap-register a shared texture's mach port; without a
       # port DXMT keeps the texture unshared instead of failing its creation
       # (Crysis Remastered died on ClearRenderTargetView(NULL) after that).

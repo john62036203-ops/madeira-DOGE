@@ -2874,6 +2874,22 @@ static struct mad_resource *mad_texture_of_view(struct mad_device *d, UINT64 id,
 static struct mad_resource *mad_resolve_address(struct mad_device *d, UINT64 addr, UINT64 *off);
 static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, enum WMTTextureType want,
                                   UINT lvl0, UINT nlvl, UINT sl0, UINT nsl, enum WMTPixelFormat pf, UINT swz);   /* madeira-doge: dxbc-tex-2d */
+/* madeira-doge: which Metal texture types can view each other. 1D and 1DArray;
+ * 2D, 2DArray, Cube and CubeArray; 2DMultisample and its array; 3D alone. */
+static int mad_tex_family(UINT t) {
+    switch (t) {
+    case WMTTextureType1D: case WMTTextureType1DArray: return 1;
+    case WMTTextureType2D: case WMTTextureType2DArray: case WMTTextureTypeCube: case WMTTextureTypeCubeArray: return 2;
+    case WMTTextureType2DMultisample: case WMTTextureType2DMultisampleArray: return 3;
+    case WMTTextureType3D: return 4;
+    default: return 0;
+    }
+}
+static const char *mad_tex_type_name(UINT t) {
+    static const char *const names[] = { "texture1d", "texture1d_array", "texture2d", "texture2d_array", "texture2d_ms",
+                                         "texturecube", "texturecube_array", "texture3d", "texture2d_ms_array", "texture_buffer" };
+    return t < 10 ? names[t] : "?";
+}
 static void mad_capture_rs_tables(struct mad_exec *e, obj_handle_t benc, unsigned seq, const struct mad_rootsig *rs,
                                   const UINT64 *root, const UINT32 (*consts)[64], const char *tag);   /* madeira-bcd */
 static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
@@ -6066,26 +6082,48 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                  * discarded, while a runtime-made TYPE-2D white texture sampled correctly (build 405).
                  * A range the shader declares without the ARRAY flag gets a non-array VIEW of the same
                  * texture (cached in xview like every other view). dxbc-tex-2d = 0 turns it off. */
-                if (!(rg->flags & MADEIRA_IR_AIR_F_TEXTURE_ARRAY) && pso->backend == MADEIRA_IR_BACKEND_AIRCONV) {
-                    static int t2d = -1; static LONG said_t2d; int xv = -1; struct mad_resource *tr;
+                if (pso->backend == MADEIRA_IR_BACKEND_AIRCONV) {
+                    static int t2d = -1; static LONG said_t2d, said_dim; int xv = -1; struct mad_resource *tr;
                     if (t2d < 0) t2d = mad_cfg_int_pe("dxbc-tex-2d", 1) ? 1 : 0;
                     if (t2d && (tr = mad_texture_of_view(d, de.texture_view_id, &xv)) != NULL && tr->texture) {
-                        UINT type = xv >= 0 ? tr->xview[xv].type : (UINT)tr->tex_type; enum WMTTextureType want = (enum WMTTextureType)0;
-                        if (type == (UINT)WMTTextureType2DArray) want = WMTTextureType2D;
-                        else if (type == (UINT)WMTTextureTypeCubeArray) want = WMTTextureTypeCube;
-                        else if (type == (UINT)WMTTextureType2DMultisampleArray) want = WMTTextureType2DMultisample;
-                        if (want) {
-                            UINT lvl0 = xv >= 0 ? tr->xview[xv].lvl0 + tr->mip_drop : 0, nlvl = xv >= 0 ? tr->xview[xv].nlvl : 0;
-                            UINT sl0 = xv >= 0 ? tr->xview[xv].sl0 : 0, nsl = want == WMTTextureTypeCube ? 6u : 1u;
-                            enum WMTPixelFormat vpf = xv >= 0 ? (enum WMTPixelFormat)tr->xview[xv].pf : (enum WMTPixelFormat)0;
-                            UINT vswz = xv >= 0 ? tr->xview[xv].swz : 0;
-                            UINT64 id2 = mad_texture_view_id(d, tr, want, lvl0, nlvl, sl0, nsl, vpf, vswz);
-                            if (id2) {
-                                bind_id = id2;
-                                if (InterlockedIncrement(&said_t2d) <= 6)
-                                    d3d12_log("[madeira-d3d12] dxbc-tex-2d: %c%u of '%s' is a non-array texture in the shader; %s r#%u %ux%u type %u -> view type %u (id %#llx -> %#llx)\n",
-                                              rg->type == MADEIRA_IR_AIR_SRV ? 't' : 'u', rg->lower_bound, pso->ps_name, tr->name ? tr->name : "?", tr->serial,
-                                              tr->width, tr->height, type, (unsigned)want, (unsigned long long)de.texture_view_id, (unsigned long long)id2);
+                        /* The type the shader declared (the dimension bits come from
+                         * tools/patch-airconv-range-dim.py; without them a plain 2D is assumed). */
+                        UINT type = xv >= 0 ? tr->xview[xv].type : (UINT)tr->tex_type;
+                        int arr = (rg->flags & MADEIRA_IR_AIR_F_TEXTURE_ARRAY) != 0;
+                        enum WMTTextureType want;
+                        if (rg->flags & MADEIRA_IR_AIR_F_TEX_1D) want = arr ? WMTTextureType1DArray : WMTTextureType1D;
+                        else if (rg->flags & MADEIRA_IR_AIR_F_TEX_3D) want = WMTTextureType3D;
+                        else if (rg->flags & MADEIRA_IR_AIR_F_TEX_CUBE) want = arr ? WMTTextureTypeCubeArray : WMTTextureTypeCube;
+                        else if (rg->flags & MADEIRA_IR_AIR_F_TEX_MS) want = arr ? WMTTextureType2DMultisampleArray : WMTTextureType2DMultisample;
+                        else want = arr ? WMTTextureType2DArray : WMTTextureType2D;
+                        if ((UINT)want != type) {
+                            /* Metal view families: 1D/1DArray; 2D/2DArray/Cube/CubeArray; 2DMS/2DMSArray; 3D. */
+                            int fam_t = mad_tex_family(type), fam_w = mad_tex_family((UINT)want);
+                            if (fam_t == fam_w) {
+                                UINT lvl0 = xv >= 0 ? tr->xview[xv].lvl0 + tr->mip_drop : 0, nlvl = xv >= 0 ? tr->xview[xv].nlvl : 0;
+                                UINT sl0 = xv >= 0 ? tr->xview[xv].sl0 : 0, nsl = xv >= 0 ? tr->xview[xv].nsl : tr->tex_layers;
+                                enum WMTPixelFormat vpf = xv >= 0 ? (enum WMTPixelFormat)tr->xview[xv].pf : (enum WMTPixelFormat)0;
+                                UINT vswz = xv >= 0 ? tr->xview[xv].swz : 0;
+                                UINT64 id2;
+                                if (want == WMTTextureTypeCube) nsl = 6;
+                                else if (!arr && want != WMTTextureTypeCubeArray) nsl = 1;
+                                id2 = mad_texture_view_id(d, tr, want, lvl0, nlvl, sl0, nsl, vpf, vswz);
+                                if (id2) {
+                                    bind_id = id2;
+                                    if (InterlockedIncrement(&said_t2d) <= 8)
+                                        d3d12_log("[madeira-d3d12] dxbc-tex-2d: %c%u of '%s' is %s%s in the shader; %s r#%u %ux%u type %u -> view type %u (id %#llx -> %#llx)\n",
+                                                  rg->type == MADEIRA_IR_AIR_SRV ? 't' : 'u', rg->lower_bound, pso->is_compute ? pso->vs_name : pso->ps_name,
+                                                  mad_tex_type_name((UINT)want), arr ? " (array)" : "", tr->name ? tr->name : "?", tr->serial,
+                                                  tr->width, tr->height, type, (unsigned)want, (unsigned long long)de.texture_view_id, (unsigned long long)id2);
+                                }
+                            } else if (InterlockedIncrement(&said_dim) <= 12) {
+                                /* No view can bridge the families (a 1D resource allocated as a 2D array,
+                                 * a 3D texture read as 2D ...): the sample is undefined. Named so the next
+                                 * invisible effect can be matched to it. */
+                                d3d12_log("[madeira-d3d12] dxbc-tex-dim: %c%u of '%s' is %s%s in the shader but %s r#%u %ux%ux%u is Metal type %u (%s) -- no view can satisfy it, the sample is undefined\n",
+                                          rg->type == MADEIRA_IR_AIR_SRV ? 't' : 'u', rg->lower_bound, pso->is_compute ? pso->vs_name : pso->ps_name,
+                                          mad_tex_type_name((UINT)want), arr ? " (array)" : "", tr->name ? tr->name : "?", tr->serial,
+                                          tr->width, tr->height, tr->tex_layers, type, mad_tex_type_name(type));
                             }
                         }
                     }
@@ -10792,8 +10830,8 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
         if (desc) {   /* ml913: one mip, the named slices, the named dimension */
             enum WMTTextureType want = r->tex_type; UINT lvl0 = 0, sl0 = 0, nsl = ~0u;
             switch (desc->ViewDimension) {
-            case D3D12_UAV_DIMENSION_TEXTURE1D: want = WMTTextureType2DArray; lvl0 = desc->Texture1D.MipSlice; nsl = 1; break;   /* ml932: arrays everywhere */
-            case D3D12_UAV_DIMENSION_TEXTURE1DARRAY: want = WMTTextureType2DArray; lvl0 = desc->Texture1DArray.MipSlice; sl0 = desc->Texture1DArray.FirstArraySlice; nsl = desc->Texture1DArray.ArraySize; break;
+            case D3D12_UAV_DIMENSION_TEXTURE1D: want = r->tex_type == WMTTextureType1DArray ? WMTTextureType1DArray : WMTTextureType2DArray; lvl0 = desc->Texture1D.MipSlice; nsl = 1; break;   /* ml932: arrays everywhere */
+            case D3D12_UAV_DIMENSION_TEXTURE1DARRAY: want = r->tex_type == WMTTextureType1DArray ? WMTTextureType1DArray : WMTTextureType2DArray; lvl0 = desc->Texture1DArray.MipSlice; sl0 = desc->Texture1DArray.FirstArraySlice; nsl = desc->Texture1DArray.ArraySize; break;
             case D3D12_UAV_DIMENSION_TEXTURE2D: want = WMTTextureType2DArray; lvl0 = desc->Texture2D.MipSlice; nsl = 1; break;
             case D3D12_UAV_DIMENSION_TEXTURE2DARRAY: want = WMTTextureType2DArray; lvl0 = desc->Texture2DArray.MipSlice; sl0 = desc->Texture2DArray.FirstArraySlice; nsl = desc->Texture2DArray.ArraySize; break;
             case D3D12_UAV_DIMENSION_TEXTURE3D:
@@ -11724,7 +11762,19 @@ static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTText
      * (the converter manual's "Texture arrays" table). 3D is unchanged. */
     switch (desc->Dimension) {
     case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
-        ti->type = WMTTextureType2DArray; ti->height = 1; ti->array_length = layers; break;
+        ti->type = WMTTextureType2DArray; ti->height = 1; ti->array_length = layers;
+        /* madeira-doge: dxbc-tex-1d = 1 -- a 1D resource becomes a Metal 1D ARRAY texture, which a
+         * DXBC (airconv) shader's texture1d can view (a 2D array cannot be viewed as 1D: dxbc-tex-dim).
+         * Metal 1D textures have no mipmaps and no multisampling, so only single-mip, non-target
+         * resources change. DXIL shaders see 1D textures as 2D arrays (ml932), so this is per game. */
+        {
+            static int t1d = -1;
+            if (t1d < 0) t1d = mad_cfg_int_pe("dxbc-tex-1d", 0) ? 1 : 0;
+            if (t1d && ti->mipmap_level_count == 1 && ti->sample_count == 1 &&
+                !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+                ti->type = WMTTextureType1DArray;
+        }
+        break;
     case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
         ti->type = WMTTextureType3D; ti->depth = layers; break;
     default:
@@ -13735,8 +13785,8 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
     if (desc) {   /* ml913: honour the view dimension and sub-range */
         enum WMTTextureType want = r->tex_type; UINT lvl0 = 0, nlvl = ~0u, sl0 = 0, nsl = ~0u;
         switch (desc->ViewDimension) {
-        case D3D12_SRV_DIMENSION_TEXTURE1D: want = WMTTextureType2DArray; lvl0 = desc->Texture1D.MostDetailedMip; nlvl = desc->Texture1D.MipLevels; nsl = 1; break;   /* ml932: arrays everywhere */
-        case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: want = WMTTextureType2DArray; lvl0 = desc->Texture1DArray.MostDetailedMip; nlvl = desc->Texture1DArray.MipLevels; sl0 = desc->Texture1DArray.FirstArraySlice; nsl = desc->Texture1DArray.ArraySize; break;
+        case D3D12_SRV_DIMENSION_TEXTURE1D: want = r->tex_type == WMTTextureType1DArray ? WMTTextureType1DArray : WMTTextureType2DArray; lvl0 = desc->Texture1D.MostDetailedMip; nlvl = desc->Texture1D.MipLevels; nsl = 1; break;   /* ml932: arrays everywhere */
+        case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: want = r->tex_type == WMTTextureType1DArray ? WMTTextureType1DArray : WMTTextureType2DArray; lvl0 = desc->Texture1DArray.MostDetailedMip; nlvl = desc->Texture1DArray.MipLevels; sl0 = desc->Texture1DArray.FirstArraySlice; nsl = desc->Texture1DArray.ArraySize; break;
         case D3D12_SRV_DIMENSION_TEXTURE2D: want = WMTTextureType2DArray; lvl0 = desc->Texture2D.MostDetailedMip; nlvl = desc->Texture2D.MipLevels; nsl = 1; break;
         case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: want = WMTTextureType2DArray; lvl0 = desc->Texture2DArray.MostDetailedMip; nlvl = desc->Texture2DArray.MipLevels; sl0 = desc->Texture2DArray.FirstArraySlice; nsl = desc->Texture2DArray.ArraySize; break;
         case D3D12_SRV_DIMENSION_TEXTURE2DMS: want = WMTTextureType2DMultisampleArray; nsl = 1; break;
@@ -19169,6 +19219,16 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         if ((s->presents % 300) == 299) mad_sd_report(s->presents + 1);
     }
     if (mad_swap_offscreen_check(s)) {   /* madeira-doge: a window off the desktop does not take the shared layer */
+        /* madeira-doge: swap-offscreen-min-ms = N (default 0): a process whose window is never shown
+         * (EXVS2's LM, a second copy of the whole game engine rendering 256x144 at full rate) is paced
+         * to one frame per N ms by sleeping in its Present, so the visible process gets the CPU and GPU. */
+        static int omin = -1; static DWORD olast;
+        if (omin < 0) omin = (int)mad_cfg_int_pe("swap-offscreen-min-ms", 0);
+        if (omin > 0) {
+            DWORD now = GetTickCount();
+            if (olast && now - olast < (DWORD)omin) Sleep((DWORD)omin - (now - olast));
+            olast = GetTickCount();
+        }
         s->presents++;
         return;
     }

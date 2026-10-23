@@ -115,8 +115,15 @@ enum madeira_ir_air_flag {
     MADEIRA_IR_AIR_F_MINLOD_CLAMP   = 1u << 4,
     MADEIRA_IR_AIR_F_TBUFFER_OFFSET = 1u << 5,
     MADEIRA_IR_AIR_F_TEXTURE_ARRAY  = 1u << 6,
+    /* madeira-doge: the texture's dimension as the shader declared it, set by
+     * tools/patch-airconv-range-dim.py (SM50GetRangeInfo). All 0 = a plain 2D
+     * texture, or a converter without the patch. */
+    MADEIRA_IR_AIR_F_TEX_1D         = 1u << 7,
+    MADEIRA_IR_AIR_F_TEX_3D         = 1u << 8,
+    MADEIRA_IR_AIR_F_TEX_CUBE       = 1u << 9,
     MADEIRA_IR_AIR_F_READ           = 1u << 10,
     MADEIRA_IR_AIR_F_WRITE          = 1u << 11,
+    MADEIRA_IR_AIR_F_TEX_MS         = 1u << 12,
 };
 struct madeira_ir_air_range {
     uint32_t type;          /* madeira_ir_air_type */
