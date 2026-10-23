@@ -1446,6 +1446,43 @@ static void *wine_process_thread(void *arg) {
                     LOG("game config env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
                     fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);
                 }
+                {   /* madeira-doge: extra drive letters. env.MADEIRA_DRIVE_G = C:\Some\Folder in a
+                     * game's settings links dosdevices/g: to that folder under drive_c, so G:\x
+                     * opens C:\Some\Folder\x (Gundam EXVS2 IB keeps its 29\ data on G:\ and F:\
+                     * and never falls back to its own folder). An empty value removes the link.
+                     * Only symlinks are replaced; c: is never touched. The name is built at run
+                     * time, so it has no settings-catalog row. */
+                    NSFileManager *dfm = [NSFileManager defaultManager];
+                    NSString *ddir = [[NSString stringWithUTF8String:g_prefix_path] stringByAppendingPathComponent:@"dosdevices"];
+                    for (char L = 'D'; L <= 'Y'; L++) {
+                        char ename[24];
+                        snprintf(ename, sizeof ename, "%s%c", "MADEIRA_DRIVE_", L);
+                        const char *val = getenv(ename);
+                        if (!val) continue;
+                        NSString *link = [ddir stringByAppendingPathComponent:[NSString stringWithFormat:@"%c:", (char)(L + 32)]];
+                        NSDictionary *attrs = [dfm attributesOfItemAtPath:link error:nil];
+                        if (attrs && ![attrs[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+                            fprintf(stderr, "[drive] madeira-doge %c: exists and is not a link; left alone\n", L);
+                            continue;
+                        }
+                        if (attrs) [dfm removeItemAtPath:link error:nil];
+                        NSString *v = [[NSString stringWithUTF8String:val] stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+                        if (!v.length) { fprintf(stderr, "[drive] madeira-doge %c: link removed\n", L); continue; }
+                        if (v.length >= 2 && [v characterAtIndex:1] == ':') {
+                            unichar d = [v characterAtIndex:0] | 32;
+                            if (d != 'c') { fprintf(stderr, "[drive] madeira-doge %c: only C:\\ targets are supported (%s)\n", L, val); continue; }
+                            v = [v substringFromIndex:2];
+                        }
+                        while ([v hasPrefix:@"/"]) v = [v substringFromIndex:1];
+                        NSString *dest = [@"../drive_c" stringByAppendingPathComponent:v];
+                        NSError *lerr = nil;
+                        BOOL ok = [dfm createSymbolicLinkAtPath:link withDestinationPath:dest error:&lerr];
+                        BOOL isDir = NO;
+                        BOOL exists = [dfm fileExistsAtPath:link isDirectory:&isDir];
+                        fprintf(stderr, "[drive] madeira-doge %c: -> %s (%s%s)\n", L, dest.UTF8String,
+                                ok ? "linked" : "link FAILED", ok ? (exists && isDir ? ", target folder found" : ", target folder MISSING") : "");
+                    }
+                }
                 {   /* madeira-bcd: the server's per-launch switches (fd_ios.c, request_ios.c) */
                     const char *ef = getenv("MADEIRA_SRV_ECO_FOLLOW");   /* 1: the server thread runs at utility QoS while ECO is on */
                     const char *dr = getenv("MADEIRA_SRV_DIRECT");       /* 1 or 2: listed requests run on the calling thread */
