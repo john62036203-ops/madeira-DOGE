@@ -43,6 +43,15 @@ ACE_NEW = ACE_OLD + '''    /* madeira-doge (NutsEmu 0141): and read for BUILTIN\
 def main(src, dst):
     s = open(src, encoding="utf-8", errors="surrogateescape").read()
     if MARK not in s:
+        # The copy is compiled from obj/, so "security.h" would resolve to the Windows SDK
+        # header wine/include/security.h (-I include comes before -I server): name the
+        # server's own header by its full path.
+        import os
+        srv = os.path.dirname(os.path.abspath(src))
+        if s.count('#include "security.h"\n') != 1:
+            print("patch-server-file-dacl: security.h include not found once", file=sys.stderr)
+            return 1
+        s = s.replace('#include "security.h"\n', '#include "%s/security.h"  /* %s */\n' % (srv, MARK))
         for name, old in (("size", SIZE_OLD), ("count", COUNT_OLD), ("ace", ACE_OLD)):
             if s.count(old) != 1:
                 print("patch-server-file-dacl: anchor '%s' found %d times, expected 1" % (name, s.count(old)), file=sys.stderr)
