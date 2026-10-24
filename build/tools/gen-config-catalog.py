@@ -135,6 +135,13 @@ OVERLAY = {
     "cpu-count": {"title": "Reported CPU count (0 = device)"},
     "desktop-size": {"title": "Virtual desktop size (WxH)",
                      "note": "The developer interface's Wine desktop size (ml1127); its Resolution menu writes it (ml1157). Madeira Dock sessions without a game's Resolution use it too. Unset: this screen's shape at 1280x720's pixel count (ml1172: 1408x648 on a 19.5:9 iPhone, 1152x800 on an 11-inch iPad). Applies at the next app start."},
+    "env.MADEIRA_DOCK_PRESENCE": {"category": "Steam & Dock", "title": "Friends see you as (Madeira Dock)", "kind": "choice",
+             "default": "1",
+             "note": "madeira-doge: once Valve's client in a Dock session is signed in, it is asked to set this persona "
+                     "state (IClientFriends::SetPersonaState), so friends see the game being played. Unset or 1 online, "
+                     "3 away, 7 invisible, 0 leaves the client's state alone (offline to friends, as before). January "
+                     "2026 client only; any other client skips it. Settings > Steam has the same picker.",
+             "choices": [("", "Online, playing the game"), ("3", "Away"), ("7", "Invisible"), ("0", "Offline (as before)")]},
     "d3d9": {"title": "Direct3D 9 frontend (32-bit)", "kind": "choice",
              "choices": [("", "Default (emulated)"), ("native", "Native ARM64 frontend")]},
     "fence-chain": {"title": "D3D12 fence chain mode"},

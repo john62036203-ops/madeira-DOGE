@@ -688,6 +688,14 @@ struct SteamSettingsSection: View {
     @ObservedObject private var dock = MadeiraDockModel.shared
     @ObservedObject private var onboarding = OnboardingModel.shared
     @State private var confirmSignOut = false
+    /// madeira-doge: what friends see while a Madeira Dock game runs
+    /// (env.MADEIRA_DOCK_PRESENCE, tools/patch-dock-presence.py). "" = online (the default).
+    @State private var presence = SteamSettingsSection.currentPresence()
+    static let presenceKey = "env.MADEIRA_DOCK_PRESENCE"
+    static func currentPresence() -> String {
+        let v = MadeiraConfig.get("env.MADEIRA_DOCK_PRESENCE")?.trimmingCharacters(in: .whitespaces) ?? ""
+        return v == "1" ? "" : v
+    }
 
     /// Shown when Steam sign-in or Madeira Dock is available.
     static var shown: Bool { SteamSignIn.isEnabled || MadeiraDock.enabled }
@@ -702,6 +710,16 @@ struct SteamSettingsSection: View {
             }
             if MadeiraDock.enabled {
                 Button { open(.dock) } label: { Label("Madeira Dock", systemImage: "shippingbox") }
+                Picker("Friends see you as", selection: $presence) {
+                    Text("Online, playing the game").tag("")
+                    Text("Away").tag("3")
+                    Text("Invisible").tag("7")
+                    Text("Offline (as before)").tag("0")
+                }
+                .onChange(of: presence) { _, value in
+                    MadeiraConfig.set(Self.presenceKey, value.isEmpty ? nil : value)
+                    LogStore.shared.log("[steam-presence] \(Self.presenceKey) = \(value.isEmpty ? "(default)" : value)")
+                }
                 if let status = dock.status {
                     Text(status).font(.caption).foregroundStyle(.secondary)
                 }
@@ -712,7 +730,8 @@ struct SteamSettingsSection: View {
         } header: {
             Text("Steam")
         } footer: {
-            Text("Madeira keeps a Steam sign-in token in this device's Keychain, for this device only. Signing out removes it.")
+            Text("Madeira keeps a Steam sign-in token in this device's Keychain, for this device only. Signing out removes it." +
+                 (MadeiraDock.enabled ? "\n\nFriends see you as: how your Steam friends see you while a game started through Madeira Dock runs. Applies from the next game start." : ""))
         }
         .confirmationDialog("Sign out of Steam?", isPresented: $confirmSignOut, titleVisibility: .visible) {
             Button("Sign out", role: .destructive) { signIn.signOut() }
