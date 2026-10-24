@@ -4218,6 +4218,21 @@ struct LibraryHUD: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 HStack { Label("Session", systemImage: "gamecontroller.fill").font(.title2.bold()); Spacer(); Button("Done") { model.menu = false }.buttonStyle(.bordered) }
+                // madeira-doge: the developer interface's CAP, first in the menu (owner's request:
+                // it has to be reachable mid-fight); the metrics capsule carries a CAP button too.
+                Button {
+                    model.menu = false
+                    // After the menu has gone, so the frame shows what the player saw.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        madeira_capture_request(1)
+                        LogStore.shared.log("[capture] madeira-doge: frame capture requested from the session menu")
+                    }
+                } label: {
+                    Label("Capture the next frame", systemImage: "camera.viewfinder")
+                }
+                Text("For a wrong or missing picture: saves what every drawing step of the next frame produced as picture sheets in Files \u{203A} Madeira \u{203A} capture.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Divider()
                 // The controls come first, the easiest to reach; the overlay settings last.
                 Toggle("Touch controls", isOn: $controls.visible)
                 // The named layouts (Xbox controller, custom ones) live here in a session: this
@@ -4320,20 +4335,6 @@ struct LibraryHUD: View {
                     Divider()
                     SteamCloudQuitRow(appID: appID)
                 }
-                Divider()
-                // madeira-doge: the developer interface's CAP, reachable in a library session.
-                Button {
-                    model.menu = false
-                    // After the menu has gone, so the frame shows what the player saw.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                        madeira_capture_request(1)
-                        LogStore.shared.log("[capture] madeira-doge: frame capture requested from the session menu")
-                    }
-                } label: {
-                    Label("Capture the next frame", systemImage: "camera.viewfinder")
-                }
-                Text("For a wrong or missing picture: saves what every drawing step of the next frame produced as picture sheets in Files \u{203A} Madeira \u{203A} capture.")
-                    .font(.caption).foregroundStyle(.secondary)
                 Divider()
                 // Red label and symbol; the menu's .primary style would otherwise win.
                 Button(role: .destructive) { model.requestQuit() } label: {
@@ -4452,8 +4453,25 @@ struct LibraryMetrics: View {
     @State private var gpu = -1.0
     @State private var gpuFrameMs = 0.0
     private let ticks = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    /// madeira-doge: CAP on the capsule itself, so a capture can be taken mid-fight
+    /// without opening the menu (the owner could not reach the menu item in time).
+    @State private var captureFlash = false
     var body: some View {
-        Text(parts.joined(separator: "  ·  "))
+        HStack(spacing: 10) {
+            Button {
+                madeira_capture_request(1)
+                LogStore.shared.log("[capture] madeira-doge: frame capture requested from the metrics capsule")
+                captureFlash = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { captureFlash = false }
+            } label: {
+                Text("CAP").font(.caption.weight(.bold))
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .foregroundStyle(captureFlash ? .black : .cyan)
+                    .background(captureFlash ? Color.cyan : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.cyan, lineWidth: 1))
+            }.buttonStyle(.plain)
+            Text(parts.joined(separator: "  ·  "))
+        }
             .font(.caption.monospacedDigit().weight(.medium)).padding(.horizontal, 12).padding(.vertical, 8)
             .background(.black.opacity(0.8), in: Capsule()).foregroundStyle(.white)
             .onAppear {
