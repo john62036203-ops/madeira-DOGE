@@ -19352,7 +19352,14 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
          * scenes). Before presenting frame N, wait until the GPU has finished the
          * batches of frame N-latency (default 2, honouring 1..3). */
         struct mad_device *dv = s->queue->device;
-        UINT lat = s->max_latency ? s->max_latency : 2; if (lat > 3) lat = 3;
+        static int cfg_lat = -1;
+        UINT lat;
+        if (cfg_lat < 0) {   /* madeira-doge: madeira.cfg frame-latency = 1..3 overrides the game's SetMaximumFrameLatency (0 = the game's, default 2); 1 = the CPU waits for the previous frame's GPU work before each Present (one frame less input latency, lower fps when the GPU is the bottleneck) */
+            cfg_lat = (int)mad_cfg_int_pe("frame-latency", 0);
+            if (cfg_lat < 0 || cfg_lat > 3) cfg_lat = 0;
+            if (cfg_lat) d3d12_log("[madeira-d3d12] frame-latency = %d: Present waits for the GPU to finish frame N-%d (madeira.cfg)\n", cfg_lat, cfg_lat);
+        }
+        lat = cfg_lat ? (UINT)cfg_lat : s->max_latency ? s->max_latency : 2; if (lat > 3) lat = 3;
         UINT64 need = s->present_serial[(s->presents + 8 - lat) & 7];
         s->present_serial[s->presents & 7] = (UINT64)dv->gpu_serial_committed;
         if (g_sd_state > 0 && g_fence_strict >= 2) need = (UINT64)dv->gpu_serial_committed;   /* madeira-bcd: fence-strict 2, the frame being presented */
