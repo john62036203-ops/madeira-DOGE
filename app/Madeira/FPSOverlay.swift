@@ -250,6 +250,7 @@ struct FPSOverlay: View {
         Group {
             if visible && compact {
                 VStack(spacing: 4) {
+                    capturePill   // madeira-doge: first, so a CAP tap lands mid-fight
                     Text(String(format: "%.1f", fps))
                         .foregroundColor(fpsColor)
                     // madeira-doge: the footprint, as in portrait (MB used; the
@@ -258,7 +259,6 @@ struct FPSOverlay: View {
                         .foregroundColor(memColor)
                     pacingPill
                     thermalPill
-                    capturePill
                     ecoPill
                     fencePill
                 }
@@ -268,6 +268,7 @@ struct FPSOverlay: View {
                 .cornerRadius(6)
             } else if visible {
                 HStack(spacing: 8) {
+                    capturePill   // madeira-doge: first, so a CAP tap lands mid-fight
                     // ml606: live phys_footprint — the SAME number jetsam kills on.
                     // ml605 died at 4080MB against a 4096MB limit with no warning
                     // of any kind in the log, so having it on screen turns "it
@@ -295,7 +296,6 @@ struct FPSOverlay: View {
                         .frame(width: 40, alignment: .trailing)
                     pacingPill
                     thermalPill
-                    capturePill
                     ecoPill
                     fencePill
                 }
@@ -384,9 +384,10 @@ struct FPSOverlay: View {
     @State private var captureFlash = false
     private var capturePill: some View {
         Text("CAP")
+            .font(.system(.body, design: .monospaced).weight(.bold))   // madeira-doge: a thumb-sized target
             .foregroundColor(captureFlash ? .black : .cyan)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
             .background(captureFlash ? Color.cyan : Color.clear)
             .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.cyan, lineWidth: 1))
             .onTapGesture {
