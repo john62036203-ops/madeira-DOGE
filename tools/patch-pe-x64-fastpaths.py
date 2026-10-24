@@ -125,6 +125,63 @@ def patch_dll(path, todo):
     open(path, "wb").write(bytes(d))
     print("%s: x64 fast paths: %s" % (os.path.basename(path), ", ".join(done) or "none"))
 
+# Part 2 (build 454): blobs at fixed RVAs (assembled with that org: tests/host/
+# x64stubs/cs_ntdll.asm, wfso_kernelbase.asm), each FFS redirected to its entry.
+# A redirect is applied only when the FFS still jumps to the expected ARM64EC
+# body (same binary the blob was assembled against).
+#   ntdll: uncontended RtlEnterCriticalSection / RtlLeaveCriticalSection in x64
+#   (held by another thread, waiters to wake, or not owned -> the ARM64EC body);
+#   kernelbase: WaitForSingleObject(h, 0) that times out calls SwitchToThread.
+# EXVS2 battle, log 2026-10-25 01:55: 1.9M/s each of EnterCriticalSection,
+# LeaveCriticalSection and WaitForSingleObject during a polling phase.
+CS_BLOB = bytes.fromhex(
+    "4889e048895820555de93e3cfdffcccc4889e048895820555de9ae41fdffcccc"
+    "b8ffffffff31d2f00fb15108751765488b04254800000048894110c7410c0100"
+    "000031c0c365488b0425480000004839411075acf0ff4108ff410c31c0c38b41"
+    "0c83f8017f3b75a8c7410c0000000048c741100000000031c0bafffffffff00f"
+    "b15108750331c0c365488b04254800000048894110c7410c01000000e96fffff"
+    "ffff490cf0ff490831c0c3"
+)
+WFSO_BLOB = bytes.fromhex(
+    "4889e048895820555de9d635feffcccc85d275ec4883ec28e8e3ffffff3d0201"
+    "0000750ae8e7f6ffffb8020100004883c428c3"
+)
+BLOBS = {
+    "ntdll.dll": (0x93c00, CS_BLOB, [("RtlEnterCriticalSection", 0x93c20, 0x6784c),
+                                      ("RtlLeaveCriticalSection", 0x93c5e, 0x67dcc)]),
+    "kernelbase.dll": (0x85450, WFSO_BLOB, [("WaitForSingleObject", 0x85460, 0x68a34)]),
+}
+
+
+def patch_blobs(path, spec):
+    rva0, blob, redirects = spec
+    d = bytearray(open(path, "rb").read())
+    pe, secs = sections(d)
+    ho, hvs, hva, hrs, hrp = secs[".hexpthk"]
+    exp = exports(d, pe, secs)
+    name = os.path.basename(path)
+    o0 = rva_to_off(secs, rva0)
+    if bytes(d[o0:o0 + len(blob)]) == blob:
+        print("%s: x64 fast paths part 2 already applied" % name); return
+    if not (hva <= rva0 and rva0 + len(blob) <= hva + hrs) or hva + hvs > rva0 or set(d[o0:o0 + len(blob)]) != {0xcc}:
+        print("::warning::%s: blob area %#x is not free padding after .hexpthk; part 2 skipped" % (name, rva0)); return
+    checks = []
+    for ename, entry, ec in redirects:
+        rva = exp.get(ename)
+        off = rva_to_off(secs, rva) if rva is not None else None
+        slot = bytes(d[off:off + 16]) if off is not None else b""
+        if slot[:10] != FFS_HEAD or rva + 14 + struct.unpack_from("<i", slot, 10)[0] != ec:
+            print("::warning::%s: %s FFS does not jump to %#x; part 2 skipped" % (name, ename, ec)); return
+        checks.append((off, rva, entry))
+    d[o0:o0 + len(blob)] = blob
+    for off, rva, entry in checks:
+        d[off:off + 16] = b"\xe9" + struct.pack("<i", entry - (rva + 5)) + b"\xcc" * 11
+    end = (rva0 + len(blob) + 0xf) & ~0xf
+    if end - hva > hvs:
+        struct.pack_into("<I", d, ho + 8, end - hva)
+    open(path, "wb").write(bytes(d))
+    print("%s: x64 fast paths part 2: %s" % (name, ", ".join(r[0] for r in redirects)))
+
 
 def main():
     base = sys.argv[1]
@@ -132,6 +189,8 @@ def main():
         p = os.path.join(base, dll)
         if os.path.exists(p):
             patch_dll(p, todo)
+            if dll in BLOBS:
+                patch_blobs(p, BLOBS[dll])
         else:
             print("::warning::%s missing; skipped" % p)
 
