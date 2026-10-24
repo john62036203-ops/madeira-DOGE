@@ -1883,6 +1883,7 @@ struct mad_queue {
      * submit_lock (the replay and mad_queue_flush both hold it). */
     obj_handle_t f6_pool[64]; unsigned f6_next;
     struct mad_f6_pend { unsigned char idx, kind, natt; struct mad_resource *att[9]; } f6_pend[40]; unsigned f6_npend;
+    struct mad_exec *carry; int carry_valid;   /* madeira-doge pass-carry: a render encoder left open across a list end (submit_lock) */
     UINT64 open_ticket;   /* madeira-bcd: sync diagnostics (upload-guard / desc-guard), the open batch's ticket; 0 = none */
 };
 
@@ -1921,6 +1922,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         d3d12_log("[madeira-d3d12] destroyed %s\n", q->name);
         DeleteCriticalSection(&q->submit_lock);   /* ml1021 */
         free(q->ring_parked);   /* madeira-bcd ring-share: emptied by the flush above */
+        free(q->carry);   /* madeira-doge pass-carry (ended by the flush above) */
         free(q);
     }
     return (ULONG)r;
@@ -2438,6 +2440,28 @@ static void exec_end(struct mad_exec *e) {
     }
 }
 
+/* madeira-doge pass-carry (default 1): a render pass that is still open when a
+ * command list ends is NOT closed; the next list of the same batch continues it
+ * when its first pass binds the same targets. EXVS2 records a frame as ~35
+ * lists and ends almost every one inside its G-buffer pass (6 colour targets +
+ * depth/stencil at 960x540): ml1070 said "ended by list-end 205" of 237 passes
+ * per 600 lists, and each of those ends stores ~20 MB of attachments and the
+ * next begin loads them again -- 50 MB loaded / 78 MB stored per frame in the
+ * ml1137 census, plus a tile-pipeline drain each time. The carried encoder is
+ * ended by anything that would have ended it inside a list (other targets, a
+ * dispatch, a copy, a barrier that closes passes) and before the batch is
+ * committed (mad_queue_flush). Not carried: pending clears, indirect-count
+ * records, a blit/compute encoder open at the same time, capture frames,
+ * perf-pass-split frames. */
+static LONG g_pass_carried, g_pass_carry_resumed, g_pass_carry_dropped;
+static int g_pass_carry = -1;
+static void mad_carry_end(struct mad_queue *q) {
+    if (!q || !q->carry_valid) return;
+    q->carry_valid = 0;
+    g_enc_why = "carry-end";
+    exec_end(q->carry);
+    InterlockedIncrement(&g_pass_carry_dropped);
+}
 static obj_handle_t mad_capbuf_alloc(struct mad_device *d, UINT64 len, void **cpu) {
     SIZE_T alen = (SIZE_T)((len + 0xffff) & ~(UINT64)0xffff);
     void *mem = VirtualAlloc(NULL, alen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -8657,6 +8681,22 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     e.f7_reason = 2;                             /* ml1137: list start */
     e.q = q; e.l = l; e.cb = cb;
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
+    if (q->carry_valid) {   /* madeira-doge pass-carry: continue the render pass the previous list left open */
+        struct mad_exec *c = q->carry;
+        if (c->cb == cb && c->renc) {
+            unsigned k;
+            e.renc = c->renc; e.renc_seq = c->renc_seq;
+            e.enc_nrt = c->enc_nrt; memcpy(e.enc_rt, c->enc_rt, sizeof e.enc_rt); memcpy(e.enc_rtp, c->enc_rtp, sizeof e.enc_rtp);
+            e.enc_depth = c->enc_depth; e.enc_dp = c->enc_dp; e.enc_w = c->enc_w; e.enc_h = c->enc_h;
+            e.vis_prev = c->vis_prev; e.enc_vis_buf = c->enc_vis_buf; e.pass_draws = c->pass_draws;
+            memcpy(e.diag_pso, c->diag_pso, sizeof e.diag_pso); e.diag_npso = c->diag_npso; e.diag_more = c->diag_more;
+            e.f6_cur = c->f6_cur; e.f6_enc_synced = c->f6_enc_synced; e.f6_natt = c->f6_natt; memcpy(e.f6_att, c->f6_att, sizeof e.f6_att);
+            e.ud_enc = c->ud_enc; e.ud_n = c->ud_n; e.ud_committed = c->ud_committed; for (k = 0; k < c->ud_n && k < sizeof e.ud / sizeof e.ud[0]; k++) e.ud[k] = c->ud[k];
+            e.gui_rt = c->gui_rt;
+            q->carry_valid = 0;
+            InterlockedIncrement(&g_pass_carry_resumed);
+        } else mad_carry_end(q);
+    }
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     for (i = 0; i < l->ncmds; i++) {
@@ -8815,9 +8855,18 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
     }
-    if (e.renc) InterlockedIncrement(&g_pass_end_list);
-    g_enc_why = "list-end";
-    exec_end(&e);
+    if (g_pass_carry < 0) g_pass_carry = mad_cfg_int_pe("pass-carry", 1) ? 1 : 0;   /* 1: a render pass still open when a command list ends stays open for the next list of the batch (no attachment store/load at the list boundary); 0: every list ends its pass */
+    if (g_pass_carry && e.renc && !e.benc && !e.cenc && !e.npend && !e.nic && !g_pps_active && !g_capture_on && e.cb == q->open_cb) {
+        if (!q->carry) q->carry = calloc(1, sizeof *q->carry);
+        if (q->carry) {   /* madeira-doge pass-carry: leave the pass open for the next list */
+            *q->carry = e; q->carry->l = NULL; q->carry_valid = 1;
+            InterlockedIncrement(&g_pass_carried);
+        } else { g_enc_why = "list-end"; exec_end(&e); }
+    } else {
+        if (e.renc) InterlockedIncrement(&g_pass_end_list);
+        g_enc_why = "list-end";
+        exec_end(&e);
+    }
     while (e.npend) exec_flush_clear(&e, 0);
     /* ml1042: a PERIODIC summary. Every per-list line is rate-limited to the first
      * dozen, which is the menu -- so the first run to reach real 3D (black, ~2 FPS)
@@ -8841,8 +8890,9 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                       InterlockedExchange(&g_pass_end_clear, 0), InterlockedExchange(&g_pass_end_dispatch, 0), InterlockedExchange(&g_pass_end_blit, 0),
                       InterlockedExchange(&g_pass_end_list, 0), InterlockedExchange(&g_pass_end_attachless, 0), InterlockedExchange(&g_pass_clear_only, 0),
                       (long long)(InterlockedExchange64(&g_pass_attach_bytes, 0) >> 20));
-            d3d12_log("[madeira-d3d12] madeira-doge pass merging in those lists: %ld null-target unbinds kept the pass open (rts-null-lazy), %ld blit encoders kept open at a barrier (barrier-blit-open)\n",
-                      InterlockedExchange(&g_pass_rts_null_kept, 0), InterlockedExchange(&g_blit_barrier_kept, 0));
+            d3d12_log("[madeira-d3d12] madeira-doge pass merging in those lists: %ld null-target unbinds kept the pass open (rts-null-lazy), %ld blit encoders kept open at a barrier (barrier-blit-open); pass-carry: %ld passes carried past a list end, %ld resumed by the next list, %ld ended before a commit\n",
+                      InterlockedExchange(&g_pass_rts_null_kept, 0), InterlockedExchange(&g_blit_barrier_kept, 0),
+                      InterlockedExchange(&g_pass_carried, 0), InterlockedExchange(&g_pass_carry_resumed, 0), InterlockedExchange(&g_pass_carry_dropped, 0));
             if (g_ind_clamp_n)
                 d3d12_log("[madeira-d3d12] ind-count-clamp: %ld ExecuteIndirect(s) with a count buffer clamped, %ld records, in those lists\n",
                           InterlockedExchange(&g_ind_clamp_n, 0), InterlockedExchange(&g_ind_clamp_recs, 0));
@@ -9198,6 +9248,7 @@ static void mad_log_nserror(const char *what, obj_handle_t err) {
 static void mad_queue_flush(struct mad_queue *q) {
     if (!q) return;
     EnterCriticalSection(&q->submit_lock);   /* ml1021 */
+    mad_carry_end(q);   /* madeira-doge pass-carry: nothing stays open across a commit */
     if (!q->open_cb) { LeaveCriticalSection(&q->submit_lock); return; }
     if (q->npending == 16) {
         for (unsigned k = 0; k < q->npending; k++) mad_cb_retire(q->device, q->pending[k]);
