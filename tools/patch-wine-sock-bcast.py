@@ -33,6 +33,7 @@ HELPERS = r'''#ifdef __APPLE__
  * address on the same port. */
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <arpa/inet.h>
 
 static int madeira_bcast_is_broadcast( in_addr_t dst )
 {
@@ -69,6 +70,26 @@ static ssize_t madeira_bcast_fanout( int fd, const struct msghdr *orig, int flag
     unsigned int n;
 
     targets[count++] = htonl( INADDR_LOOPBACK );
+    {   /* madeira-doge: MADEIRA_BCAST_PEERS=a.b.c.d[,a.b.c.d...] -- hosts on the
+         * same LAN (the PC running EXVS2's LM / card server over the phone's
+         * hotspot) that a broadcast must reach; iOS cannot send it to them. */
+        static int peers_read; static in_addr_t peers[16]; static int npeers;
+        if (!peers_read)
+        {
+            const char *env = getenv( "MADEIRA_BCAST_PEERS" );
+            peers_read = 1;
+            while (env && *env && npeers < 16)
+            {
+                char buf[32]; int n = 0; struct in_addr a;
+                while (*env == ',' || *env == ' ') env++;
+                while (*env && *env != ',' && *env != ' ' && n < 31) buf[n++] = *env++;
+                buf[n] = 0;
+                if (n && inet_aton( buf, &a )) peers[npeers++] = a.s_addr;
+            }
+            if (npeers) dprintf( 2, "[sock-bcast] madeira-doge %d broadcast peer(s) from MADEIRA_BCAST_PEERS\n", npeers );
+        }
+        for (i = 0; i < npeers && count < 32; i++) targets[count++] = peers[i];
+    }
     if (getifaddrs( &ifs ) == 0)
     {
         for (ifa = ifs; ifa && count < 32; ifa = ifa->ifa_next)
