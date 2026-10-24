@@ -10,17 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile-check dockhost
+      - name: Inspect
         shell: bash
         run: |
           set +e
           R=$(mktemp -d); exec > >(tee "$R/RESULT.txt") 2>&1
-          git submodule update --init --depth 1 madeira-dock
-          sudo apt-get install -y -q gcc-mingw-w64-x86-64 >/dev/null 2>&1
-          T=$(mktemp -d); cp madeira-dock/src/*.c madeira-dock/src/*.h "$T/"
-          python3 tools/patch-dock-game-scm.py "$T/launch.c"; python3 tools/patch-dock-keep-alive.py "$T/launch.c"
-          python3 tools/patch-dock-presence.py "$T/session.c"; echo "patch=$?"
-          x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Werror -Wno-cast-function-type -static -I"$T" -o "$T/dockhost.exe" "$T"/*.c -ladvapi32; echo "compile=$?"
+          O=https://client-update.akamai.steamstatic.com/
+          curl -sSfL -o p.zip "${O}bins_win32.zip.23e34a6d4b10596a44561a5100dac5585d2517da"
+          python3 -c "import zipfile; z=zipfile.ZipFile('p.zip'); n=[x for x in z.namelist() if x.lower().endswith('steamclient64.dll')][0]; open('steamclient64.dll','wb').write(z.read(n))"
+          python3 .github/inspect-client.py steamclient64.dll
           cd "$R" && git init -q -b inspect-results && git config user.name github-actions && git config user.email actions@github.com
           git add -A && git commit -qm "check" && git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" inspect-results 2>&1 | tail -2
           true
