@@ -8645,6 +8645,15 @@ static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *re
             rec->ExceptionAddress, (unsigned long long)pc, (unsigned int)rec->NumberParameters,
             rec->NumberParameters > 0 ? (unsigned long long)rec->ExceptionInformation[0] : 0,
             rec->NumberParameters > 1 ? (unsigned long long)rec->ExceptionInformation[1] : 0);
+    if (rec->ExceptionCode == 0xc0000005)
+    {
+        /* madeira-doge: with env.MADEIRA_SYSRING = 1, the faulting thread's last syscalls at the
+         * FIRST-chance access violation too (madeira_sysring_dump otherwise runs only when nothing
+         * handles it -- MH Wilds' own SEH catches its startup fault, so the dump never printed). */
+        static volatile int av_dumps = 0;
+        extern void madeira_sysring_dump( int max );
+        if (__sync_add_and_fetch( &av_dumps, 1 ) <= 3) madeira_sysring_dump( 256 );
+    }
     if (rec->ExceptionCode == 0x40010006 && rec->NumberParameters >= 2 &&
         rec->ExceptionInformation[1])   /* DBG_PRINTEXCEPTION_C: [0]=len [1]=char* */
         dprintf(2, "[exc-disp]   OutputDebugStringA: \"%.*s\"\n",
