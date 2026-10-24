@@ -3610,12 +3610,36 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
     exec_drop_pending(e, i);
 }
 
+/* madeira-doge clear-defer (default 1): a clear of a target that is NOT an
+ * attachment of the open pass no longer ends that pass, and a pending clear
+ * is no longer flushed as a clear-only pass when some OTHER pass begins: it
+ * stays pending until its target is bound (then it is the pass's load action,
+ * free), a dispatch or copy could read it, or the list ends. EXVS2 clears small
+ * targets in the middle of its G-buffer pass: ml1070 counted 24 passes a
+ * frame ended by a clear and 12 clear-only passes a frame, each a store and
+ * reload of the 6-target G-buffer plus an encoder drain. clear-defer = 0
+ * restores the old order. */
+static int g_clear_defer = -1;
+static LONG g_cd_kept_open, g_cd_kept_pending;
+static int exec_clear_defer(void) { if (g_clear_defer < 0) g_clear_defer = mad_cfg_int_pe("clear-defer", 1) ? 1 : 0; return g_clear_defer; }   /* 1: a clear of a target the open pass does not draw into leaves the pass open and stays pending until that target is bound, read by a dispatch/copy, or the list ends; 0: the clear ends the pass */
+static int exec_is_attachment(const struct mad_exec *e, const struct mad_resource *r) {
+    unsigned k;
+    if (!e->renc || !r) return 0;
+    for (k = 0; k < e->enc_nrt; k++) if (e->enc_rt[k] == r) return 1;
+    return e->enc_depth == r;
+}
+static void exec_flush_pend_for(struct mad_exec *e, const struct mad_resource *r) {   /* a dispatch or copy may read it */
+    unsigned k;
+    if (!r) return;
+    for (k = 0; k < e->npend; ) { if (e->pend[k].res == r) exec_flush_clear(e, (int)k); else k++; }
+}
 static void exec_add_clear(struct mad_exec *e, struct mad_resource *r, const struct mad_rtvp *v, const float *rgba, float depth, int is_depth, UINT8 stencil, UINT8 flags) {
     int i;
     if (!r) return;
     /* A clear ends the pass in progress so the next one can load it as a
      * clear; a clear mid-pass would otherwise be lost. */
-    if (e->renc) { InterlockedIncrement(&g_pass_end_clear); g_enc_why = "clear"; exec_end(e); }
+    if (e->renc && exec_clear_defer() && !exec_is_attachment(e, r)) InterlockedIncrement(&g_cd_kept_open);   /* madeira-doge clear-defer */
+    else if (e->renc) { InterlockedIncrement(&g_pass_end_clear); g_enc_why = "clear"; exec_end(e); }
     i = exec_pending_index(e, r, v);
     if (i >= 0 && is_depth && e->pend[i].is_depth && e->pend[i].flags) {
         /* ml904: a second clear of the other aspect merges; the values of the
@@ -4216,7 +4240,8 @@ static int exec_begin_render(struct mad_exec *e) {
     for (k = 0; k < e->npend; ) {
         int bound = (e->pend[k].res == e->depth && mad_rtvp_eq(&e->pend[k].v, &e->dp));
         for (i = 0; i < e->nrt && !bound; i++) if (e->rt[i] == e->pend[k].res && mad_rtvp_eq(&e->pend[k].v, &e->rtp[i])) bound = 1;
-        if (!bound) exec_flush_clear(e, (int)k); else k++;
+        if (!bound && exec_clear_defer()) { InterlockedIncrement(&g_cd_kept_pending); k++; }   /* madeira-doge clear-defer: stays pending */
+        else if (!bound) exec_flush_clear(e, (int)k); else k++;
     }
     memset(&rpi, 0, sizeof rpi);
     for (i = 0; i < e->nrt; i++) exec_note_write(e, e->rt[i]);   /* ml1116 */
@@ -7691,6 +7716,14 @@ static int exec_copy_compute(struct mad_exec *e, const struct mad_cmd *c) {
 }
 static void mad_hz_stamp(struct mad_resource *r) { if (r) __atomic_store_n(&r->hz_write, (LONG64)g_presents_now + 1, __ATOMIC_RELAXED); }   /* madeira-doge fence-chain 9: written by the GPU now */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
+    if (e->npend) switch (c->kind) {   /* madeira-doge clear-defer: a copy of a pending target happens after its clear */
+    case MC_COPY_BB: exec_flush_pend_for(e, c->u.bb.dst); exec_flush_pend_for(e, c->u.bb.src); break;
+    case MC_FILL_BB: exec_flush_pend_for(e, c->u.fill.res); break;
+    case MC_FILL_TEX: exec_flush_pend_for(e, c->u.filltex.res); break;
+    case MC_COPY_B2T: case MC_COPY_T2B: exec_flush_pend_for(e, c->u.bt.tex); exec_flush_pend_for(e, c->u.bt.buf); break;
+    case MC_COPY_T2T: exec_flush_pend_for(e, c->u.tt.dst); exec_flush_pend_for(e, c->u.tt.src); break;
+    default: break;
+    }
     switch (c->kind) {   /* madeira-doge fence-chain 9: the destination was written by the GPU this frame */
     case MC_COPY_BB: mad_hz_stamp(c->u.bb.dst); break;
     case MC_FILL_BB: mad_hz_stamp(c->u.fill.res); break;
@@ -8419,6 +8452,7 @@ static void exec_gui_overlay(struct mad_exec *e) {
 }
 static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_compute_setpso c_pso;
+    while (e->npend) exec_flush_clear(e, 0);   /* madeira-doge clear-defer: a dispatch may read any pending target */
     e->wr_all = 1;   /* ml1116: a dispatch writes through UAVs we do not enumerate here */
     struct wmtcmd_compute_setbuffer sb[4];   /* ml1008: MSC uses 3; the sm5 path binds cb + arg + both heaps */
     struct wmtcmd_compute_useresource ur[256];
@@ -8894,9 +8928,10 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                       InterlockedExchange(&g_pass_end_clear, 0), InterlockedExchange(&g_pass_end_dispatch, 0), InterlockedExchange(&g_pass_end_blit, 0),
                       InterlockedExchange(&g_pass_end_list, 0), InterlockedExchange(&g_pass_end_attachless, 0), InterlockedExchange(&g_pass_clear_only, 0),
                       (long long)(InterlockedExchange64(&g_pass_attach_bytes, 0) >> 20));
-            d3d12_log("[madeira-d3d12] madeira-doge pass merging in those lists: %ld null-target unbinds kept the pass open (rts-null-lazy), %ld blit encoders kept open at a barrier (barrier-blit-open); pass-carry: %ld passes carried past a list end, %ld resumed by the next list, %ld ended before a commit\n",
+            d3d12_log("[madeira-d3d12] madeira-doge pass merging in those lists: %ld null-target unbinds kept the pass open (rts-null-lazy), %ld blit encoders kept open at a barrier (barrier-blit-open); pass-carry: %ld passes carried past a list end, %ld resumed by the next list, %ld ended before a commit; clear-defer: %ld clears left the pass open, %ld pending clears kept past another pass\n",
                       InterlockedExchange(&g_pass_rts_null_kept, 0), InterlockedExchange(&g_blit_barrier_kept, 0),
-                      InterlockedExchange(&g_pass_carried, 0), InterlockedExchange(&g_pass_carry_resumed, 0), InterlockedExchange(&g_pass_carry_dropped, 0));
+                      InterlockedExchange(&g_pass_carried, 0), InterlockedExchange(&g_pass_carry_resumed, 0), InterlockedExchange(&g_pass_carry_dropped, 0),
+                      InterlockedExchange(&g_cd_kept_open, 0), InterlockedExchange(&g_cd_kept_pending, 0));
             if (g_ind_clamp_n)
                 d3d12_log("[madeira-d3d12] ind-count-clamp: %ld ExecuteIndirect(s) with a count buffer clamped, %ld records, in those lists\n",
                           InterlockedExchange(&g_ind_clamp_n, 0), InterlockedExchange(&g_ind_clamp_recs, 0));
