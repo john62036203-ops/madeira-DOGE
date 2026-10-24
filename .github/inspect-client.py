@@ -42,3 +42,36 @@ print("\n==== strings")
 for key in [rb'FriendsUI', rb'nofriendsui', rb'SignIntoFriends', rb'SetPersonaState', rb'PersonaStateDesired', rb'friends network', rb'ChangeStatus', rb'GamesPlayed']:
     for m in list(re.finditer(key, image))[:6]:
         a = max(0, m.start()-40); print(key.decode(), hex(m.start()), bytes(image[a:m.start()+60]))
+
+print("\n\n######## PASS 6")
+def cstrs(start, end):
+    out=[]; p=start
+    while p < end:
+        e=image.find(b'\0', p, end)
+        if e<0: break
+        if e>p: out.append((p, image[p:e].decode('latin1')))
+        p=e+1
+    return out
+print("name table near SetPersonaState:", [s for _, s in cstrs(0x12ad900, 0x12adb40)])
+def disasm(rva, length):
+    return subprocess.run(['objdump','-d','-M','intel','--start-address=%#x'%(base+rva),'--stop-address=%#x'%(base+rva+length),str(path)],capture_output=True,text=True).stdout
+text_va, text_size = None, None
+for i in range(sections):
+    h=opt+optional_size+i*40
+    if raw[h:h+8].rstrip(b'\0')==b'.text': text_va, text_size = struct.unpack_from('<II', raw, h+12)
+def lea_refs(t):
+    out=[]
+    for m in re.finditer(rb'[\x48\x4c]\x8d[\x05\x0d\x15\x1d\x25\x2d\x35\x3d]', image[text_va:text_va+text_size]):
+        p=text_va+m.start()
+        if p+7+struct.unpack_from('<i',image,p+3)[0]==t: out.append(p)
+    return out
+for key in [b'AutoSignIntoFriends\0', b'PersonaStateDesired\0', b'm_ePersonaStateDesired == k_EPersonaStateOffline\0', b'-nofriendsui\0', b'-friendsui\0']:
+    t=image.find(key)
+    refs=lea_refs(t)
+    print("\n==== %r at %#x refs %s"%(key, t, [hex(r) for r in refs]))
+    for r in refs[:4]:
+        print("-- ref %#x"%r); print(disasm(r-160, 160+200))
+fr=vtable('IClientFriendsMap')
+for slot in (6,7,8):
+    q=struct.unpack_from('<Q',image,fr+8*slot)[0]-base
+    print("\n==== friends slot %d %#x"%(slot,q)); print(disasm(q, 260))
