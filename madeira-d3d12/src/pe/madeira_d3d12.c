@@ -11137,9 +11137,29 @@ static void STDMETHODCALLTYPE list_BeginQuery(ID3D12GraphicsCommandList *This, I
     if (!heap || !mad_query_is_occlusion(type)) return;   /* ml1088: only occlusion is counted; the rest resolve to zero */
     if ((c = mad_list_push((struct mad_list *)This, MC_QUERY_BEGIN))) { c->u.query.heap = (struct mad_queryheap *)heap; c->u.query.type = type; c->u.query.index = index; }
 }
+/* madeira-doge: a TIMESTAMP query's value is the CPU clock in nanoseconds at the
+ * moment EndQuery is RECORDED, kept per query slot and copied out by
+ * ResolveQueryData. EXVS2 (nu engine) resolves ~37 timestamps a frame and feeds
+ * them back into its effect system: with every value resolved at resolve time
+ * (one clock reading for the whole heap) GPU sections measured 0 ns and only the
+ * long-lived hit flashes showed; with zeros (MADEIRA_QUERY_ZERO) only the muzzle
+ * flash did. Recording-time stamps give begin/end pairs the spacing the GPU work
+ * between them has on the CPU side, monotonic across frames. */
+static UINT64 mad_qpc_ns(void) {
+    static LONG64 freq;
+    LARGE_INTEGER t;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 1; }
+    QueryPerformanceCounter(&t);
+    return (UINT64)((double)t.QuadPart * (1e9 / (double)freq));
+}
 static void STDMETHODCALLTYPE list_EndQuery(ID3D12GraphicsCommandList *This, ID3D12QueryHeap *heap,
         D3D12_QUERY_TYPE type, UINT index) {
     struct mad_cmd *c;
+    if (heap && type == D3D12_QUERY_TYPE_TIMESTAMP) {   /* madeira-doge: see mad_qpc_ns */
+        struct mad_queryheap *q = (struct mad_queryheap *)heap;
+        if (index < q->desc.Count) { EnterCriticalSection(&q->lock); q->results[index] = mad_qpc_ns(); LeaveCriticalSection(&q->lock); }
+        return;
+    }
     if (!heap || !mad_query_is_occlusion(type)) return;
     if ((c = mad_list_push((struct mad_list *)This, MC_QUERY_END))) { c->u.query.heap = (struct mad_queryheap *)heap; c->u.query.type = type; c->u.query.index = index; }
 }
@@ -11167,19 +11187,23 @@ static void STDMETHODCALLTYPE list_ResolveQueryData(ID3D12GraphicsCommandList *T
         static int zero = -1;
         if (zero < 0) { static const char qz_name[] = "MADEIRA_QUERY_ZERO"; char v[8]; zero = GetEnvironmentVariableA(qz_name, v, sizeof v) && v[0] == '1'; }
         if (!said++) d3d12_log("[madeira-d3d12] ResolveQueryData: non-occlusion queries resolve to %s (madeira-doge)\n",
-                               zero ? "zero" : "CPU-clock timestamps / pipeline statistics of 1");
+                               zero ? "zero" : "CPU-clock timestamps taken at EndQuery / pipeline statistics of 1");
         if (r->cpu && offset + (UINT64)count * each <= r->size) {
             char *p = (char *)r->cpu + offset;
             UINT i;
             if (zero || (type != D3D12_QUERY_TYPE_TIMESTAMP && type != D3D12_QUERY_TYPE_PIPELINE_STATISTICS)) {
                 memset(p, 0, (size_t)(count * each));
             } else if (type == D3D12_QUERY_TYPE_TIMESTAMP) {
-                static LONG64 freq;
-                LARGE_INTEGER t; UINT64 ns;
-                if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 1; }
-                QueryPerformanceCounter(&t);
-                ns = (UINT64)((double)t.QuadPart * (1e9 / (double)freq));
-                for (i = 0; i < count; i++) { UINT64 v = ns + start + i; memcpy(p + (size_t)i * 8, &v, 8); }
+                /* madeira-doge: the stamps EndQuery recorded (mad_qpc_ns); a slot never
+                 * ended gets the clock now, so a sloppy begin/end pair still orders. */
+                struct mad_queryheap *q = (struct mad_queryheap *)heap;
+                UINT64 now = mad_qpc_ns();
+                EnterCriticalSection(&q->lock);
+                for (i = 0; i < count; i++) {
+                    UINT64 v = (start + i < q->desc.Count && q->results[start + i]) ? q->results[start + i] : now + i;
+                    memcpy(p + (size_t)i * 8, &v, 8);
+                }
+                LeaveCriticalSection(&q->lock);
             } else {
                 for (i = 0; i < count * (UINT)(each / 8); i++) { UINT64 one = 1; memcpy(p + (size_t)i * 8, &one, 8); }
             }
