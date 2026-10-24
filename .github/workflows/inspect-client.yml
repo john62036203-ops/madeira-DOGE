@@ -1,5 +1,6 @@
-# Temporary: fetch Valve's pinned client packages (the ones Madeira itself
-# downloads for Dock) and keep the client DLLs one day for inspection.
+# Temporary: fetch Valve's pinned client package (the one Madeira itself
+# downloads for Dock), inspect steamclient64.dll on the runner and push the
+# text results (no binary) to the orphan branch inspect-results.
 name: Inspect Steam client
 on:
   push:
@@ -8,25 +9,28 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch pinned packages
+      - uses: actions/checkout@v4
+      - name: Fetch, inspect, publish text
+        shell: bash
         run: |
-          set -eu
+          set +e
+          R=$(mktemp -d); exec > >(tee "$R/RESULT.txt") 2>&1
           O=https://client-update.akamai.steamstatic.com/
-          curl -sSfL -o jan.zip "${O}bins_win64_win32.zip.f29d67dc38a4be027f1734802697c668621a6da1"
+          curl -sSfL -o jan.zip "${O}bins_win64_win32.zip.f29d67dc38a4be027f1734802697c668621a6da1"; echo "curl=$?"
+          ls -la jan.zip; file jan.zip
           echo "345f6e4bdc19b27ae53bf752c21e2d894e0e899d94823222fb426e890d1226b5  jan.zip" | sha256sum -c
-          mkdir out && python3 - <<'PY'
+          python3 - <<'PY'
           import zipfile
           z = zipfile.ZipFile('jan.zip')
+          for n in z.namelist(): print('  ', n, z.getinfo(n).file_size)
           for n in z.namelist():
               if n.lower().endswith('steamclient64.dll'):
-                  open('out/steamclient64-jan.dll','wb').write(z.read(n)); print('jan', n)
+                  open('steamclient64.dll','wb').write(z.read(n)); print('extracted', n)
           PY
-          # The September build Dock also supports: manifest names its package.
-          curl -sSfL -o manifest.txt "${O}steam_client_win32" || true
-          grep -o 'bins_win64_win32.zip.[0-9a-f]*' manifest.txt | sort -u | head -5 || true
-          sha256sum out/*
-      - uses: actions/upload-artifact@v4
-        with:
-          name: steamclient-dlls
-          path: out/
-          retention-days: 1
+          sha256sum steamclient64.dll
+          python3 .github/inspect-client.py steamclient64.dll
+          curl -sSfL -o manifest.txt "${O}steam_client_win32"; grep -o 'bins_win64_win32.zip.[0-9a-f]*' manifest.txt | sort -u
+          echo "run ${{ github.run_number }} $(date -u +%FT%TZ)" > "$R/RUN.txt"
+          cd "$R" && git init -q -b inspect-results && git config user.name github-actions && git config user.email actions@github.com
+          git add -A && git commit -qm "inspect ${{ github.run_number }}" && \
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" inspect-results 2>&1 | tail -2
