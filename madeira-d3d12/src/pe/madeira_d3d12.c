@@ -8679,7 +8679,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                     exec_end(&e);
                 }
             }
-            if (e.mode == 6 || e.mode == 7) {   /* ml1134: see f6_begin; madeira-doge mode 7 */
+            if (e.mode == 6 || e.mode == 7) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
