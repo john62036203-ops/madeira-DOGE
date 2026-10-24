@@ -39,3 +39,26 @@ for cls in ['IClientUserMap','IClientFriendsMap','IClientUtilsMap','IClientGameS
     print("\n==== %s vtable %#x; code refs: %s"%(cls,vt,[hex(r) for r in refs]))
     for r in refs:
         print("-- around %#x"%r); print(disasm(r-96, 96+160))
+
+print("\n\n######## PASS 3: factory functions and their callers")
+va,size=text
+def func_start(rva):
+    p=rva
+    while p>va:
+        # previous function ends with ret/jmp followed by int3 padding, or 16-aligned after int3 run
+        if image[p-1]==0xcc and image[p]!=0xcc: return p
+        p-=1
+    return None
+def callers(fstart):
+    out=[]
+    for m in re.finditer(rb'\xe8', image[va:va+size]):
+        p=va+m.start(); disp=struct.unpack_from('<i',image,p+1)[0]
+        if p+5+disp==fstart: out.append(p)
+    return out
+for cls in ['IClientUserMap','IClientFriendsMap','IClientUtilsMap','IClientAppsMap','IClientMatchmakingMap','IClientBillingMap']:
+    vt=vtable(cls); refs=lea_refs(vt)
+    for r in refs:
+        fs=func_start(r); cs=callers(fs) if fs else []
+        print("\n==== %s ctor ref %#x, function start %s, callers %s"%(cls,r,hex(fs) if fs else None,[hex(c) for c in cs]))
+        for c in cs[:6]:
+            print("-- caller %#x"%c); print(disasm(c-24, 24+72))
