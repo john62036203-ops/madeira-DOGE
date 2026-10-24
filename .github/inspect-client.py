@@ -75,3 +75,8 @@ fr=vtable('IClientFriendsMap')
 for slot in (6,7,8):
     q=struct.unpack_from('<Q',image,fr+8*slot)[0]-base
     print("\n==== friends slot %d %#x"%(slot,q)); print(disasm(q, 260))
+
+print("\n\n######## PASS 7")
+for slot in (13, 23, 26):
+    q=struct.unpack_from('<Q',image,fr+8*slot)[0]-base
+    print("\n==== friends slot %d %#x"%(slot,q)); print(disasm(q, 300))
