@@ -1838,11 +1838,22 @@ jobs:
           # com.willfaust.mythicemu, 2026-10-21), so the asset is named after the bundle id.
           BID="$(unzip -p "$IPA" 'Payload/*.app/Info.plist' > info.plist && plutil -extract CFBundleIdentifier raw -o - info.plist || true)"
           if [ -n "$BID" ]; then cp "$IPA" "$BID.ipa"; IPA="$BID.ipa"; echo "::notice::release asset named $IPA (SideStore matches the file name)"; fi
-          if ! gh release create "build-${{ github.run_number }}" "$IPA" --repo "$GITHUB_REPOSITORY" \
-               --target "$GITHUB_SHA" --title "Madeira 0.1.${{ github.run_number }}" \
-               --notes "${NOTES:-Build ${{ github.run_number }}}" >/dev/null 2>release.err; then
-            echo "::error::release create failed :: $(head -c 1500 release.err | tr '\n' ' ')"
+          # madeira-doge: one retry (build 430's create failed with the reason lost -- the
+          # job had already used its 50 annotations), and the failure text is also left
+          # as a commit comment, which the sessions can read through the REST API.
+          ok=0
+          for attempt in 1 2; do
+            if gh release create "build-${{ github.run_number }}" "$IPA" --repo "$GITHUB_REPOSITORY" \
+                 --target "$GITHUB_SHA" --title "Madeira 0.1.${{ github.run_number }}" \
+                 --notes "${NOTES:-Build ${{ github.run_number }}}" >/dev/null 2>release.err; then ok=1; break; fi
+            echo "::error::release create failed (attempt $attempt) :: $(head -c 1500 release.err | tr '\n' ' ')"
+            gh release delete "build-${{ github.run_number }}" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag >/dev/null 2>&1 || true
+            sleep 20
+          done
+          if [ "$ok" != 1 ]; then
             gh api "repos/$GITHUB_REPOSITORY" -q '"token check :: permissions \(.permissions // "none")"' 2>&1 | sed 's/^/::notice::/' || true
+            gh api -X POST "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/comments" \
+              -f body="build-${{ github.run_number }}: release create failed: $(head -c 1500 release.err | tr '\n' ' ')" >/dev/null 2>&1 || true
             exit 1
           fi
           echo "::notice::published release build-${{ github.run_number }}"
