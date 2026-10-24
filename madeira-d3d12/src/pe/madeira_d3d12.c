@@ -18847,6 +18847,53 @@ static LUID * STDMETHODCALLTYPE device_GetAdapterLuid(ID3D12Device10 *This, LUID
     return ret;
 }
 
+/* madeira-doge x64-api-stubs (default 1): the game's hottest D3D12 calls run as
+ * x64 code, with no x64 -> ARM64EC crossing. EXVS2's render thread calls
+ * CopyDescriptorsSimple ~900k/s, GetHeapProperties ~600k/s,
+ * GetGPUVirtualAddress ~150k/s and GetDesc ~100k/s ([xp-api-top], 20:59 log);
+ * our side of each is a few instructions, the crossing is the cost (the
+ * same finding as x64fast_ios.h for critical sections and memcpy). The four
+ * methods are reimplemented as x64 machine code (tests/host/x64stubs/stubs.asm,
+ * nasm -f bin) in a page of guest memory, struct offsets patched in at
+ * install, and the COM vtables point at them; FEX runs them like game code.
+ * Left native (the stubs are not installed) when desc-guard or restrace is on,
+ * since those instrument the native versions. x64-api-stubs = 0 turns it off. */
+static const unsigned char x64s_cds[62] = { 0x85, 0xd2, 0x74, 0x39, 0x4d, 0x85, 0xc0, 0x74, 0x34, 0x4d, 0x85, 0xc9, 0x74, 0x2f, 0x8b, 0x44, 0x24, 0x28, 0x41, 0xba, 0x11, 0x11, 0x11, 0x11, 0x83, 0xf8, 0x02, 0x74, 0x05, 0x83, 0xf8, 0x03, 0x75, 0x06, 0x41, 0xba, 0x22, 0x22, 0x22, 0x22, 0x89, 0xd0, 0x49, 0x0f, 0xaf, 0xc2, 0x57, 0x56, 0x4c, 0x89, 0xc7, 0x4c, 0x89, 0xce, 0x48, 0x89, 0xc1, 0xf3, 0xa4, 0x5e, 0x5f, 0xc3 };
+static const unsigned char x64s_ghp[65] = { 0x48, 0x85, 0xd2, 0x74, 0x2d, 0x8b, 0x81, 0x33, 0x33, 0x33, 0x33, 0x85, 0xc0, 0x75, 0x05, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x89, 0x02, 0xc7, 0x42, 0x04, 0x00, 0x00, 0x00, 0x00, 0xc7, 0x42, 0x08, 0x00, 0x00, 0x00, 0x00, 0xc7, 0x42, 0x0c, 0x01, 0x00, 0x00, 0x00, 0xc7, 0x42, 0x10, 0x01, 0x00, 0x00, 0x00, 0x4d, 0x85, 0xc0, 0x74, 0x07, 0x41, 0xc7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xc3 };
+static const unsigned char x64s_gdesc[82] = { 0x4c, 0x8d, 0x91, 0x55, 0x55, 0x55, 0x55, 0x49, 0x8b, 0x02, 0x48, 0x89, 0x02, 0x49, 0x8b, 0x42, 0x08, 0x48, 0x89, 0x42, 0x08, 0x49, 0x8b, 0x42, 0x10, 0x48, 0x89, 0x42, 0x10, 0x49, 0x8b, 0x42, 0x18, 0x48, 0x89, 0x42, 0x18, 0x49, 0x8b, 0x42, 0x20, 0x48, 0x89, 0x42, 0x20, 0x49, 0x8b, 0x42, 0x28, 0x48, 0x89, 0x42, 0x28, 0x49, 0x8b, 0x42, 0x30, 0x48, 0x89, 0x42, 0x30, 0x48, 0x83, 0xb9, 0x66, 0x66, 0x66, 0x66, 0x00, 0x74, 0x07, 0xc7, 0x42, 0x20, 0x67, 0x00, 0x00, 0x00, 0x48, 0x89, 0xd0, 0xc3 };
+static const unsigned char x64s_ggva[8] = { 0x48, 0x8b, 0x81, 0x44, 0x44, 0x44, 0x44, 0xc3 };
+
+static void mad_x64_patch(unsigned char *p, size_t n, UINT32 marker, UINT32 value) {
+    size_t i;
+    for (i = 0; i + 4 <= n; i++) if (!memcmp(p + i, &marker, 4)) { memcpy(p + i, &value, 4); i += 3; }
+}
+static void mad_x64_stubs_install(void) {
+    unsigned char *page; size_t off = 0; DWORD old = 0;
+    void *p_cds, *p_ghp, *p_gdesc, *p_ggva;
+    if (!mad_cfg_int_pe("x64-api-stubs", 1)) return;   /* 1: CopyDescriptorsSimple, GetHeapProperties, GetDesc and GetGPUVirtualAddress run as x64 code (no emulator crossing); 0: native */
+    if (g_sd_state < 0) mad_sync_diag_load();
+    if (g_sd_state > 0 || mad_restrace()) { d3d12_log("[madeira-d3d12] x64-api-stubs: off (desc-guard / restrace instrument the native entries)\n"); return; }
+    _Static_assert(sizeof(D3D12_RESOURCE_DESC) == 56, "GetDesc stub copies 56 bytes");
+    _Static_assert(sizeof(D3D12_HEAP_PROPERTIES) == 20, "GetHeapProperties stub fills 20 bytes");
+    page = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!page) return;
+#define MAD_X64_PLACE(dst, arr) do { memcpy(page + off, arr, sizeof arr); dst = page + off; off += (sizeof arr + 15) & ~(size_t)15; } while (0)
+    MAD_X64_PLACE(p_cds, x64s_cds); MAD_X64_PLACE(p_ghp, x64s_ghp); MAD_X64_PLACE(p_gdesc, x64s_gdesc); MAD_X64_PLACE(p_ggva, x64s_ggva);
+#undef MAD_X64_PLACE
+    mad_x64_patch(page, off, 0x11111111u, (UINT32)sizeof(struct mad_descriptor));
+    mad_x64_patch(page, off, 0x22222222u, (UINT32)sizeof(struct mad_rtv));
+    mad_x64_patch(page, off, 0x33333333u, (UINT32)(UINT32)((size_t)&((struct mad_resource *)0)->heap));
+    mad_x64_patch(page, off, 0x44444444u, (UINT32)(UINT32)((size_t)&((struct mad_resource *)0)->gpu_address));
+    mad_x64_patch(page, off, 0x55555555u, (UINT32)(UINT32)((size_t)&((struct mad_resource *)0)->desc));
+    mad_x64_patch(page, off, 0x66666666u, (UINT32)(UINT32)((size_t)&((struct mad_resource *)0)->nv12_uv));
+    if (!VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old)) { VirtualFree(page, 0, MEM_RELEASE); d3d12_log("[madeira-d3d12] x64-api-stubs: VirtualProtect failed (%lu)\n", GetLastError()); return; }
+    FlushInstructionCache(GetCurrentProcess(), page, 4096);
+    g_device_vtbl.CopyDescriptorsSimple = (void *)p_cds;
+    g_res_vtbl.GetHeapProperties = (void *)p_ghp;
+    g_res_vtbl.GetDesc = (void *)p_gdesc;
+    g_res_vtbl.GetGPUVirtualAddress = (void *)p_ggva;
+    d3d12_log("[madeira-d3d12] x64-api-stubs: CopyDescriptorsSimple, GetHeapProperties, GetDesc, GetGPUVirtualAddress run as x64 code at %p (%u bytes)\n", (void *)page, (unsigned)off);
+}
 static void build_vtables(void) {
     static LONG done;
     if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
@@ -18983,6 +19030,7 @@ static void build_vtables(void) {
     g_res_vtbl.GetPrivateData = res_GetPrivateData;                     /* madeira-doge: traced */
     g_res_vtbl.SetPrivateData = res_SetPrivateData;
     g_res_vtbl.SetPrivateDataInterface = res_SetPrivateDataInterface;
+    mad_x64_stubs_install();   /* madeira-doge x64-api-stubs: after the native entries are in place */
 
     madeira_fill_ID3D12GraphicsCommandList7(&g_list_vtbl);
     g_list_vtbl.GetDevice = (void *)list_GetDevice;
