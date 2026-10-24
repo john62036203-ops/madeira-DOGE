@@ -3053,6 +3053,26 @@ struct LibraryDetail: View {
                                 }.clipped()
                         )
                 }
+                // madeira-doge: the owner edits this file on every test run, so it sits at the top
+                // of the page instead of under Advanced at the bottom.
+                // madeira-bcd: this game's config is its own GameProfiles.swift file
+                // (Application Support/GameConfigs/<hash>.cfg), the file every launch of
+                // the game exports as MADEIRA_CFG_GAME; the switches above write their
+                // lines into it too. Lines an entry saved in upstream's `config` field are
+                // moved into it when the page opens (migrateEntryOptions).
+                Section {
+                    NavigationLink {
+                        LibraryGameConfigEditor(text: Binding(get: { bcd.configText }, set: { text in
+                            bcd.configText = text
+                            GameProfile(windowsPath: entry.windowsPath).text = text
+                        }))
+                        .onDisappear { reloadBCD() }
+                    } label: {
+                        LabeledContent("This game's config", value: Self.configSummary(bcd.configText))
+                    }
+                } header: { Text("This game's config") } footer: {
+                    Text("Lines in madeira.cfg's format for this game only. A key set here wins over madeira.cfg wherever the runtime reads it, env.NAME lines are exported after madeira.cfg's, and dxmt options are added to madeira.cfg's. Applies from the next start.")
+                }
                 if entry.desktop != true { Section("Library details") {
                     TextField("Title", text: $entry.title)
                     Button("Find on Steam", systemImage: "magnifyingglass") { findCover = true }
@@ -3231,24 +3251,6 @@ struct LibraryDetail: View {
                         Text("XInput and DirectInput: for games older than XInput, which read the pad through DirectInput. The same pad is offered through both APIs, so a game that reads both may list two controllers. Applies to the next launch.").font(.caption).foregroundStyle(.secondary)
                         Text("Keyboard and mouse: for games without controller support. The controller presses keys and moves the mouse (left stick WASD, right stick mouse, triggers click, D-pad arrows, Start Esc, Select Tab) and the game sees no controller. Change what each button does under Controller binds, here or in the in-game menu.").font(.caption).foregroundStyle(.secondary)
                     }
-                }
-                // madeira-bcd: this game's config is its own GameProfiles.swift file
-                // (Application Support/GameConfigs/<hash>.cfg), the file every launch of
-                // the game exports as MADEIRA_CFG_GAME; the switches above write their
-                // lines into it too. Lines an entry saved in upstream's `config` field are
-                // moved into it when the page opens (migrateEntryOptions).
-                Section {
-                    NavigationLink {
-                        LibraryGameConfigEditor(text: Binding(get: { bcd.configText }, set: { text in
-                            bcd.configText = text
-                            GameProfile(windowsPath: entry.windowsPath).text = text
-                        }))
-                        .onDisappear { reloadBCD() }
-                    } label: {
-                        LabeledContent("This game's config", value: Self.configSummary(bcd.configText))
-                    }
-                } header: { Text("Advanced") } footer: {
-                    Text("Lines in madeira.cfg's format for this game only. A key set here wins over madeira.cfg wherever the runtime reads it, env.NAME lines are exported after madeira.cfg's, and dxmt options are added to madeira.cfg's. Applies from the next start.")
                 }
                 // A link that starts this game from a Home Screen icon (SavesAndShortcuts.swift).
                 if entry.desktop != true {
