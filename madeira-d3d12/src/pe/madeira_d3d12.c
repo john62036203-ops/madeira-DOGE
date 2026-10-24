@@ -477,6 +477,7 @@ static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n
 static LONG64 g_gstore_reused, g_gstore_fresh, g_gstore_held; static unsigned g_gstore_n;   /* madeira-doge gpu-store-pool */
 static LONG g_copy_compute_n;   /* madeira-doge copy-compute */
 static LONG g_tbuf_fix_n, g_tbuf_fix_fail;   /* madeira-doge dxbc-typed-fix */
+static LONG g_hz_decl, g_hz_lookups, g_hz_dxil;   /* madeira-doge fence-chain 9 counters */
 static volatile LONG64 g_defswap_bytes; static volatile LONG g_defswap_n;   /* madeira-bcd default-buffer-swap: LIVE moved DEFAULT buffers (default-swap-mb/-kb or default-buffer-swap), a part of the ml1154 count */
 static volatile LONG64 g_defswap_wired; static volatile LONG g_defswap_nwired, g_defswap_wire_fail;   /* madeira-bcd default-buffer-swap-wire (opt-in) */
 static void mad_dsw_census(void);   /* madeira-bcd default-buffer-swap residency census (opt-in) */
@@ -538,7 +539,6 @@ static int mad_grow(void **arr, unsigned *cap, unsigned need, size_t elem) {
 #define MAD_VREC_TOMB (~(UINT64)0)
 static unsigned mad_vmap_slot(UINT64 id, unsigned cap) { return (unsigned)((id * 0x9E3779B97F4A7C15ull) >> 40) & (cap - 1); }
 static void mad_vmap_put_locked_r(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b, struct mad_resource *r);
-static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b) { mad_vmap_put_locked_r(d, id, a, b, NULL); }
 static void mad_vmap_put_locked_r(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b, struct mad_resource *r) {
     unsigned i;
     if (!id || id == MAD_VREC_TOMB) return;
@@ -7662,7 +7662,6 @@ static int exec_copy_compute(struct mad_exec *e, const struct mad_cmd *c) {
     InterlockedIncrement(&g_copy_compute_n);
     return 1;
 }
-static LONG g_hz_decl, g_hz_lookups, g_hz_dxil;   /* madeira-doge fence-chain 9 counters */
 static void mad_hz_stamp(struct mad_resource *r) { if (r) __atomic_store_n(&r->hz_write, (LONG64)g_presents_now + 1, __ATOMIC_RELAXED); }   /* madeira-doge fence-chain 9: written by the GPU now */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     switch (c->kind) {   /* madeira-doge fence-chain 9: the destination was written by the GPU this frame */
