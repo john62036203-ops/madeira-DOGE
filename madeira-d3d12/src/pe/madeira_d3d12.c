@@ -1932,6 +1932,7 @@ struct mad_exec {
     int fence_needed;
     obj_handle_t air_use[16]; unsigned n_air_use;   /* madeira-doge: dxbc-tex-use -- textures the trace-ps shaders sample, useResource'd per draw */
     struct { obj_handle_t h; UINT32 usage; } hz[48]; unsigned nhz; unsigned hz_over;   /* madeira-doge fence-chain 9: GPU-written resources this draw/dispatch reaches through its tables */
+    int renc_retained;          /* madeira-doge pass-carry: renc holds our own retain (the ExecuteCommandLists autorelease pool that made it has drained) */
     obj_handle_t tind_buf; UINT64 tind_off;   /* madeira-bcd: this indirect tessellation draw's mesh dispatch arguments */
     struct mad_resource *wr[64]; unsigned nwr; int wr_all;   /* ml1116: written since the last fence wait (mode 3) */   /* ml1111: fence-chain = 2: a barrier (or list start) was seen since the last wait */
     struct mad_queue *q;
@@ -2425,7 +2426,9 @@ static void exec_end(struct mad_exec *e) {
     pps_render = e->renc && e->pass_draws;
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
-        MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
+        MTLCommandEncoder_endEncoding(e->renc);
+        if (e->renc_retained) { NSObject_release(e->renc); e->renc_retained = 0; }   /* madeira-doge pass-carry */
+        e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
         if (e->q->vis && e->q->vis->dirty) { e->q->vis->next++; e->q->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
         e->pass_draws = 0;
@@ -8685,7 +8688,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         struct mad_exec *c = q->carry;
         if (c->cb == cb && c->renc) {
             unsigned k;
-            e.renc = c->renc; e.renc_seq = c->renc_seq;
+            e.renc = c->renc; e.renc_seq = c->renc_seq; e.renc_retained = c->renc_retained;
             e.enc_nrt = c->enc_nrt; memcpy(e.enc_rt, c->enc_rt, sizeof e.enc_rt); memcpy(e.enc_rtp, c->enc_rtp, sizeof e.enc_rtp);
             e.enc_depth = c->enc_depth; e.enc_dp = c->enc_dp; e.enc_w = c->enc_w; e.enc_h = c->enc_h;
             e.vis_prev = c->vis_prev; e.enc_vis_buf = c->enc_vis_buf; e.pass_draws = c->pass_draws;
@@ -8859,6 +8862,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     if (g_pass_carry && e.renc && !e.benc && !e.cenc && !e.npend && !e.nic && !g_pps_active && !g_capture_on && e.cb == q->open_cb) {
         if (!q->carry) q->carry = calloc(1, sizeof *q->carry);
         if (q->carry) {   /* madeira-doge pass-carry: leave the pass open for the next list */
+            if (!e.renc_retained) { NSObject_retain(e.renc); e.renc_retained = 1; }   /* outlive this call's autorelease pool (build 443: "Command encoder released without endEncoding") */
             *q->carry = e; q->carry->l = NULL; q->carry_valid = 1;
             InterlockedIncrement(&g_pass_carried);
         } else { g_enc_why = "list-end"; exec_end(&e); }
