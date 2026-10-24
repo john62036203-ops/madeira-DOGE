@@ -18,9 +18,9 @@ jobs:
           set +e
           R=$(mktemp -d); exec > >(tee "$R/RESULT.txt") 2>&1
           O=https://client-update.akamai.steamstatic.com/
-          curl -sSfL -o jan.zip "${O}bins_win64_win32.zip.f29d67dc38a4be027f1734802697c668621a6da1"; echo "curl=$?"
+          curl -sSfL -o jan.zip "${O}bins_win32.zip.23e34a6d4b10596a44561a5100dac5585d2517da"; echo "curl=$?"
           ls -la jan.zip; file jan.zip
-          echo "345f6e4bdc19b27ae53bf752c21e2d894e0e899d94823222fb426e890d1226b5  jan.zip" | sha256sum -c
+          echo "8b712b2a3412a9066b7725f4e1c5cef9a7ca5b187b6585a5b92d25d09df0ba62  jan.zip" | sha256sum -c
           python3 - <<'PY'
           import zipfile
           z = zipfile.ZipFile('jan.zip')
