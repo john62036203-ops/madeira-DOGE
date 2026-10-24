@@ -474,6 +474,7 @@ static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
 static LONG64 g_gstore_reused, g_gstore_fresh, g_gstore_held; static unsigned g_gstore_n;   /* madeira-doge gpu-store-pool */
+static LONG g_copy_compute_n;   /* madeira-doge copy-compute */
 static volatile LONG64 g_defswap_bytes; static volatile LONG g_defswap_n;   /* madeira-bcd default-buffer-swap: LIVE moved DEFAULT buffers (default-swap-mb/-kb or default-buffer-swap), a part of the ml1154 count */
 static volatile LONG64 g_defswap_wired; static volatile LONG g_defswap_nwired, g_defswap_wire_fail;   /* madeira-bcd default-buffer-swap-wire (opt-in) */
 static void mad_dsw_census(void);   /* madeira-bcd default-buffer-swap residency census (opt-in) */
@@ -751,8 +752,8 @@ static void mad_skip_report(void) {
     d3d12_log("[madeira-d3d12] ml1088 occlusion queries: %ld begun, %ld results delivered, %ld queries counted samples > 0, %ld pass restarts; "
               "ml1089 SRVs with a min-LOD clamp folded into the view: %ld (largest clamp %.1f)\n",
               g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts, g_srv_clamped, (double)g_srv_clamp_max);
-    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass); ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld\n",
-              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_zero_inst, g_stencil_srv);
+    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass); ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld; copy-compute %ld buffer copies as dispatches\n",
+              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_zero_inst, g_stencil_srv, g_copy_compute_n);
     mad_acct_report();
     d3d12_log("[madeira-d3d12] ml1050 residency set: %ld added, %ld removed (%ld members); tessellation: %ld pipelines (%ld built as mesh pipelines), "
               "%ld draws dropped, %ld drawn (%ld non-indexed); ml1147 DXBC geometry: %ld mesh pipelines, %ld draws; DXIL tessellation: %ld drawn (%ld indirect)\n",
@@ -7512,7 +7513,46 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
 }
 static void mad_u10_dirty(struct mad_resource *r);   /* madeira-doge */
 #define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
+/* madeira-doge copy-compute (default 1): a small buffer-to-buffer copy while a
+ * compute encoder is open runs as a dispatch of mad_probe_words inside it instead
+ * of closing it for a blit encoder. EXVS2's particle lists go dispatch / copy 4
+ * bytes (a UAV counter into the next dispatch's constants) / dispatch ... and
+ * every copy cost a compute encoder end, a blit encoder and two fences: ~94
+ * compute + 46 blit encoders a frame. Serial dispatches in one encoder see each
+ * other's buffer writes, which is all the copy needs. Word-aligned copies of up
+ * to copy-compute-kb KB (default 16) only. */
+static int g_copy_compute = -1; static UINT64 g_copy_compute_max;
+static int exec_copy_compute(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_device *d = e->q->device;
+    struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_setbuffer sb[2]; struct wmtcmd_compute_setbytes sby; struct wmtcmd_compute_dispatch dsp;
+    UINT32 n;
+    if (g_copy_compute < 0) {
+        g_copy_compute = mad_cfg_int_pe("copy-compute", 1) ? 1 : 0;   /* 1: a small word-aligned CopyBufferRegion while a compute encoder is open is a copy kernel dispatch in it, not a blit encoder; 0: always a blit */
+        g_copy_compute_max = (UINT64)mad_cfg_int_pe("copy-compute-kb", 16) << 10;   /* the largest copy (KB) copy-compute takes; bigger ones blit */
+        d3d12_log("[madeira-d3d12] copy-compute = %d (buffer copies of up to %llu KB inside an open compute encoder)\n", g_copy_compute, (unsigned long long)(g_copy_compute_max >> 10));
+    }
+    if (!g_copy_compute || !e->cenc || e->benc || c->kind != MC_COPY_BB) return 0;
+    if (!c->u.bb.dst->buffer || !c->u.bb.src->buffer || !c->u.bb.len || c->u.bb.len > g_copy_compute_max ||
+        (c->u.bb.len & 3) || (c->u.bb.soff & 3) || (c->u.bb.doff & 3)) return 0;
+    if (!mad_kernels_ready(d) || !d->k_probe_pso) return 0;
+    n = (UINT32)(c->u.bb.len / 4);
+    memset(&sp, 0, sizeof sp); memset(sb, 0, sizeof sb); memset(&sby, 0, sizeof sby); memset(&dsp, 0, sizeof dsp);
+    sp.type = WMTComputeCommandSetPSO; sp.pso = d->k_probe_pso;
+    sp.threadgroup_size.width = 64; sp.threadgroup_size.height = 1; sp.threadgroup_size.depth = 1;
+    sb[0].type = WMTComputeCommandSetBuffer; sb[0].buffer = c->u.bb.src->buffer; sb[0].offset = c->u.bb.soff; sb[0].index = 0;
+    sb[1].type = WMTComputeCommandSetBuffer; sb[1].buffer = c->u.bb.dst->buffer; sb[1].offset = c->u.bb.doff; sb[1].index = 1;
+    sby.type = WMTComputeCommandSetBytes; sby.bytes.ptr = &n; sby.length = sizeof n; sby.index = 2;
+    dsp.type = WMTComputeCommandDispatch; dsp.size.width = (n + 63) / 64; dsp.size.height = 1; dsp.size.depth = 1;
+    sp.next.ptr = &sb[0]; sb[0].next.ptr = &sb[1]; sb[1].next.ptr = &sby; sby.next.ptr = &dsp;
+    MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&sp);
+    exec_note_write(e, c->u.bb.dst); mad_u10_dirty(c->u.bb.dst);
+    if (g_sd_state > 0 && g_upload_guard)
+        mad_ug_note(e, c->u.bb.src, c->u.bb.soff, c->u.bb.len < g_ug_bytes ? c->u.bb.len : g_ug_bytes, MAD_UG_COPY, 0, 1, "CopyBufferRegion");
+    InterlockedIncrement(&g_copy_compute_n);
+    return 1;
+}
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
+    if (exec_copy_compute(e, c)) return;   /* madeira-doge copy-compute */
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     switch (c->kind) {   /* ml1116: the destination is written */
     case MC_FILL_BB: exec_note_write(e, c->u.fill.res); mad_u10_dirty(c->u.fill.res); break;
