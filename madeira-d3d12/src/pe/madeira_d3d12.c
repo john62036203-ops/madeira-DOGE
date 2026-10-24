@@ -473,6 +473,7 @@ static volatile LONG64 g_bp_bytes[6]; static volatile LONG g_bp_count[6];
 static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
+static LONG64 g_gstore_reused, g_gstore_fresh, g_gstore_held; static unsigned g_gstore_n;   /* madeira-doge gpu-store-pool */
 static volatile LONG64 g_defswap_bytes; static volatile LONG g_defswap_n;   /* madeira-bcd default-buffer-swap: LIVE moved DEFAULT buffers (default-swap-mb/-kb or default-buffer-swap), a part of the ml1154 count */
 static volatile LONG64 g_defswap_wired; static volatile LONG g_defswap_nwired, g_defswap_wire_fail;   /* madeira-bcd default-buffer-swap-wire (opt-in) */
 static void mad_dsw_census(void);   /* madeira-bcd default-buffer-swap residency census (opt-in) */
@@ -1154,7 +1155,6 @@ struct mad_memheap;
 static void mad_pl_del(struct mad_memheap *h, struct mad_resource *r);
 struct mad_device;
 static void mad_mheap_reclaim(struct mad_device *d, int all);   /* ml1148 */
-static LONG64 g_gstore_reused, g_gstore_fresh, g_gstore_held; static unsigned g_gstore_n;   /* madeira-doge gpu-store-pool */
 struct mad_rootsig;
 static UINT mad_root_layout(const struct mad_rootsig *rs, UINT offsets[32]);
 static int mad_tiled_on(void);   /* d3d12-tiled-resources (opt-in), see TILED RESOURCES */
