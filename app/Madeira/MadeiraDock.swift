@@ -325,6 +325,7 @@ enum MadeiraDock {
         "session-offline-fallback", "session-offline-ready",
         "presence-off", "presence-unsupported", "presence-abi-mismatch", "presence-friends-missing",
         "presence-before", "presence-set", "presence-step", "presence-after",
+        "presence-step-echo", "presence-set-echo", "presence-friend-updates",
         "launch-client-error", "launch-option-index", "launch-option-invalid", "launch-option-missing",
         "launch-update-wait", "launch-update-retry", "launch-update-ready",
         "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
