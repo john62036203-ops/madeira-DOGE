@@ -1,0 +1,94 @@
+base 0x138000000
+CUserFriends [('0x1302d08', 0), ('0x13034c8', 8)]
+  vt 0x1302d08 ends at 255
+  vt 0x13034c8 ends at 7
+CClientFriends no RTTI
+CUser [('0x12faa40', 0), ('0x12faba0', 7744), ('0x12fb3c8', 7752), ('0x12fb548', 7760), ('0x12fb558', 7768)]
+  vt 0x12faa40 ends at 362
+  vt 0x12faba0 ends at 318
+  vt 0x12fb3c8 ends at 57
+  vt 0x12fb548 ends at 9
+  vt 0x12fb558 ends at 7
+ptr refs to 0x9e61d0: []
+ptr refs to 0x9dd260: []
+
+==== 0x9e61d0
+
+steamclient64.dll:     file format pei-x86-64
+
+
+Disassembly of section .text:
+
+00000001389e61d0 <.text+0x9e51d0>:
+   1389e61d0:	rex push rbx
+   1389e61d2:	push   rbp
+   1389e61d3:	push   rsi
+   1389e61d4:	sub    rsp,0x30
+   1389e61d8:	movzx  esi,r8b
+   1389e61dc:	mov    ebp,edx
+   1389e61de:	mov    rbx,rcx
+   1389e61e1:	call   0x13868f550
+   1389e61e6:	test   al,al
+   1389e61e8:	je     0x1389e6283
+   1389e61ee:	test   sil,sil
+   1389e61f1:	jne    0x1389e6211
+   1389e61f3:	lea    r8,[rip+0x91d6d6]        # 0x1393038d0
+   1389e61fa:	mov    edx,0x546
+   1389e61ff:	lea    rcx,[rip+0x91d40a]        # 0x139303610
+   1389e6206:	call   QWORD PTR [rip+0x7521f4]        # 0x139138400
+   1389e620c:	test   al,al
+   1389e620e:	jne    0x1389e6211
+
+direct calls/jmps to 0x9dd260: []
+direct calls/jmps to 0x9dd240: ['0x5145b4']
+direct calls/jmps to 0x9dd250: ['0x9b66cd']
+
+==== before 0x9dd260
+
+steamclient64.dll:     file format pei-x86-64
+
+
+Disassembly of section .text:
+
+00000001389dd200 <.text+0x9dc200>:
+   1389dd200:	mov    rax,QWORD PTR [rbx+0x5c0]
+   1389dd207:	mov    rcx,QWORD PTR [rax+rdx*8]
+   1389dd20b:	test   rcx,rcx
+   1389dd20e:	je     0x1389dd219
+   1389dd210:	mov    WORD PTR [rcx+0x80],0x0
+   1389dd219:	sub    rdx,0x1
+   1389dd21d:	jns    0x1389dd200
+   1389dd21f:	mov    rcx,QWORD PTR [rsp+0x40]
+   1389dd224:	mov    BYTE PTR [rbx+0x70],0x0
+   1389dd228:	test   rcx,rcx
+   1389dd22b:	je     0x1389dd233
+   1389dd22d:	call   QWORD PTR [rip+0x75b1b5]        # 0x1391383e8
+   1389dd233:	add    rsp,0x30
+   1389dd237:	pop    rbx
+   1389dd238:	ret
+   1389dd239:	int3
+   1389dd23a:	int3
+   1389dd23b:	int3
+   1389dd23c:	int3
+   1389dd23d:	int3
+   1389dd23e:	int3
+   1389dd23f:	int3
+   1389dd240:	jmp    0x1389e61d0
+   1389dd245:	int3
+   1389dd246:	int3
+   1389dd247:	int3
+   1389dd248:	int3
+   1389dd249:	int3
+   1389dd24a:	int3
+   1389dd24b:	int3
+   1389dd24c:	int3
+   1389dd24d:	int3
+   1389dd24e:	int3
+   1389dd24f:	int3
+   1389dd250:	add    rcx,0xac8
+   1389dd257:	jmp    0x1389e0500
+   1389dd25c:	int3
+   1389dd25d:	int3
+   1389dd25e:	int3
+   1389dd25f:	int3
+
