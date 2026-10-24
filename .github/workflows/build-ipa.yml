@@ -1051,6 +1051,8 @@ jobs:
           python3 tools/patch-dock-game-scm.py madeira-dock/src/launch.c || echo "::warning::Dock game-session service manager patch not applied"
           # env.MADEIRA_DOCK_KEEP_ALIVE = <exe>;<exe>: hold the session while a self-updating launcher restarts
           python3 tools/patch-dock-keep-alive.py madeira-dock/src/launch.c || echo "::warning::Dock keep-alive patch not applied"
+          # env.MADEIRA_DOCK_PRESENCE (default 1 online, 7 invisible, 0 off): friends see the game being played
+          python3 tools/patch-dock-presence.py madeira-dock/src/session.c || echo "::warning::Dock presence patch not applied"
           bash build/madeira-dock/build.sh
 
       # 30 and 40 FPS caps (pacing modes 3 and 4) for the Session panel.
