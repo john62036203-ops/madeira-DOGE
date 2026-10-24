@@ -425,7 +425,7 @@ struct FPSOverlay: View {
     // The mode lives in a static so it survives, and @State mirrors it for redraws.
     @State private var fenceMode: Int = FPSOverlayFenceMode.current
     private var fencePill: some View {
-        let color: Color = fenceMode == 1 ? .white : fenceMode == 6 ? .purple : fenceMode == 7 ? .green : fenceMode == 8 ? .orange : fenceMode == 5 ? .blue : .red
+        let color: Color = fenceMode == 1 ? .white : fenceMode == 6 ? .purple : fenceMode == 7 ? .green : fenceMode == 8 ? .orange : fenceMode == 9 ? .yellow : fenceMode == 5 ? .blue : .red
         return Text("F\(fenceMode)")
             .foregroundColor(color)
             .padding(.horizontal, 5)
@@ -433,9 +433,9 @@ struct FPSOverlay: View {
             .overlay(RoundedRectangle(cornerRadius: 4).stroke(color, lineWidth: 1))
             .onTapGesture {
                 fenceMode = FPSOverlayFenceMode.current
-                fenceMode = fenceMode == 1 ? 6 : fenceMode == 6 ? 7 : fenceMode == 7 ? 8 : fenceMode == 8 ? 5 : fenceMode == 5 ? 0 : 1
+                fenceMode = fenceMode == 1 ? 6 : fenceMode == 6 ? 7 : fenceMode == 7 ? 8 : fenceMode == 8 ? 9 : fenceMode == 9 ? 5 : fenceMode == 5 ? 0 : 1
                 FPSOverlayFenceMode.current = fenceMode
-                madeira_set_fence_mode(Int32(fenceMode == 0 ? 9 : fenceMode))
+                madeira_set_fence_mode(Int32(fenceMode == 0 ? 10 : fenceMode))
             }
     }
 

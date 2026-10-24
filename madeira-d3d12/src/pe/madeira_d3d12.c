@@ -379,7 +379,7 @@ struct mad_device {
      * old lookup walked the TEXTURE registries, which a buffer never enters, so
      * every typed-buffer binding failed and its draw or dispatch was skipped. */
     CRITICAL_SECTION view_lock;
-    struct mad_viewrec { UINT64 id; UINT32 a, b; } *vmap; unsigned vmap_cap, vmap_used, vmap_live;
+    struct mad_viewrec { UINT64 id; UINT32 a, b; struct mad_resource *r; } *vmap; unsigned vmap_cap, vmap_used, vmap_live;   /* madeira-doge: r = the resource the view is of (fence-chain 9) */
     /* ml1061: GPU timeline. Every committed batch signals `gpu_event` with its
      * serial, so "has the GPU finished X" is a read of one value instead of a
      * blocking wait. Fences are delivered by a worker thread; argument-ring
@@ -537,7 +537,9 @@ static int mad_grow(void **arr, unsigned *cap, unsigned need, size_t elem) {
  * a/b: typed buffer = element count / first element; texture view = slices / 0. */
 #define MAD_VREC_TOMB (~(UINT64)0)
 static unsigned mad_vmap_slot(UINT64 id, unsigned cap) { return (unsigned)((id * 0x9E3779B97F4A7C15ull) >> 40) & (cap - 1); }
-static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b) {
+static void mad_vmap_put_locked_r(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b, struct mad_resource *r);
+static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b) { mad_vmap_put_locked_r(d, id, a, b, NULL); }
+static void mad_vmap_put_locked_r(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b, struct mad_resource *r) {
     unsigned i;
     if (!id || id == MAD_VREC_TOMB) return;
     if (!d->vmap_cap || (d->vmap_used + 1) * 10 > d->vmap_cap * 6) {
@@ -557,7 +559,22 @@ static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT3
     i = mad_vmap_slot(id, d->vmap_cap);
     while (d->vmap[i].id && d->vmap[i].id != id) i = (i + 1) & (d->vmap_cap - 1);
     if (!d->vmap[i].id) { d->vmap_used++; d->vmap_live++; }
-    d->vmap[i].id = id; d->vmap[i].a = a; d->vmap[i].b = b;
+    d->vmap[i].id = id; d->vmap[i].a = a; d->vmap[i].b = b; d->vmap[i].r = r;
+}
+/* madeira-doge fence-chain 9: the resource a view id belongs to, O(1) */
+static struct mad_resource *mad_vmap_res(struct mad_device *d, UINT64 id) {
+    struct mad_resource *r = NULL; unsigned i;
+    if (!id || id == MAD_VREC_TOMB) return NULL;
+    EnterCriticalSection(&d->view_lock);
+    if (d->vmap_cap) {
+        i = mad_vmap_slot(id, d->vmap_cap);
+        while (d->vmap[i].id) {
+            if (d->vmap[i].id == id) { r = d->vmap[i].r; break; }
+            i = (i + 1) & (d->vmap_cap - 1);
+        }
+    }
+    LeaveCriticalSection(&d->view_lock);
+    return r;
 }
 static void mad_vmap_del_locked(struct mad_device *d, UINT64 id) {
     unsigned i;
@@ -864,6 +881,7 @@ struct mad_resource {
     struct mad_resource *nv12_uv;      /* madeira-doge nv12: plane 1 (R8G8, half size); this resource is plane 0 (R8) */
     int own_wired;                     /* madeira-bcd default-buffer-swap-wire: own_mem is VirtualLock'ed (VirtualFree unwires it) */
     unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
+    volatile LONG64 hz_write;          /* madeira-doge fence-chain 9: present # of the last blit/resolve that wrote it (0 = never) */
     obj_handle_t buffer;
     void *cpu;                 /* NULL for GPU-private */
     UINT64 size;
@@ -1911,6 +1929,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
 struct mad_exec {
     int fence_needed;
     obj_handle_t air_use[16]; unsigned n_air_use;   /* madeira-doge: dxbc-tex-use -- textures the trace-ps shaders sample, useResource'd per draw */
+    struct { obj_handle_t h; UINT32 usage; } hz[48]; unsigned nhz; unsigned hz_over;   /* madeira-doge fence-chain 9: GPU-written resources this draw/dispatch reaches through its tables */
     obj_handle_t tind_buf; UINT64 tind_off;   /* madeira-bcd: this indirect tessellation draw's mesh dispatch arguments */
     struct mad_resource *wr[64]; unsigned nwr; int wr_all;   /* ml1116: written since the last fence wait (mode 3) */   /* ml1111: fence-chain = 2: a barrier (or list start) was seen since the last wait */
     struct mad_queue *q;
@@ -2034,8 +2053,8 @@ static int g_fence_chain = -1;   /* ml1110: madeira.cfg fence-chain = 0 disables
 static volatile LONG64 g_presents_now, g_f0_quiet_until;
 static int mad_f0_quiet(void) { return g_fence_chain == 0 || g_presents_now < g_f0_quiet_until; }
 static obj_handle_t mad_enc_fence(struct mad_device *d) {
-    if (g_fence_chain < 0) { g_fence_chain = (int)mad_cfg_int_pe("fence-chain", 1); if (g_fence_chain < 0 || g_fence_chain > 8 || g_fence_chain == 4) g_fence_chain = 1;   /* ml1114: 2 was clamped to 1 in ml1110-ml1113 */
-                             d3d12_log("[madeira-d3d12] ml1110 fence-chain = %d (%s)\n", g_fence_chain, g_fence_chain == 8 ? "madeira-doge: mode 6, but a barrier batch of read->write transitions only (WAR) syncs nothing" : g_fence_chain == 7 ? "madeira-doge: mode 6, and a render pass waits at its FRAGMENT stage unless a pending encoder is compute or blit (vertex/tiling overlap the previous pass)" : g_fence_chain == 6 ? "ml1134: barrier-driven: an encoder waits for every pending encoder only after a ResourceBarrier, at a list start, or when it reuses a pending encoder's attachment; compute stays open across barriers" : g_fence_chain == 5 ? "ml1118: full chain; a render pass waits at its FRAGMENT stage unless a compute/blit encoder ran since the last vertex-stage wait" : g_fence_chain == 3 ? "ml1116: an encoder waits only after a barrier on a resource written since the last wait" : g_fence_chain == 2 ? "ml1111: an encoder waits only after a ResourceBarrier or at a list start" : g_fence_chain ? "every encoder waits for the previous one" : "NO inter-encoder fences: perf experiment"); }
+    if (g_fence_chain < 0) { g_fence_chain = (int)mad_cfg_int_pe("fence-chain", 1); if (g_fence_chain < 0 || g_fence_chain > 9 || g_fence_chain == 4) g_fence_chain = 1;   /* ml1114: 2 was clamped to 1 in ml1110-ml1113 */
+                             d3d12_log("[madeira-d3d12] ml1110 fence-chain = %d (%s)\n", g_fence_chain, g_fence_chain == 9 ? "madeira-doge: NO inter-encoder fences; every GPU-written resource a draw/dispatch reaches through its tables is declared to the encoder and Metal inserts the waits (DXBC backend)" : g_fence_chain == 8 ? "madeira-doge: mode 6, but a barrier batch of read->write transitions only (WAR) syncs nothing" : g_fence_chain == 7 ? "madeira-doge: mode 6, and a render pass waits at its FRAGMENT stage unless a pending encoder is compute or blit (vertex/tiling overlap the previous pass)" : g_fence_chain == 6 ? "ml1134: barrier-driven: an encoder waits for every pending encoder only after a ResourceBarrier, at a list start, or when it reuses a pending encoder's attachment; compute stays open across barriers" : g_fence_chain == 5 ? "ml1118: full chain; a render pass waits at its FRAGMENT stage unless a compute/blit encoder ran since the last vertex-stage wait" : g_fence_chain == 3 ? "ml1116: an encoder waits only after a barrier on a resource written since the last wait" : g_fence_chain == 2 ? "ml1111: an encoder waits only after a ResourceBarrier or at a list start" : g_fence_chain ? "every encoder waits for the previous one" : "NO inter-encoder fences: perf experiment"); }
     if (!g_fence_chain) return 0;
     if (!d->enc_fence) d->enc_fence = MTLDevice_newFence(d->mtl_device);
     return d->enc_fence;
@@ -2254,6 +2273,7 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
     if (!enc || !e->mode) return;   /* ml1136: the list's own mode */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
+    if (e->mode == 9) return;   /* madeira-doge fence-chain 9: Metal tracks the declared resources */
     if (e->mode == 6 || e->mode == 7 || e->mode == 8) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_RENDER, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
@@ -2282,6 +2302,7 @@ static void exec_fence_blit(struct mad_exec *e, obj_handle_t enc, int update) {
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
+    if (e->mode == 9) return;   /* madeira-doge fence-chain 9: Metal tracks the declared resources */
     if (e->mode == 6 || e->mode == 7 || e->mode == 8) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_BLIT, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
@@ -2298,6 +2319,7 @@ static void exec_fence_compute(struct mad_exec *e, obj_handle_t enc, int update)
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
+    if (e->mode == 9) return;   /* madeira-doge fence-chain 9: Metal tracks the declared resources */
     if (e->mode == 6 || e->mode == 7 || e->mode == 8) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_COMPUTE, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
@@ -6077,6 +6099,33 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
             InterlockedIncrement(&g_vis_fallback);
         }
 
+        if (e->mode == 9 && rg->type != MADEIRA_IR_AIR_CBV && rg->type != MADEIRA_IR_AIR_SAMPLER) {
+            /* madeira-doge fence-chain 9: PRECISE HAZARDS. No fence between encoders;
+             * instead every resource a draw or dispatch can reach through its tables
+             * that the GPU may have written recently is declared to the encoder
+             * (useResource), and Metal -- which tracks every resource this runtime
+             * allocates -- inserts the minimal wait itself. "Written recently" =
+             * created with RT/DS/UAV flags (written by passes and dispatches), or the
+             * destination of a blit/resolve within the last 3 presents (uploads: the
+             * blit declares its destination directly, the consumer must declare it
+             * too). Everything else is static data: no wait could ever be needed. */
+            struct mad_resource *hr = NULL;
+            InterlockedIncrement(&g_hz_lookups); g_f6_used = 1;
+            if (de.texture_view_id) hr = mad_vmap_res(d, de.texture_view_id);
+            else if (direct || de.gpu_va) { UINT64 hoff; hr = mad_resolve_address(d, direct ? direct : de.gpu_va, &hoff); }
+            if (hr && (hr->buffer || hr->texture)) {
+                LONG64 wf = __atomic_load_n(&hr->hz_write, __ATOMIC_RELAXED);
+                int hot = (hr->desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0
+                       || (wf && wf + 3 > (LONG64)g_presents_now);
+                if (hot) {
+                    obj_handle_t hh = hr->texture ? hr->texture : hr->buffer;
+                    UINT32 us = rg->type == MADEIRA_IR_AIR_UAV ? (WMTResourceUsageRead | WMTResourceUsageWrite) : WMTResourceUsageRead;
+                    unsigned hk;
+                    for (hk = 0; hk < e->nhz; hk++) if (e->hz[hk].h == hh) { e->hz[hk].usage |= us; break; }
+                    if (hk == e->nhz) { if (e->nhz < 48) { e->hz[e->nhz].h = hh; e->hz[e->nhz].usage = us; e->nhz++; } else e->hz_over++; }
+                }
+            }
+        }
         if (g_dump_tables)   /* ml1106 */
             d3d12_log("[capture-draw]   %s%u space%u -> %s word %u: va=0x%llx view=%llu meta=0x%llx direct=0x%llx flags=%#x\n",
                       rg->type == 0 ? "b" : rg->type == 1 ? "s" : rg->type == 2 ? "t" : "u", rg->lower_bound, rg->space,
@@ -7240,6 +7289,8 @@ tess_go:
     if (e->srv) MAD_USE(e->srv->buffer);
     if (e->smp) MAD_USE(e->smp->buffer);
     { unsigned au; for (au = 0; au < e->n_air_use; au++) MAD_USE(e->air_use[au]); e->n_air_use = 0; }   /* madeira-doge: dxbc-tex-use */
+    { unsigned hk; for (hk = 0; hk < e->nhz; hk++) MAD_USE_U(e->hz[hk].h, e->hz[hk].usage); if (e->nhz) InterlockedExchangeAdd(&g_hz_decl, (LONG)e->nhz); e->nhz = 0;
+      if (e->mode == 9 && e->pso->backend != MADEIRA_IR_BACKEND_AIRCONV) InterlockedIncrement(&g_hz_dxil); }   /* madeira-doge fence-chain 9 (a DXIL pipeline's tables are not walked here: undeclared) */
     if (gsemu || tv || e->pso->backend == MADEIRA_IR_BACKEND_AIRCONV) {   /* ml927: the object stage reads vertices and indices through the tables, not encoder bindings; ml1105: so does the DXBC vertex stage */
         for (i = 0; i < 16; i++) if (e->vb[i].res) MAD_USE(e->vb[i].res->buffer);
         if (e->ib) MAD_USE(e->ib->buffer);
@@ -7611,7 +7662,18 @@ static int exec_copy_compute(struct mad_exec *e, const struct mad_cmd *c) {
     InterlockedIncrement(&g_copy_compute_n);
     return 1;
 }
+static LONG g_hz_decl, g_hz_lookups, g_hz_dxil;   /* madeira-doge fence-chain 9 counters */
+static void mad_hz_stamp(struct mad_resource *r) { if (r) __atomic_store_n(&r->hz_write, (LONG64)g_presents_now + 1, __ATOMIC_RELAXED); }   /* madeira-doge fence-chain 9: written by the GPU now */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
+    switch (c->kind) {   /* madeira-doge fence-chain 9: the destination was written by the GPU this frame */
+    case MC_COPY_BB: mad_hz_stamp(c->u.bb.dst); break;
+    case MC_FILL_BB: mad_hz_stamp(c->u.fill.res); break;
+    case MC_FILL_TEX: mad_hz_stamp(c->u.filltex.res); break;
+    case MC_COPY_B2T: mad_hz_stamp(c->u.bt.tex); break;
+    case MC_COPY_T2B: mad_hz_stamp(c->u.bt.buf); break;
+    case MC_COPY_T2T: mad_hz_stamp(c->u.tt.dst); break;
+    default: break;
+    }
     if (exec_copy_compute(e, c)) return;   /* madeira-doge copy-compute */
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     switch (c->kind) {   /* ml1116: the destination is written */
@@ -8113,6 +8175,7 @@ static obj_handle_t mad_resolve_view(struct mad_resource *r, enum WMTPixelFormat
 
 static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     struct mad_resource *src = c->u.tt.src, *dst = c->u.tt.dst;
+    mad_hz_stamp(dst);   /* madeira-doge fence-chain 9 */
     struct WMTRenderPassInfo rpi;
     obj_handle_t enc, target = dst->texture, dview = 0;
     enum WMTPixelFormat spf = src->tex_pf;
@@ -8510,6 +8573,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         ur[nur].usage = (u); MAD_APPEND(&ur[nur]); nur++; } } while (0)
     if (e->srv) MAD_CUSE(e->srv->buffer, WMTResourceUsageRead);
     if (e->smp) MAD_CUSE(e->smp->buffer, WMTResourceUsageRead);
+    { unsigned hk; for (hk = 0; hk < e->nhz; hk++) MAD_CUSE(e->hz[hk].h, (enum WMTResourceUsage)e->hz[hk].usage); if (e->nhz) InterlockedExchangeAdd(&g_hz_decl, (LONG)e->nhz); e->nhz = 0; }   /* madeira-doge fence-chain 9 */
     for (i = e->l->nused > 64 ? e->l->nused - 64 : 0; i < e->l->nused; i++) {
         struct mad_resource *r = e->l->used[i];
         if (r) MAD_CUSE(r->texture ? r->texture : r->buffer, (enum WMTResourceUsage)(WMTResourceUsageRead | WMTResourceUsageWrite));
@@ -8684,7 +8748,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 InterlockedIncrement(&g_f8_skipped);
                 break;
             }
-            if (e.mode == 6 || e.mode == 7 || e.mode == 8) {   /* ml1134: see f6_begin */
+            if (e.mode == 6 || e.mode == 7 || e.mode == 8 || e.mode == 9) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
@@ -9049,9 +9113,10 @@ static void mad_perf_present(void) {
                 LONG ko = InterlockedExchange(&g_f6_kept_open, 0), jn = InterlockedExchange(&g_f6_joins, 0), rc = InterlockedExchange(&g_f6_rclose, 0);
                 LONG fw = InterlockedExchange(&g_f7_frag_waits, 0);   /* madeira-doge mode 7 */
                 LONG war = InterlockedExchange(&g_bc_war, 0), sk = InterlockedExchange(&g_f8_skipped, 0);   /* madeira-doge mode 8 */
+                LONG hzd = InterlockedExchange(&g_hz_decl, 0), hzl = InterlockedExchange(&g_hz_lookups, 0), hzx = InterlockedExchange(&g_hz_dxil, 0);   /* madeira-doge mode 9 */
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
-                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; mode 7 fragment-stage waits %.1f; WAR entries %.1f, mode 8 WAR-only batches skipped %.1f\n",
-                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, fw / np, war / np, sk / np);
+                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; mode 7 fragment-stage waits %.1f; WAR entries %.1f, mode 8 WAR-only batches skipped %.1f; mode 9 hazard lookups %.1f, declarations %.1f, DXIL draws undeclared %.1f\n",
+                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, fw / np, war / np, sk / np, hzl / np, hzd / np, hzx / np);
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
                 double np = (double)g_perf_presents;
@@ -10857,7 +10922,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         r->tview[k].tex = tex; r->tview[k].id = ti.gpu_resource_id;
         r->ntview = k + 1;   /* published last: a reader never sees a half-written entry */
         mad_tvh_add(r, k);   /* madeira-bcd tv-hash */
-        mad_vmap_put_locked(d, ti.gpu_resource_id, (UINT32)num, (UINT32)elem_off);
+        mad_vmap_put_locked_r(d, ti.gpu_resource_id, (UINT32)num, (UINT32)elem_off, r);
         mad_view_census("typed-buffer", r, r->ntview);
         if (said_ok++ < 12)
             d3d12_log("[madeira-d3d12] typed buffer view: fmt %u first %llu num %llu%s -> %ux1 texture buffer, element offset %llu\n",
@@ -10927,7 +10992,7 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
     r->xview[k].pf = (UINT)pf; r->xview[k].swz = swz;
     r->xview[k].tex = tex; r->xview[k].id = id;
     r->nxview = k + 1;
-    mad_vmap_put_locked(d, id, nsl ? nsl : 1, 0);
+    mad_vmap_put_locked_r(d, id, nsl ? nsl : 1, 0, r);
     mad_view_census("texture", r, r->nxview);
     LeaveCriticalSection(&d->view_lock);
     if (said++ < 24)
@@ -12736,7 +12801,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * draw. With the JIT no longer thrashing it was 34 of 36 samples taken
          * inside this DLL. */
         EnterCriticalSection(&d->view_lock);
-        mad_vmap_put_locked(d, r->gpu_resource_id, r->tex_layers ? r->tex_layers : 1, 0);
+        mad_vmap_put_locked_r(d, r->gpu_resource_id, r->tex_layers ? r->tex_layers : 1, 0, r);
         LeaveCriticalSection(&d->view_lock);
         r->name = is_depth ? "DepthTarget" : (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? "RenderTarget" : "Texture";
         r->is_depth = is_depth;
@@ -19520,7 +19585,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                               settle, (long)g_fault_nbad);
                 }
             }
-            if (want >= 1 && want <= 8 && want != 4 && want != g_fence_chain && g_fence_chain >= 0) {   /* madeira-doge: 7 and 8 are modes; 9 asks for 0 */
+            if (want >= 1 && want <= 9 && want != 4 && want != g_fence_chain && g_fence_chain >= 0) {   /* madeira-doge: 7, 8 and 9 are modes; 10 asks for 0 */
                 d3d12_log("[madeira-d3d12] ml1136 fence-chain %d -> %d at present #%llu\n", g_fence_chain, want, (unsigned long long)s->presents);
                 if (g_fence_chain == 0) {   /* madeira-bcd: leaving F0 -- forget its faults */
                     g_f0_quiet_until = (LONG64)s->presents + 8;
@@ -19531,7 +19596,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                     g_enc_labels = -1;   /* back to madeira.cfg encoder-labels */
                 }
                 g_fence_chain = want;
-            } else if (a.ret == 9 && g_fence_chain != 0 && g_fence_chain >= 0) {   /* 9 = request mode 0 (0 means "no request"; madeira-doge: was 7) */
+            } else if (a.ret == 10 && g_fence_chain != 0 && g_fence_chain >= 0) {   /* 10 = request mode 0 (0 means "no request"; madeira-doge: was 7) */
                 d3d12_log("[madeira-d3d12] ml1136 fence-chain %d -> 0 (NO fences, diagnostic) at present #%llu\n", g_fence_chain, (unsigned long long)s->presents);
                 g_fence_chain = 0;
             }
