@@ -1422,6 +1422,12 @@ jobs:
             echo "::warning::d3d11-src.dll missing: this IPA has only upstream's d3d11.dll (no SwapDeviceContextState); env.MADEIRA_D3D11_SRC = 1 does nothing"
           fi
 
+      # [trycs-x64]: RtlTryEnterCriticalSection's x64 export runs as x64 code
+      # (EXVS2 polls a held lock ~20M times a second across the emulator
+      # boundary); a held lock waits 64 pause rounds, then yields once.
+      - name: Patch ntdll so x64 TryEnterCriticalSection stays in x64
+        run: python3 tools/patch-ntdll-trycs-x64.py app/Madeira/arm64ec-windows/ntdll.dll
+
       # tools/fetch-vcruntime.md: the twelve VC++ runtime DLLs are Microsoft's
       # and are not redistributable under this project's license, so they are
       # gitignored and "you supply them yourself". Fetching them straight from
