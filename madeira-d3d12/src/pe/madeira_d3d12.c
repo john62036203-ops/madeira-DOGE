@@ -2273,7 +2273,7 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
     if (!enc || !e->mode) return;   /* ml1136: the list's own mode */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 9) return;   /* madeira-doge fence-chain 9: Metal tracks the declared resources */
+    if (e->mode == 9) { if (!update) e->f6_enc_synced = 1; return; }   /* madeira-doge fence-chain 9: Metal tracks the declared resources; the encoder counts as synced so barriers keep mode 6's structure (build 441 closed every render pass at every barrier: 443 encoders a frame) */
     if (e->mode == 6 || e->mode == 7 || e->mode == 8) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_RENDER, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
@@ -2302,7 +2302,7 @@ static void exec_fence_blit(struct mad_exec *e, obj_handle_t enc, int update) {
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 9) return;   /* madeira-doge fence-chain 9: Metal tracks the declared resources */
+    if (e->mode == 9) { if (!update) e->f6_enc_synced = 1; return; }   /* madeira-doge fence-chain 9: Metal tracks the declared resources; the encoder counts as synced so barriers keep mode 6's structure (build 441 closed every render pass at every barrier: 443 encoders a frame) */
     if (e->mode == 6 || e->mode == 7 || e->mode == 8) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_BLIT, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
@@ -2319,7 +2319,7 @@ static void exec_fence_compute(struct mad_exec *e, obj_handle_t enc, int update)
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 9) return;   /* madeira-doge fence-chain 9: Metal tracks the declared resources */
+    if (e->mode == 9) { if (!update) e->f6_enc_synced = 1; return; }   /* madeira-doge fence-chain 9: Metal tracks the declared resources; the encoder counts as synced so barriers keep mode 6's structure (build 441 closed every render pass at every barrier: 443 encoders a frame) */
     if (e->mode == 6 || e->mode == 7 || e->mode == 8) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_COMPUTE, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
