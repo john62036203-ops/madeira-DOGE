@@ -62,3 +62,9 @@ for cls in ['IClientUserMap','IClientFriendsMap','IClientUtilsMap','IClientAppsM
         print("\n==== %s ctor ref %#x, function start %s, callers %s"%(cls,r,hex(fs) if fs else None,[hex(c) for c in cs]))
         for c in cs[:6]:
             print("-- caller %#x"%c); print(disasm(c-24, 24+72))
+
+print("\n\n######## PASS 4: friends slots 4/5 wrappers, engine slot 13")
+fr=vtable('IClientFriendsMap'); eng=vtable('CSteamClient')
+for name,table,slot in [('engine',eng,13),('friends',fr,4),('friends',fr,5)]:
+    rva=struct.unpack_from('<Q',image,table+8*slot)[0]-base
+    print("\n==== %s slot %d rva %#x"%(name,slot,rva)); print(disasm(rva, 420))
