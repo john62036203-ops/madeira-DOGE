@@ -10407,20 +10407,16 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
  * method answered (first 3000 calls), to find the answer a game did not expect
  * (Monster Hunter Wilds demo stops right after handing one of our resources to
  * its own code, build 211). */
-/* madeira-doge efx-diag (madeira.cfg efx-diag = 1): logs what a GPU-driven effect
- * system hands back to the CPU -- copies into READBACK buffers, the words the CPU
- * then Maps, and every ExecuteIndirect -- to see why EXVS2 never issues its
- * particle draws here. */
-static int mad_efx_diag(void) {
-    static int on = -1;
-    if (on < 0) on = mad_cfg_int_pe("efx-diag", 0) ? 1 : 0;   /* diagnostic: 1 = log READBACK copies, the words the CPU maps from READBACK buffers and every ExecuteIndirect (first 60 each) */
-    return on;
-}
 static int mad_restrace(void) {
     static int on = -1;
     if (on < 0) { char v[4]; on = GetEnvironmentVariableA("MADEIRA_D3D12_RESTRACE", v, sizeof v) == 1 && v[0] == '1'; }
     if (!on) return 0;
     { static LONG n; return InterlockedIncrement(&n) <= 3000; }
+}
+static int mad_efx_diag(void) {   /* madeira-doge efx-diag: what a GPU-driven effect system hands back to the CPU (EXVS2 never issues its particle ExecuteIndirect here) */
+    static int on = -1;
+    if (on < 0) on = mad_cfg_int_pe("efx-diag", 0) ? 1 : 0;   /* diagnostic: 1 = log READBACK copies, the words the CPU maps from READBACK buffers and every ExecuteIndirect (first 60 each) */
+    return on;
 }
 
 static D3D12_RESOURCE_DESC1 * STDMETHODCALLTYPE res_GetDesc1(ID3D12Resource2 *This, D3D12_RESOURCE_DESC1 *ret) {
