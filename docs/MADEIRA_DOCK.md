@@ -481,3 +481,17 @@ credentials:
   ASan/UBSan and ThreadSanitizer (top-level windows only, one path lookup per
   process, frames and swapchains, capacity, the born-minimized restore and its
   switch), the driver's path form, and the wiring and glyph row.
+
+## Friends see what is played (madeira-doge)
+
+The headless client never sets a persona state, so a Dock session stayed
+offline to friends. `tools/patch-dock-presence.py` (applied to the Dock
+sources at build time) asks Valve's client, once it reports the account signed
+in, to go online through its own `IClientFriends::SetPersonaState`; the client
+already reports the game it launched, so friends then see "playing <game>".
+Only the January 2026 client (layout 202601) is supported; any other client or
+a method pointer that does not match skips the call and changes nothing else.
+
+`env.MADEIRA_DOCK_PRESENCE`: unset or `1` online (default), `3` away, `7`
+invisible, `0` leaves the persona state alone. `[dock-report] presence-before`
+and `presence-set` show the state before and the state asked for.
