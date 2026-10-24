@@ -504,6 +504,12 @@ jobs:
       - name: Patch wine so UDP broadcasts fan out to local sockets
         run: python3 tools/patch-wine-sock-bcast.py wine/dlls/ntdll/unix/socket.c
 
+      # [udp-bind]: a UDP socket bound to a LAN address is not pinned to that
+      # interface (IP_BOUND_IF), so the fan-out's loopback copy reaches it with
+      # Wi-Fi off (EXVS2 cabinet discovery in airplane mode, log 12:59:23).
+      - name: Patch wine so UDP binds to an interface address are not pinned to it
+        run: python3 tools/patch-wine-udp-bind-any.py wine/server/sock.c
+
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 

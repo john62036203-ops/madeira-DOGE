@@ -99,6 +99,12 @@ static ssize_t madeira_bcast_fanout( int fd, const struct msghdr *orig, int flag
             sent++;
             if (ret > best) best = ret;
         }
+        else if (__atomic_load_n( &calls, __ATOMIC_RELAXED ) < 4)
+        {   /* madeira-doge: which copy fails and why (airplane mode: utun/cellular copies, EHOSTUNREACH) */
+            const unsigned char *b = (const unsigned char *)&targets[i];
+            dprintf( 2, "[sock-bcast]   copy to %u.%u.%u.%u:%u failed: errno %d\n",
+                     b[0], b[1], b[2], b[3], ntohs( dst->sin_port ), errno );
+        }
     }
 
     n = __atomic_fetch_add( &calls, 1, __ATOMIC_RELAXED );
