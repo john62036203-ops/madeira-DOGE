@@ -189,7 +189,12 @@ def main():
         p = os.path.join(base, dll)
         if os.path.exists(p):
             patch_dll(p, todo)
-            if dll in BLOBS:
+            # Part 2 is OFF: build 454 crashed at start (log 2026-10-25 02:29): ARM64EC
+            # code (ucrtbase's CRT lock init) calls these exports through their
+            # x64 address, and the ARM64EC call checker only recognises the original
+            # FFS byte pattern; a redirected FFS made it take the x64 exit thunk
+            # before the emulator dispatcher exists (blr x16 = 0).
+            if dll in BLOBS and os.environ.get("MADEIRA_X64_FASTPATHS_PART2") == "1":
                 patch_blobs(p, BLOBS[dll])
         else:
             print("::warning::%s missing; skipped" % p)
