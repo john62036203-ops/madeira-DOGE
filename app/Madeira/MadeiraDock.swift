@@ -482,8 +482,20 @@ enum MadeiraDock {
     /// split at spaces and passed on as is, so quote characters would reach Wine
     /// literally, and none of these paths contains a space.
     static func launchArguments(width: Int, height: Int, installers: String? = nil) -> String {
-        guard let installers else { return "/desktop=madeira,\(width)x\(height) \(executable)" }
-        return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(executable)"
+        let host = executable + hostArguments
+        guard let installers else { return "/desktop=madeira,\(width)x\(height) \(host)" }
+        return "/desktop=madeira,\(width)x\(height) C:\\windows\\system32\\cmd.exe /c call \(installers) & \(host)"
+    }
+
+    /// madeira-doge: arguments on the host's own command line, which Valve's client
+    /// reads (tier0 CommandLine()). Without a Steam bootstrapper the client decides the
+    /// friends UI is off and holds the persona offline (CUserFriends +0x15: every
+    /// SetPersonaState is dropped; build 433 log 2026-10-24 15:06, no echo for the
+    /// account), so friends never saw a Dock session. "-friendsui" is the client's own
+    /// switch for "friends UI on". env.MADEIRA_DOCK_PRESENCE = 0 leaves it out.
+    static var hostArguments: String {
+        let presence = MadeiraConfig.get("env.MADEIRA_DOCK_PRESENCE")?.trimmingCharacters(in: .whitespaces)
+        return presence == "0" ? "" : " -friendsui"
     }
 
     /// Set on the main actor right before a Dock launch; read (and cleared) once by the

@@ -492,6 +492,10 @@ already reports the game it launched, so friends then see "playing <game>".
 Only the January 2026 client (layout 202601) is supported; any other client or
 a method pointer that does not match skips the call and changes nothing else.
 
+Without Steam's bootstrapper the client decides its friends UI is off and holds
+the persona offline, dropping every `SetPersonaState`; the app therefore starts the
+host with `-friendsui` (the client's own switch) unless presence is `0`.
+
 `env.MADEIRA_DOCK_PRESENCE`: unset or `1` online (default), `3` away, `7`
 invisible, `0` leaves the persona state alone. `[dock-report] presence-before`
 and `presence-set` show the state before and the state asked for.
