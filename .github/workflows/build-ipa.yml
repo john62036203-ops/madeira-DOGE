@@ -1428,6 +1428,12 @@ jobs:
       - name: Patch ntdll so x64 TryEnterCriticalSection stays in x64
         run: python3 tools/patch-ntdll-trycs-x64.py app/Madeira/arm64ec-windows/ntdll.dll
 
+      # [x64-fastpaths]: GetLastError / SetLastError / TlsGetValue as x64 code
+      # at their x64 exports (~750k emulator crossings a second in an EXVS2
+      # battle after trycs-x64).
+      - name: Patch ntdll/kernelbase so x64 GetLastError, SetLastError, TlsGetValue stay in x64
+        run: python3 tools/patch-pe-x64-fastpaths.py app/Madeira/arm64ec-windows
+
       # tools/fetch-vcruntime.md: the twelve VC++ runtime DLLs are Microsoft's
       # and are not redistributable under this project's license, so they are
       # gitignored and "you supply them yourself". Fetching them straight from
