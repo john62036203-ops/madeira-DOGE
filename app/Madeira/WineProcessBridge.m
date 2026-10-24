@@ -1161,6 +1161,17 @@ static void *wine_process_thread(void *arg) {
             if (aerr) LOG("AVAudioSession setCategory failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
             aerr = nil;
+            {
+                const char *io = getenv("MADEIRA_AUDIO_IO_MS");   /* speaker hardware buffer in ms (3..40); unset: the iOS default (about 21 ms). Lower cuts audio latency; pair it with env.MADEIRA_AUDIO_LEAD_MS. Set it in the game's own file */
+                int ms = io ? atoi(io) : 0;
+                if (ms >= 3 && ms <= 40) {
+                    NSError *ioerr = nil;
+                    [session setPreferredIOBufferDuration:ms / 1000.0 error:&ioerr];
+                    dprintf(STDERR_FILENO, "[audio] io-buffer asked %d ms -> %.1f ms%s%s\n", ms,
+                            session.IOBufferDuration * 1000.0, ioerr ? " error: " : "",
+                            ioerr ? ioerr.localizedDescription.UTF8String : "");
+                }
+            }
             [session setActive:YES error:&aerr];
             if (aerr) LOG("AVAudioSession setActive failed: %{public}s",
                           aerr.localizedDescription.UTF8String);

@@ -2848,6 +2848,23 @@ struct ContentView: View {
         runWineFullSequence(profile: entry)
     }
 
+    /// madeira-doge: frames the game layer may queue ahead of the screen. Each queued
+    /// frame is one more refresh between a button press and the picture; a light
+    /// game that already holds its frame rate gains input latency from 2. Read
+    /// after the game's own file is exported, every session (unset puts 3 back).
+    static func applyDrawableCount() {
+        let v = getenv("MADEIRA_DRAWABLE_COUNT").map { String(cString: $0) }   // 2: the game view keeps at most two frames queued (lower input latency); unset/3: as before. Set it in the game's own file
+        let n = (v == "2") ? 2 : 3
+        DispatchQueue.main.async {
+            let layer = MetalHostView.shared.metalLayer
+            let was = layer.maximumDrawableCount
+            layer.maximumDrawableCount = n
+            if v != nil || was != n {
+                LogStore.shared.log("[drawables] max=\(n) (was \(was))")
+            }
+        }
+    }
+
     /// madeira-bcd: LibraryPrefs' AVX, NVIDIA and Wine C++ runtime switches for a
     /// library launch, set again after LibraryEntry.applyEnvironment (which unsets
     /// what its own fields do not choose). For the Desktop entry too: Game details
@@ -2961,6 +2978,7 @@ struct ContentView: View {
                 // the game file LaunchRequest.apply exported (MadeiraConfig.applyGame).
                 _ = try? MadeiraConfig.applyGame(nil)
             }
+            Self.applyDrawableCount()
 
             // Step 1: Allocate JIT pool (BRK suspends entire process)
             // 128 MB was enough for cube but Thumper exhausts it (more PE
