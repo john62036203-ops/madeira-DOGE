@@ -18872,7 +18872,7 @@ static void mad_x64_stubs_install(void) {
     void *p_cds, *p_ghp, *p_gdesc, *p_ggva;
     if (!mad_cfg_int_pe("x64-api-stubs", 1)) return;   /* 1: CopyDescriptorsSimple, GetHeapProperties, GetDesc and GetGPUVirtualAddress run as x64 code (no emulator crossing); 0: native */
     if (g_sd_state < 0) mad_sync_diag_load();
-    if (g_sd_state > 0 || mad_restrace()) { d3d12_log("[madeira-d3d12] x64-api-stubs: off (desc-guard / restrace instrument the native entries)\n"); return; }
+    if ((g_sd_state > 0 && g_desc_guard) || mad_restrace()) { d3d12_log("[madeira-d3d12] x64-api-stubs: off (desc-guard / restrace instrument the native entries)\n"); return; }   /* build 448 gated on any sync diagnostic (fence-strict) and never installed */
     _Static_assert(sizeof(D3D12_RESOURCE_DESC) == 56, "GetDesc stub copies 56 bytes");
     _Static_assert(sizeof(D3D12_HEAP_PROPERTIES) == 20, "GetHeapProperties stub fills 20 bytes");
     page = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
