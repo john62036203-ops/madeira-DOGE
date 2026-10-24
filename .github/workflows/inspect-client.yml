@@ -5,6 +5,8 @@ name: Inspect Steam client
 on:
   push:
     branches: [inspect-client]
+permissions:
+  contents: write
 jobs:
   fetch:
     runs-on: ubuntu-latest
@@ -34,3 +36,5 @@ jobs:
           cd "$R" && git init -q -b inspect-results && git config user.name github-actions && git config user.email actions@github.com
           git add -A && git commit -qm "inspect ${{ github.run_number }}" && \
           git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" inspect-results 2>&1 | tail -2
+          echo "push=$?"
+          true
