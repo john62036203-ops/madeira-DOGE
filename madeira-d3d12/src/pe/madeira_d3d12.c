@@ -776,7 +776,8 @@ static void mad_acct_report(void) {
                       (long long)(g_cat_bytes[c] >> 20), g_cat_count[c], (long long)(g_cat_peak[c] >> 20));
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
-    d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+    d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB; gpu-store-pool: %lld fresh, %lld reused, %u regions, %lld MB decommitted and held\n",
+              g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20), (long long)g_gstore_fresh, (long long)g_gstore_reused, g_gstore_n, (long long)(g_gstore_held >> 20));
     if (g_defswap_n || g_defswap_bytes)   /* madeira-bcd default-buffer-swap (default-swap-mb/-kb or default-buffer-swap, opt-in) */
         d3d12_log("[madeira-d3d12] default-buffer-swap: %ld DEFAULT buffers on file-backed storage, %lld MB (inside the ml1154 count above)\n",
                   (long)g_defswap_n, (long long)(g_defswap_bytes >> 20));
@@ -1153,6 +1154,7 @@ struct mad_memheap;
 static void mad_pl_del(struct mad_memheap *h, struct mad_resource *r);
 struct mad_device;
 static void mad_mheap_reclaim(struct mad_device *d, int all);   /* ml1148 */
+static LONG64 g_gstore_reused, g_gstore_fresh, g_gstore_held; static unsigned g_gstore_n;   /* madeira-doge gpu-store-pool */
 struct mad_rootsig;
 static UINT mad_root_layout(const struct mad_rootsig *rs, UINT offsets[32]);
 static int mad_tiled_on(void);   /* d3d12-tiled-resources (opt-in), see TILED RESOURCES */
@@ -10459,6 +10461,63 @@ static void mad_hp_free_locked(struct mad_texheap *h, UINT64 off, UINT64 size) {
  * freed, first during a capture and then while the fence mode was switched;
  * heaps freed with placed resources still held by an in-flight command buffer
  * are the new lifetime in ml1145. */
+/* madeira-doge gpu-store-pool (default 1): the guest storage behind buffers Metal
+ * writes -- ml1154 upload-swap, default-swap and upload-heap-backing -- is never
+ * returned to the application. EXVS2 (2026-10-24): 德天使/正義 in the training
+ * stage, the TypedUAVLoad path and the NVIDIA-vendor path all died in
+ * nu::PageHeap's bucket pop with float garbage in the table, and every variant
+ * stopped with upload-swap = 0. GPU and CPU addresses are the same here: once a
+ * region was VirtualFree'd and the game's allocator had reused the page, a late
+ * GPU write through a stale descriptor (or a copy past a buffer's end) landed in
+ * the game's heap. Windows separates the two address spaces, so the same write
+ * only damages GPU memory there. Freed storage is DECOMMITTED (the GPU then
+ * faults on it, which the command-buffer error path logs) and the reservation is
+ * kept for the next storage request of the same or a smaller size. */
+#define MAD_GSTORE_CAP 512
+static struct mad_gstore { void *base; SIZE_T cap; int live; } g_gstore[MAD_GSTORE_CAP];
+static SRWLOCK g_gstore_lock = SRWLOCK_INIT;
+static int mad_gstore_on(void) {
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("gpu-store-pool", 1) ? 1 : 0;   /* 1: storage behind GPU-written buffers in guest memory is recycled inside the runtime, never returned to the game (stale GPU writes cannot reach its heap); 0: released as before */
+                  d3d12_log("[madeira-d3d12] gpu-store-pool = %d: freed buffer storage is %s\n", on, on ? "decommitted and kept for reuse (never returned to the application)" : "released to the application"); }
+    return on;
+}
+static void *mad_gstore_alloc(SIZE_T len) {
+    void *mem = NULL; unsigned i, best = ~0u;
+    if (!mad_gstore_on()) return VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    AcquireSRWLockExclusive(&g_gstore_lock);
+    for (i = 0; i < g_gstore_n; i++)
+        if (!g_gstore[i].live && g_gstore[i].cap >= len && (best == ~0u || g_gstore[i].cap < g_gstore[best].cap)) best = i;
+    if (best != ~0u) {
+        mem = VirtualAlloc(g_gstore[best].base, len, MEM_COMMIT, PAGE_READWRITE);
+        if (mem) { g_gstore[best].live = 1; InterlockedIncrement64(&g_gstore_reused); InterlockedExchangeAdd64(&g_gstore_held, -(LONG64)g_gstore[best].cap); }
+    }
+    if (!mem) {
+        mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (mem) {
+            InterlockedIncrement64(&g_gstore_fresh);
+            if (g_gstore_n < MAD_GSTORE_CAP) { g_gstore[g_gstore_n].base = mem; g_gstore[g_gstore_n].cap = len; g_gstore[g_gstore_n].live = 1; g_gstore_n++; }
+            else { static unsigned said; if (said++ < 2) d3d12_log("[madeira-d3d12] gpu-store-pool: table full (%u regions); this storage will be released when freed\n", (unsigned)MAD_GSTORE_CAP); }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_gstore_lock);
+    return mem;
+}
+static void mad_gstore_free(void *mem) {
+    unsigned i; int pooled = 0;
+    if (!mem) return;
+    if (mad_gstore_on()) {
+        AcquireSRWLockExclusive(&g_gstore_lock);
+        for (i = 0; i < g_gstore_n; i++)
+            if (g_gstore[i].base == mem) {
+                if (VirtualFree(mem, 0, MEM_DECOMMIT)) { g_gstore[i].live = 0; InterlockedExchangeAdd64(&g_gstore_held, (LONG64)g_gstore[i].cap); pooled = 1; }
+                else { g_gstore[i] = g_gstore[--g_gstore_n]; }   /* could not decommit: release it, forget it */
+                break;
+            }
+        ReleaseSRWLockExclusive(&g_gstore_lock);
+    }
+    if (!pooled) VirtualFree(mem, 0, MEM_RELEASE);
+}
 static void mad_mheap_reclaim(struct mad_device *d, int all) {
     obj_handle_t done_list[64]; void *done_mem[64]; unsigned nd = 0, i = 0;
     UINT64 done;
@@ -10472,7 +10531,7 @@ static void mad_mheap_reclaim(struct mad_device *d, int all) {
     LeaveCriticalSection(&d->heap_lock);
     for (i = 0; i < nd; i++) {
         if (done_list[i]) { mad_unresident(d, done_list[i]); NSObject_release(done_list[i]); }
-        if (done_mem[i]) VirtualFree(done_mem[i], 0, MEM_RELEASE);   /* ml1154: a file-backed CPU-visible buffer's storage */
+        if (done_mem[i]) mad_gstore_free(done_mem[i]);   /* ml1154: a file-backed CPU-visible buffer's storage; madeira-doge gpu-store-pool */
     }
 }
 static void mad_hp_reclaim_locked(struct mad_device *d) {
@@ -12607,13 +12666,13 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on() &&
             (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {   /* madeira-bcd readback-swap */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
-            void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            void *mem = mad_gstore_alloc(len);   /* madeira-doge gpu-store-pool */
             if (mem) {
                 UINT64 want = info.length;
                 info.length = len; info.memory.ptr = mem;
                 r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
                 if (r->buffer) { r->own_mem = mem; InterlockedExchangeAdd64(&g_upload_swap_bytes, (LONG64)len); InterlockedIncrement(&g_upload_swap_n); }
-                else { VirtualFree(mem, 0, MEM_RELEASE); info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; }
+                else { mad_gstore_free(mem); info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; }
                 {
                     static unsigned said;
                     if (said++ < 8)
@@ -12627,7 +12686,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             && info.length >= mad_default_swap_min() && mad_defswap_flags_ok(desc->Flags)
             && mad_defswap_room(info.length)) {   /* madeira-doge: default-swap-mb; madeira-bcd default-buffer-swap (flags, -max-mb) */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
-            void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            void *mem = mad_gstore_alloc(len);   /* madeira-doge gpu-store-pool */
             if (mem) {
                 UINT64 want = info.length;
                 info.length = len; info.memory.ptr = mem; info.options = WMTResourceStorageModeShared;
@@ -12642,7 +12701,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                     mad_dsw_track(mem, len, 1);   /* madeira-bcd default-buffer-swap residency census */
                     info.memory.ptr = NULL;   /* never CPU-visible to the application */
                 } else {
-                    VirtualFree(mem, 0, MEM_RELEASE);
+                    mad_gstore_free(mem);
                     info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; info.options = WMTResourceStorageModePrivate;
                 }
                 {
@@ -12819,7 +12878,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
         && desc->SizeInBytes && mad_upload_heap_backing_on()) {   /* madeira-doge upload-heap-backing */
         SIZE_T len = (SIZE_T)((desc->SizeInBytes + 0xffff) & ~(UINT64)0xffff);
         static unsigned said_u;
-        h->cpu_base = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        h->cpu_base = mad_gstore_alloc(len);   /* madeira-doge gpu-store-pool */
         if (h->cpu_base) { h->cpu_len = len; InterlockedExchangeAdd64(&g_uheap_bytes, (LONG64)len); InterlockedIncrement(&g_uheap_n); }
         if (said_u++ < 16)
             d3d12_log("[madeira-d3d12] upload-heap-backing: heap%u %llu KB type %u %s (%ld live, %lld MB)\n", h->serial,
