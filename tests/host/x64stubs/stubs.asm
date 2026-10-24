@@ -85,3 +85,94 @@ ggva:                                    ; GetGPUVirtualAddress(This)
     mov rax, [rcx + 0x44444444]
     ret
 ggva_end:
+
+; --- build 450: list-side entries -----------------------------------------
+; Markers: 0x77777777 = MAD_ROOT_PARAM_MAX, 0x88888888 = offsetof(mad_list, closed),
+; 0x99999999 = offsetof(mad_list, ncmds), 0xaaaaaaaa = offsetof(mad_list, ccap),
+; 0xbbbbbbbb = offsetof(mad_list, cmds), 0xcccccccc = sizeof(struct mad_cmd),
+; 0xdddddddd = MC_ROOT, 0xeeeeeeee = offsetof(mad_cmd, u.root.index), 0x12121212 = offsetof(mad_cmd, u.root.value)
+; 0x1313131313131313 = &g_scbv_on (8 bytes). The qword after each `jmp [rip+0]` holds the native entry.
+
+srdt:                                    ; SetGraphicsRootDescriptorTable(list, index, handle)
+    cmp edx, 0x77777777
+    jae .fb
+    cmp dword [rcx + 0x88888888], 0      ; closed
+    jne .fb
+    mov eax, [rcx + 0x99999999]          ; ncmds
+    cmp eax, [rcx + 0xaaaaaaaa]          ; ccap
+    jae .fb
+    mov r10, 0x1313131313131313
+    cmp dword [r10], 0                   ; g_scbv_on > 0 -> the native path records its table
+    jg .fb
+    mov r10, [rcx + 0xbbbbbbbb]          ; cmds
+    mov r11d, 0xcccccccc
+    imul r11, rax                        ; ncmds * sizeof cmd
+    add r10, r11                         ; c
+    inc dword [rcx + 0x99999999]         ; ncmds++
+    push rdi
+    mov rdi, r10
+    xor eax, eax
+    mov ecx, 0xcccccccc
+    rep stosb                            ; memset(c, 0, sizeof *c)
+    pop rdi
+    mov dword [r10], 0xdddddddd          ; c->kind = MC_ROOT
+    mov [r10 + 0xeeeeeeee], edx          ; c->u.root.index
+    mov [r10 + 0x12121212], r8           ; c->u.root.value
+    ret
+.fb:
+    jmp [rel .slot]
+.slot: dq 0
+srdt_end:
+
+cd:                                      ; CopyDescriptors(This, ndst, dsts, dst_sizes, [nsrc], [srcs], [src_sizes], [type])
+    cmp edx, 1
+    jne .fb
+    mov eax, [rsp+0x28]                  ; nsrc
+    cmp eax, 1
+    jne .fb
+    mov r10, [r8]                        ; dsts[0].ptr
+    mov r11, [rsp+0x30]
+    mov r11, [r11]                       ; srcs[0].ptr
+    test r10, r10
+    jz .ret
+    test r11, r11
+    jz .ret
+    mov eax, 1
+    test r9, r9
+    jz .dok
+    mov eax, [r9]                        ; dst_sizes[0]
+.dok:
+    mov edx, 1
+    mov rcx, [rsp+0x38]                  ; src_sizes
+    test rcx, rcx
+    jz .sok
+    mov edx, [rcx]
+.sok:
+    cmp eax, edx
+    cmova eax, edx                       ; take = min
+    test eax, eax
+    jz .ret
+    mov ecx, [rsp+0x40]                  ; type
+    mov r9d, 0x11111111
+    cmp ecx, 2
+    je .rtv
+    cmp ecx, 3
+    jne .have
+.rtv:
+    mov r9d, 0x22222222
+.have:
+    imul rax, r9
+    push rdi
+    push rsi
+    mov rdi, r10
+    mov rsi, r11
+    mov rcx, rax
+    rep movsb
+    pop rsi
+    pop rdi
+.ret:
+    ret
+.fb:
+    jmp [rel .slot]
+.slot: dq 0
+cd_end:
