@@ -1015,6 +1015,26 @@ static void madeira_audio_observers_install(void)
     });
 }
 
+extern void madeira_apply_drawable_count(void);   /* ContentView.swift (@_cdecl) */
+
+/* madeira-doge: per-game latency switches, read once the game's own env lines are
+ * exported (they are set further down wine_process_thread than the audio session's
+ * activation, so reading them there never saw a game's value). */
+static void madeira_apply_latency_switches(void)
+{
+    const char *io = getenv("MADEIRA_AUDIO_IO_MS");   /* speaker hardware buffer in ms (3..40); unset: the iOS default (about 21 ms). Lower cuts audio latency; pair it with env.MADEIRA_AUDIO_LEAD_MS. Set it in the game's own file */
+    int ms = io ? atoi(io) : 0;
+    if (ms >= 3 && ms <= 40) {
+        NSError *ioerr = nil;
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        [session setPreferredIOBufferDuration:ms / 1000.0 error:&ioerr];
+        dprintf(STDERR_FILENO, "[audio] io-buffer asked %d ms -> %.1f ms%s%s\n", ms,
+                session.IOBufferDuration * 1000.0, ioerr ? " error: " : "",
+                ioerr ? ioerr.localizedDescription.UTF8String : "");
+    }
+    madeira_apply_drawable_count();
+}
+
 static void *wine_process_thread(void *arg) {
     @autoreleasepool {
         /* Perf: the guest main thread runs ON this pthread. Promote to
@@ -1161,17 +1181,6 @@ static void *wine_process_thread(void *arg) {
             if (aerr) LOG("AVAudioSession setCategory failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
             aerr = nil;
-            {
-                const char *io = getenv("MADEIRA_AUDIO_IO_MS");   /* speaker hardware buffer in ms (3..40); unset: the iOS default (about 21 ms). Lower cuts audio latency; pair it with env.MADEIRA_AUDIO_LEAD_MS. Set it in the game's own file */
-                int ms = io ? atoi(io) : 0;
-                if (ms >= 3 && ms <= 40) {
-                    NSError *ioerr = nil;
-                    [session setPreferredIOBufferDuration:ms / 1000.0 error:&ioerr];
-                    dprintf(STDERR_FILENO, "[audio] io-buffer asked %d ms -> %.1f ms%s%s\n", ms,
-                            session.IOBufferDuration * 1000.0, ioerr ? " error: " : "",
-                            ioerr ? ioerr.localizedDescription.UTF8String : "");
-                }
-            }
             [session setActive:YES error:&aerr];
             if (aerr) LOG("AVAudioSession setActive failed: %{public}s",
                           aerr.localizedDescription.UTF8String);
@@ -1457,6 +1466,7 @@ static void *wine_process_thread(void *arg) {
                     LOG("game config env: %{public}s=%{public}s", k.UTF8String, v.UTF8String);
                     fprintf(stderr, "[madeira-env] game %s=%s\n", k.UTF8String, v.UTF8String);
                 }
+                madeira_apply_latency_switches();   /* madeira-doge: after the game's own env lines */
                 {   /* madeira-doge: extra drive letters. env.MADEIRA_DRIVE_G = C:\Some\Folder in a
                      * game's settings links dosdevices/g: to that folder under drive_c, so G:\x
                      * opens C:\Some\Folder\x (Gundam EXVS2 IB keeps its 29\ data on G:\ and F:\

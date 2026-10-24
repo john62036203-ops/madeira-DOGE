@@ -1324,7 +1324,22 @@ static NTSTATUS ios_create_stream(void *args) {
     /* Ring capacity: the requested buffer duration (100ns units), floor
      * 100ms so a slow FEX-translated mixer has slack. */
     dur_frames = (uint64_t)(p->duration > 0 ? p->duration : 0) * s->sample_rate / 10000000ull;
-    if (dur_frames < s->sample_rate / 10) dur_frames = s->sample_rate / 10;
+    {   /* madeira-doge: the 100 ms floor is also the latency a client that fills its
+         * whole buffer adds (FAudio: Mega Man X Legacy Collection asked 30 ms and the
+         * ring swung 256..4800 frames). MADEIRA_AUDIO_RING_MS lowers or raises it. */
+        static int floor_ms = -1;
+        if (floor_ms < 0) {
+            const char *e = getenv("MADEIRA_AUDIO_RING_MS");   /* smallest audio ring in ms (10..1000, default 100); a game asking for more keeps its own size. Lower cuts the latency of games that fill their whole buffer; set it in the game's own file */
+            int v = e ? atoi(e) : 0;
+            floor_ms = (v >= 10 && v <= 1000) ? v : 100;
+            if (e) fprintf(stderr, "[ios_audio] ring floor %d ms (env.MADEIRA_AUDIO_RING_MS)\n", floor_ms);
+        }
+        if (dur_frames < (uint64_t)s->sample_rate * floor_ms / 1000) dur_frames = (uint64_t)s->sample_rate * floor_ms / 1000;
+    }
+    {   /* one period of slack beyond the client's own size, so the lead pacing never starves it */
+        uint64_t per = (uint64_t)(p->period > 0 ? p->period : 100000) * s->sample_rate / 10000000ull;
+        if (dur_frames < 2 * per) dur_frames = 2 * per;
+    }
     if (dur_frames > s->sample_rate * 4) dur_frames = s->sample_rate * 4;
     s->buffer_frames = (UINT32)dur_frames;
     free(s->ring);
