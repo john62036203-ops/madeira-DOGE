@@ -450,7 +450,8 @@ static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins,
  * between, and what a state-aware wait rule would have needed at each
  * barrier-caused sync of mode 6; attachment bytes loaded / cleared / stored in
  * 1 of 16 frames, with what happens NEXT to each stored attachment in its list. */
-enum { BC_RAR, BC_RAW_ATT, BC_RAW_COPY, BC_RAW_UAV, BC_ALL, BC_NONE = 255 };
+enum { BC_RAR, BC_RAW_ATT, BC_RAW_COPY, BC_RAW_UAV, BC_ALL, BC_WAR = 6, BC_NONE = 255 };   /* madeira-doge: BC_WAR = read state -> write state, counted apart (mode 8 skips it) */
+static LONG g_bc_war, g_f8_skipped;   /* madeira-doge mode 8 */
 static LONG g_bc_ent[5], g_f7_bsync, g_f7_none, g_f7_subset, g_f7_all;
 static LONG64 g_f7_fw6, g_f7_fwr;
 static LONG64 g_ac_load, g_ac_clear, g_ac_store, g_ac_st_cleared, g_ac_st_read, g_ac_st_rebound, g_ac_st_write, g_ac_st_none;
@@ -1655,7 +1656,7 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT64 off; enum WMTIndexType type; } ib;
         struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; UINT size; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
-        struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*) */
+        struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; UINT8 rank; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*); madeira-doge mode 8: rank = strongest class over every entry (0 none/RAR, 1 WAR, 2 RAW, 3 WAW/COMMON/alias) */
         struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared */
         struct { UINT vcount, icount, vstart, istart; } draw;
         struct { UINT icount, inst, start; INT base; UINT istart; } drawi;
@@ -2033,8 +2034,8 @@ static int g_fence_chain = -1;   /* ml1110: madeira.cfg fence-chain = 0 disables
 static volatile LONG64 g_presents_now, g_f0_quiet_until;
 static int mad_f0_quiet(void) { return g_fence_chain == 0 || g_presents_now < g_f0_quiet_until; }
 static obj_handle_t mad_enc_fence(struct mad_device *d) {
-    if (g_fence_chain < 0) { g_fence_chain = (int)mad_cfg_int_pe("fence-chain", 1); if (g_fence_chain < 0 || g_fence_chain > 7 || g_fence_chain == 4) g_fence_chain = 1;   /* ml1114: 2 was clamped to 1 in ml1110-ml1113 */
-                             d3d12_log("[madeira-d3d12] ml1110 fence-chain = %d (%s)\n", g_fence_chain, g_fence_chain == 7 ? "madeira-doge: mode 6, and a render pass waits at its FRAGMENT stage unless a pending encoder is compute or blit (vertex/tiling overlap the previous pass)" : g_fence_chain == 6 ? "ml1134: barrier-driven: an encoder waits for every pending encoder only after a ResourceBarrier, at a list start, or when it reuses a pending encoder's attachment; compute stays open across barriers" : g_fence_chain == 5 ? "ml1118: full chain; a render pass waits at its FRAGMENT stage unless a compute/blit encoder ran since the last vertex-stage wait" : g_fence_chain == 3 ? "ml1116: an encoder waits only after a barrier on a resource written since the last wait" : g_fence_chain == 2 ? "ml1111: an encoder waits only after a ResourceBarrier or at a list start" : g_fence_chain ? "every encoder waits for the previous one" : "NO inter-encoder fences: perf experiment"); }
+    if (g_fence_chain < 0) { g_fence_chain = (int)mad_cfg_int_pe("fence-chain", 1); if (g_fence_chain < 0 || g_fence_chain > 8 || g_fence_chain == 4) g_fence_chain = 1;   /* ml1114: 2 was clamped to 1 in ml1110-ml1113 */
+                             d3d12_log("[madeira-d3d12] ml1110 fence-chain = %d (%s)\n", g_fence_chain, g_fence_chain == 8 ? "madeira-doge: mode 6, but a barrier batch of read->write transitions only (WAR) syncs nothing" : g_fence_chain == 7 ? "madeira-doge: mode 6, and a render pass waits at its FRAGMENT stage unless a pending encoder is compute or blit (vertex/tiling overlap the previous pass)" : g_fence_chain == 6 ? "ml1134: barrier-driven: an encoder waits for every pending encoder only after a ResourceBarrier, at a list start, or when it reuses a pending encoder's attachment; compute stays open across barriers" : g_fence_chain == 5 ? "ml1118: full chain; a render pass waits at its FRAGMENT stage unless a compute/blit encoder ran since the last vertex-stage wait" : g_fence_chain == 3 ? "ml1116: an encoder waits only after a barrier on a resource written since the last wait" : g_fence_chain == 2 ? "ml1111: an encoder waits only after a ResourceBarrier or at a list start" : g_fence_chain ? "every encoder waits for the previous one" : "NO inter-encoder fences: perf experiment"); }
     if (!g_fence_chain) return 0;
     if (!d->enc_fence) d->enc_fence = MTLDevice_newFence(d->mtl_device);
     return d->enc_fence;
@@ -2253,7 +2254,7 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
     if (!enc || !e->mode) return;   /* ml1136: the list's own mode */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 6 || e->mode == 7) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134; madeira-doge mode 7 */
+    if (e->mode == 6 || e->mode == 7 || e->mode == 8) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_RENDER, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
@@ -2281,7 +2282,7 @@ static void exec_fence_blit(struct mad_exec *e, obj_handle_t enc, int update) {
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 6 || e->mode == 7) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134; madeira-doge mode 7 */
+    if (e->mode == 6 || e->mode == 7 || e->mode == 8) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_BLIT, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
@@ -2297,7 +2298,7 @@ static void exec_fence_compute(struct mad_exec *e, obj_handle_t enc, int update)
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 6 || e->mode == 7) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134; madeira-doge mode 7 */
+    if (e->mode == 6 || e->mode == 7 || e->mode == 8) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_COMPUTE, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
@@ -8679,7 +8680,11 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                     exec_end(&e);
                 }
             }
-            if (e.mode == 6 || e.mode == 7) {   /* ml1134: see f6_begin */
+            if (e.mode == 8 && c->u.barrier.rank <= 1) {   /* madeira-doge mode 8: a batch of read->write (WAR) transitions only: no sync, encoders stay open */
+                InterlockedIncrement(&g_f8_skipped);
+                break;
+            }
+            if (e.mode == 6 || e.mode == 7 || e.mode == 8) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
@@ -9043,9 +9048,10 @@ static void mad_perf_present(void) {
                 LONG b = InterlockedExchange(&g_f6_begins, 0), sy = InterlockedExchange(&g_f6_synced, 0), at = InterlockedExchange(&g_f6_att_sync, 0);
                 LONG ko = InterlockedExchange(&g_f6_kept_open, 0), jn = InterlockedExchange(&g_f6_joins, 0), rc = InterlockedExchange(&g_f6_rclose, 0);
                 LONG fw = InterlockedExchange(&g_f7_frag_waits, 0);   /* madeira-doge mode 7 */
+                LONG war = InterlockedExchange(&g_bc_war, 0), sk = InterlockedExchange(&g_f8_skipped, 0);   /* madeira-doge mode 8 */
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
-                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; mode 7 fragment-stage waits %.1f\n",
-                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, fw / np);
+                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; mode 7 fragment-stage waits %.1f; WAR entries %.1f, mode 8 WAR-only batches skipped %.1f\n",
+                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, fw / np, war / np, sk / np);
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
                 double np = (double)g_perf_presents;
@@ -17749,7 +17755,8 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             r = (struct mad_resource *)b[i].Transition.pResource;
             /* ml1137: COMMON on either side and any write after are "wait for everything" */
             if (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) cls = BC_RAR;
-            else if (!as || (as & W) || !bs) cls = BC_ALL;
+            else if (!as || !bs) cls = BC_ALL;
+            else if (as & W) cls = (bs & W) ? BC_ALL : BC_WAR;   /* madeira-doge: a reader -> writer transition is WAR, a writer -> writer one WAW */
             else if (!(bs & W)) cls = BC_RAR;
             else if (!(bs & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE))) cls = BC_RAW_ATT;
             else if (bs == D3D12_RESOURCE_STATE_COPY_DEST) cls = BC_RAW_COPY;
@@ -17757,6 +17764,11 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
         } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
             r = (struct mad_resource *)b[i].UAV.pResource;
             cls = BC_RAW_UAV;   /* UAV accesses happen only in compute and render encoders */
+        }
+        {   /* madeira-doge mode 8: the strongest class of the whole batch, overflow included */
+            UINT8 rk = cls == BC_ALL ? 3 : cls == BC_WAR ? 1 : cls == BC_RAR ? 0 : 2;
+            if (rk > c->u.barrier.rank) c->u.barrier.rank = rk;
+            if (cls == BC_WAR) { InterlockedIncrement(&g_bc_war); cls = BC_ALL; }   /* the ml1137 census and modes 2-7 see it as before */
         }
         if (!r) {
             c->u.barrier.all = 1;
@@ -19508,7 +19520,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                               settle, (long)g_fault_nbad);
                 }
             }
-            if (want >= 1 && want <= 7 && want != 4 && want != g_fence_chain && g_fence_chain >= 0) {   /* madeira-doge: 7 is a mode now; 8 asks for 0 */
+            if (want >= 1 && want <= 8 && want != 4 && want != g_fence_chain && g_fence_chain >= 0) {   /* madeira-doge: 7 and 8 are modes; 9 asks for 0 */
                 d3d12_log("[madeira-d3d12] ml1136 fence-chain %d -> %d at present #%llu\n", g_fence_chain, want, (unsigned long long)s->presents);
                 if (g_fence_chain == 0) {   /* madeira-bcd: leaving F0 -- forget its faults */
                     g_f0_quiet_until = (LONG64)s->presents + 8;
@@ -19519,7 +19531,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                     g_enc_labels = -1;   /* back to madeira.cfg encoder-labels */
                 }
                 g_fence_chain = want;
-            } else if (a.ret == 8 && g_fence_chain != 0 && g_fence_chain >= 0) {   /* 8 = request mode 0 (0 means "no request"; madeira-doge: was 7) */
+            } else if (a.ret == 9 && g_fence_chain != 0 && g_fence_chain >= 0) {   /* 9 = request mode 0 (0 means "no request"; madeira-doge: was 7) */
                 d3d12_log("[madeira-d3d12] ml1136 fence-chain %d -> 0 (NO fences, diagnostic) at present #%llu\n", g_fence_chain, (unsigned long long)s->presents);
                 g_fence_chain = 0;
             }

@@ -218,13 +218,14 @@ struct SessionPanelView: View {
                         Text("F1").tag(1)
                         Text("F6").tag(6)
                         Text("F7").tag(7)
+                        Text("F8").tag(8)
                         Text("F5").tag(5)
                         Text("F0").tag(0)
                     }
                     .pickerStyle(.segmented)
                     .onChange(of: fenceMode) { _, mode in
                         FPSOverlayFenceMode.current = mode
-                        madeira_set_fence_mode(Int32(mode == 0 ? 8 : mode))
+                        madeira_set_fence_mode(Int32(mode == 0 ? 9 : mode))
                         LogStore.shared.log("[hud] madeira-bcd: GPU sync F\(mode) from the Session panel")
                     }
                 } header: {

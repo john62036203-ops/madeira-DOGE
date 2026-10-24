@@ -4323,9 +4323,9 @@ struct LibraryHUD: View {
                     LabeledContent("GPU sync") {
                         Picker("GPU sync", selection: Binding(get: { fenceMode }, set: { mode in
                             fenceMode = mode; FPSOverlayFenceMode.current = mode
-                            madeira_set_fence_mode(Int32(mode == 0 ? 8 : mode))
+                            madeira_set_fence_mode(Int32(mode == 0 ? 9 : mode))
                         })) {
-                            Text("F1").tag(1); Text("F6").tag(6); Text("F7").tag(7); Text("F5").tag(5); Text("F0").tag(0)
+                            Text("F1").tag(1); Text("F6").tag(6); Text("F7").tag(7); Text("F8").tag(8); Text("F5").tag(5); Text("F0").tag(0)
                         }.pickerStyle(.segmented).frame(maxWidth: 220)
                     }
                     Text("Both apply to Direct3D 12 games only. Capture writes the render passes of the next frame to Documents/capture and its draw list to the log. GPU sync: F1 makes every pass wait for the one before (the default), F6 waits only where the game's barriers ask, F5 makes render passes wait at the fragment stage, F0 has no sync at all (expect flicker; for tests).")
