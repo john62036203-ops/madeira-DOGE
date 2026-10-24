@@ -155,7 +155,7 @@ struct GameProfile {
     /// fence-chain: F1 = every GPU pass waits for the one before (accurate,
     /// default); F6 = only where the game's barriers say so (the GPU overlaps
     /// work; the overlay's F pill switches the same thing live).
-    static let gpuSyncChoices: [(String, String)] = [("", "Every pass (F1, default)"), ("6", "Barriers only (F6)")]
+    static let gpuSyncChoices: [(String, String)] = [("", "Every pass (F1, default)"), ("6", "Barriers only (F6)"), ("7", "Barriers only, fragment-stage waits (F7)")]
     /// env.MADEIRA_FRAMEGEN: MetalFX frame interpolation in the present path
     /// (tools/patch-dxmt-framegen.py), D3D11 and D3D12 alike.
     static let frameGenChoices: [(String, String)] = [("", "Off"), ("1", "MetalFX 2× (experimental)")]

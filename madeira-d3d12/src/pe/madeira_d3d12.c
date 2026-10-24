@@ -2033,8 +2033,8 @@ static int g_fence_chain = -1;   /* ml1110: madeira.cfg fence-chain = 0 disables
 static volatile LONG64 g_presents_now, g_f0_quiet_until;
 static int mad_f0_quiet(void) { return g_fence_chain == 0 || g_presents_now < g_f0_quiet_until; }
 static obj_handle_t mad_enc_fence(struct mad_device *d) {
-    if (g_fence_chain < 0) { g_fence_chain = (int)mad_cfg_int_pe("fence-chain", 1); if (g_fence_chain < 0 || g_fence_chain > 6 || g_fence_chain == 4) g_fence_chain = 1;   /* ml1114: 2 was clamped to 1 in ml1110-ml1113 */
-                             d3d12_log("[madeira-d3d12] ml1110 fence-chain = %d (%s)\n", g_fence_chain, g_fence_chain == 6 ? "ml1134: barrier-driven: an encoder waits for every pending encoder only after a ResourceBarrier, at a list start, or when it reuses a pending encoder's attachment; compute stays open across barriers" : g_fence_chain == 5 ? "ml1118: full chain; a render pass waits at its FRAGMENT stage unless a compute/blit encoder ran since the last vertex-stage wait" : g_fence_chain == 3 ? "ml1116: an encoder waits only after a barrier on a resource written since the last wait" : g_fence_chain == 2 ? "ml1111: an encoder waits only after a ResourceBarrier or at a list start" : g_fence_chain ? "every encoder waits for the previous one" : "NO inter-encoder fences: perf experiment"); }
+    if (g_fence_chain < 0) { g_fence_chain = (int)mad_cfg_int_pe("fence-chain", 1); if (g_fence_chain < 0 || g_fence_chain > 7 || g_fence_chain == 4) g_fence_chain = 1;   /* ml1114: 2 was clamped to 1 in ml1110-ml1113 */
+                             d3d12_log("[madeira-d3d12] ml1110 fence-chain = %d (%s)\n", g_fence_chain, g_fence_chain == 7 ? "madeira-doge: mode 6, and a render pass waits at its FRAGMENT stage unless a pending encoder is compute or blit (vertex/tiling overlap the previous pass)" : g_fence_chain == 6 ? "ml1134: barrier-driven: an encoder waits for every pending encoder only after a ResourceBarrier, at a list start, or when it reuses a pending encoder's attachment; compute stays open across barriers" : g_fence_chain == 5 ? "ml1118: full chain; a render pass waits at its FRAGMENT stage unless a compute/blit encoder ran since the last vertex-stage wait" : g_fence_chain == 3 ? "ml1116: an encoder waits only after a barrier on a resource written since the last wait" : g_fence_chain == 2 ? "ml1111: an encoder waits only after a ResourceBarrier or at a list start" : g_fence_chain ? "every encoder waits for the previous one" : "NO inter-encoder fences: perf experiment"); }
     if (!g_fence_chain) return 0;
     if (!d->enc_fence) d->enc_fence = MTLDevice_newFence(d->mtl_device);
     return d->enc_fence;
@@ -2092,12 +2092,13 @@ static obj_handle_t f6_fence(struct mad_queue *q, unsigned idx) {
     return q->f6_pool[idx];
 }
 /* One encodeCommands call for all of an encoder's fence operations (a chain). */
-static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigned nwait, obj_handle_t update) {
+static LONG g_f7_frag_waits;   /* madeira-doge mode 7: render passes that waited at the fragment stage only */
+static void f6_encode_st(obj_handle_t enc, int kind, const obj_handle_t *f, unsigned nwait, obj_handle_t update, enum WMTRenderStages wait_stages) {
     union f6_op ops[48];
     unsigned i, n = 0;
     memset(ops, 0, sizeof ops);
     for (i = 0; i < nwait && n < 47; i++, n++) {
-        if (kind == F6_RENDER) { ops[n].r.type = WMTRenderCommandWaitForFence; ops[n].r.fence = f[i]; ops[n].r.stages = (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject); }
+        if (kind == F6_RENDER) { ops[n].r.type = WMTRenderCommandWaitForFence; ops[n].r.fence = f[i]; ops[n].r.stages = wait_stages; }
         else if (kind == F6_BLIT) { ops[n].b.type = WMTBlitCommandWaitForFence; ops[n].b.fence = f[i]; }
         else { ops[n].c.type = WMTComputeCommandWaitForFence; ops[n].c.fence = f[i]; }
     }
@@ -2112,6 +2113,9 @@ static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigne
     if (kind == F6_RENDER) MTLRenderCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&ops[0]);
     else if (kind == F6_BLIT) MTLBlitCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&ops[0]);
     else MTLComputeCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&ops[0]);
+}
+static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigned nwait, obj_handle_t update) {
+    f6_encode_st(enc, kind, f, nwait, update, (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject));
 }
 static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
     struct mad_queue *q = e->q;
@@ -2137,9 +2141,26 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
     }
     if (need) { e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0; }
     if (need) {
+        /* madeira-doge: fence-chain = 7. Mode 6 waits at the VERTEX stage, so the
+         * next pass's vertex and tiling work idles until the previous pass's
+         * fragments are stored -- the boundary cost a tile-based GPU pays most
+         * (EXVS2: 52 encoders a frame, GPU 22-28 ms with waits, 10-13 ms with
+         * none, 15:11/15:14 logs). What a render pass consumes from an earlier
+         * RENDER pass is read in its fragment stage (sampled textures, blends),
+         * so the wait moves to the fragment stage -- mode 5's rule -- unless a
+         * pending encoder is compute or blit (skinning, culling, indirect
+         * arguments, uploads: vertex-stage consumers) or the device fence is in
+         * the set (another queue/batch: unknown). Hazard it does not cover: a
+         * vertex shader sampling the previous pass's target. */
+        enum WMTRenderStages st = (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject);
+        if (e->mode == 7 && kind == F6_RENDER && !(e->f6_list_start && q->device->enc_fence)) {
+            int frag = 1;
+            for (i = 0; i < q->f6_npend; i++) if (q->f6_pend[i].kind != F6_RENDER) { frag = 0; break; }
+            if (frag) { st = WMTRenderStageFragment; InterlockedIncrement(&g_f7_frag_waits); }
+        }
         if (e->f6_list_start && q->device->enc_fence) waits[nw++] = q->device->enc_fence;
         for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
-        f6_encode(enc, kind, waits, nw, 0);
+        f6_encode_st(enc, kind, waits, nw, 0, st);
         InterlockedExchangeAdd(&g_fence_waits, (LONG)nw);
         q->f6_npend = 0; e->f6_sync_needed = 0; e->f6_list_start = 0; e->f6_enc_synced = 1;
         InterlockedIncrement(&g_f6_synced);
@@ -2232,7 +2253,7 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
     if (!enc || !e->mode) return;   /* ml1136: the list's own mode */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 6) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134 */
+    if (e->mode == 6 || e->mode == 7) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_RENDER, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
@@ -2260,7 +2281,7 @@ static void exec_fence_blit(struct mad_exec *e, obj_handle_t enc, int update) {
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 6) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134 */
+    if (e->mode == 6 || e->mode == 7) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_BLIT, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
@@ -2276,7 +2297,7 @@ static void exec_fence_compute(struct mad_exec *e, obj_handle_t enc, int update)
     if (!enc || !e->mode) return;   /* ml1136 */
     fence = mad_enc_fence_obj(e->q->device);
     if (!fence) return;
-    if (e->mode == 6) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134 */
+    if (e->mode == 6 || e->mode == 7) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134; madeira-doge mode 7 */
     if (!update) f6_drain(e, F6_COMPUTE, enc);   /* ml1136 */
     if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
@@ -8658,7 +8679,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                     exec_end(&e);
                 }
             }
-            if (e.mode == 6) {   /* ml1134: see f6_begin */
+            if (e.mode == 6 || e.mode == 7) {   /* ml1134: see f6_begin; madeira-doge mode 7 */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
@@ -9021,9 +9042,10 @@ static void mad_perf_present(void) {
                 double np = (double)g_perf_presents;
                 LONG b = InterlockedExchange(&g_f6_begins, 0), sy = InterlockedExchange(&g_f6_synced, 0), at = InterlockedExchange(&g_f6_att_sync, 0);
                 LONG ko = InterlockedExchange(&g_f6_kept_open, 0), jn = InterlockedExchange(&g_f6_joins, 0), rc = InterlockedExchange(&g_f6_rclose, 0);
+                LONG fw = InterlockedExchange(&g_f7_frag_waits, 0);   /* madeira-doge mode 7 */
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
-                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins\n",
-                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np);
+                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; mode 7 fragment-stage waits %.1f\n",
+                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, fw / np);
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
                 double np = (double)g_perf_presents;
@@ -19486,7 +19508,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                               settle, (long)g_fault_nbad);
                 }
             }
-            if (want >= 1 && want <= 6 && want != 4 && want != g_fence_chain && g_fence_chain >= 0) {
+            if (want >= 1 && want <= 7 && want != 4 && want != g_fence_chain && g_fence_chain >= 0) {   /* madeira-doge: 7 is a mode now; 8 asks for 0 */
                 d3d12_log("[madeira-d3d12] ml1136 fence-chain %d -> %d at present #%llu\n", g_fence_chain, want, (unsigned long long)s->presents);
                 if (g_fence_chain == 0) {   /* madeira-bcd: leaving F0 -- forget its faults */
                     g_f0_quiet_until = (LONG64)s->presents + 8;
@@ -19497,7 +19519,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                     g_enc_labels = -1;   /* back to madeira.cfg encoder-labels */
                 }
                 g_fence_chain = want;
-            } else if (a.ret == 7 && g_fence_chain != 0 && g_fence_chain >= 0) {   /* 7 = request mode 0 (0 means "no request") */
+            } else if (a.ret == 8 && g_fence_chain != 0 && g_fence_chain >= 0) {   /* 8 = request mode 0 (0 means "no request"; madeira-doge: was 7) */
                 d3d12_log("[madeira-d3d12] ml1136 fence-chain %d -> 0 (NO fences, diagnostic) at present #%llu\n", g_fence_chain, (unsigned long long)s->presents);
                 g_fence_chain = 0;
             }
