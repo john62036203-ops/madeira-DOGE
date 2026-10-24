@@ -510,6 +510,12 @@ jobs:
       - name: Patch wine so UDP binds to an interface address are not pinned to it
         run: python3 tools/patch-wine-udp-bind-any.py wine/server/sock.c
 
+      # [poll-yield]: a locally answered zero-timeout wait yields one poll in
+      # poll-yield-every (4) instead of 64 (EXVS2 polls a handle 7M times a
+      # second in some battle phases).
+      - name: Patch wine so zero-timeout polls yield more often
+        run: python3 tools/patch-wine-poll-yield.py wine/dlls/ntdll/unix/sync.c
+
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 
