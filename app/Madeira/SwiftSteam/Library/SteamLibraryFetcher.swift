@@ -128,9 +128,17 @@ class SteamLibraryFetcher {
             if changed == 0 { break }
         }
         let resolved = app.inheritDepots(from: owners)
-        let missing = app.depots.filter { eligible($0) && $0.fromApp != nil && $0.publicManifestID == nil }
-        SteamLog.event("[steam-shared] app=\(appID) owners=\(visited.count - 1) resolved=\(resolved) missing=\(missing.count)")
-        guard missing.isEmpty else { throw SteamFileError.invalid("Steam did not provide required shared content metadata. Refresh and retry the download.") }
+        let unresolved = app.depots.filter { eligible($0) && $0.fromApp != nil && $0.publicManifestID == nil }
+        // madeira-doge: a shared depot still without a public manifest after its
+        // owner was asked is content nobody can install (Mega Man X Legacy Collection 2
+        // lists an "Unused" depot 906639 from its soundtrack DLC app 906630, which
+        // Steam describes with no manifest, or not at all to a non-owner); Valve's
+        // client skips such depots and installDepots() leaves them out too. A failed
+        // request still throws above, so a transient Steam error does not get here.
+        let skipped = unresolved.map { "\($0.depotID)<\($0.fromApp!)\(owners[$0.fromApp!] == nil ? ":undescribed" : "")" }
+        SteamLog.event("[steam-shared] app=\(appID) owners=\(visited.count - 1) resolved=\(resolved) missing=0"
+                       + (skipped.isEmpty ? "" : " skipped-no-manifest=\(skipped.joined(separator: ","))"))
+        guard !app.installDepots().isEmpty else { throw SteamFileError.invalid("Steam did not provide required shared content metadata. Refresh and retry the download.") }
         // The direct owner of each selected shared depot, for its install
         // record. Metadata only; Valve still decides access and launch readiness.
         for id in Set(app.installDepots().compactMap(\.fromApp)).subtracting([appID]).sorted() {
