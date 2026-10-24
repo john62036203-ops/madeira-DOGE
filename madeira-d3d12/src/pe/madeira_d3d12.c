@@ -450,7 +450,8 @@ static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins,
  * between, and what a state-aware wait rule would have needed at each
  * barrier-caused sync of mode 6; attachment bytes loaded / cleared / stored in
  * 1 of 16 frames, with what happens NEXT to each stored attachment in its list. */
-enum { BC_RAR, BC_RAW_ATT, BC_RAW_COPY, BC_RAW_UAV, BC_ALL, BC_WAR = 6, BC_NONE = 255 };   /* madeira-doge: BC_WAR = read state -> write state, counted apart (mode 8 skips it) */
+enum { BC_RAR, BC_RAW_ATT, BC_RAW_COPY, BC_RAW_UAV, BC_ALL, BC_WAR = 6, BC_WAR_ATT = 7, BC_NONE = 255 };   /* madeira-doge: BC_WAR = read state -> write state (BC_WAR_ATT: the writer is a render target / depth write), counted apart (mode 8 skips it; list-hoist reads it); everywhere else both are BC_ALL */
+#define BC_FOLD(c) ((c) == BC_WAR || (c) == BC_WAR_ATT ? BC_ALL : (c))
 static LONG g_bc_war, g_f8_skipped;   /* madeira-doge mode 8 */
 static LONG g_bc_ent[5], g_f7_bsync, g_f7_none, g_f7_subset, g_f7_all;
 static LONG64 g_f7_fw6, g_f7_fwr;
@@ -1930,6 +1931,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
 /* ---- execution: replaying a list into Metal encoders -------------------- */
 struct mad_exec {
     int fence_needed;
+    UINT8 hoist;                /* madeira-doge list-hoist: 0 in-order replay, 1 the compute/copy pass, 2 the graphics pass */
     obj_handle_t air_use[16]; unsigned n_air_use;   /* madeira-doge: dxbc-tex-use -- textures the trace-ps shaders sample, useResource'd per draw */
     struct { obj_handle_t h; UINT32 usage; } hz[48]; unsigned nhz; unsigned hz_over;   /* madeira-doge fence-chain 9: GPU-written resources this draw/dispatch reaches through its tables */
     int renc_retained;          /* madeira-doge pass-carry: renc holds our own retain (the ExecuteCommandLists autorelease pool that made it has drained) */
@@ -2260,7 +2262,7 @@ static void f7_need(struct mad_exec *e, UINT8 cls, const struct mad_resource *r)
 static void f7_census_barrier(struct mad_exec *e, const struct mad_cmd *c) {
     unsigned k;
     for (k = 0; k < c->u.barrier.n; k++) {
-        UINT8 cls = c->u.barrier.cls[k];
+        UINT8 cls = BC_FOLD(c->u.barrier.cls[k]);
         if (cls < 5) InterlockedIncrement(&g_bc_ent[cls]);
         f7_need(e, cls, c->u.barrier.res[k]);
     }
@@ -2374,7 +2376,7 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
             break;
         case MC_BARRIER:
             for (k = 0; k < c->u.barrier.n; k++)
-                if (c->u.barrier.res[k] == r) { cls = rebound ? &g_ac_st_rebound : c->u.barrier.cls[k] == BC_ALL ? &g_ac_st_write : &g_ac_st_read; goto done; }
+                if (c->u.barrier.res[k] == r) { cls = rebound ? &g_ac_st_rebound : BC_FOLD(c->u.barrier.cls[k]) == BC_ALL ? &g_ac_st_write : &g_ac_st_read; goto done; }
             break;
         case MC_COPY_T2T: case MC_RESOLVE:
             if (c->u.tt.src == r) { cls = &g_ac_st_read; goto done; }
@@ -2458,6 +2460,83 @@ static void exec_end(struct mad_exec *e) {
  * perf-pass-split frames. */
 static LONG g_pass_carried, g_pass_carry_resumed, g_pass_carry_dropped;
 static int g_pass_carry = -1;
+/* madeira-doge list-hoist: EXVS2 records, per object, copy -> dispatch -> draw
+ * into the same list, so the G-buffer render pass is ended and reopened for
+ * every object (capture enc-timeline: 45-53 encoders per frame, ~160 MB of
+ * attachment stores and reloads). A list whose copies and dispatches come
+ * after a draw is replayed in two passes: first its compute stream (compute
+ * pipeline / root signature / root arguments / root constants, heaps,
+ * dispatches, copies, fills, barriers), then its graphics stream (everything
+ * else, heaps and barriers again), so every render pass of the list runs
+ * unbroken. The move is refused (in-order replay, counted by reason) when a
+ * barrier after the first draw shows a hazard the move would break:
+ *   att: a render target / depth read afterwards (BC_RAW_ATT) -- a dispatch
+ *        or copy might be the reader;
+ *   war: a resource read then written by a copy / dispatch (BC_WAR) -- the
+ *        writer would run before the reading draw;
+ *   waw: a render-target-capable texture written twice, or a COMMON / aliasing
+ *        / overflow batch (BC_ALL);
+ * or when a copy / fill after the first draw touches a render-target-capable
+ * texture. list-hoist = 2 moves regardless (experiment). */
+static LONG g_hoist_lists, g_hoist_moved, g_hoist_nogain, g_hoist_fb_att, g_hoist_fb_war, g_hoist_fb_waw, g_hoist_fb_copy;
+static int g_list_hoist = -1;
+static int mad_hoist_rt_tex(const struct mad_resource *r) {
+    return r && r->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+           (r->desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+}
+/* which pass a command belongs to: 1 compute/copy, 2 graphics, 3 both */
+static int mad_hoist_class(const struct mad_cmd *c) {
+    switch (c->kind) {
+    case MC_HEAPS: case MC_BARRIER: return 3;
+    case MC_PSO: return c->u.pso && c->u.pso->is_compute ? 1 : 2;
+    case MC_CBV_LATCH: return c->u.latch.bp == 1 ? 1 : 2;
+    case MC_CROOTSIG: case MC_CROOT: case MC_CROOT_CONST:
+    case MC_DISPATCH: case MC_DISPATCH_INDIRECT:
+    case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX:
+        return 1;
+    default: return 2;
+    }
+}
+/* 1 when the list is worth and safe to replay in two passes */
+static int mad_hoist_plan(const struct mad_list *l) {
+    unsigned i, k; int seen_draw = 0, gain = 0, att = 0, war = 0, waw = 0, cp = 0;
+    if (g_list_hoist < 0) g_list_hoist = mad_cfg_int_pe("list-hoist", 1);   /* 1: a list's dispatches and copies run before its draws when its barriers show no hazard, so its render passes are not ended per object; 2: always (ignores the hazard check); 0: in-order replay */
+    if (!g_list_hoist) return 0;
+    for (i = 0; i < l->ncmds; i++) {
+        const struct mad_cmd *c = &l->cmds[i];
+        switch (c->kind) {
+        case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: seen_draw = 1; break;
+        case MC_DISPATCH: case MC_DISPATCH_INDIRECT: if (seen_draw) gain++; break;
+        case MC_COPY_BB: if (seen_draw) gain++; break;
+        case MC_FILL_BB: if (seen_draw) gain++; break;
+        case MC_COPY_B2T: case MC_COPY_T2B: if (seen_draw) { gain++; if (mad_hoist_rt_tex(c->u.bt.tex)) cp++; } break;
+        case MC_COPY_T2T: if (seen_draw) { gain++; if (mad_hoist_rt_tex(c->u.tt.dst) || mad_hoist_rt_tex(c->u.tt.src)) cp++; } break;
+        case MC_FILL_TEX: if (seen_draw) { gain++; if (mad_hoist_rt_tex(c->u.filltex.res)) cp++; } break;
+        case MC_BARRIER:
+            if (!seen_draw) break;
+            for (k = 0; k < c->u.barrier.n; k++) {
+                UINT8 cls = c->u.barrier.cls[k];
+                if (cls == BC_RAW_ATT) att++;
+                else if (cls == BC_WAR) war++;
+                else if (cls == BC_ALL && mad_hoist_rt_tex(c->u.barrier.res[k])) waw++;
+            }
+            if (c->u.barrier.all && c->u.barrier.cls_noref == BC_ALL) waw++;
+            break;
+        default: break;
+        }
+    }
+    if (!gain) { InterlockedIncrement(&g_hoist_nogain); return 0; }
+    if (g_list_hoist < 2) {
+        if (att) InterlockedIncrement(&g_hoist_fb_att);
+        if (war) InterlockedIncrement(&g_hoist_fb_war);
+        if (waw) InterlockedIncrement(&g_hoist_fb_waw);
+        if (cp) InterlockedIncrement(&g_hoist_fb_copy);
+        if (att || war || waw || cp) return 0;
+    }
+    InterlockedIncrement(&g_hoist_lists);
+    InterlockedExchangeAdd(&g_hoist_moved, (LONG)gain);
+    return 1;
+}
 static void mad_carry_end(struct mad_queue *q) {
     if (!q || !q->carry_valid) return;
     q->carry_valid = 0;
@@ -8736,8 +8815,17 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     }
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    {
+    int hoist = mad_hoist_plan(l), pass;   /* madeira-doge list-hoist */
+    for (pass = 0; pass < (hoist ? 2 : 1); pass++) {
+    e.hoist = hoist ? (UINT8)(pass + 1) : 0;
+    if (pass == 1) {   /* the graphics pass begins behind everything the compute pass encoded */
+        if (e.cenc || e.benc) { g_enc_why = "hoist"; exec_end(&e); }
+        e.fence_needed = 1; e.f6_sync_needed = 1;
+    }
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
+        if (e.hoist && !(mad_hoist_class(c) & e.hoist)) continue;
         e.cur = i;   /* ml1137 */
         if (g_capture_on) mad_capture_log_op(c);   /* madeira-bcd */
         switch (c->kind) {
@@ -8825,7 +8913,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 break;
             }
             if (e.mode == 6 || e.mode == 7 || e.mode == 8 || e.mode == 9) {   /* ml1134: see f6_begin */
-                f7_census_barrier(&e, c);   /* ml1137: counts only */
+                if (e.hoist != 2) f7_census_barrier(&e, c);   /* ml1137: counts only (list-hoist: once per barrier) */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
                 if (g_barrier_blit_open < 0) g_barrier_blit_open = mad_cfg_int_pe("barrier-blit-open", 1) ? 1 : 0;   /* 1: a ResourceBarrier leaves an open blit encoder open (its copies run in order); EXVS2's particle lists alternate copy / barrier / copy, one encoder per copy */
@@ -8892,6 +8980,9 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
     }
+    }
+    e.hoist = 0;
+    }
     if (g_pass_carry < 0) g_pass_carry = mad_cfg_int_pe("pass-carry", 1) ? 1 : 0;   /* 1: a render pass still open when a command list ends stays open for the next list of the batch (no attachment store/load at the list boundary); 0: every list ends its pass */
     if (g_pass_carry && e.renc && !e.benc && !e.cenc && !e.npend && !e.nic && !g_pps_active && !g_capture_on && e.cb == q->open_cb) {
         if (!q->carry) q->carry = calloc(1, sizeof *q->carry);
@@ -8932,6 +9023,9 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                       InterlockedExchange(&g_pass_rts_null_kept, 0), InterlockedExchange(&g_blit_barrier_kept, 0),
                       InterlockedExchange(&g_pass_carried, 0), InterlockedExchange(&g_pass_carry_resumed, 0), InterlockedExchange(&g_pass_carry_dropped, 0),
                       InterlockedExchange(&g_cd_kept_open, 0), InterlockedExchange(&g_cd_kept_pending, 0));
+            d3d12_log("[madeira-d3d12] list-hoist (%d) in those lists: %ld lists replayed compute-first (%ld dispatches/copies moved ahead of draws), %ld had nothing after a draw; refused for: render-target read %ld, read-then-write %ld, write-write/COMMON %ld, copy of a render target %ld\n",
+                      g_list_hoist, InterlockedExchange(&g_hoist_lists, 0), InterlockedExchange(&g_hoist_moved, 0), InterlockedExchange(&g_hoist_nogain, 0),
+                      InterlockedExchange(&g_hoist_fb_att, 0), InterlockedExchange(&g_hoist_fb_war, 0), InterlockedExchange(&g_hoist_fb_waw, 0), InterlockedExchange(&g_hoist_fb_copy, 0));
             if (g_ind_clamp_n)
                 d3d12_log("[madeira-d3d12] ind-count-clamp: %ld ExecuteIndirect(s) with a count buffer clamped, %ld records, in those lists\n",
                           InterlockedExchange(&g_ind_clamp_n, 0), InterlockedExchange(&g_ind_clamp_recs, 0));
@@ -17910,7 +18004,7 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             /* ml1137: COMMON on either side and any write after are "wait for everything" */
             if (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) cls = BC_RAR;
             else if (!as || !bs) cls = BC_ALL;
-            else if (as & W) cls = (bs & W) ? BC_ALL : BC_WAR;   /* madeira-doge: a reader -> writer transition is WAR, a writer -> writer one WAW */
+            else if (as & W) cls = (bs & W) ? BC_ALL : !(as & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE)) ? BC_WAR_ATT : BC_WAR;   /* madeira-doge: a reader -> writer transition is WAR, a writer -> writer one WAW */
             else if (!(bs & W)) cls = BC_RAR;
             else if (!(bs & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE))) cls = BC_RAW_ATT;
             else if (bs == D3D12_RESOURCE_STATE_COPY_DEST) cls = BC_RAW_COPY;
@@ -17920,11 +18014,12 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             cls = BC_RAW_UAV;   /* UAV accesses happen only in compute and render encoders */
         }
         {   /* madeira-doge mode 8: the strongest class of the whole batch, overflow included */
-            UINT8 rk = cls == BC_ALL ? 3 : cls == BC_WAR ? 1 : cls == BC_RAR ? 0 : 2;
+            UINT8 rk = cls == BC_ALL ? 3 : (cls == BC_WAR || cls == BC_WAR_ATT) ? 1 : cls == BC_RAR ? 0 : 2;
             if (rk > c->u.barrier.rank) c->u.barrier.rank = rk;
-            if (cls == BC_WAR) { InterlockedIncrement(&g_bc_war); cls = BC_ALL; }   /* the ml1137 census and modes 2-7 see it as before */
+            if (cls == BC_WAR || cls == BC_WAR_ATT) InterlockedIncrement(&g_bc_war);   /* kept in cls[] for list-hoist; the ml1137 census and modes 2-7 fold it to BC_ALL (BC_FOLD) */
         }
         if (!r) {
+            cls = BC_FOLD(cls);
             c->u.barrier.all = 1;
             if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
             continue;
