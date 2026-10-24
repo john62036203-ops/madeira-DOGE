@@ -3746,7 +3746,8 @@ struct ContentView: View {
             // kernel32.dll, status c000007b" three seconds into the launch).
             if MadeiraDock.noDesktop && DockInstallers.script == nil {
                 setenv("MADEIRA_EXE", MadeiraDock.executable, 1)
-                unsetenv("MADEIRA_ARGS")
+                let hostArgs = MadeiraDock.hostArguments.trimmingCharacters(in: .whitespaces)
+                if hostArgs.isEmpty { unsetenv("MADEIRA_ARGS") } else { setenv("MADEIRA_ARGS", hostArgs, 1) }
                 unsetenv("MADEIRA_DESKTOP")
                 logStore.log("[madeira-dock] no virtual desktop for this launch (\(MadeiraConfig.gameValue("dock-no-desktop") != nil ? "this game's config" : "Settings"))")
             } else {
