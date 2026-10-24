@@ -3610,7 +3610,7 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
     exec_drop_pending(e, i);
 }
 
-/* madeira-doge clear-defer (default 1): a clear of a target that is NOT an
+/* madeira-doge clear-defer (default 0 since build 446): a clear of a target that is NOT an
  * attachment of the open pass no longer ends that pass, and a pending clear
  * is no longer flushed as a clear-only pass when some OTHER pass begins: it
  * stays pending until its target is bound (then it is the pass's load action,
@@ -3621,7 +3621,7 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
  * restores the old order. */
 static int g_clear_defer = -1;
 static LONG g_cd_kept_open, g_cd_kept_pending;
-static int exec_clear_defer(void) { if (g_clear_defer < 0) g_clear_defer = mad_cfg_int_pe("clear-defer", 1) ? 1 : 0; return g_clear_defer; }   /* 1: a clear of a target the open pass does not draw into leaves the pass open and stays pending until that target is bound, read by a dispatch/copy, or the list ends; 0: the clear ends the pass */
+static int exec_clear_defer(void) { if (g_clear_defer < 0) g_clear_defer = mad_cfg_int_pe("clear-defer", 0) ? 1 : 0; return g_clear_defer; }   /* 1: a clear of a target the open pass does not draw into leaves the pass open and stays pending until that target is bound, read by a dispatch/copy, or the list ends (EXVS2 build 446: the mech-select lightning overlay read a target before its deferred clear -- off); 0: the clear ends the pass */
 static int exec_is_attachment(const struct mad_exec *e, const struct mad_resource *r) {
     unsigned k;
     if (!e->renc || !r) return 0;
