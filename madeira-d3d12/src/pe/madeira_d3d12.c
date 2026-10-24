@@ -10407,6 +10407,15 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
  * method answered (first 3000 calls), to find the answer a game did not expect
  * (Monster Hunter Wilds demo stops right after handing one of our resources to
  * its own code, build 211). */
+/* madeira-doge efx-diag (madeira.cfg efx-diag = 1): logs what a GPU-driven effect
+ * system hands back to the CPU -- copies into READBACK buffers, the words the CPU
+ * then Maps, and every ExecuteIndirect -- to see why EXVS2 never issues its
+ * particle draws here. */
+static int mad_efx_diag(void) {
+    static int on = -1;
+    if (on < 0) on = mad_cfg_int_pe("efx-diag", 0) ? 1 : 0;   /* diagnostic: 1 = log READBACK copies, the words the CPU maps from READBACK buffers and every ExecuteIndirect (first 60 each) */
+    return on;
+}
 static int mad_restrace(void) {
     static int on = -1;
     if (on < 0) { char v[4]; on = GetEnvironmentVariableA("MADEIRA_D3D12_RESTRACE", v, sizeof v) == 1 && v[0] == '1'; }
@@ -11700,6 +11709,15 @@ static HRESULT STDMETHODCALLTYPE res_Map(ID3D12Resource *This, UINT sub,
     InterlockedIncrement(&r->mapped);
     if (data) *data = r->cpu;
     if (mad_restrace()) d3d12_log("[restrace] %p Map sub %u -> %p\n", This, sub, r->cpu);
+    if (mad_efx_diag() && r->heap == D3D12_HEAP_TYPE_READBACK) {   /* madeira-doge efx-diag: what the CPU reads back */
+        static LONG said;
+        if (InterlockedIncrement(&said) <= 60) {
+            const UINT32 *w = (const UINT32 *)r->cpu; unsigned i, nz = 0, n = (unsigned)(r->size / 4 < 4096 ? r->size / 4 : 4096);
+            for (i = 0; i < n; i++) if (w[i]) nz++;
+            d3d12_log("[efx-diag] Map READBACK r#%u (%llu KB): first words %08x %08x %08x %08x %08x %08x %08x %08x; %u of the first %u words non-zero\n",
+                      r->serial, (unsigned long long)(r->size >> 10), w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], nz, n);
+        }
+    }
     return S_OK;
 }
 static void STDMETHODCALLTYPE res_Unmap(ID3D12Resource *This, UINT sub, const D3D12_RANGE *written) {
@@ -17722,6 +17740,13 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(ID3D12GraphicsCommandList *Th
     }
     if (count_buf && said_count++ < 1)
         d3d12_log("[madeira-d3d12] ExecuteIndirect: count buffer seen (%u records max); honoured through ind-count-clamp when the helper kernels are available\n", max_count);
+    if (mad_efx_diag()) {   /* madeira-doge efx-diag */
+        static LONG said_ei;
+        if (InterlockedIncrement(&said_ei) <= 40)
+            d3d12_log("[efx-diag] ExecuteIndirect kind %d: %u records, args r#%u +%llu, count %s r#%u +%llu\n", (int)kind, max_count,
+                      ((struct mad_resource *)args)->serial, (unsigned long long)args_off, count_buf ? "buffer" : "none",
+                      count_buf ? ((struct mad_resource *)count_buf)->serial : 0u, (unsigned long long)count_off);
+    }
     if (max_count > 8192) { if (said_big++ < 4) d3d12_log("[madeira-d3d12] ExecuteIndirect: %u records capped at 8192\n", max_count); max_count = 8192; }
     if (g_scbv_on > 0) mad_scbv_latch((struct mad_list *)This, kind == MC_DISPATCH_INDIRECT ? 1 : 0);   /* madeira-bcd static-cbv */
     c = mad_list_push((struct mad_list *)This, kind);
@@ -17744,6 +17769,12 @@ static void STDMETHODCALLTYPE list_CopyBufferRegion(ID3D12GraphicsCommandList *T
     c = mad_list_push(l, MC_COPY_BB);
     if (!c) return;
     c->u.bb.dst = d; c->u.bb.doff = dst_off; c->u.bb.src = s; c->u.bb.soff = src_off; c->u.bb.len = len;
+    if (mad_efx_diag() && d->heap == D3D12_HEAP_TYPE_READBACK) {   /* madeira-doge efx-diag */
+        static LONG said_rb;
+        if (InterlockedIncrement(&said_rb) <= 60)
+            d3d12_log("[efx-diag] CopyBufferRegion -> READBACK r#%u +%llu from r#%u (%s, heap %u, flags %#x) +%llu, %llu bytes\n", d->serial, (unsigned long long)dst_off,
+                      s->serial, s->name ? s->name : "?", (unsigned)s->heap, (unsigned)s->desc.Flags, (unsigned long long)src_off, (unsigned long long)len);
+    }
 }
 static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *This,
         const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z,
