@@ -11,7 +11,7 @@ for i in range(sections):
     h = opt+optional_size+i*40; va, size, offset = struct.unpack_from('<III', raw, h+12); image[va:va+size] = raw[offset:offset+size]
 def cs(t):
     e=image.find(b'\0',t,t+200); return image[t:e].decode('latin1') if e>t else ''
-for rva in (0x974d8c0, 0x974d8b8, 0x974d8c8, 0x9755788, 0x974d8d0):
+for rva in (0x174d8c0, 0x174d8b8, 0x174d8c8, 0x1755788, 0x174d8d0):
     q=struct.unpack_from('<Q',image,rva)[0]
     print(hex(rva), hex(q), repr(cs(q-base)) if base<=q<base+image_size else '(runtime)')
 for rva in (0x1285b40, 0x1285b70, 0x1285bc8, 0x12ed1a0, 0x12efa08, 0x1145f20, 0x1285b20, 0x1285b30):
