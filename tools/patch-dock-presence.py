@@ -21,7 +21,8 @@ check and launch are untouched either way.
 
 env.MADEIRA_DOCK_PRESENCE: unset or 1 = online (default), 3 = away,
 7 = invisible (signed in, not shown), 0 = do not touch the persona state.
-Report fields: presence-before (state the client had), presence-set.
+Report fields: presence-before (state the client had), presence-step (the state
+passed through when it already had the requested one), presence-set, presence-after.
 
 Usage: patch-dock-presence.py madeira-dock/src/session.c (idempotent)
 """
@@ -51,9 +52,22 @@ static void madeira_presence(HMODULE module, void *engine, int32_t user, int32_t
     if (!dock_method_is((uintptr_t)module, friends, 4, 0x768a20) ||
         !dock_method_is((uintptr_t)module, friends, 5, 0x848460)) { o->event("presence-abi-mismatch", 5); return; }
     void **f = *(void ***)friends;
-    o->event("presence-before", ((madeira_get_persona_fn)f[4])(friends));
+    int32_t before = ((madeira_get_persona_fn)f[4])(friends);
+    o->event("presence-before", before);
+    /* The headless client already holds "online" locally (build 430 log,
+     * 2026-10-24 13:51: presence-before=1), so asking for the same state was a
+     * no-op and Steam was never told. Step through another state first so the
+     * client sees a real change and sends it to Steam. */
+    if (before == (int32_t)state) {
+        int32_t step = state == 7 ? 1 : 7;
+        ((madeira_set_persona_fn)f[5])(friends, step);
+        o->event("presence-step", step);
+        o->sleep_ms(1500);
+    }
     ((madeira_set_persona_fn)f[5])(friends, (int32_t)state);
     o->event("presence-set", (int32_t)state);
+    o->sleep_ms(500);
+    o->event("presence-after", ((madeira_get_persona_fn)f[4])(friends));
 }
 
 ''' + anchor_fn
