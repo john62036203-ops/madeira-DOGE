@@ -475,6 +475,7 @@ static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
 static LONG64 g_gstore_reused, g_gstore_fresh, g_gstore_held; static unsigned g_gstore_n;   /* madeira-doge gpu-store-pool */
 static LONG g_copy_compute_n;   /* madeira-doge copy-compute */
+static LONG g_tbuf_fix_n, g_tbuf_fix_fail;   /* madeira-doge dxbc-typed-fix */
 static volatile LONG64 g_defswap_bytes; static volatile LONG g_defswap_n;   /* madeira-bcd default-buffer-swap: LIVE moved DEFAULT buffers (default-swap-mb/-kb or default-buffer-swap), a part of the ml1154 count */
 static volatile LONG64 g_defswap_wired; static volatile LONG g_defswap_nwired, g_defswap_wire_fail;   /* madeira-bcd default-buffer-swap-wire (opt-in) */
 static void mad_dsw_census(void);   /* madeira-bcd default-buffer-swap residency census (opt-in) */
@@ -752,8 +753,8 @@ static void mad_skip_report(void) {
     d3d12_log("[madeira-d3d12] ml1088 occlusion queries: %ld begun, %ld results delivered, %ld queries counted samples > 0, %ld pass restarts; "
               "ml1089 SRVs with a min-LOD clamp folded into the view: %ld (largest clamp %.1f)\n",
               g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts, g_srv_clamped, (double)g_srv_clamp_max);
-    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass); ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld; copy-compute %ld buffer copies as dispatches\n",
-              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_zero_inst, g_stencil_srv, g_copy_compute_n);
+    d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass); ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld; copy-compute %ld buffer copies as dispatches; dxbc-typed-fix %ld typed-buffer ranges re-viewed (%ld without a view)\n",
+              g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_zero_inst, g_stencil_srv, g_copy_compute_n, g_tbuf_fix_n, g_tbuf_fix_fail);
     mad_acct_report();
     d3d12_log("[madeira-d3d12] ml1050 residency set: %ld added, %ld removed (%ld members); tessellation: %ld pipelines (%ld built as mesh pipelines), "
               "%ld draws dropped, %ld drawn (%ld non-indexed); ml1147 DXBC geometry: %ld mesh pipelines, %ld draws; DXIL tessellation: %ld drawn (%ld indirect)\n",
@@ -5999,6 +6000,8 @@ static int mad_air_build_vb_table(struct mad_exec *e, const struct mad_pso *pso,
     return mad_air_build_vb_table_mask(e, pso, pso->air_slot_mask, buf, off);
 }
 
+static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,
+                                 UINT64 first, UINT64 num, int uav, struct mad_descriptor *e);   /* madeira-doge: dxbc-typed-fix uses it below */
 /* Build the two argument buffers for one dispatch. Returns 0 and logs the first
  * unresolvable range rather than dispatching against a half-filled table. */
 static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
@@ -6084,6 +6087,41 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
             tab[off + 0] = de.gpu_va;
             tab[off + 1] = de.metadata & 0xffffffffull;          /* byte length */
         } else if (rg->flags & MADEIRA_IR_AIR_F_TEXTURE) {
+            /* madeira-doge: dxbc-typed-fix (default 1). The shader declares a TYPED buffer
+             * (Buffer<T> / RWBuffer<T>, a texture-buffer object here) but the descriptor is
+             * a PLAIN buffer: the game made a raw or structured view of it. On PC the two
+             * are one hardware descriptor and the mismatch is harmless; here the table got
+             * texture id 0 and every load read nothing. EXVS2's whole GPU particle system
+             * (Efx3rd) reads its append-buffer counters through such a Buffer<uint> SRV: all
+             * counts read 0, so no particle was ever spawned, sorted or drawn (builds <=427,
+             * capture tables "t1 ... view=0 meta=0x14 flags=0x422"). Build an R32 texture-
+             * buffer view of the descriptor's range in the scalar type the shader declared
+             * (bits 13/14 from tools/patch-airconv-range-dim.py; float when unpatched). */
+            if (!de.texture_view_id && de.gpu_va && !(de.metadata & MAD_DESC_TYPEDBUF)) {
+                static int fix_on = -1;
+                if (fix_on < 0) fix_on = mad_cfg_int_pe("dxbc-typed-fix", 1) ? 1 : 0;
+                if (fix_on) {
+                    UINT64 boff = 0, blen = de.metadata & 0xffffffffull;
+                    struct mad_resource *br = mad_resolve_address(d, de.gpu_va, &boff);
+                    struct mad_descriptor td;
+                    DXGI_FORMAT tf = (rg->flags & MADEIRA_IR_AIR_F_TBUF_UINT) ? DXGI_FORMAT_R32_UINT
+                                   : (rg->flags & MADEIRA_IR_AIR_F_TBUF_SINT) ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_FLOAT;
+                    memset(&td, 0, sizeof td);
+                    if (br && br->buffer && !(boff & 3) && blen >= 4 &&
+                        mad_typed_buffer_view(d, br, tf, boff / 4, blen / 4, rg->type == MADEIRA_IR_AIR_UAV, &td)) {
+                        if (InterlockedIncrement(&g_tbuf_fix_n) <= 8)
+                            d3d12_log("[madeira-d3d12] dxbc-typed-fix: %c%u of '%s' is a typed buffer (%s) in the shader but the descriptor is a plain buffer (%s r#%u +%llu, %llu bytes): texture-buffer view %#llx bound\n",
+                                      rg->type == MADEIRA_IR_AIR_UAV ? 'u' : 't', rg->lower_bound, pso->is_compute ? pso->vs_name : pso->ps_name,
+                                      tf == DXGI_FORMAT_R32_UINT ? "uint" : tf == DXGI_FORMAT_R32_SINT ? "int" : "float",
+                                      br->name ? br->name : "?", br->serial, (unsigned long long)boff, (unsigned long long)blen,
+                                      (unsigned long long)td.texture_view_id);
+                        de = td;
+                    } else if (InterlockedIncrement(&g_tbuf_fix_fail) <= 8)
+                        d3d12_log("[madeira-d3d12] dxbc-typed-fix: %c%u of '%s' is a typed buffer in the shader but the plain-buffer descriptor (va %#llx, %llu bytes) has no view; texture id 0 stays\n",
+                                  rg->type == MADEIRA_IR_AIR_UAV ? 'u' : 't', rg->lower_bound, pso->is_compute ? pso->vs_name : pso->ps_name,
+                                  (unsigned long long)de.gpu_va, (unsigned long long)blen);
+                }
+            }
             if (de.metadata & MAD_DESC_TYPEDBUF) {
                 UINT32 count = 0, first = 0;
                 if (!mad_air_texbuf(d, de.texture_view_id, &count, &first)) {

@@ -124,6 +124,9 @@ enum madeira_ir_air_flag {
     MADEIRA_IR_AIR_F_READ           = 1u << 10,
     MADEIRA_IR_AIR_F_WRITE          = 1u << 11,
     MADEIRA_IR_AIR_F_TEX_MS         = 1u << 12,
+    /* madeira-doge: a typed buffer's scalar type (same patch); neither = float */
+    MADEIRA_IR_AIR_F_TBUF_UINT      = 1u << 13,
+    MADEIRA_IR_AIR_F_TBUF_SINT      = 1u << 14,
 };
 struct madeira_ir_air_range {
     uint32_t type;          /* madeira_ir_air_type */
