@@ -16,6 +16,7 @@
 
 extern unsigned char qpcw[], qpcw_end[], qpcw_e_stub[], qpcw_e_data[], qpcw_e_iv[], qpcw_e_delay[];
 static unsigned char qpcw_state[64];
+extern unsigned char qpca[], qpca_end[], qpca_e_base[], qpca_e_dis[], qpca_e_freq[], qpca_e_last[], qpca_e_shift[], qpca_e_off[];
 extern unsigned char qpc[], qpc_end[], qpc_e_dis[], qpc_e_freq[], qpc_e_last[], qpc_e_shift[], qpc_e_off[];
 static long fallbacks; static void *fb_arg;
 __attribute__((ms_abi)) static int fb(int64_t *c) { fallbacks++; fb_arg = c; *c = -7; return 1; }
@@ -69,19 +70,28 @@ struct statics { uint8_t dis; uint8_t pad[7]; uint64_t freq, last; int64_t off; 
 
 static uint64_t ticks(uint64_t c, uint64_t f) { return (c / f) * 10000000ull + (c % f) * 10000000ull / f; }
 
-int main(void)
+/* variant 0: qpc (rip-relative statics); 1: qpca (absolute base + disp32) */
+static int run_variant(int abs, int *pcases)
 {
     unsigned char *page = mmap(NULL, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    size_t n = qpc_end - qpc; unsigned end[4] = { qpc_e_dis - qpc, qpc_e_freq - qpc, qpc_e_last - qpc, qpc_e_off - qpc };
+    unsigned char *code = abs ? qpca : qpc;
+    size_t n = abs ? (size_t)(qpca_end - qpca) : (size_t)(qpc_end - qpc);
+    unsigned end[4] = { abs ? qpca_e_dis - qpca : qpc_e_dis - qpc, abs ? qpca_e_freq - qpca : qpc_e_freq - qpc,
+                        abs ? qpca_e_last - qpca : qpc_e_last - qpc, abs ? qpca_e_off - qpca : qpc_e_off - qpc };
+    unsigned shift_at = abs ? (unsigned)(qpca_e_shift - qpca) : (unsigned)(qpc_e_shift - qpc);
     struct statics *st = (struct statics *)(page + 0x1000);
     uintptr_t field[4] = { (uintptr_t)&st->dis, (uintptr_t)&st->freq, (uintptr_t)&st->last, (uintptr_t)&st->off };
     void *f = (void *)fb; int bad = 0, cases = 0;
-    memcpy(page, qpc, n);
-    for (int i = 0; i < 4; i++) { int d = (int)(field[i] - ((uintptr_t)page + end[i])); memcpy(page + end[i] - (i ? 4 : 5), &d, 4); }
+    memcpy(page, code, n);
+    if (abs) {
+        uint64_t base = field[0]; memcpy(page + (qpca_e_base - qpca) - 8, &base, 8);
+        for (int i = 0; i < 4; i++) { int d = (int)(field[i] - field[0]); memcpy(page + end[i] - (i ? 4 : 5), &d, 4); }
+    } else
+        for (int i = 0; i < 4; i++) { int d = (int)(field[i] - ((uintptr_t)page + end[i])); memcpy(page + end[i] - (i ? 4 : 5), &d, 4); }
     page[n] = 0xff; page[n + 1] = 0x25; memset(page + n + 2, 0, 4); memcpy(page + n + 6, &f, 8);
     qpcfn Q = (qpcfn)page;
     for (unsigned shift = 0; shift <= 6; shift += 6) {
-        page[(qpc_e_shift - qpc) - 1] = (unsigned char)shift;
+        page[shift_at - 1] = (unsigned char)shift;
         uint64_t now = __rdtsc() >> shift, F = 24000000;
         struct { const char *what; uint8_t dis; uint64_t freq, last; int want_fb; } c[] = {
             { "disabled", 1, F, now, 1 }, { "no frequency", 0, 0, now, 1 }, { "no sync yet", 0, F, 0, 1 },
@@ -97,7 +107,7 @@ int main(void)
             int ok = r == 1 && took_fb == c[k].want_fb;
             if (took_fb) ok = ok && fb_arg == &out && out == -7;
             else ok = ok && (uint64_t)(out - offv) >= ticks(c0, st->freq) && (uint64_t)(out - offv) <= ticks(c1, st->freq);
-            if (!ok) { bad++; printf("FAIL shift %u %s: r=%d fallback=%d out=%lld\n", shift, c[k].what, r, took_fb, (long long)out); }
+            if (!ok) { bad++; printf("FAIL %s shift %u %s: r=%d fallback=%d out=%lld\n", abs ? "qpca" : "qpc", shift, c[k].what, r, took_fb, (long long)out); }
         }
         /* monotonic over many fast calls at 24 MHz */
         st->dis = 0; st->freq = 24000000; st->last = (__rdtsc() >> shift) - 100; int64_t prev = 0; long fbs = fallbacks;
@@ -105,6 +115,15 @@ int main(void)
         cases++;
         if (fallbacks - fbs > 200000 / 2) { printf("FAIL shift %u: the fast path was not taken (%ld fallbacks)\n", shift, fallbacks - fbs); bad++; }
     }
+    *pcases += cases;
+    return bad;
+}
+
+int main(void)
+{
+    int bad = 0, cases = 0;
+    bad += run_variant(0, &cases);
+    bad += run_variant(1, &cases);
     bad += check_qpcw(); cases += 4;
     printf("qpc: %d cases, %d bad -> %s\n", cases, bad, bad ? "FAIL" : "PASS");
     return !!bad;

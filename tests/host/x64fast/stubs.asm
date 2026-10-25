@@ -12,6 +12,7 @@ global cs_enter, cs_enter_end, cs_leave, cs_leave_end, cs_try, cs_try_end
 global le_set, le_set_end, le_get, le_get_end, tls_get, tls_get_end, fls_get, fls_get_end
 global srw_as, srw_as_end, srw_rs, srw_rs_end, srw_ax, srw_ax_end, mem_copy, mem_copy_end, mem_set, mem_set_end
 global qpc, qpc_end, qpc_e_dis, qpc_e_freq, qpc_e_last, qpc_e_shift, qpc_e_off
+global qpca, qpca_end, qpca_e_base, qpca_e_dis, qpca_e_freq, qpca_e_last, qpca_e_shift, qpca_e_off
 global qpcw, qpcw_end, qpcw_e_stub, qpcw_e_data, qpcw_e_iv, qpcw_e_delay
 
 cs_enter:
@@ -372,6 +373,54 @@ qpc_d_dis:  db 0
 qpc_d_freq: dq 0
 qpc_d_last: dq 0
 qpc_d_off:  dq 0
+
+;
+; qpca: the same as qpc with the four statics addressed through an absolute
+; base (imm64 before qpca_e_base) plus a disp32 each (the 4 bytes before
+; qpca_e_freq / _last / _off; for the cmp, the 4 bytes before the imm8, i.e.
+; 5 before qpca_e_dis). Used when ntdll's ARM64EC code runs from a JIT-pool
+; copy: its statics live in THAT copy's .data, out of rel32 reach of the x64
+; stub at the PE address, and the PE image's own .data never sees a sync
+; (qpc_last_sync stays 0 there, so the rip-relative stub fell back to the EC
+; body on every call: EXVS2, log 2026-10-25 12:58, build 465, 260k crossings/s
+; to ntdll+0x71aac with the stub in place).
+qpca:
+        mov     r10, 0x5a5a5a5a5a5a5a5a
+qpca_e_base:
+        cmp     byte [r10+0x7f7f7f7f], 0
+qpca_e_dis:
+        jne     qpca_end
+        mov     r8, [r10+0x7f7f7f7f]
+qpca_e_freq:
+        test    r8, r8
+        jz      qpca_end
+        mov     r9, [r10+0x7f7f7f7f]
+qpca_e_last:
+        test    r9, r9
+        jz      qpca_end
+        rdtsc
+        shl     rdx, 32
+        or      rax, rdx
+        shr     rax, 6
+qpca_e_shift:
+        mov     r11, rax
+        sub     rax, r9
+        cmp     rax, r8
+        jae     qpca_end
+        mov     rax, r11
+        xor     edx, edx
+        div     r8
+        imul    r11, rax, 10000000
+        imul    rax, rdx, 10000000
+        xor     edx, edx
+        div     r8
+        add     rax, r11
+        add     rax, [r10+0x7f7f7f7f]
+qpca_e_off:
+        mov     [rcx], rax
+        mov     eax, 1
+        ret
+qpca_end:
 
 ;
 ; qpcw: spin throttle in front of the qpc stub (madeira.cfg qpc-spin-sleep-us).
