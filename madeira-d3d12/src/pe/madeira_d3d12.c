@@ -1498,6 +1498,14 @@ static LONG64 g_fpb_win = 1200;           /* 50 us in mad_tick units */
 static LONG64 g_fpb_wait = 2000;          /* the longest sleep, 100 ns units */
 static volatile LONG g_fpb_n, g_fpb_moved;   /* back-offs; of which the fence moved */
 static volatile LONG64 g_fpb_ticks;       /* time asleep, mad_tick units */
+/* madeira-doge fpb-why: what each back-off waited behind, from the fence's own
+ * counters at the moment it went to sleep (the value it waits for is unknown, so
+ * "the next value" stands in): [0] a signal past it is committed to Metal = the
+ * GPU has the work; [1] a signal past it is asked for but still on our submit
+ * worker = our pipeline; [2] nothing past it is signalled yet = the game's other
+ * threads. Time asleep per class, mad_tick units. */
+static volatile LONG64 g_fpb_why_ticks[3];
+static volatile LONG g_fpb_why_n[3];
 static void mad_fpb_init(void) {
     static LONG said;
     long long n = mad_cfg_int_pe("fence-poll-backoff", 0);   /* madeira-bcd: N >= 2 = a thread that polls one unchanged fence N times in a row (each within 50 us) sleeps until it moves, at most fence-poll-backoff-us; 0 = the locked read, as before */
@@ -1521,6 +1529,7 @@ static UINT64 mad_fpb_sleep(struct mad_fence *f, UINT64 seen) {
     static sleep_cs_fn sleep_cs; static volatile LONG looked;
     UINT64 t0 = mad_tick(), v;
     LARGE_INTEGER rel;
+    int why = (UINT64)f->committed > seen ? 0 : (UINT64)f->submitted > seen ? 1 : 2;   /* madeira-doge fpb-why */
     if (!looked) {
         HMODULE nt = GetModuleHandleA("ntdll.dll");
         if (nt) sleep_cs = (sleep_cs_fn)(void *)GetProcAddress(nt, "RtlSleepConditionVariableCS");
@@ -1536,7 +1545,10 @@ static UINT64 mad_fpb_sleep(struct mad_fence *f, UINT64 seen) {
     LeaveCriticalSection(&f->lock);
     InterlockedIncrement(&g_fpb_n);
     if (v != seen) InterlockedIncrement(&g_fpb_moved);
-    InterlockedExchangeAdd64(&g_fpb_ticks, (LONG64)(mad_tick() - t0));
+    {   LONG64 dt = (LONG64)(mad_tick() - t0);
+        InterlockedExchangeAdd64(&g_fpb_ticks, dt);
+        InterlockedExchangeAdd64(&g_fpb_why_ticks[why], dt); InterlockedIncrement(&g_fpb_why_n[why]);   /* madeira-doge fpb-why */
+    }
     return v;
 }
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
@@ -9365,6 +9377,15 @@ static void mad_perf_present(void) {
             d3d12_log("[perf] fence-poll-backoff per frame: %.1f back-offs, %.1f of them ended by the fence moving, %.2f ms asleep (fence-poll-backoff = %d, at most %lld us each)\n",
                       (double)bn / g_perf_presents, (double)bm / g_perf_presents, 1000.0 * (double)bt / (double)mad_tick_freq() / g_perf_presents,
                       g_fpb, (long long)(g_fpb_wait / 10));
+            {   /* madeira-doge fpb-why */
+                double ms[3]; LONG n[3]; int k;
+                for (k = 0; k < 3; k++) {
+                    ms[k] = 1000.0 * (double)InterlockedExchange64(&g_fpb_why_ticks[k], 0) / (double)mad_tick_freq() / g_perf_presents;
+                    n[k] = InterlockedExchange(&g_fpb_why_n[k], 0);
+                }
+                d3d12_log("[perf] fence-poll-backoff asleep behind, ms per frame (back-offs): GPU running the work %.2f (%ld), our submit worker %.2f (%ld), not signalled yet %.2f (%ld)\n",
+                          ms[0], (long)n[0], ms[1], (long)n[1], ms[2], (long)n[2]);
+            }
         }
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
