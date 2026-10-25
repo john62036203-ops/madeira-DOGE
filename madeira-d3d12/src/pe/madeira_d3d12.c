@@ -2427,11 +2427,49 @@ enum { AF_ADJ, AF_LOAD, AF_CLEARED, AF_READ, AF_COPYDST, AF_FREED, AF_N };
 static volatile LONG64 g_af[2][AF_N], g_af_store[2], g_af_pend, g_af_co_store, g_af_co_waste;
 static struct { UINT w, h, pf, depth; LONG64 store, waste, adj; } g_af_shape[24];
 static CRITICAL_SECTION g_af_lock; static volatile LONG g_af_lock_init;
-static void mad_af_shape(const struct mad_resource *r, LONG64 store, LONG64 waste, LONG64 adj) {
-    unsigned i, w = r->width, h = r->height, pf = (UINT)r->tex_pf, dp = r->is_depth ? 1 : 0;
+/* The marked resources by pointer VALUE: a barrier entry is looked up here and
+ * never dereferenced (build 477 crashed reading r->ac_pb through a barrier entry
+ * that held 1, log 2026-10-25 20:14). Open addressing, under g_af_lock. */
+#define MAD_AF_SET 4096
+static struct mad_resource *g_af_set[MAD_AF_SET]; static volatile LONG g_af_set_n;
+static void mad_af_lock(void) {
     if (InterlockedCompareExchange(&g_af_lock_init, 1, 0) == 0) { InitializeCriticalSection(&g_af_lock); InterlockedExchange(&g_af_lock_init, 2); }
     while (g_af_lock_init != 2) YieldProcessor();
     EnterCriticalSection(&g_af_lock);
+}
+static unsigned mad_af_slot(const void *r) { return (unsigned)(((ULONG_PTR)r >> 4) * 2654435761u) & (MAD_AF_SET - 1); }
+static int mad_af_set_has(const void *r) {   /* g_af_lock held */
+    unsigned i = mad_af_slot(r), k;
+    for (k = 0; k < MAD_AF_SET; k++, i = (i + 1) & (MAD_AF_SET - 1)) { if (g_af_set[i] == r) return 1; if (!g_af_set[i]) return 0; }
+    return 0;
+}
+static void mad_af_set_add(struct mad_resource *r) {   /* g_af_lock held */
+    unsigned i = mad_af_slot(r), k;
+    if (g_af_set_n >= MAD_AF_SET / 2 || mad_af_set_has(r)) return;
+    for (k = 0; k < MAD_AF_SET; k++, i = (i + 1) & (MAD_AF_SET - 1))
+        if (!g_af_set[i] || g_af_set[i] == (struct mad_resource *)1) { g_af_set[i] = r; g_af_set_n++; return; }
+}
+static void mad_af_set_del(struct mad_resource *r) {   /* g_af_lock held; a tombstone keeps later probes going */
+    unsigned i = mad_af_slot(r), k;
+    for (k = 0; k < MAD_AF_SET; k++, i = (i + 1) & (MAD_AF_SET - 1)) {
+        if (g_af_set[i] == r) {
+            static unsigned tombs;
+            g_af_set[i] = (struct mad_resource *)1;
+            if (!--g_af_set_n) { memset(g_af_set, 0, sizeof g_af_set); tombs = 0; }
+            else if (++tombs > MAD_AF_SET / 4) {   /* rehash the live entries */
+                static struct mad_resource *live[MAD_AF_SET]; unsigned n = 0, j;
+                for (j = 0; j < MAD_AF_SET; j++) if ((ULONG_PTR)g_af_set[j] > 1) live[n++] = g_af_set[j];
+                memset(g_af_set, 0, sizeof g_af_set); g_af_set_n = 0; tombs = 0;
+                for (j = 0; j < n; j++) mad_af_set_add(live[j]);
+            }
+            return;
+        }
+        if (!g_af_set[i]) return;
+    }
+}
+static void mad_af_shape(const struct mad_resource *r, LONG64 store, LONG64 waste, LONG64 adj) {
+    unsigned i, w = r->width, h = r->height, pf = (UINT)r->tex_pf, dp = r->is_depth ? 1 : 0;
+    mad_af_lock();
     for (i = 0; i < 24; i++) {
         if (g_af_shape[i].w == w && g_af_shape[i].h == h && g_af_shape[i].pf == pf && g_af_shape[i].depth == dp) break;
         if (!g_af_shape[i].w) { g_af_shape[i].w = w; g_af_shape[i].h = h; g_af_shape[i].pf = pf; g_af_shape[i].depth = dp; break; }
@@ -2442,6 +2480,7 @@ static void mad_af_shape(const struct mad_resource *r, LONG64 store, LONG64 wast
 static void mad_af_store_raw(struct mad_resource *r, LONG64 b, UINT enc, int clear_only) {
     LONG64 old;
     r->ac_penc = enc; r->ac_pco = clear_only ? 1 : 0;
+    mad_af_lock(); mad_af_set_add(r); LeaveCriticalSection(&g_af_lock);
     old = InterlockedExchange64(&r->ac_pb, b);
     if (old) InterlockedExchangeAdd64(&g_af_pend, -old);
     InterlockedExchangeAdd64(&g_af_pend, b);
@@ -2457,6 +2496,7 @@ static void mad_af_decide(struct mad_resource *r, int cls) {
     if (!r || !r->ac_pb) return;
     b = InterlockedExchange64(&r->ac_pb, 0);
     if (!b) return;
+    mad_af_lock(); mad_af_set_del(r); LeaveCriticalSection(&g_af_lock);
     InterlockedExchangeAdd64(&g_af_pend, -b);
     InterlockedExchangeAdd64(&g_af[r->is_depth ? 1 : 0][cls], b);
     if (cls == AF_CLEARED || cls == AF_COPYDST || cls == AF_FREED) {
@@ -9054,11 +9094,15 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (g_barrier_render_uav < 0) { g_barrier_render_uav = mad_cfg_int_pe("barrier-render-uav", 1) ? 1 : 0;
                                             d3d12_log("[madeira-d3d12] barrier-render-uav = %d (a UAV barrier inside a render pass that has drawn %s)\n", g_barrier_render_uav, g_barrier_render_uav ? "CLOSES the pass" : "is ignored"); }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
-            {   unsigned ai;   /* madeira-doge att-fate: a transition to a read state is a use */
-                for (ai = 0; ai < c->u.barrier.n; ai++)
-                    if (c->u.barrier.res[ai] && c->u.barrier.res[ai]->ac_pb &&
-                        (c->u.barrier.cls[ai] == BC_RAW_ATT || c->u.barrier.cls[ai] == BC_RAR || c->u.barrier.cls[ai] == BC_RAW_COPY))
-                        mad_af_decide(c->u.barrier.res[ai], AF_READ);
+            if (g_af_set_n) {   /* madeira-doge att-fate: a transition to a read state is a use; entries are matched by value, never dereferenced */
+                struct mad_resource *hit[8]; unsigned ai, nh = 0;
+                mad_af_lock();
+                for (ai = 0; ai < c->u.barrier.n && ai < 8; ai++)
+                    if ((c->u.barrier.cls[ai] == BC_RAW_ATT || c->u.barrier.cls[ai] == BC_RAR || c->u.barrier.cls[ai] == BC_RAW_COPY) &&
+                        (ULONG_PTR)c->u.barrier.res[ai] > 1 && mad_af_set_has(c->u.barrier.res[ai]))
+                        hit[nh++] = c->u.barrier.res[ai];
+                LeaveCriticalSection(&g_af_lock);
+                for (ai = 0; ai < nh; ai++) mad_af_decide(hit[ai], AF_READ);
             }
             if (g_barrier_render_uav && e.renc && e.pass_draws) {   /* madeira-doge: see g_barrier_render_uav */
                 unsigned bi; int uav = c->u.barrier.all && c->u.barrier.cls_noref == BC_RAW_UAV;
