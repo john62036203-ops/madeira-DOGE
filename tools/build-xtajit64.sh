@@ -144,6 +144,8 @@ fi
 #  - patch-fex-ios-alias-retire-jit.py: a new image copy on a reused JIT range
 #    retires the dead entry that still covers it (reverse translation walks
 #    oldest-first and found the dead image).
+#  - patch-fex-ios-code-max.py: MADEIRA_FEX_CODE_MAX_MB=32..128 caps a grown code
+#    buffer (FFRS: the 128 MB tail carve crowded out system DLL copies).
 #  - patch-fex-ios-cpu-brand.py: MADEIRA_FEX_CPU_BRAND=1 gives the CPUID brand
 #    leaves an Intel string that matches the reported family/model.
 #  - patch-fex-ios-avx.py: AVX/AVX2 only when MADEIRA_FEX_AVX=1 at launch, so
@@ -176,8 +178,9 @@ python3 "$R/tools/patch-fex-ios-rpmalloc-span8.py" "$R/FEX/External/rpmalloc/rpm
 python3 "$R/tools/patch-fex-ios-branch-history.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-reg-trace.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-launcher-smc.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
+python3 "$R/tools/patch-fex-ios-code-max.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUBackend.cpp"
 build
-git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/CPUID.h FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def
+git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/CPUID.h FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/Source/Interface/Core/CPUBackend.cpp
 git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
 cp "$B/Bin/libarm64ecfex.dll" "$AVX"
