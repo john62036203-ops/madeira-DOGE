@@ -31991,6 +31991,24 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
         if (get_committed_size( view, base, size, &vprot, VPROT_COMMITTED ) >= size && (vprot & VPROT_COMMITTED))
         {
             old = get_win32_prot( vprot, view->protect );
+            /* madeira-doge (env MADEIRA_WRITECOPY_RW = 1; NutsEmu 0029): Windows reports a
+             * written copy-on-write image page as read-write. Wine maps image data writable
+             * from the start and never sees the write, so it always said WRITECOPY. */
+            if (view->protect & SEC_IMAGE)
+            {
+                static int wc_rw = -1;
+                if (wc_rw < 0)
+                {
+                    static const char wc_name[] = "MADEIRA_WRITECOPY_RW";
+                    const char *v = getenv( wc_name );
+                    wc_rw = v && v[0] == '1';
+                }
+                if (wc_rw)
+                {
+                    if ((old & 0xff) == PAGE_WRITECOPY) old = (old & ~0xff) | PAGE_READWRITE;
+                    else if ((old & 0xff) == PAGE_EXECUTE_WRITECOPY) old = (old & ~0xff) | PAGE_EXECUTE_READWRITE;
+                }
+            }
             status = set_protection( view, base, size, new_prot );
         }
         else status = STATUS_NOT_COMMITTED;

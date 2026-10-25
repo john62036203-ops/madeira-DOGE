@@ -222,7 +222,16 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
             if [ "$(grep -c 'MADEIRA_LEAP_SECONDS' "$OBJ_DIR/system_ios.c")" != 1 ]; then
                 echo "  system: leap-second patch did not apply"; exit 1
             fi
+            # madeira-doge: env MADEIRA_MACHINE_ID / MADEIRA_XSTATE_AVX (machine serial,
+            # SMBIOS without IOKit, AVX XSave state), tools/patch-wine-machine-id.py.
+            python3 "$REPO_ROOT/tools/patch-wine-machine-id.py" system "$OBJ_DIR/system_ios.c" "$OBJ_DIR/system_ios.c" || exit 1
             compile_one "$OBJ_DIR/system_ios.c" "system"
+            ;;
+        file)
+            # madeira-doge: env MADEIRA_MACHINE_ID: a stand-in PhysicalDrive0,
+            # tools/patch-wine-machine-id.py.
+            python3 "$REPO_ROOT/tools/patch-wine-machine-id.py" file "$src" "$OBJ_DIR/file_ios.c" || exit 1
+            compile_one "$OBJ_DIR/file_ios.c" "file"
             ;;
         *)
             compile_one "$src" "$name"
