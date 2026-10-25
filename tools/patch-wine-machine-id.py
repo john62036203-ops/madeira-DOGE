@@ -396,13 +396,11 @@ static NTSTATUS maddisk_ioctl( IO_STATUS_BLOCK *io, ULONG code, void *in_buffer,
 /******************************************************************************
  *              NtCreateFile   (NTDLL.@)
  */""")
-    sub("""                                         options & FILE_OPEN_REPARSE_POINT );
-
+    sub("""
     if (status == STATUS_BAD_DEVICE_TYPE)
     {
         status = server_open_file_object( handle, access, &new_attr, sharing, options );""",
-        """                                         options & FILE_OPEN_REPARSE_POINT );
-
+        """
     if (status == STATUS_BAD_DEVICE_TYPE && !attr->RootDirectory && madeira_machine_id_enabled() &&
         is_maddisk_name( attr->ObjectName ))
     {
