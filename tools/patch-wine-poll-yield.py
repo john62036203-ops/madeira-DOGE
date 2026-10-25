@@ -47,5 +47,38 @@ src = src.replace(anchor, """    {   /* madeira-doge poll-yield (tools/patch-win
     }
 """)
 
+# (2) build 457: the polls that spin are ANSWERED "signaled" by madeira_fast_try
+# (log 2026-10-25 08:33 on 456: wait1 5.9M/s, yields unchanged; with
+# MADEIRA_FASTSYNC=0 the phases are gone because each poll costs a server round
+# trip, at the price of latency everywhere). A zero-timeout wait that the cell
+# satisfies also yields one in N (same poll-yield-every).
+anchor2 = """    if (madeira_fast_try( cell, manual, gen, kind )) return STATUS_SUCCESS;
+
+    /* A zero timeout is a state query; only the RESET answer may be given
+"""
+if src.count(anchor2) != 1:
+    sys.exit("patch-wine-poll-yield: madeira_fast_wait zero-timeout anchor not found exactly once")
+src = src.replace(anchor2, """    if (madeira_fast_try( cell, manual, gen, kind ))
+    {
+        if (timeout && !timeout->QuadPart)
+        {   /* madeira-doge poll-yield: a signaled zero-timeout poll yields one in N too */
+            static __thread unsigned int hits;
+            static int mask2 = -2;
+            if (mask2 == -2)
+            {
+                long long v = madeira_cfg_int( "poll-yield-every", 4 );
+                int m = 1;
+                if (v <= 0) m = 0;
+                else { while (m < v && m < 1024) m <<= 1; }
+                mask2 = m ? m - 1 : -1;
+            }
+            if (mask2 >= 0 && !(++hits & (unsigned int)mask2)) NtYieldExecution();
+        }
+        return STATUS_SUCCESS;
+    }
+
+    /* A zero timeout is a state query; only the RESET answer may be given
+""")
+
 open(path, "w").write(src)
 print("patched " + path)
