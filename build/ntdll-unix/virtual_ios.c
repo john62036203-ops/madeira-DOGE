@@ -14262,7 +14262,20 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
  * first (a zero-size entry matches no query), barrier, then pe_base = NULL. */
 static void ios_jit_purge_window( ULONG_PTR base, ULONG_PTR size )
 {
-    int i, maps = 0, aliases = 0;
+    int i, maps = 0, aliases = 0, freed = 0;
+    size_t freed_bytes = 0;
+    /* madeira-doge: a 64-bit guest's freed RWX block gives its pool range back at
+     * once (FINAL FANTASY RESONANCE, 2026-10-25: every game thread takes a 1 MB
+     * PAGE_EXECUTE_READWRITE block from the 416 MB pool; the freed ones stayed in
+     * the ledger until the process exited and the pool ran out after ~1.5 min).
+     * MADEIRA_ANON_RWX_FREE=0: the range waits for process exit, as before. */
+    static int rwx_free = -1;
+    if (rwx_free < 0)
+    {
+        static const char name[] = "MADEIRA_ANON_RWX_FREE";
+        const char *e = getenv( name );
+        rwx_free = !(e && e[0] == '0');
+    }
 
     pthread_mutex_lock( &ios_pool_lock );
     for (i = 0; i < ios_jit_mapping_count; i++)
@@ -14295,11 +14308,35 @@ static void ios_jit_purge_window( ULONG_PTR base, ULONG_PTR size )
         ios_mono_alias_retire( uv );
         ios_jit_anon_aliases[i].user_va = 0;
         aliases++;
+        if (rwx_free && size != IOS_WOW_WINDOW_SIZE && ios_jit_rx_base_global &&
+            ios_jit_anon_aliases[i].jit_rx_alias >= (uintptr_t)ios_jit_rx_base_global)
+        {
+            size_t off = ios_jit_anon_aliases[i].jit_rx_alias - (uintptr_t)ios_jit_rx_base_global;
+            size_t t = 0; int r = 0, m = 0, al = 0, li;
+            for (li = 0; li < ios_pool_ledger_count; li++)
+                if (ios_pool_ledger[li].off == off)
+                {
+                    ios_pool_free_ledger_entry_locked( li, ios_pool_ledger[li].peb, &t, &r, &m, &al );
+                    freed++;
+                    freed_bytes += t;
+                    break;
+                }
+        }
     }
     pthread_mutex_unlock( &ios_pool_lock );
     if (maps || aliases || size == IOS_WOW_WINDOW_SIZE)   /* every freed view comes through here now */
-        dprintf( 2, "[jit-pool] window purge B=%p: %d image mapping(s), %d anon alias(es)\n",
-                 (void *)base, maps, aliases );
+        dprintf( 2, "[jit-pool] window purge B=%p: %d image mapping(s), %d anon alias(es)%s\n",
+                 (void *)base, maps, aliases, freed ? ", pool range back on the freelist" : "" );
+    if (freed)
+    {
+        static unsigned int total_n;
+        static size_t total_bytes;
+        total_n += freed;
+        total_bytes += freed_bytes;
+        if (total_n <= 8 || !(total_n % 64))
+            dprintf( 2, "[jit-pool] anon-rwx-free: %u freed RWX block(s) returned %lu KB to the pool so far\n",
+                     total_n, (unsigned long)(total_bytes >> 10) );
+    }
 }
 
 
