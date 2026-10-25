@@ -51,7 +51,9 @@ src = src.replace(anchor, """    {   /* madeira-doge poll-yield (tools/patch-win
 # (log 2026-10-25 08:33 on 456: wait1 5.9M/s, yields unchanged; with
 # MADEIRA_FASTSYNC=0 the phases are gone because each poll costs a server round
 # trip, at the price of latency everywhere). A zero-timeout wait that the cell
-# satisfies also yields one in N (same poll-yield-every).
+# satisfies also yields one in N (same poll-yield-every). Build 458: also any
+# wait a set manual-reset event answers at once (log 09:18 on 457: wait1 2-3M/s
+# phases remained with yields unchanged -> those waits carry a timeout).
 anchor2 = """    if (madeira_fast_try( cell, manual, gen, kind )) return STATUS_SUCCESS;
 
     /* A zero timeout is a state query; only the RESET answer may be given
@@ -60,8 +62,10 @@ if src.count(anchor2) != 1:
     sys.exit("patch-wine-poll-yield: madeira_fast_wait zero-timeout anchor not found exactly once")
 src = src.replace(anchor2, """    if (madeira_fast_try( cell, manual, gen, kind ))
     {
-        if (timeout && !timeout->QuadPart)
-        {   /* madeira-doge poll-yield: a signaled zero-timeout poll yields one in N too */
+        if ((timeout && !timeout->QuadPart) || (manual && kind == MADEIRA_CELL_KIND_EVENT))
+        {   /* madeira-doge poll-yield: a signaled zero-timeout poll, or any wait answered at once
+             * by a manual-reset event that stays set (build 458: 457 left the 2-3M/s phases
+             * untouched, so the spinning waits are not zero-timeout), yields one in N too */
             static __thread unsigned int hits;
             static int mask2 = -2;
             if (mask2 == -2)
@@ -78,6 +82,31 @@ src = src.replace(anchor2, """    if (madeira_fast_try( cell, manual, gen, kind 
     }
 
     /* A zero timeout is a state query; only the RESET answer may be given
+""")
+
+# (3) build 458: whatever path answers them, a thread that calls
+# NtWaitForSingleObject faster than poll-yield-rate times a second (100000)
+# yields on every 4th call while it stays that fast. Measured per thread with
+# one clock read per 4 calls.
+anchor3 = "    __sync_fetch_and_add( &ios_xp_wait_single, 1 );   /* ml1131 */\n"
+if src.count(anchor3) != 1:
+    sys.exit("patch-wine-poll-yield: NtWaitForSingleObject counter anchor not found exactly once")
+src = src.replace(anchor3, anchor3 + """    {   /* madeira-doge poll-yield (3): a thread waiting in a tight loop gives the core away */
+        static __thread unsigned int calls;
+        static __thread unsigned long long last_ns;
+        static long long min_gap_ns = -1;
+        if (min_gap_ns < 0)
+        {
+            long long rate = madeira_cfg_int( "poll-yield-rate", 100000 );   /* waits per second per thread above which every 4th yields; 0 = off */
+            min_gap_ns = rate > 0 ? 4000000000ll / rate : 0;
+        }
+        if (min_gap_ns && !(++calls & 3))
+        {
+            unsigned long long now = madeira_now_ns();
+            if (last_ns && now - last_ns < (unsigned long long)min_gap_ns) NtYieldExecution();
+            last_ns = now;
+        }
+    }
 """)
 
 open(path, "w").write(src)
