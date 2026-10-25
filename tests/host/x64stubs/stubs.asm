@@ -86,6 +86,17 @@ ggva:                                    ; GetGPUVirtualAddress(This)
     ret
 ggva_end:
 
+gdhis:                                   ; GetDescriptorHandleIncrementSize(This, type)
+    mov eax, 0x11111111                  ; CBV_SRV_UAV (0) and SAMPLER (1)
+    cmp edx, 2
+    jb .done
+    cmp edx, 3
+    ja .done
+    mov eax, 0x22222222                  ; RTV (2) and DSV (3)
+.done:
+    ret
+gdhis_end:
+
 ; --- build 450: list-side entries -----------------------------------------
 ; Markers: 0x77777777 = MAD_ROOT_PARAM_MAX, 0x88888888 = offsetof(mad_list, closed),
 ; 0x99999999 = offsetof(mad_list, ncmds), 0xaaaaaaaa = offsetof(mad_list, ccap),
