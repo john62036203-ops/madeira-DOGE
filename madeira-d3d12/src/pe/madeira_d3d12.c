@@ -5910,6 +5910,39 @@ static struct mad_resource *mad_texture_of_view(struct mad_device *d, UINT64 id,
     struct mad_resource *found = NULL;
     *xv = -1;
     if (!id) return NULL;
+    /* madeira-doge: the view map first. EXVS2 battle (log 2026-10-25 11:13, build
+     * 460): the walk below was ~58% of the replay workers' samples ([wprof]
+     * d3d12.dll+0x2adf0..0x2ae40 = this loop), 13.8 ms of worker time per frame
+     * at 36 fps. The map holds every base texture id (ml1053) and every texture
+     * view id (ml1049) -> its resource. Looked up and checked under view_lock,
+     * which a resource's release takes to drop its ids before the resource is
+     * freed, and which view creation holds while it appends to xview, so r and
+     * its views are alive and stable here. Same answer as the walk: a texture on
+     * the SRV or UAV list whose base id or one of whose views is id; anything
+     * else (no entry, a typed-buffer view, a resource off both lists, a base id
+     * a borrowed texture shares) falls through to the walk.
+     * madeira.cfg tex-view-map = 0 restores the walk alone. */
+    {
+        static int map_on = -1;
+        if (map_on < 0) map_on = mad_cfg_int_pe("tex-view-map", 1) ? 1 : 0;
+        if (map_on && d->vmap_cap) {
+            struct mad_resource *r = NULL; int x = -1;
+            EnterCriticalSection(&d->view_lock);
+            if (d->vmap_cap) {
+                i = mad_vmap_slot(id, d->vmap_cap);
+                while (d->vmap[i].id) {
+                    if (d->vmap[i].id == id) { r = d->vmap[i].r; break; }
+                    i = (i + 1) & (d->vmap_cap - 1);
+                }
+            }
+            if (r && r->texture && (r->srv_slot || r->uav_slot)) {
+                if (r->gpu_resource_id == id) found = r;
+                else for (k = 0; k < r->nxview; k++) if (r->xview[k].id == id) { x = (int)k; found = r; break; }
+            }
+            LeaveCriticalSection(&d->view_lock);
+            if (found) { *xv = x; return found; }
+        }
+    }
     AcquireSRWLockShared(&d->list_lock);
     for (pass = 0; pass < 2 && !found; pass++) {
         struct mad_resource **list = pass ? d->uav_res : d->srv_res; unsigned n = pass ? d->nuav : d->nsrv;
