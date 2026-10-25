@@ -3921,30 +3921,56 @@ static int ios_pool_recycle_range_ready( size_t off, size_t size )
  * No live buffer is resized and neither bump cursor nor tail budget changes.
  * Lock order is carve -> pool; other carve paths release one before taking the
  * other. Removal under both locks prevents code and image double-handout. */
+/* madeira-doge: MADEIRA_POOL_RECYCLE_TAIL (default on, "0" off): the same transfer
+ * for a retired code buffer in the pool's own tail, but only one smaller than the
+ * largest live tail buffer -- an outgrown generation FEX never asks for again. The
+ * free buffer of the same size FEX alternates with stays on the carve list.
+ * FINAL FANTASY RESONANCE (2026-10-25 16:07) failed XINPUT1_4.dll and 1 MB RWX
+ * blocks for want of 0.5 MB while its outgrown 16 MB buffer sat in the tail. */
+static int ios_pool_recycle_tail_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        static const char name[] = "MADEIRA_POOL_RECYCLE_TAIL";
+        const char *v = getenv( name );
+        cached = !(v && v[0] == '0');
+    }
+    return cached;
+}
+
 static int ios_pool_recycle_code_range( size_t want )
 {
     const char *env = getenv( "MADEIRA_POOL_RECYCLE_IMAGES" );
     const size_t limit = 64u * 1024 * 1024;
     unsigned i, best = ~0u;
     unsigned fitting = 0, recent = 0, dirty = 0, occupied = 0, carve_count;
-    size_t off = 0, size = 0;
+    size_t off = 0, size = 0, live_max = 0;
     time_t now = time( NULL ), freed_at = 0;
     int transferred = 0;
+    int low_on = env && !strcmp( env, "1" ) && ios_jit_low_size_global;
+    int tail_on = ios_pool_recycle_tail_enabled();
 
-    if (!env || strcmp( env, "1" ) || ios_wow_base() ||
-        !ios_jit_low_size_global || !ios_jit_rx_base_global || !ios_jit_rw_base_global ||
+    if ((!low_on && !tail_on) || ios_wow_base() ||
+        !ios_jit_rx_base_global || !ios_jit_rw_base_global ||
         !want || (want & 0x3fff) || want > limit) return 0;
 
     pthread_mutex_lock( &ios_tail_carve_lock );
     for (i = 0; i < ios_tail_carve_n; i++)
+        if (!ios_tail_carves[i].free && !ios_tail_carve_in_low( ios_tail_carves[i].off ) &&
+            ios_tail_carves[i].size > live_max)
+            live_max = ios_tail_carves[i].size;
+    for (i = 0; i < ios_tail_carve_n; i++)
     {
         uintptr_t rx = (uintptr_t)ios_jit_rx_base_global + ios_tail_carves[i].off;
-        size_t loff = rx - ios_jit_low_rx_global;
         size_t n = ios_tail_carves[i].size;
         time_t retired = ios_tail_carves[i].freed_at;
+        int in_low = ios_tail_carve_in_low( ios_tail_carves[i].off );
 
-        if (!ios_tail_carves[i].free || n < want || n > limit || (n & 0x3fff) ||
-            (rx & 0x3fff) || loff >= ios_jit_low_size_global || n > ios_jit_low_size_global - loff ||
+        if (!ios_tail_carves[i].free || n < want || n > limit || (n & 0x3fff) || (rx & 0x3fff) ||
+            (in_low ? (!low_on || n > ios_jit_low_size_global - (rx - ios_jit_low_rx_global)) : (!tail_on || n >= live_max ||
+                                 ios_tail_carves[i].off >= ios_jit_pool_size_global ||
+                                 n > ios_jit_pool_size_global - ios_tail_carves[i].off)) ||
             (best != ~0u && n >= ios_tail_carves[best].size)) continue;
         fitting++;
         if (!retired || retired > now || now - retired < IOS_POOL_REUSE_GRACE_SEC) { recent++; continue; }
@@ -3975,9 +4001,9 @@ static int ios_pool_recycle_code_range( size_t want )
     pthread_mutex_unlock( &ios_tail_carve_lock );
     if (transferred)
         dprintf( 2, "[pool-recycle] retired code rx=%p size=0x%lx age=%lus -> image freelist "
-                    "(want=0x%lx, C cursor and live buffers unchanged)\n",
+                    "(want=0x%lx, C cursor and live buffers unchanged; tail buffers up to 0x%lx stay)\n",
                  (void *)((uintptr_t)ios_jit_rx_base_global + off), (unsigned long)size,
-                 (unsigned long)(now - freed_at), (unsigned long)want );
+                 (unsigned long)(now - freed_at), (unsigned long)want, (unsigned long)live_max );
     else
     {
         static unsigned refused;
@@ -17946,6 +17972,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 }
 
                 size_t offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
+                if (offset == (size_t)-1 && ios_pool_recycle_code_range( alloc_size ))
+                    offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
                 if (offset == (size_t)-1)
                 {
                     ERR("iOS JIT: pool exhausted for anon RWX %p+0x%lx\n",
