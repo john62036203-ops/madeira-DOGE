@@ -128,6 +128,48 @@ static ssize_t madeira_bcast_fanout( int fd, const struct msghdr *orig, int flag
         }
     }
 
+    {   /* madeira-doge loop-alt: a broadcast on port P also goes to 127.0.0.1:Q
+         * (MADEIRA_BCAST_LOOP_ALT = "P:Q[,P:Q...]", default "49000:49100", "0" =
+         * off). Two programs on one phone that bind the same port can only meet
+         * on loopback when the phone has no other address (no Wi-Fi): EXVS2's
+         * cabinet binds 127.0.0.1:49000, so the loopback copy above comes back to
+         * the cabinet itself and the virtual LM (0.0.0.0:49000) never sees the
+         * discovery (log 2026-10-25 12:37: sent=1/6, LM rx=0, stuck at
+         * しばらくお待ち下さい). The launcher's LM also listens on 127.0.0.1:Q and
+         * answers from its 49000 socket, which reaches the cabinet as before. */
+        static int alt_read; static unsigned short alt_from[8], alt_to[8]; static int nalt;
+        if (!alt_read)
+        {
+            const char *env = getenv( "MADEIRA_BCAST_LOOP_ALT" );
+            if (!env) env = "49000:49100";
+            alt_read = 1;
+            while (*env && nalt < 8)
+            {
+                char *end; long f, t;
+                while (*env == ',' || *env == ' ') env++;
+                f = strtol( env, &end, 10 );
+                if (end == env || *end != ':') break;
+                t = strtol( end + 1, &end, 10 );
+                if (f > 0 && f < 65536 && t > 0 && t < 65536) { alt_from[nalt] = (unsigned short)f; alt_to[nalt] = (unsigned short)t; nalt++; }
+                env = end;
+            }
+        }
+        for (i = 0; i < nalt; i++)
+        {
+            struct sockaddr_in to = *dst;
+            struct msghdr hdr = *orig;
+            ssize_t ret;
+            if (ntohs( dst->sin_port ) != alt_from[i]) continue;
+            to.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
+            to.sin_port = htons( alt_to[i] );
+            hdr.msg_name = &to;
+            hdr.msg_namelen = sizeof(to);
+            do ret = sendmsg( fd, &hdr, flags ); while (ret == -1 && errno == EINTR);
+            if (ret >= 0) { sent++; if (ret > best) best = ret; }
+            count++;
+        }
+    }
+
     n = __atomic_fetch_add( &calls, 1, __ATOMIC_RELAXED );
     if (n < 32 || !(n % 256))
         dprintf( 2, "[sock-bcast] madeira-doge fan-out port=%u sent=%d/%d dst=%08x n=%u\n",
