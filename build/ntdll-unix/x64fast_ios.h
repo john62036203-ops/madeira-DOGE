@@ -179,6 +179,39 @@ static const unsigned char x64f_qpc[103] = {
 #define X64F_QPC_SHIFT_END 46
 #define X64F_QPC_OFF_END   94
 
+/* QueryPerformanceCounter spin throttle (stubs.asm qpcw; madeira.cfg
+ * qpc-spin-sleep-us). EXVS2 (log 2026-10-25 09:53, build 458): one game thread
+ * called QPC 300-600k times a second, 100% of the gaps < 1 us -- a busy-wait on
+ * the clock holding a P-core at 100% while the SoC sat in its 1.26 GHz thermal
+ * clamp. Placed after the qpc stub and its fallback and registered instead of
+ * it: the followed thread, after 256 calls each < 1 us apart, sleeps the
+ * interval on every 16th call; other threads are never delayed. Offsets: the
+ * END of the call to the stub, of the interval imm32, of the call to
+ * NtDelayExecution (each field is the 4 bytes before). */
+static const unsigned char x64f_qpcw[232] = {
+    0x53, 0x48, 0x83, 0xec, 0x30, 0x48, 0x89, 0xcb, 0xe8, 0xf3, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x0b,
+    0x65, 0x8b, 0x14, 0x25, 0x48, 0x00, 0x00, 0x00, 0x3b, 0x15, 0xba, 0x00, 0x00, 0x00, 0x74, 0x37,
+    0x49, 0x89, 0xc8, 0x4c, 0x2b, 0x05, 0xa6, 0x00, 0x00, 0x00, 0x49, 0x81, 0xf8, 0x10, 0x27, 0x00,
+    0x00, 0x0f, 0x82, 0x89, 0x00, 0x00, 0x00, 0x89, 0x15, 0x9b, 0x00, 0x00, 0x00, 0xc7, 0x05, 0x95,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc6, 0x05, 0x92, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89,
+    0x0d, 0x7b, 0x00, 0x00, 0x00, 0xeb, 0x69, 0x49, 0x89, 0xc8, 0x4c, 0x2b, 0x05, 0x6f, 0x00, 0x00,
+    0x00, 0x48, 0x89, 0x0d, 0x68, 0x00, 0x00, 0x00, 0x80, 0x3d, 0x71, 0x00, 0x00, 0x00, 0x00, 0xc6,
+    0x05, 0x6a, 0x00, 0x00, 0x00, 0x00, 0x75, 0x06, 0x49, 0x83, 0xf8, 0x0a, 0x73, 0x38, 0xff, 0x05,
+    0x58, 0x00, 0x00, 0x00, 0x8b, 0x05, 0x52, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x01, 0x00, 0x00, 0x72,
+    0x2f, 0xa9, 0x0f, 0x00, 0x00, 0x00, 0x75, 0x28, 0xc6, 0x05, 0x41, 0x00, 0x00, 0x00, 0x01, 0x48,
+    0xc7, 0x44, 0x24, 0x28, 0x18, 0xfc, 0xff, 0xff, 0x31, 0xc9, 0x48, 0x8d, 0x54, 0x24, 0x28, 0xe8,
+    0x4c, 0xff, 0xff, 0xff, 0xeb, 0x0a, 0xc7, 0x05, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xb8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x83, 0xc4, 0x30, 0x5b, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+};
+#define X64F_QPCW_STUB_END  0x0d
+#define X64F_QPCW_IV_END    0xa8
+#define X64F_QPCW_DELAY_END 0xb4
+/* ntdll's x64 syscall stub shape: mov r10, rcx; mov eax, imm32; test byte [0x7ffe0308], 1 */
+static const unsigned char x64f_sys_head[4] = { 0x4c, 0x8b, 0xd1, 0xb8 };
+static const unsigned char x64f_sys_tail[8] = { 0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe, 0x7f, 0x01 };
+
 
 enum { X64F_ENTER, X64F_LEAVE, X64F_TRY, X64F_LESET, X64F_LEGET, X64F_TLS, X64F_FLS,
        X64F_SRW_AS, X64F_SRW_RS, X64F_SRW_AX, X64F_MEMCPY, X64F_MEMSET, X64F_QPC };
@@ -225,6 +258,7 @@ static const struct { const char *module, *name; int kind; } x64f_targets[] =
 };
 
 static int x64f_mode = -1, x64f_spin;
+static long long x64f_qpcw_us;
 
 /* entry -> stub pairs of every placed module copy (each pseudo-process maps its own) */
 #define X64F_MAX_PAIRS 512
@@ -248,6 +282,10 @@ static int x64f_enabled( void )
         if (x64f_spin > 100000) x64f_spin = 100000;
         /* 1: x64 fast paths for critical sections, SRW locks, small memcpy/memmove/memset, TlsGetValue, FlsGetValue and Get/SetLastError (Sekiro: ~40% of the game thread was spent calling these) */
         x64f_mode = madeira_cfg_int( "x64-fast", 0 ) == 1;
+        /* x64-fast = 1 only: a thread busy-waiting on QueryPerformanceCounter (256+ calls each < 1 us apart) sleeps this many us every 16th call (EXVS2: one thread spun 300-600k calls/s); 0 = off */
+        x64f_qpcw_us = madeira_cfg_int( "qpc-spin-sleep-us", 100 );
+        if (x64f_qpcw_us < 0) x64f_qpcw_us = 0;
+        if (x64f_qpcw_us > 2000) x64f_qpcw_us = 2000;
     }
     return x64f_mode;
 }
@@ -445,6 +483,7 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
     unsigned int lo, hi, used = 0, i, n = 0, want = 0;
     struct { unsigned int entry, stub; } done[32];
     unsigned int qpc_v[4] = { 0, 0, 0, 0 }, qpc_shift = 0;
+    unsigned int qpcw_at = 0;
 
     if (!mn || !x64f_enabled()) return;
     for (i = 0; i < sizeof(x64f_targets) / sizeof(x64f_targets[0]); i++)
@@ -514,6 +553,26 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
         if (x64f_stub[x64f_targets[i].kind].needs_fallback) memcpy( blob + used + len, fall, fall_len );
         done[n].entry = e;
         done[n].stub = stub;
+        if (x64f_targets[i].kind == X64F_QPC && x64f_qpcw_us > 0)
+        {
+            /* the spin throttle goes after the stub and is what x64 callers reach */
+            unsigned int delay = x64f_export( img, size, "NtDelayExecution" ), w = lo + used + need;
+            if (delay && x64f_in( size, delay, 16 ) && !memcmp( img + delay, x64f_sys_head, 4 ) &&
+                !memcmp( img + delay + 8, x64f_sys_tail, 8 ) && w + sizeof(x64f_qpcw) <= hi)
+            {
+                unsigned char *q = blob + used + need;
+                int iv = -(int)(x64f_qpcw_us * 10), r1 = (int)(stub - (w + X64F_QPCW_STUB_END)),
+                    r2 = (int)(delay - (w + X64F_QPCW_DELAY_END));
+                memcpy( q, x64f_qpcw, sizeof(x64f_qpcw) );
+                memcpy( q + X64F_QPCW_STUB_END - 4, &r1, 4 );
+                memcpy( q + X64F_QPCW_IV_END - 4, &iv, 4 );
+                memcpy( q + X64F_QPCW_DELAY_END - 4, &r2, 4 );
+                done[n].stub = w;
+                need += (sizeof(x64f_qpcw) + 15) & ~15u;
+                qpcw_at = w;
+            }
+            else dprintf( 2, "[x64-fast] %s: QPC spin throttle left out (NtDelayExecution stub not the known shape or no room)\n", mn );
+        }
         n++;
         used += need;
     }
@@ -546,6 +605,9 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
     if (qpc_v[1])
         dprintf( 2, "[x64-fast] %s: QueryPerformanceCounter in x64 (statics +0x%x/+0x%x/+0x%x/+0x%x, tsc >> %u)\n",
                  mn, qpc_v[0], qpc_v[1], qpc_v[2], qpc_v[3], qpc_shift );
+    if (qpcw_at)
+        dprintf( 2, "[x64-fast] %s: QPC spin throttle at +0x%x: a thread past 256 calls < 1 us apart sleeps %lld us every 16th call\n",
+                 mn, qpcw_at, x64f_qpcw_us );
 }
 
 /* entry is a `jmp [rip+slot]` forwarder inside a module that got stubs, whose

@@ -14,7 +14,7 @@ D = os.path.join(ROOT, "tests", "host", "x64fast")
 HDR = os.path.join(ROOT, "build", "ntdll-unix", "x64fast_ios.h")
 DLLS = os.path.join(ROOT, "app", "Madeira", "arm64ec-windows")
 STUBS = ["cs_enter", "cs_leave", "cs_try", "le_set", "le_get", "tls_get", "fls_get",
-         "srw_as", "srw_rs", "srw_ax", "mem_copy", "mem_set", "qpc"]
+         "srw_as", "srw_rs", "srw_ax", "mem_copy", "mem_set", "qpc", "qpcw"]
 
 if not (shutil.which("nasm") and shutil.which("gcc") and platform.machine() in ("x86_64", "AMD64")):
     print("note: nasm/gcc on x86-64 unavailable, x64-fast checks skipped")
@@ -39,6 +39,11 @@ for n in STUBS:
     ok = got == want
     bad += not ok
     print("ok  " if ok else "FAIL", "header bytes of", n, "match stubs.asm")
+for d, lab in (("X64F_QPCW_STUB_END", "qpcw_e_stub"), ("X64F_QPCW_IV_END", "qpcw_e_iv"), ("X64F_QPCW_DELAY_END", "qpcw_e_delay")):
+    m = re.search(r"#define %s\s+(0x[0-9a-f]+|\d+)" % d, hdr)
+    ok = bool(m) and int(m.group(1), 0) == syms[lab] - syms["qpcw"]
+    bad += not ok
+    print("ok  " if ok else "FAIL", d, "matches stubs.asm")
 enter = blob[syms["cs_enter"]:syms["cs_enter_end"]]
 spin_at = int(re.search(r"#define X64F_SPIN_AT (\d+)", hdr).group(1))
 ok = enter[spin_at:spin_at + 4] == b"\x5a" * 4

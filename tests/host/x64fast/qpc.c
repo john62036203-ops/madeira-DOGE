@@ -10,11 +10,57 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <x86intrin.h>
+#include <asm/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
+extern unsigned char qpcw[], qpcw_end[], qpcw_e_stub[], qpcw_e_iv[], qpcw_e_delay[];
 extern unsigned char qpc[], qpc_end[], qpc_e_dis[], qpc_e_freq[], qpc_e_last[], qpc_e_shift[], qpc_e_off[];
 static long fallbacks; static void *fb_arg;
 __attribute__((ms_abi)) static int fb(int64_t *c) { fallbacks++; fb_arg = c; *c = -7; return 1; }
 typedef int (__attribute__((ms_abi)) *qpcfn)(int64_t *);
+
+/* qpcw (the spin throttle): a fake clock and a fake NtDelayExecution */
+static int64_t fake_now; static long delays, bad_delay;
+__attribute__((ms_abi)) static int fake_qpc(int64_t *c) { *c = fake_now; return 1; }
+__attribute__((ms_abi)) static int fake_delay(int alertable, const int64_t *iv) { delays++; if (alertable || *iv != -1000) bad_delay++; return 0; }
+static unsigned char tebs[2][0x2000];
+static void set_tid(int t) { *(uint64_t *)(tebs[t] + 0x48) = 0x100 + t; syscall(SYS_arch_prctl, ARCH_SET_GS, tebs[t]); }
+
+static int check_qpcw(void)
+{
+    unsigned char *page = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    size_t n = qpcw_end - qpcw; int bad = 0;
+    memcpy(page, qpcw, n);
+    /* trampolines after the wrapper: jmp [rip+0] -> the fakes */
+    void *t1 = (void *)fake_qpc, *t2 = (void *)fake_delay; unsigned char *j1 = page + 0x800, *j2 = page + 0x810;
+    j1[0] = 0xff; j1[1] = 0x25; memset(j1 + 2, 0, 4); memcpy(j1 + 6, &t1, 8);
+    j2[0] = 0xff; j2[1] = 0x25; memset(j2 + 2, 0, 4); memcpy(j2 + 6, &t2, 8);
+    unsigned es = qpcw_e_stub - qpcw, ed = qpcw_e_delay - qpcw;
+    int r1 = (int)(0x800 - es), r2 = (int)(0x810 - ed);
+    memcpy(page + es - 4, &r1, 4); memcpy(page + ed - 4, &r2, 4);
+    qpcfn W = (qpcfn)page; int64_t v;
+    struct { const char *what; int calls, step, other_every; long want; } c[] = {
+        { "tight spin, 1000 calls", 1000, 1, 0, (992 - 256) / 16 + 1 },
+        { "calls 1 us apart", 1000, 10, 0, 0 },
+        { "tight spin with another thread every 40 calls", 1000, 1, 40, -1 },
+        { "short burst of 200", 200, 1, 0, 0 },
+    };
+    for (unsigned k = 0; k < sizeof(c) / sizeof(c[0]); k++) {
+        fake_now += 1000000; delays = 0;   /* > 1 ms after any earlier case: the first call takes over */
+        int mine = 0;
+        for (int i = 0; i < c[k].calls + mine; i++) {
+            if (c[k].other_every && i % c[k].other_every == c[k].other_every - 1) { set_tid(1); fake_now++; W(&v); set_tid(0); continue; }
+            set_tid(0); fake_now += c[k].step; if (W(&v) != 1 || v != fake_now) bad++;
+        }
+        long want = c[k].want;
+        if (want < 0) want = delays >= 30 ? delays : 30;   /* the other thread must not stop the throttle */
+        int ok = delays == want && !bad_delay;
+        if (!ok) bad++;
+        printf("qpcw %-46s sleeps %ld (want %ld) %s\n", c[k].what, delays, want, ok ? "ok" : "WRONG");
+    }
+    return bad;
+}
 
 struct statics { uint8_t dis; uint8_t pad[7]; uint64_t freq, last; int64_t off; };
 
@@ -56,6 +102,7 @@ int main(void)
         cases++;
         if (fallbacks - fbs > 200000 / 2) { printf("FAIL shift %u: the fast path was not taken (%ld fallbacks)\n", shift, fallbacks - fbs); bad++; }
     }
+    bad += check_qpcw(); cases += 4;
     printf("qpc: %d cases, %d bad -> %s\n", cases, bad, bad ? "FAIL" : "PASS");
     return !!bad;
 }

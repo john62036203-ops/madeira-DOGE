@@ -80,6 +80,22 @@ int main(int argc, char **argv)
             slots[ns++] = (uintptr_t)img + e;
             int k = x64f_targets[i].kind; unsigned len = x64f_stub[k].len;
             if (k == X64F_QPC) {
+                /* qpc-spin-sleep-us (default 100): the registered entry is the spin throttle in front of the stub */
+                unsigned w = stub; int r1, iv, r2; unsigned de = x64f_export(orig, size, "NtDelayExecution");
+                if (memcmp(img + w, x64f_qpcw, X64F_QPCW_STUB_END - 4)) { printf("  qpc spin throttle missing\n"); bad++; }
+                memcpy(&r1, img + w + X64F_QPCW_STUB_END - 4, 4); memcpy(&iv, img + w + X64F_QPCW_IV_END - 4, 4); memcpy(&r2, img + w + X64F_QPCW_DELAY_END - 4, 4);
+                stub = w + X64F_QPCW_STUB_END + r1;
+                unsigned dt = w + X64F_QPCW_DELAY_END + r2;
+                printf("  qpc spin throttle 0x%x -> stub 0x%x, NtDelayExecution 0x%x (want 0x%x), interval %d %s\n", w, stub, dt, de, iv,
+                       dt == de && iv == -1000 && stub < w ? "ok" : "WRONG");
+                if (dt != de || iv != -1000 || stub >= w) bad++;
+                unsigned char t[sizeof(x64f_qpcw)]; memcpy(t, img + w, sizeof t);
+                memcpy(t + X64F_QPCW_STUB_END - 4, x64f_qpcw + X64F_QPCW_STUB_END - 4, 4);
+                memcpy(t + X64F_QPCW_IV_END - 4, x64f_qpcw + X64F_QPCW_IV_END - 4, 4);
+                memcpy(t + X64F_QPCW_DELAY_END - 4, x64f_qpcw + X64F_QPCW_DELAY_END - 4, 4);
+                if (memcmp(t, x64f_qpcw, sizeof t)) { printf("  qpc spin throttle mismatch outside the linked fields\n"); bad++; }
+            }
+            if (k == X64F_QPC) {
                 /* the four displacements must reach ntdll's statics, the shift is FEX's 24 MHz -> 1.536 GHz */
                 static const unsigned endo[4] = { X64F_QPC_DIS_END, X64F_QPC_FREQ_END, X64F_QPC_LAST_END, X64F_QPC_OFF_END };
                 static const unsigned want_v[4] = { 0xe2a50, 0xe2a58, 0xe2a60, 0xe2a68 };

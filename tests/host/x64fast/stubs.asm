@@ -12,6 +12,7 @@ global cs_enter, cs_enter_end, cs_leave, cs_leave_end, cs_try, cs_try_end
 global le_set, le_set_end, le_get, le_get_end, tls_get, tls_get_end, fls_get, fls_get_end
 global srw_as, srw_as_end, srw_rs, srw_rs_end, srw_ax, srw_ax_end, mem_copy, mem_copy_end, mem_set, mem_set_end
 global qpc, qpc_end, qpc_e_dis, qpc_e_freq, qpc_e_last, qpc_e_shift, qpc_e_off
+global qpcw, qpcw_end, qpcw_e_stub, qpcw_e_iv, qpcw_e_delay
 
 cs_enter:
         mov     rdx, [gs:0x48]
@@ -371,6 +372,79 @@ qpc_d_dis:  db 0
 qpc_d_freq: dq 0
 qpc_d_last: dq 0
 qpc_d_off:  dq 0
+
+;
+; qpcw: spin throttle in front of the qpc stub (madeira.cfg qpc-spin-sleep-us).
+; EXVS2 (log 2026-10-25 09:53, build 458): one game thread calls
+; QueryPerformanceCounter 300-600k times a second, every call < 1 us after the
+; previous one ([xp-api-qpc] 100% <1us): a busy-wait on the clock that keeps a
+; P-core at 100% and heats the SoC into its 1.26 GHz clamp. The wrapper follows
+; one thread at a time (the last caller, taken over when the followed one has
+; not called for 1 ms); once that thread has made 256 calls each < 1 us apart,
+; every 16th call sleeps NtDelayExecution(FALSE, -interval) before returning.
+; A sleep does not break the run (the call after it counts as tight); a gap of
+; 1 us or more does. Other threads' calls are never delayed. Fix-ups by the
+; installer: the rel32 before qpcw_e_stub (-> the qpc stub), the imm32 before
+; qpcw_e_iv (relative interval, 100 ns units) and the rel32 before
+; qpcw_e_delay (-> ntdll's x64 NtDelayExecution syscall stub). State is shared
+; (one followed thread); races only blur the heuristic.
+qpcw:
+        push    rbx
+        sub     rsp, 0x30
+        mov     rbx, rcx
+        call    qpcw
+qpcw_e_stub:
+        mov     rcx, [rbx]
+        mov     edx, [gs:0x48]
+        cmp     edx, [qpcw_d_tid]
+        je      qpcw_same
+        mov     r8, rcx
+        sub     r8, [qpcw_d_last]
+        cmp     r8, 10000
+        jb      qpcw_done
+        mov     [qpcw_d_tid], edx
+        mov     dword [qpcw_d_run], 0
+        mov     byte [qpcw_d_slept], 0
+        mov     [qpcw_d_last], rcx
+        jmp     qpcw_done
+qpcw_same:
+        mov     r8, rcx
+        sub     r8, [qpcw_d_last]
+        mov     [qpcw_d_last], rcx
+        cmp     byte [qpcw_d_slept], 0
+        mov     byte [qpcw_d_slept], 0
+        jne     qpcw_tight
+        cmp     r8, 10
+        jae     qpcw_reset
+qpcw_tight:
+        inc     dword [qpcw_d_run]
+        mov     eax, [qpcw_d_run]
+        cmp     eax, 256
+        jb      qpcw_done
+        test    eax, 15
+        jnz     qpcw_done
+        mov     byte [qpcw_d_slept], 1
+        mov     qword [rsp+0x28], -1000
+qpcw_e_iv:
+        xor     ecx, ecx
+        lea     rdx, [rsp+0x28]
+        call    qpcw
+qpcw_e_delay:
+        jmp     qpcw_done
+qpcw_reset:
+        mov     dword [qpcw_d_run], 0
+qpcw_done:
+        mov     eax, 1
+        add     rsp, 0x30
+        pop     rbx
+        ret
+        align   8
+qpcw_d_last:  dq 0
+qpcw_d_tid:   dd 0
+qpcw_d_run:   dd 0
+qpcw_d_slept: db 0
+        align   8
+qpcw_end:
 
 %ifidn __OUTPUT_FORMAT__, elf64
 section .note.GNU-stack noalloc noexec nowrite progbits
