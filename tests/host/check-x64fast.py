@@ -14,7 +14,7 @@ D = os.path.join(ROOT, "tests", "host", "x64fast")
 HDR = os.path.join(ROOT, "build", "ntdll-unix", "x64fast_ios.h")
 DLLS = os.path.join(ROOT, "app", "Madeira", "arm64ec-windows")
 STUBS = ["cs_enter", "cs_leave", "cs_try", "le_set", "le_get", "tls_get", "fls_get",
-         "srw_as", "srw_rs", "srw_ax", "mem_copy", "mem_set", "qpc", "qpca", "qpcw"]
+         "srw_as", "srw_rs", "srw_ax", "mem_copy", "mem_set", "qpc", "qpca", "qpcw", "cur_tid", "cur_pid", "cur_thr", "cur_proc"]
 
 if not (shutil.which("nasm") and shutil.which("gcc") and platform.machine() in ("x86_64", "AMD64")):
     print("note: nasm/gcc on x86-64 unavailable, x64-fast checks skipped")

@@ -9,6 +9,7 @@ bits 64
 default rel
 
 global cs_enter, cs_enter_end, cs_leave, cs_leave_end, cs_try, cs_try_end
+global cur_tid, cur_tid_end, cur_pid, cur_pid_end, cur_thr, cur_thr_end, cur_proc, cur_proc_end
 global le_set, le_set_end, le_get, le_get_end, tls_get, tls_get_end, fls_get, fls_get_end
 global srw_as, srw_as_end, srw_rs, srw_rs_end, srw_ax, srw_ax_end, mem_copy, mem_copy_end, mem_set, mem_set_end
 global qpc, qpc_end, qpc_e_dis, qpc_e_freq, qpc_e_last, qpc_e_shift, qpc_e_off
@@ -101,6 +102,27 @@ le_get:
         mov     eax, [gs:0x68]
         ret
 le_get_end:
+
+; GetCurrentThreadId / GetCurrentProcessId: TEB ClientId (+0x48 thread, +0x40
+; process); GetCurrentThread / GetCurrentProcess: the pseudo handles -2 / -1.
+; EXVS2 2v2 (log 2026-10-25 12:58, build 465): kernel32 GetCurrentThreadId
+; ~40k and GetCurrentThread ~10k x64 -> ARM64EC crossings a second.
+cur_tid:
+        mov     eax, [gs:0x48]
+        ret
+cur_tid_end:
+cur_pid:
+        mov     eax, [gs:0x40]
+        ret
+cur_pid_end:
+cur_thr:
+        mov     rax, -2
+        ret
+cur_thr_end:
+cur_proc:
+        mov     rax, -1
+        ret
+cur_proc_end:
 
 tls_get:
         cmp     ecx, 64
