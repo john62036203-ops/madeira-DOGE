@@ -333,6 +333,18 @@ OVERLAY = {
                         "CPU; e.g. 1500 keeps a 60 fps menu near 30-40 fps. [fps-gov] lines every 10 s. "
                         "env.MADEIRA_FPS_GOV_MIN / _MAX (20 / 60) bound the cap, _BAND_MJ (1500) is the energy the "
                         "average may drift before it moves. Needs the [xp] sampler. Read at session start."},
+    "env.MADEIRA_FPS_THERMAL_CAP": {"category": "Windows, display & input", "title": "Frame cap while the device is hot (fps)",
+                "kind": "int", "default": "",
+                "sources": ["build/ntdll-unix/server_ios.c", "app/Madeira/WineProcessBridge.m"],
+                "note": "Unset (default): off. 10-120: while iOS reports the device serious or critical "
+                        "(env.MADEIRA_FPS_THERMAL_AT = fair / serious / critical), frames start at most N times a second, "
+                        "with the same low-latency wait as env.MADEIRA_FPS_CAP; the cap is lifted again at nominal. "
+                        "With MADEIRA_FPS_CAP the lower of the two applies while hot; with the governor, its step capped "
+                        "at N. [fps-gov] logs each change. Read at session start."},
+    "env.MADEIRA_FPS_THERMAL_AT": {"category": "Windows, display & input", "title": "Thermal frame cap: hot from",
+                "kind": "text", "default": "serious", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "Only with env.MADEIRA_FPS_THERMAL_CAP set: the thermal state from which the cap applies: fair, "
+                        "serious (default) or critical. Read at session start."},
     "env.MADEIRA_FPS_GOV_MAX": {"category": "Windows, display & input", "title": "Frame-cap governor: highest cap (fps)",
                 "kind": "int", "default": "60", "sources": ["build/ntdll-unix/server_ios.c"],
                 "note": "Only with env.MADEIRA_FPS_GOV_MW set: the highest frame cap the governor uses, the largest of "

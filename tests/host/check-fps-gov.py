@@ -138,6 +138,7 @@ int main( void )
     double energy = 0, frac = 0;
     uint64_t now = 0, presents = 0, last_change_ns = 0, min_gap = ~0ull;
     int i = 0, last_cap = -1, changes = 0, first_cap = -1;
+    int caps[3] = { 0, 0, 0 }, ncaps = 0;
     while (t < 600)
     {
         const struct phase *p = ph; double fps, w;
@@ -162,7 +163,13 @@ int main( void )
         frames += fps * dt;
         if (p->kind == 2) { play_s += dt; play_frames += fps * dt; if (clamp_s < 0) play_unclamped += dt; }
         now += 250000000ull; t += dt; i++;
+        if (getenv( "HOT_S" ))   /* thermal cap: fair until HOT_S, serious until COOL_S, nominal after */
+        {
+            double hs = atof( getenv( "HOT_S" ) ), cs = getenv( "COOL_S" ) ? atof( getenv( "COOL_S" ) ) : 1e9;
+            madeira_fps_thermal_state( t >= cs ? 0 : t >= hs ? 2 : 1 );
+        }
         ios_fps_gov_step( now, dt * 1000, w * dt * 1000, presents, 0 );
+        if (getenv( "HOT_S" ) && (i == 200 || i == 1000 || i == 2390)) caps[ncaps++] = ios_fps_cap;
         if (first_cap < 0) first_cap = ios_fps_cap;
         if (ios_fps_cap != last_cap)
         {
@@ -175,6 +182,7 @@ int main( void )
             (unsigned long long)(min_gap == ~0ull ? 0 : min_gap / 1000000), held_logs, navg );
     for (i = 0; i < navg; i++) printf( " %.3f", avg_w[i] );
     printf( "\n" );
+    if (getenv( "HOT_S" )) printf( "CAPS %d %d %d\n", caps[0], caps[1], caps[2] );
     return 0;
 }
 '''
@@ -195,6 +203,25 @@ with tempfile.TemporaryDirectory(prefix="madeira-fps-gov-") as tmp:
                         energy=float(f[5]), frames=float(f[6]), changes=int(f[7]), gap=int(f[8]), held=int(f[9]),
                         avgs=[float(x) for x in f[11:]])
 
+        def caps(**sw):   # cap at 50 s, 250 s, 597.5 s
+            env = dict(clean, MODEL="steady", LEAK="1.0", CAP_J="100000", **sw)
+            r = subprocess.run([str(exe)], capture_output=True, text=True, env=env)
+            assert r.returncode == 0, r.stdout + r.stderr
+            line = [l for l in r.stdout.splitlines() if l.startswith("CAPS")][0]
+            return [int(x) for x in line.split()[1:]], int(r.stdout.split()[0])
+
+        c, armed = caps(MADEIRA_FPS_THERMAL_CAP="40", HOT_S="100", COOL_S="500")
+        check(armed == 1 and c == [0, 40, 0], "MADEIRA_FPS_THERMAL_CAP=40: no cap while fair, 40 while serious, lifted at nominal (%s)" % c)
+        c, armed = caps(MADEIRA_FPS_THERMAL_CAP="40", MADEIRA_FPS_THERMAL_AT="fair", HOT_S="100", COOL_S="500")
+        check(c == [40, 40, 0], "MADEIRA_FPS_THERMAL_AT=fair: 40 from fair on (%s)" % c)
+        c, armed = caps(MADEIRA_FPS_THERMAL_CAP="40", MADEIRA_FPS_CAP="45", HOT_S="100", COOL_S="500")
+        check(c == [45, 40, 45], "with MADEIRA_FPS_CAP=45: 45 cool, 40 hot (%s)" % c)
+        c, armed = caps(MADEIRA_FPS_THERMAL_CAP="40", MADEIRA_FPS_CAP="30", HOT_S="100", COOL_S="500")
+        check(c == [30, 30, 30], "a fixed cap below the thermal cap stays (%s)" % c)
+        c, armed = caps(MADEIRA_FPS_THERMAL_CAP="40", MADEIRA_FPS_GOV_MW="20000", HOT_S="100", COOL_S="500")
+        check(c == [60, 40, 60], "with the governor: its step, 40 while hot (%s)" % c)
+        c, armed = caps(HOT_S="100", COOL_S="500")
+        check(armed == 0 and c == [0, 0, 0], "thermal state without MADEIRA_FPS_THERMAL_CAP changes nothing")
         off = run("hzd", 1.0, 240)
         check(off["armed"] == 0 and off["first"] == 0 and off["changes"] == 0, "unset: nothing armed, the cap stays 0")
         fixed = run("rdr2", 1.0, 240, MADEIRA_FPS_CAP="30")
@@ -387,7 +414,7 @@ else:
     print("SKIP winemetal patch application: no dxmt sources (check out the submodule)")
 gen = GEN.read_text(encoding="utf-8")
 cat = CAT.read_text(encoding="utf-8")
-for key in ("env.MADEIRA_FPS_CAP", "env.MADEIRA_FPS_GOV_MW"):
+for key in ("env.MADEIRA_FPS_CAP", "env.MADEIRA_FPS_GOV_MW", "env.MADEIRA_FPS_THERMAL_CAP"):
     check(('"%s"' % key) in gen and key in cat, "the catalog documents %s" % key)
 for key in ("env.MADEIRA_FPS_GOV_BAND_MJ", "env.MADEIRA_FPS_GOV_MIN", "env.MADEIRA_FPS_GOV_MAX"):
     check(key in cat, "the catalog lists %s" % key)

@@ -102,6 +102,7 @@ static void wine_log_write(const char *fmt, ...)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* madeira-doge: strcasecmp (fps-gov thermal cap) */
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -1928,6 +1929,24 @@ static volatile uint64_t ios_fps_paced_ns;    /* time DXMT presents waited for t
 static const int ios_fps_steps[] = { 60, 40, 30, 24, 20 };
 #define IOS_FPS_NSTEPS ((int)(sizeof(ios_fps_steps) / sizeof(ios_fps_steps[0])))
 
+/* madeira-doge thermal cap: env.MADEIRA_FPS_THERMAL_CAP = N (10-120) lowers the cap
+ * to N fps while the device is hot, with the same low-latency pacing as
+ * MADEIRA_FPS_CAP (Present waits after queuing; nothing is queued ahead). Hot =
+ * ProcessInfo.thermalState at or above env.MADEIRA_FPS_THERMAL_AT (fair, serious
+ * = default, critical); the cap is lifted again at nominal. Works alone (no cap
+ * while cool), with MADEIRA_FPS_CAP (the lower of the two while hot) and with
+ * the power governor (its step, capped at N while hot). EXVS2 (log 2026-10-25
+ * 09:53, build 458): 55-60 fps for ~50 s, then fair -> serious and the P-cores
+ * at 1.26-1.65 GHz for the rest of the session at 30-36 fps, GPU busy 16-19 ms
+ * a frame at 60. Same idea as upstream #246 (env.MADEIRA_THERMAL_CAP), which
+ * switches DXMT's display pacing instead (drawable back-pressure, more latency).
+ * The app reports the state through madeira_fps_thermal_state (WineProcessBridge.m). */
+static volatile int ios_fps_thermal = -1;     /* ProcessInfo.thermalState: 0 nominal, 1 fair, 2 serious, 3 critical; -1 unknown */
+void madeira_fps_thermal_state( int state )
+{
+    ios_fps_thermal = state;
+}
+
 /* the D3D12 runtime's part of its counter block (madeira-d3d12 struct mad_xp, after
  * the fields struct ios_xp_pe mirrors): fps_cap is ours to write, the rest is its own */
 struct ios_xp_pe_cap { int64_t fps_cap, t_cap, n_cap; };
@@ -1935,6 +1954,7 @@ struct ios_xp_pe_cap { int64_t fps_cap, t_cap, n_cap; };
 static void ios_fps_gov_step( uint64_t now, double dt_ms, double mj, uint64_t presents, double paced_ms )
 {
     static int inited, fixed, target_mw, band_mj, hi, lo, idx, active;
+    static int thermal_cap, thermal_at = 2, hot;
     static double balance, sum_mj, sum_ms, sum_paced, fps_avg;
     static uint64_t last_presents, last_present_ns, last_change, last_report, report_presents;
     static unsigned changes;
@@ -1952,6 +1972,20 @@ static void ios_fps_gov_step( uint64_t now, double dt_ms, double mj, uint64_t pr
         inited = 1;
         fixed = c ? atoi( c ) : 0;
         if (fixed < 10 || fixed > 120) fixed = 0;
+        {
+            const char *t = getenv( "MADEIRA_FPS_THERMAL_CAP" );  /* fps cap while the device is hot (10-120); unset/0 = none */
+            const char *at = getenv( "MADEIRA_FPS_THERMAL_AT" );  /* thermal state that counts as hot: fair, serious (default) or critical */
+            thermal_cap = t ? atoi( t ) : 0;
+            if (thermal_cap < 10 || thermal_cap > 120) thermal_cap = 0;
+            if (at && !strcasecmp( at, "fair" )) thermal_at = 1;
+            else if (at && !strcasecmp( at, "critical" )) thermal_at = 3;
+            if (thermal_cap)
+            {
+                ios_fps_gov_armed = 1;
+                wine_log_write( "[fps-gov] madeira-doge thermal cap: %d fps while the device is %s or hotter, lifted at nominal "
+                                "(MADEIRA_FPS_THERMAL_CAP, _AT)", thermal_cap, thermal_at == 1 ? "fair" : thermal_at == 3 ? "critical" : "serious" );
+            }
+        }
         target_mw = e ? atoi( e ) : 0;
         if (target_mw < 0 || target_mw > 20000) target_mw = 0;
         band_mj = b && *b ? atoi( b ) : 1500;
@@ -1972,6 +2006,25 @@ static void ios_fps_gov_step( uint64_t now, double dt_ms, double mj, uint64_t pr
             wine_log_write( "[fps-gov] madeira-bcd on: process CPU power held at %d mW while a game presents, by a frame "
                             "cap of %d..%d fps (band %d mJ; MADEIRA_FPS_GOV_MW, _MIN, _MAX, _BAND_MJ)",
                             target_mw, ios_fps_steps[lo], ios_fps_steps[hi], band_mj );
+        }
+    }
+    if (thermal_cap)
+    {
+        int t = ios_fps_thermal;
+        if (!hot && t >= thermal_at)
+        {
+            hot = 1;
+            wine_log_write( "[fps-gov] thermal state %d: cap %d fps", t, thermal_cap );
+        }
+        else if (hot && t == 0)
+        {
+            hot = 0;
+            wine_log_write( "[fps-gov] nominal again: thermal cap lifted" );
+        }
+        if (!target_mw)
+        {
+            int base = fixed;
+            ios_fps_cap = hot && (!base || thermal_cap < base) ? thermal_cap : base;
         }
     }
     if (fixed || !target_mw || dt_ms <= 0) return;
@@ -2023,7 +2076,7 @@ static void ios_fps_gov_step( uint64_t now, double dt_ms, double mj, uint64_t pr
             changes++;
         }
     }
-    ios_fps_cap = ios_fps_steps[idx];
+    ios_fps_cap = hot && thermal_cap < ios_fps_steps[idx] ? thermal_cap : ios_fps_steps[idx];
     if (now - last_report >= 10000000000ull && sum_ms > 0)
     {
         i = (int)(presents - report_presents);

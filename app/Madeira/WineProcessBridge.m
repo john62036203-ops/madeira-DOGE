@@ -1308,6 +1308,19 @@ static void *wine_process_thread(void *arg) {
             /* a game session starts with no game-mode overlay windows and
              * no known Metal windows (Winios.m) */
             { extern void winios_session_reset(void); winios_session_reset(); }
+            /* madeira-doge: the device's thermal state for the fps-gov thermal cap
+             * (env.MADEIRA_FPS_THERMAL_CAP, server_ios.c); only UIKit/Foundation knows it */
+            {
+                extern void madeira_fps_thermal_state(int state);
+                static dispatch_once_t once;
+                dispatch_once(&once, ^{
+                    [[NSNotificationCenter defaultCenter] addObserverForName:NSProcessInfoThermalStateDidChangeNotification
+                                                                      object:nil queue:nil usingBlock:^(NSNotification *n) {
+                        madeira_fps_thermal_state((int)[NSProcessInfo processInfo].thermalState);
+                    }];
+                });
+                madeira_fps_thermal_state((int)[NSProcessInfo processInfo].thermalState);
+            }
             LOG("Wine log file: %{public}s", logPath.UTF8String);
             /* Expose the app Documents dir to Wine code (e.g. for fex-jit-dump.bin) */
             setenv("MADEIRA_DOCS_DIR", docs.UTF8String, 1);
