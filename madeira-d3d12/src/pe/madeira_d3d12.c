@@ -927,6 +927,7 @@ struct mad_resource {
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
     struct mad_sp_tile { UINT32 hs, ht; } *sp_map; UINT32 sp_ntiles;   /* madeira-doge d3d12-sparse: per tile the (heap serial, heap tile) it maps; hs 0 = unmapped */
+    volatile LONG64 ac_pb; UINT ac_penc; UINT8 ac_pco;   /* madeira-doge att-fate: bytes of a census-frame store not yet followed by a use, the storing encoder, stored by a clear-only pass */
 };
 /* srv_res / uav_res membership, O(1) through the resource's slot (the linear
  * scan it replaces ran over ~15,000 textures on every view creation). */
@@ -2407,6 +2408,100 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
 done:
     InterlockedExchangeAdd64(cls, b);
 }
+/* madeira-doge att-fate: what happens to a stored attachment NEXT, across command
+ * lists, batches and frames (f7_store_census looks inside its own list only, and
+ * there most stores had no use or a barrier to COMMON). A census-frame store marks
+ * the resource; the first later event decides:
+ *   reloaded by the very next render pass  (adjacent split: a merge would save store + load)
+ *   reloaded by a later pass                (needed)
+ *   next pass CLEARS it / does not load it  (store wasted: dontCare / memoryless candidate)
+ *   read: barrier to a read state, copy/resolve source, presented (needed)
+ *   overwritten by a copy/resolve dest      (store wasted)
+ *   released by the application             (store wasted)
+ * A barrier to COMMON / a write state does not decide (it keeps waiting). What is
+ * still undecided is reported as "no use seen yet". Bytes per census frame, colour
+ * and depth apart, plus the attachment shapes with the most wasted / split bytes.
+ * Only resources stored in a census frame are marked, so off-census cost is one
+ * load of r->ac_pb at each event. */
+enum { AF_ADJ, AF_LOAD, AF_CLEARED, AF_READ, AF_COPYDST, AF_FREED, AF_N };
+static volatile LONG64 g_af[2][AF_N], g_af_store[2], g_af_pend, g_af_co_store, g_af_co_waste;
+static struct { UINT w, h, pf, depth; LONG64 store, waste, adj; } g_af_shape[24];
+static CRITICAL_SECTION g_af_lock; static volatile LONG g_af_lock_init;
+static void mad_af_shape(const struct mad_resource *r, LONG64 store, LONG64 waste, LONG64 adj) {
+    unsigned i, w = r->width, h = r->height, pf = (UINT)r->tex_pf, dp = r->is_depth ? 1 : 0;
+    if (InterlockedCompareExchange(&g_af_lock_init, 1, 0) == 0) { InitializeCriticalSection(&g_af_lock); InterlockedExchange(&g_af_lock_init, 2); }
+    while (g_af_lock_init != 2) YieldProcessor();
+    EnterCriticalSection(&g_af_lock);
+    for (i = 0; i < 24; i++) {
+        if (g_af_shape[i].w == w && g_af_shape[i].h == h && g_af_shape[i].pf == pf && g_af_shape[i].depth == dp) break;
+        if (!g_af_shape[i].w) { g_af_shape[i].w = w; g_af_shape[i].h = h; g_af_shape[i].pf = pf; g_af_shape[i].depth = dp; break; }
+    }
+    if (i < 24) { g_af_shape[i].store += store; g_af_shape[i].waste += waste; g_af_shape[i].adj += adj; }
+    LeaveCriticalSection(&g_af_lock);
+}
+static void mad_af_store_raw(struct mad_resource *r, LONG64 b, UINT enc, int clear_only) {
+    LONG64 old;
+    r->ac_penc = enc; r->ac_pco = clear_only ? 1 : 0;
+    old = InterlockedExchange64(&r->ac_pb, b);
+    if (old) InterlockedExchangeAdd64(&g_af_pend, -old);
+    InterlockedExchangeAdd64(&g_af_pend, b);
+    InterlockedExchangeAdd64(&g_af_store[r->is_depth ? 1 : 0], b);
+    if (clear_only) InterlockedExchangeAdd64(&g_af_co_store, b);
+    mad_af_shape(r, b, 0, 0);
+}
+static void mad_af_store(struct mad_exec *e, struct mad_resource *r, UINT level) {
+    mad_af_store_raw(r, f7_att_bytes(r, level), e->renc_seq, !e->pass_draws);
+}
+static void mad_af_decide(struct mad_resource *r, int cls) {
+    LONG64 b;
+    if (!r || !r->ac_pb) return;
+    b = InterlockedExchange64(&r->ac_pb, 0);
+    if (!b) return;
+    InterlockedExchangeAdd64(&g_af_pend, -b);
+    InterlockedExchangeAdd64(&g_af[r->is_depth ? 1 : 0][cls], b);
+    if (cls == AF_CLEARED || cls == AF_COPYDST || cls == AF_FREED) {
+        if (r->ac_pco) InterlockedExchangeAdd64(&g_af_co_waste, b);
+        mad_af_shape(r, 0, b, 0);
+    } else if (cls == AF_ADJ) mad_af_shape(r, 0, 0, b);
+}
+/* A render pass just began with r as an attachment: its load action decides. */
+static void mad_af_attach(struct mad_exec *e, struct mad_resource *r, int load) {
+    if (!r || !r->ac_pb) return;
+    mad_af_decide(r, !load ? AF_CLEARED : (e->renc_seq == r->ac_penc + 1 ? AF_ADJ : AF_LOAD));
+}
+static void mad_af_report(double nf) {
+    static const char *const nm[AF_N] = { "reloaded by the next pass", "reloaded later", "cleared/not loaded next", "read", "copy-overwritten", "released" };
+    double mb = 1048576.0; char line[1200]; int n, k, i, best[6], nb = 0; LONG64 v[2][AF_N];
+    for (k = 0; k < 2; k++) for (i = 0; i < AF_N; i++) v[k][i] = InterlockedExchange64(&g_af[k][i], 0);
+    n = snprintf(line, sizeof line, "[perf] att-fate per census frame: stored colour %.1f MB depth %.1f MB; next use (colour/depth MB):",
+                 InterlockedExchange64(&g_af_store[0], 0) / mb / nf, InterlockedExchange64(&g_af_store[1], 0) / mb / nf);
+    for (i = 0; i < AF_N && n < (int)sizeof line - 80; i++) n += snprintf(line + n, sizeof line - n, " %s %.1f/%.1f;", nm[i], v[0][i] / mb / nf, v[1][i] / mb / nf);
+    snprintf(line + n, sizeof line - n, " no use seen yet %.1f MB (outstanding); clear-only passes stored %.1f MB, %.1f MB of it wasted\n",
+             g_af_pend / mb, InterlockedExchange64(&g_af_co_store, 0) / mb / nf, InterlockedExchange64(&g_af_co_waste, 0) / mb / nf);
+    d3d12_log("%s", line);
+    if (g_af_lock_init != 2) return;
+    EnterCriticalSection(&g_af_lock);
+    for (k = 0; k < 6; k++) {
+        int bi = -1;
+        for (i = 0; i < 24; i++) {
+            int taken = 0, j;
+            if (!g_af_shape[i].w) continue;
+            for (j = 0; j < nb; j++) if (best[j] == i) taken = 1;
+            if (taken) continue;
+            if (bi < 0 || g_af_shape[i].waste + g_af_shape[i].adj > g_af_shape[bi].waste + g_af_shape[bi].adj) bi = i;
+        }
+        if (bi < 0 || !(g_af_shape[bi].waste + g_af_shape[bi].adj)) break;
+        best[nb++] = bi;
+    }
+    for (k = 0; k < nb; k++) {
+        i = best[k];
+        d3d12_log("[perf] att-fate shape %ux%u pf%u %s: stored %.1f MB, wasted %.1f MB, split (next pass reloads) %.1f MB per census frame\n",
+                  g_af_shape[i].w, g_af_shape[i].h, g_af_shape[i].pf, g_af_shape[i].depth ? "depth" : "colour",
+                  g_af_shape[i].store / mb / nf, g_af_shape[i].waste / mb / nf, g_af_shape[i].adj / mb / nf);
+    }
+    for (i = 0; i < 24; i++) g_af_shape[i].store = g_af_shape[i].waste = g_af_shape[i].adj = 0;
+    LeaveCriticalSection(&g_af_lock);
+}
 static volatile LONG g_fault_diag;   /* madeira-bcd: GPU fault attribution, below */
 static volatile LONG64 g_fault_last_present;   /* madeira-doge: gpu-fault-settle -- present count at the last GPU fault */
 static void mad_fault_label_render(struct mad_exec *e);
@@ -2433,6 +2528,8 @@ static void exec_end(struct mad_exec *e) {
         unsigned k;
         for (k = 0; k < e->enc_nrt; k++) if (e->enc_rt[k] && e->enc_rt[k]->texture) f7_store_census(e, e->enc_rt[k], e->enc_rtp[k].level);
         if (e->enc_depth && e->enc_depth->texture) f7_store_census(e, e->enc_depth, e->enc_dp.level);
+        for (k = 0; k < e->enc_nrt; k++) if (e->enc_rt[k] && e->enc_rt[k]->texture) mad_af_store(e, e->enc_rt[k], e->enc_rtp[k].level);   /* madeira-doge att-fate */
+        if (e->enc_depth && e->enc_depth->texture) mad_af_store(e, e->enc_depth, e->enc_dp.level);
     }
     e->f7_next_rts = 0;
     if (e->renc && g_fault_diag && e->diag_npso) mad_fault_label_render(e);   /* madeira-bcd */
@@ -3694,6 +3791,12 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
     if (!rpi.render_target_width) rpi.render_target_width = 1; if (!rpi.render_target_height) rpi.render_target_height = 1;
     rpi.default_raster_sample_count = e->pend[i].res->samples ? e->pend[i].res->samples : 1;
     enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+    if (enc) {   /* madeira-doge att-fate: a clear-only pass is a pass too: it decides an earlier store, and in a census frame its own store is tracked */
+        struct mad_resource *cr = e->pend[i].res;
+        int ld = e->pend[i].is_depth ? rpi.depth.load_action == WMTLoadActionLoad : 0;
+        if (cr->ac_pb) mad_af_decide(cr, !ld ? AF_CLEARED : (g_enc_seq == cr->ac_penc + 1 ? AF_ADJ : AF_LOAD));
+        if (g_att_census && e->l) mad_af_store_raw(cr, f7_att_bytes(cr, e->pend[i].v.level), g_enc_seq, 1);
+    }
     e->f6_att[0] = e->pend[i].res; e->f6_natt = 1;   /* ml1134 */
     if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }   /* ml1091: a clear pass writes its target; keep it in the chain */
     e->f6_natt = 0;
@@ -4390,6 +4493,10 @@ static int exec_begin_render(struct mad_exec *e) {
             InterlockedExchangeAdd64(rpi.depth.load_action == WMTLoadActionClear ? &g_ac_clear : &g_ac_load, f7_att_bytes(e->depth, e->dp.level));
     }
     e->renc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (e->renc) e->renc_seq = ++g_enc_seq;
+    if (e->renc) {   /* madeira-doge att-fate */
+        for (i = 0; i < e->nrt; i++) if (e->rt[i]) mad_af_attach(e, e->rt[i], rpi.colors[i].load_action == WMTLoadActionLoad);
+        if (e->depth) mad_af_attach(e, e->depth, rpi.depth.load_action == WMTLoadActionLoad);
+    }
     if (g_enc_labels) mad_label(e->renc, "R#%u %s|%s %ux%u", e->renc_seq, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1142 */
     e->diag_npso = 0; e->diag_more = 0;   /* madeira-bcd: GPU fault attribution */
     e->f6_natt = 0;   /* ml1134: what this pass writes, for the same-attachment ordering rule */
@@ -7840,6 +7947,12 @@ static int exec_copy_compute(struct mad_exec *e, const struct mad_cmd *c) {
 }
 static void mad_hz_stamp(struct mad_resource *r) { if (r) __atomic_store_n(&r->hz_write, (LONG64)g_presents_now + 1, __ATOMIC_RELAXED); }   /* madeira-doge fence-chain 9: written by the GPU now */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
+    switch (c->kind) {   /* madeira-doge att-fate */
+    case MC_COPY_T2T: mad_af_decide(c->u.tt.src, AF_READ); mad_af_decide(c->u.tt.dst, AF_COPYDST); break;
+    case MC_COPY_T2B: mad_af_decide(c->u.bt.tex, AF_READ); break;
+    case MC_COPY_B2T: mad_af_decide(c->u.bt.tex, AF_COPYDST); break;
+    default: break;
+    }
     if (e->npend) switch (c->kind) {   /* madeira-doge clear-defer: a copy of a pending target happens after its clear */
     case MC_COPY_BB: exec_flush_pend_for(e, c->u.bb.dst); exec_flush_pend_for(e, c->u.bb.src); break;
     case MC_FILL_BB: exec_flush_pend_for(e, c->u.fill.res); break;
@@ -8359,6 +8472,7 @@ static obj_handle_t mad_resolve_view(struct mad_resource *r, enum WMTPixelFormat
 static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     struct mad_resource *src = c->u.tt.src, *dst = c->u.tt.dst;
     mad_hz_stamp(dst);   /* madeira-doge fence-chain 9 */
+    mad_af_decide(src, AF_READ); mad_af_decide(dst, AF_COPYDST);   /* madeira-doge att-fate */
     struct WMTRenderPassInfo rpi;
     obj_handle_t enc, target = dst->texture, dview = 0;
     enum WMTPixelFormat spf = src->tex_pf;
@@ -8940,6 +9054,12 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (g_barrier_render_uav < 0) { g_barrier_render_uav = mad_cfg_int_pe("barrier-render-uav", 1) ? 1 : 0;
                                             d3d12_log("[madeira-d3d12] barrier-render-uav = %d (a UAV barrier inside a render pass that has drawn %s)\n", g_barrier_render_uav, g_barrier_render_uav ? "CLOSES the pass" : "is ignored"); }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
+            {   unsigned ai;   /* madeira-doge att-fate: a transition to a read state is a use */
+                for (ai = 0; ai < c->u.barrier.n; ai++)
+                    if (c->u.barrier.res[ai] && c->u.barrier.res[ai]->ac_pb &&
+                        (c->u.barrier.cls[ai] == BC_RAW_ATT || c->u.barrier.cls[ai] == BC_RAR || c->u.barrier.cls[ai] == BC_RAW_COPY))
+                        mad_af_decide(c->u.barrier.res[ai], AF_READ);
+            }
             if (g_barrier_render_uav && e.renc && e.pass_draws) {   /* madeira-doge: see g_barrier_render_uav */
                 unsigned bi; int uav = c->u.barrier.all && c->u.barrier.cls_noref == BC_RAW_UAV;
                 for (bi = 0; bi < c->u.barrier.n && !uav; bi++) if (c->u.barrier.cls[bi] == BC_RAW_UAV) uav = 1;
@@ -9362,6 +9482,7 @@ static void mad_perf_present(void) {
                           InterlockedExchange64(&g_ac_load, 0) / mb / nf, InterlockedExchange64(&g_ac_clear, 0) / mb / nf, InterlockedExchange64(&g_ac_store, 0) / mb / nf,
                           InterlockedExchange64(&g_ac_st_cleared, 0) / mb / nf, InterlockedExchange64(&g_ac_st_read, 0) / mb / nf, InterlockedExchange64(&g_ac_st_rebound, 0) / mb / nf,
                           InterlockedExchange64(&g_ac_st_write, 0) / mb / nf, InterlockedExchange64(&g_ac_st_none, 0) / mb / nf, InterlockedExchange(&g_discards, 0));
+                mad_af_report(nf);   /* madeira-doge att-fate */
             }
         }
         d3d12_log("[perf] ml1109 sync per frame: ExecuteCommandLists %.1f, Signal %.1f, fence waits %.1f (game blocked %.1f ms/frame = %.0f%% of wall), "
@@ -11982,6 +12103,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
     struct mad_resource *r = (struct mad_resource *)This;
     LONG n = InterlockedDecrement(&r->refs);
     if (n == 0) { mad_pd_purge(This);   /* ml1143 */
+        mad_af_decide(r, AF_FREED);   /* madeira-doge att-fate */
         /* The backend owns the storage, so releasing the buffer is the whole
          * teardown; there is no separate free to order against it. */
         mad_untrack(r->owner, r);
@@ -19913,6 +20035,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     struct wmtcmd_blit_copy_from_texture_to_texture t2t;
     if (idx >= s->nbuf) return;
     src = s->buffers[idx];
+    mad_af_decide(src, AF_READ);   /* madeira-doge att-fate: presented */
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
     { LONG64 tf = mad_qpc();   /* ml1128 */
     mad_device_flush_all(s->queue->device);          /* ml884: the frame's batch precedes the present */
