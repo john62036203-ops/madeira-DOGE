@@ -3939,6 +3939,37 @@ static int ios_pool_recycle_tail_enabled( void )
     return cached;
 }
 
+/* madeira-doge: MADEIRA_POOL_IMAGE_RESERVE_MB (default 0, up to 64): anonymous RWX
+ * allocations stop N MB short of the head's bump limit, so the last N MB stay for
+ * DLL images. FINAL FANTASY RESONANCE (2026-10-25 21:16) gives every new thread a
+ * 1 MB RWX block; at 72 threads the pool was full, AVRT.dll could not load and
+ * XAudio2's "not installed" dialog stopped the game. A refused block was survivable
+ * there (39 refusals in the 16:15 run), a refused DLL was not. Freed ranges on the
+ * freelist stay open to both. */
+static size_t ios_pool_image_reserve( void )
+{
+    static size_t cached = (size_t)-1;
+    if (cached == (size_t)-1)
+    {
+        static const char name[] = "MADEIRA_POOL_IMAGE_RESERVE_MB";
+        const char *v = getenv( name );
+        long mb = v ? strtol( v, NULL, 10 ) : 0;
+        if (mb < 0) mb = 0;
+        if (mb > 64) mb = 64;
+        cached = (size_t)mb << 20;
+        if (cached) dprintf( 2, "[pool-reserve] MADEIRA_POOL_IMAGE_RESERVE_MB: the last %ld MB of the head bump stay for DLL images\n", mb );
+    }
+    return cached;
+}
+
+static size_t ios_pool_anon_limit( size_t head_limit )
+{
+    size_t rsv = ios_pool_image_reserve();
+    if (!rsv) return head_limit;
+    /* 0 would mean the freelist-only take, which is what is left past the reserve */
+    return head_limit > rsv ? head_limit - rsv : 0;
+}
+
 static int ios_pool_recycle_code_range( size_t want )
 {
     const char *env = getenv( "MADEIRA_POOL_RECYCLE_IMAGES" );
@@ -17971,9 +18002,12 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     }
                 }
 
-                size_t offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
+                /* madeira-doge: MADEIRA_POOL_IMAGE_RESERVE_MB keeps the last N MB of the head
+                 * bump for DLL images (ios_pool_image_reserve). */
+                size_t anon_limit = ios_pool_anon_limit( jit_pool_size - ios_jit_tail_reserved );
+                size_t offset = ios_pool_alloc_range(alloc_size, anon_limit);
                 if (offset == (size_t)-1 && ios_pool_recycle_code_range( alloc_size ))
-                    offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
+                    offset = ios_pool_alloc_range(alloc_size, anon_limit);
                 if (offset == (size_t)-1)
                 {
                     ERR("iOS JIT: pool exhausted for anon RWX %p+0x%lx\n",

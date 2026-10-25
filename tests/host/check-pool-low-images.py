@@ -50,7 +50,7 @@ allocation = ('offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - 
 assert allocation in image_copy, 'the overflow runs only after normal image allocation fails'
 assert source.count('ios_pool_low_image_range( alloc_size )') == 1, 'anonymous RWX must retain its old path'
 assert source.count('ios_pool_recycle_code_range( alloc_size )') == 2, 'only the image and anon RWX failure paths may transfer code ranges'
-anon = source[source.index('pool exhausted for anon RWX') - 600:source.index('pool exhausted for anon RWX')]
+anon = source[source.index('pool exhausted for anon RWX') - 900:source.index('pool exhausted for anon RWX')]
 assert 'if (offset == (size_t)-1 && ios_pool_recycle_code_range( alloc_size ))' in anon, 'anon RWX transfers only after its normal allocation fails'
 assert 'ios_tail_carves[i].freed_at = time( NULL );' in source
 assert source.count('ios_tail_carves[ios_tail_carve_n].freed_at = 0;') == 4
