@@ -35,6 +35,7 @@ helpers = ''.join(function(signature) for signature in (
     'static int ios_tail_carve_scan(',
     'static int ios_tail_carve_occupied(',
     'static int ios_pool_recycle_range_ready(',
+    'static int ios_pool_recycle_tail_enabled(',
     'static int ios_pool_recycle_code_range(',
     'static size_t ios_pool_take_freed_for_tail(',
 ))
@@ -48,7 +49,9 @@ allocation = ('offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - 
               '                    offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);')
 assert allocation in image_copy, 'the overflow runs only after normal image allocation fails'
 assert source.count('ios_pool_low_image_range( alloc_size )') == 1, 'anonymous RWX must retain its old path'
-assert source.count('ios_pool_recycle_code_range( alloc_size )') == 1, 'only the image failure path may transfer code ranges'
+assert source.count('ios_pool_recycle_code_range( alloc_size )') == 2, 'only the image and anon RWX failure paths may transfer code ranges'
+anon = source[source.index('pool exhausted for anon RWX') - 600:source.index('pool exhausted for anon RWX')]
+assert 'if (offset == (size_t)-1 && ios_pool_recycle_code_range( alloc_size ))' in anon, 'anon RWX transfers only after its normal allocation fails'
 assert 'ios_tail_carves[i].freed_at = time( NULL );' in source
 assert source.count('ios_tail_carves[ios_tail_carve_n].freed_at = 0;') == 4
 assert 'size_t image_used = image_in_low ? ios_jit_low_reserved : offset + alloc_size;' in source
@@ -115,6 +118,9 @@ static int ios_pool_execable_runs(uint64_t rx, size_t off, size_t size, ios_pool
                                  size_t *ro, size_t *rs, int max)
 { (void)rx; (void)off; (void)size; (void)fn; (void)ro; (void)rs; (void)max; return 0; }
 ''' + carve_table + r'''
+static int ios_tail_carve_in_low(size_t off)
+{ uintptr_t a = (uintptr_t)ios_jit_rx_base_global + off;
+  return ios_jit_low_size_global && a - ios_jit_low_rx_global < ios_jit_low_size_global; }
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef unsigned mach_port_t, mach_msg_type_number_t, thread_act_t;
