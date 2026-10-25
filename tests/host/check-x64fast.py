@@ -39,7 +39,7 @@ for n in STUBS:
     ok = got == want
     bad += not ok
     print("ok  " if ok else "FAIL", "header bytes of", n, "match stubs.asm")
-for d, lab in (("X64F_QPCW_STUB_END", "qpcw_e_stub"), ("X64F_QPCW_IV_END", "qpcw_e_iv"), ("X64F_QPCW_DELAY_END", "qpcw_e_delay")):
+for d, lab in (("X64F_QPCW_STUB_END", "qpcw_e_stub"), ("X64F_QPCW_DATA_END", "qpcw_e_data"), ("X64F_QPCW_IV_END", "qpcw_e_iv"), ("X64F_QPCW_DELAY_END", "qpcw_e_delay")):
     m = re.search(r"#define %s\s+(0x[0-9a-f]+|\d+)" % d, hdr)
     ok = bool(m) and int(m.group(1), 0) == syms[lab] - syms["qpcw"]
     bad += not ok

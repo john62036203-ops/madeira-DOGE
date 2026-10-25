@@ -12,7 +12,7 @@ global cs_enter, cs_enter_end, cs_leave, cs_leave_end, cs_try, cs_try_end
 global le_set, le_set_end, le_get, le_get_end, tls_get, tls_get_end, fls_get, fls_get_end
 global srw_as, srw_as_end, srw_rs, srw_rs_end, srw_ax, srw_ax_end, mem_copy, mem_copy_end, mem_set, mem_set_end
 global qpc, qpc_end, qpc_e_dis, qpc_e_freq, qpc_e_last, qpc_e_shift, qpc_e_off
-global qpcw, qpcw_end, qpcw_e_stub, qpcw_e_iv, qpcw_e_delay
+global qpcw, qpcw_end, qpcw_e_stub, qpcw_e_data, qpcw_e_iv, qpcw_e_delay
 
 cs_enter:
         mov     rdx, [gs:0x48]
@@ -386,44 +386,51 @@ qpc_d_off:  dq 0
 ; 1 us or more does. Other threads' calls are never delayed. Fix-ups by the
 ; installer: the rel32 before qpcw_e_stub (-> the qpc stub), the imm32 before
 ; qpcw_e_iv (relative interval, 100 ns units) and the rel32 before
-; qpcw_e_delay (-> ntdll's x64 NtDelayExecution syscall stub). State is shared
-; (one followed thread); races only blur the heuristic.
+; qpcw_e_delay (-> ntdll's x64 NtDelayExecution syscall stub), and the imm64
+; before qpcw_e_data: the address of the 24-byte state (+0 last count, +8 tid,
+; +12 run, +16 slept), which must be WRITABLE memory -- build 462 kept it next
+; to the code in ntdll's .hexpthk tail, which is read-only on the device, and
+; the launcher died at its first QPC call (log 2026-10-25 11:48, c0000005
+; writing ntdll+0x93ea8). State is shared (one followed thread); races only
+; blur the heuristic.
 qpcw:
         push    rbx
         sub     rsp, 0x30
         mov     rbx, rcx
         call    qpcw
 qpcw_e_stub:
+        mov     r9, 0x5a5a5a5a5a5a5a5a
+qpcw_e_data:
         mov     rcx, [rbx]
         mov     edx, [gs:0x48]
-        cmp     edx, [qpcw_d_tid]
+        cmp     edx, [r9+8]
         je      qpcw_same
         mov     r8, rcx
-        sub     r8, [qpcw_d_last]
+        sub     r8, [r9]
         cmp     r8, 10000
         jb      qpcw_done
-        mov     [qpcw_d_tid], edx
-        mov     dword [qpcw_d_run], 0
-        mov     byte [qpcw_d_slept], 0
-        mov     [qpcw_d_last], rcx
+        mov     [r9+8], edx
+        mov     dword [r9+12], 0
+        mov     byte [r9+16], 0
+        mov     [r9], rcx
         jmp     qpcw_done
 qpcw_same:
         mov     r8, rcx
-        sub     r8, [qpcw_d_last]
-        mov     [qpcw_d_last], rcx
-        cmp     byte [qpcw_d_slept], 0
-        mov     byte [qpcw_d_slept], 0
+        sub     r8, [r9]
+        mov     [r9], rcx
+        cmp     byte [r9+16], 0
+        mov     byte [r9+16], 0
         jne     qpcw_tight
         cmp     r8, 10
         jae     qpcw_reset
 qpcw_tight:
-        inc     dword [qpcw_d_run]
-        mov     eax, [qpcw_d_run]
+        inc     dword [r9+12]
+        mov     eax, [r9+12]
         cmp     eax, 256
         jb      qpcw_done
         test    eax, 15
         jnz     qpcw_done
-        mov     byte [qpcw_d_slept], 1
+        mov     byte [r9+16], 1
         mov     qword [rsp+0x28], -1000
 qpcw_e_iv:
         xor     ecx, ecx
@@ -432,18 +439,12 @@ qpcw_e_iv:
 qpcw_e_delay:
         jmp     qpcw_done
 qpcw_reset:
-        mov     dword [qpcw_d_run], 0
+        mov     dword [r9+12], 0
 qpcw_done:
         mov     eax, 1
         add     rsp, 0x30
         pop     rbx
         ret
-        align   8
-qpcw_d_last:  dq 0
-qpcw_d_tid:   dd 0
-qpcw_d_run:   dd 0
-qpcw_d_slept: db 0
-        align   8
 qpcw_end:
 
 %ifidn __OUTPUT_FORMAT__, elf64

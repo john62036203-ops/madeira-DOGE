@@ -91,6 +91,9 @@ int main(int argc, char **argv)
                 if (dt != de || iv != -1000 || stub >= w) bad++;
                 unsigned char t[sizeof(x64f_qpcw)]; memcpy(t, img + w, sizeof t);
                 memcpy(t + X64F_QPCW_STUB_END - 4, x64f_qpcw + X64F_QPCW_STUB_END - 4, 4);
+                memcpy(t + X64F_QPCW_DATA_END - 8, x64f_qpcw + X64F_QPCW_DATA_END - 8, 8);
+                { uint64_t st; memcpy(&st, img + w + X64F_QPCW_DATA_END - 8, 8);
+                  if (!st || (st >= (uintptr_t)img && st < (uintptr_t)img + size)) { printf("  qpc spin throttle state not in separate writable memory\n"); bad++; } }
                 memcpy(t + X64F_QPCW_IV_END - 4, x64f_qpcw + X64F_QPCW_IV_END - 4, 4);
                 memcpy(t + X64F_QPCW_DELAY_END - 4, x64f_qpcw + X64F_QPCW_DELAY_END - 4, 4);
                 if (memcmp(t, x64f_qpcw, sizeof t)) { printf("  qpc spin throttle mismatch outside the linked fields\n"); bad++; }

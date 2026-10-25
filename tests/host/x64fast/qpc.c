@@ -14,7 +14,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-extern unsigned char qpcw[], qpcw_end[], qpcw_e_stub[], qpcw_e_iv[], qpcw_e_delay[];
+extern unsigned char qpcw[], qpcw_end[], qpcw_e_stub[], qpcw_e_data[], qpcw_e_iv[], qpcw_e_delay[];
+static unsigned char qpcw_state[64];
 extern unsigned char qpc[], qpc_end[], qpc_e_dis[], qpc_e_freq[], qpc_e_last[], qpc_e_shift[], qpc_e_off[];
 static long fallbacks; static void *fb_arg;
 __attribute__((ms_abi)) static int fb(int64_t *c) { fallbacks++; fb_arg = c; *c = -7; return 1; }
@@ -39,6 +40,8 @@ static int check_qpcw(void)
     unsigned es = qpcw_e_stub - qpcw, ed = qpcw_e_delay - qpcw;
     int r1 = (int)(0x800 - es), r2 = (int)(0x810 - ed);
     memcpy(page + es - 4, &r1, 4); memcpy(page + ed - 4, &r2, 4);
+    { uint64_t st = (uint64_t)(uintptr_t)qpcw_state; memcpy(page + (qpcw_e_data - qpcw) - 8, &st, 8); }
+    mprotect(page, 0x800, PROT_READ | PROT_EXEC);   /* the code page is read-only on the device: the state must not be on it */
     qpcfn W = (qpcfn)page; int64_t v;
     struct { const char *what; int calls, step, other_every; long want; } c[] = {
         { "tight spin, 1000 calls", 1000, 1, 0, (992 - 256) / 16 + 1 },
