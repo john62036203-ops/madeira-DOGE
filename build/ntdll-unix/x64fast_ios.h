@@ -45,6 +45,11 @@
  * thread holds before taking Wine's waiting path (0 = Wine's own behaviour).
  * Nothing here runs unless x64-fast = 1. */
 
+#include <time.h>
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
+
 /* Generated from tests/host/x64fast/stubs.asm (nasm -f bin). */
 static const unsigned char x64f_cs_enter[93] = {
     0x65, 0x48, 0x8b, 0x14, 0x25, 0x48, 0x00, 0x00, 0x00, 0x45, 0x31, 0xc0,
@@ -194,28 +199,24 @@ static const unsigned char x64f_qpc[103] = {
 #define X64F_QPC_SHIFT_END 46
 #define X64F_QPC_OFF_END   94
 
-/* qpca (stubs.asm): qpc with an absolute statics base, for an ntdll whose
- * ARM64EC code runs from its JIT-pool copy -- the statics it updates (qpc_freq,
- * qpc_last_sync, qpc_offset) are that copy's, and the image's own stay 0, so
- * the rip-relative qpc fell back to the EC body on every call (EXVS2, log
- * 2026-10-25 12:58, build 465). Offsets: END of the base imm64, of each disp32
- * (for the cmp the imm8 comes last, so 5 before), of the shift imm8. */
-static const unsigned char x64f_qpca[114] = {
-    0x49, 0xba, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x41, 0x80, 0xba, 0x7f, 0x7f, 0x7f,
-    0x7f, 0x00, 0x75, 0x5e, 0x4d, 0x8b, 0x82, 0x7f, 0x7f, 0x7f, 0x7f, 0x4d, 0x85, 0xc0, 0x74, 0x52,
-    0x4d, 0x8b, 0x8a, 0x7f, 0x7f, 0x7f, 0x7f, 0x4d, 0x85, 0xc9, 0x74, 0x46, 0x0f, 0x31, 0x48, 0xc1,
-    0xe2, 0x20, 0x48, 0x09, 0xd0, 0x48, 0xc1, 0xe8, 0x06, 0x49, 0x89, 0xc3, 0x4c, 0x29, 0xc8, 0x4c,
-    0x39, 0xc0, 0x73, 0x2e, 0x4c, 0x89, 0xd8, 0x31, 0xd2, 0x49, 0xf7, 0xf0, 0x4c, 0x69, 0xd8, 0x80,
-    0x96, 0x98, 0x00, 0x48, 0x69, 0xc2, 0x80, 0x96, 0x98, 0x00, 0x31, 0xd2, 0x49, 0xf7, 0xf0, 0x4c,
-    0x01, 0xd8, 0x49, 0x03, 0x82, 0x7f, 0x7f, 0x7f, 0x7f, 0x48, 0x89, 0x01, 0xb8, 0x01, 0x00, 0x00,
+/* qpcx (stubs.asm): QueryPerformanceCounter from the stub's own state
+ * (+0 counter frequency, +8 offset in 100 ns ticks), calibrated here the way
+ * Wine's RtlQueryPerformanceCounter calibrates (CNTVCT_EL0 against the unix
+ * monotonic counter) and refreshed by ios_x64f_qpc_refresh (raised only, by
+ * more than 1 ms, like Wine's qpc_offset). Wine's own statics live in each
+ * process's JIT-pool copy of ntdll: build 465 read the image's (never written),
+ * 468 one pool copy's (the launcher's), and in the game every call fell back to
+ * the EC body (260k crossings/s, logs 2026-10-25 12:58 and 14:07). Offsets: END
+ * of the state imm64 and of the shift imm8. */
+static const unsigned char x64f_qpcx[66] = {
+    0x49, 0xba, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20,
+    0x48, 0x09, 0xd0, 0x48, 0xc1, 0xe8, 0x06, 0x4d, 0x8b, 0x02, 0x31, 0xd2, 0x49, 0xf7, 0xf0, 0x4c,
+    0x69, 0xd8, 0x80, 0x96, 0x98, 0x00, 0x48, 0x69, 0xc2, 0x80, 0x96, 0x98, 0x00, 0x31, 0xd2, 0x49,
+    0xf7, 0xf0, 0x4c, 0x01, 0xd8, 0x49, 0x03, 0x42, 0x08, 0x48, 0x89, 0x01, 0xb8, 0x01, 0x00, 0x00,
     0x00, 0xc3
 };
-#define X64F_QPCA_BASE_END  0x0a
-#define X64F_QPCA_DIS_END   0x12
-#define X64F_QPCA_FREQ_END  0x1b
-#define X64F_QPCA_LAST_END  0x27
-#define X64F_QPCA_SHIFT_END 0x39
-#define X64F_QPCA_OFF_END   0x69
+#define X64F_QPCX_BASE_END  0x0a
+#define X64F_QPCX_SHIFT_END 0x17
 
 /* QueryPerformanceCounter spin throttle (stubs.asm qpcw; madeira.cfg
  * qpc-spin-sleep-us). EXVS2 (log 2026-10-25 09:53, build 458): one game thread
@@ -521,20 +522,67 @@ static void x64f_qpc_link( unsigned char *b, unsigned int stub, const unsigned i
     b[X64F_QPC_SHIFT_END - 1] = (unsigned char)shift;
 }
 
-/* Point a copied qpca at the statics in the copy at pool_rx (base = the copy's
- * qpc_disabled, each disp32 = that static's distance from it). */
-static void x64f_qpca_link( unsigned char *b, uintptr_t pool_rx, const unsigned int v[4], unsigned int shift )
+/* qpcx state: calibration (and the refresh the xprobe loop calls) */
+#define X64F_MAX_QPCX 16
+static uint64_t *x64f_qpcx_state[X64F_MAX_QPCX];
+static int x64f_nqpcx;
+
+static uint64_t x64f_cntvct( void )
 {
-    static const unsigned int end[4] = { X64F_QPCA_DIS_END, X64F_QPCA_FREQ_END, X64F_QPCA_LAST_END, X64F_QPCA_OFF_END };
-    uint64_t base = (uint64_t)(pool_rx + v[0]);
-    unsigned int i;
-    memcpy( b + X64F_QPCA_BASE_END - 8, &base, 8 );
-    for (i = 0; i < 4; i++)
-    {
-        int disp = (int)(v[i] - v[0]);
-        memcpy( b + end[i] - (i ? 4 : 5), &disp, 4 );
-    }
-    b[X64F_QPCA_SHIFT_END - 1] = (unsigned char)shift;
+#if defined(__aarch64__)
+    uint64_t v;
+    __asm__ __volatile__( "isb\n\tmrs %0, cntvct_el0" : "=r"(v) :: "memory" );
+    return v;
+#else
+    unsigned int lo, hi;   /* host test: the TSC the stub reads */
+    __asm__ __volatile__( "rdtsc" : "=a"(lo), "=d"(hi) );
+    return (((uint64_t)hi << 32) | lo) >> 6;
+#endif
+}
+
+static uint64_t x64f_cntfrq( void )
+{
+#if defined(__aarch64__)
+    uint64_t f;
+    __asm__ __volatile__( "mrs %0, cntfrq_el0" : "=r"(f) );
+    return f;
+#else
+    return 24000000;   /* host test: tsc >> 6 counts at ~24-50 MHz; only consistency matters there */
+#endif
+}
+
+/* Wine's unix monotonic_counter (dlls/ntdll/unix/sync.c), 100 ns units */
+static uint64_t x64f_mono( void )
+{
+#ifdef __APPLE__
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info( &tb );
+    return mach_continuous_time() * tb.numer / tb.denom / 100;
+#else
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (uint64_t)ts.tv_sec * 10000000ull + (uint64_t)ts.tv_nsec / 100;
+#endif
+}
+
+static void x64f_qpcx_calibrate( uint64_t *st, int raise_only )
+{
+    uint64_t f = x64f_cntfrq(), c0, c1, m, c, ticks;
+    int64_t off;
+    if (!f) return;
+    c0 = x64f_cntvct(); m = x64f_mono(); c1 = x64f_cntvct();
+    c = c0 + (c1 - c0) / 2;
+    ticks = (c / f) * 10000000ull + (c % f) * 10000000ull / f;
+    off = (int64_t)(m - ticks);
+    if (!raise_only || off > (int64_t)st[1] + 10000) st[1] = (uint64_t)off;
+    st[0] = f;
+}
+
+/* called from the xprobe loop (server_ios.c) */
+void ios_x64f_qpc_refresh( void )
+{
+    int i, n = __atomic_load_n( &x64f_nqpcx, __ATOMIC_ACQUIRE );
+    for (i = 0; i < n; i++) x64f_qpcx_calibrate( x64f_qpcx_state[i], 1 );
 }
 
 /* Modules that got stubs, for chasing a `jmp [rip+slot]` forwarder (kernel32's
@@ -574,16 +622,16 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
     {
         const unsigned char *code = x64f_stub[x64f_targets[i].kind].code;
         unsigned int len = x64f_stub[x64f_targets[i].kind].len;
-        /* QPC: ntdll's ARM64EC code runs from its JIT-pool copy unless the image
-         * IS the pool (in-pool images); then its statics are the copy's, reached
-         * through an absolute base (qpca) */
+        /* QPC: ntdll's ARM64EC code runs from per-process JIT-pool copies unless
+         * the image IS the pool (in-pool images); then the stub keeps its own
+         * calibrated state (qpcx) instead of reading Wine's statics */
         int qabs = x64f_targets[i].kind == X64F_QPC && pool_rx && pool_rx != img;
         unsigned int e = 0, stub = lo + used, fb, need;
         unsigned char fall[16];
         unsigned int fall_len = 0;
         int rel;
 
-        if (qabs) { code = x64f_qpca; len = sizeof(x64f_qpca); }
+        if (qabs) { code = x64f_qpcx; len = sizeof(x64f_qpcx); }
         fb = stub + len;
 
         if (strcasecmp( mn, x64f_targets[i].module )) continue;
@@ -625,7 +673,18 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
         memcpy( blob + used, code, len );
         if (x64f_targets[i].kind == X64F_ENTER) memcpy( blob + used + X64F_SPIN_AT, &x64f_spin, 4 );
         if (x64f_targets[i].kind == X64F_QPC && !qabs) x64f_qpc_link( blob + used, stub, qpc_v, qpc_shift );
-        if (qabs) { x64f_qpca_link( blob + used, (uintptr_t)pool_rx, qpc_v, qpc_shift ); qpc_abs = 1; }
+        if (qabs)
+        {
+            uint64_t *st = calloc( 2, sizeof(uint64_t) ), base = (uint64_t)(uintptr_t)st;
+            int k = __atomic_load_n( &x64f_nqpcx, __ATOMIC_ACQUIRE );
+            if (!st || k >= X64F_MAX_QPCX) { free( st ); dprintf( 2, "[x64-fast] %s: no QPC state, QueryPerformanceCounter left native\n", mn ); continue; }
+            x64f_qpcx_calibrate( st, 0 );
+            memcpy( blob + used + X64F_QPCX_BASE_END - 8, &base, 8 );
+            blob[used + X64F_QPCX_SHIFT_END - 1] = (unsigned char)qpc_shift;
+            x64f_qpcx_state[k] = st;
+            __atomic_store_n( &x64f_nqpcx, k + 1, __ATOMIC_RELEASE );
+            qpc_abs = 1;
+        }
         if (x64f_stub[x64f_targets[i].kind].needs_fallback) memcpy( blob + used + len, fall, fall_len );
         done[n].entry = e;
         done[n].stub = stub;
@@ -684,7 +743,7 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
              mn, img, n, want, lo, used, x64f_spin );
     if (qpc_v[1])
         dprintf( 2, "[x64-fast] %s: QueryPerformanceCounter in x64 (statics +0x%x/+0x%x/+0x%x/+0x%x %s, tsc >> %u)\n",
-                 mn, qpc_v[0], qpc_v[1], qpc_v[2], qpc_v[3], qpc_abs ? "in the JIT-pool copy" : "in the image", qpc_shift );
+                 mn, qpc_v[0], qpc_v[1], qpc_v[2], qpc_v[3], qpc_abs ? "not read: own calibrated state" : "in the image", qpc_shift );
     if (qpcw_at)
         dprintf( 2, "[x64-fast] %s: QPC spin throttle at +0x%x: a thread past 256 calls < 1 us apart sleeps %lld us every 16th call\n",
                  mn, qpcw_at, x64f_qpcw_us );

@@ -99,24 +99,18 @@ int main(int argc, char **argv)
                 if (memcmp(t, x64f_qpcw, sizeof t)) { printf("  qpc spin throttle mismatch outside the linked fields\n"); bad++; }
             }
             if (k == X64F_QPC && img[stub] == 0x49 && img[stub + 1] == 0xba) {
-                /* qpca: this test's pool is a separate copy, so the statics are the pool copy's:
-                 * base = pool + qpc_disabled, disp32s = distance of each static from it */
-                static const unsigned endo[4] = { X64F_QPCA_DIS_END, X64F_QPCA_FREQ_END, X64F_QPCA_LAST_END, X64F_QPCA_OFF_END };
-                static const unsigned want_v[4] = { 0xe2a50, 0xe2a58, 0xe2a60, 0xe2a68 };
-                unsigned char tmpl[256]; uint64_t base; len = sizeof(x64f_qpca);
-                memcpy(tmpl, img + stub, len); memcpy(&base, img + stub + X64F_QPCA_BASE_END - 8, 8);
-                printf("  qpca base 0x%llx (want pool+0x%x) %s\n", (unsigned long long)base, want_v[0], base == (uintptr_t)pool + want_v[0] ? "ok" : "WRONG");
-                if (base != (uintptr_t)pool + want_v[0]) bad++;
-                memcpy(tmpl + X64F_QPCA_BASE_END - 8, x64f_qpca + X64F_QPCA_BASE_END - 8, 8);
-                for (int q = 0; q < 4; q++) {
-                    unsigned at = endo[q] - (q ? 4 : 5); int disp; memcpy(&disp, img + stub + at, 4);
-                    printf("  qpca static %d at base%+d (want %+d) %s\n", q, disp, (int)(want_v[q] - want_v[0]), disp == (int)(want_v[q] - want_v[0]) ? "ok" : "WRONG");
-                    if (disp != (int)(want_v[q] - want_v[0])) bad++;
-                    memcpy(tmpl + at, x64f_qpca + at, 4);
-                }
-                if (img[stub + X64F_QPCA_SHIFT_END - 1] != 6) { printf("  qpca tsc shift WRONG\n"); bad++; }
-                tmpl[X64F_QPCA_SHIFT_END - 1] = x64f_qpca[X64F_QPCA_SHIFT_END - 1];
-                if (memcmp(tmpl, x64f_qpca, len)) { printf("  qpca stub mismatch outside the linked fields\n"); bad++; }
+                /* qpcx: this test's pool is a separate copy, so the stub keeps its own calibrated state */
+                uint64_t base; len = sizeof(x64f_qpcx);
+                memcpy(&base, img + stub + X64F_QPCX_BASE_END - 8, 8);
+                const uint64_t *stp = (const uint64_t *)(uintptr_t)base;
+                int okst = base && !(base >= (uintptr_t)img && base < (uintptr_t)img + size) && stp[0] == 24000000;
+                printf("  qpcx state %p freq %llu offset %lld shift %u %s\n", (void *)stp, okst ? (unsigned long long)stp[0] : 0ull,
+                       okst ? (long long)stp[1] : 0ll, img[stub + X64F_QPCX_SHIFT_END - 1], okst && img[stub + X64F_QPCX_SHIFT_END - 1] == 6 ? "ok" : "WRONG");
+                if (!okst || img[stub + X64F_QPCX_SHIFT_END - 1] != 6) bad++;
+                unsigned char tmpl[256]; memcpy(tmpl, img + stub, len);
+                memcpy(tmpl + X64F_QPCX_BASE_END - 8, x64f_qpcx + X64F_QPCX_BASE_END - 8, 8);
+                tmpl[X64F_QPCX_SHIFT_END - 1] = x64f_qpcx[X64F_QPCX_SHIFT_END - 1];
+                if (memcmp(tmpl, x64f_qpcx, len)) { printf("  qpcx stub mismatch outside the linked fields\n"); bad++; }
                 qpc_entry = (uintptr_t)img + e; qpc_stub = sa;
             }
             else if (k == X64F_QPC) {

@@ -2233,6 +2233,7 @@ static void ios_xprobe_main( void )
                 double paced_ms = __atomic_exchange_n( &ios_fps_paced_ns, 0, __ATOMIC_RELAXED ) / 1e6;
                 if (pc && qf) { int64_t t = pc->t_cap; if (prev_t_cap && t >= prev_t_cap) paced_ms += (t - prev_t_cap) * qf; prev_t_cap = t; }
                 ios_fps_gov_step( ios_fps_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6, ios_fps_presents, paced_ms );
+                { extern void ios_x64f_qpc_refresh( void ); ios_x64f_qpc_refresh(); }   /* madeira-doge: x64-fast QPC offset follows the clock (x64fast_ios.h qpcx) */
                 if (pc && pe.magic == 0x3130305058444d4dLL && ios_fps_gov_armed && pc->fps_cap != ios_fps_cap) pc->fps_cap = ios_fps_cap;
             }
             gettimeofday( &tv, NULL ); localtime_r( &tv.tv_sec, &tmv );

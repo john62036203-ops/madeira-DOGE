@@ -13,7 +13,7 @@ global cur_tid, cur_tid_end, cur_pid, cur_pid_end, cur_thr, cur_thr_end, cur_pro
 global le_set, le_set_end, le_get, le_get_end, tls_get, tls_get_end, fls_get, fls_get_end
 global srw_as, srw_as_end, srw_rs, srw_rs_end, srw_ax, srw_ax_end, mem_copy, mem_copy_end, mem_set, mem_set_end
 global qpc, qpc_end, qpc_e_dis, qpc_e_freq, qpc_e_last, qpc_e_shift, qpc_e_off
-global qpca, qpca_end, qpca_e_base, qpca_e_dis, qpca_e_freq, qpca_e_last, qpca_e_shift, qpca_e_off
+global qpcx, qpcx_end, qpcx_e_base, qpcx_e_shift
 global qpcw, qpcw_end, qpcw_e_stub, qpcw_e_data, qpcw_e_iv, qpcw_e_delay
 
 cs_enter:
@@ -397,39 +397,25 @@ qpc_d_last: dq 0
 qpc_d_off:  dq 0
 
 ;
-; qpca: the same as qpc with the four statics addressed through an absolute
-; base (imm64 before qpca_e_base) plus a disp32 each (the 4 bytes before
-; qpca_e_freq / _last / _off; for the cmp, the 4 bytes before the imm8, i.e.
-; 5 before qpca_e_dis). Used when ntdll's ARM64EC code runs from a JIT-pool
-; copy: its statics live in THAT copy's .data, out of rel32 reach of the x64
-; stub at the PE address, and the PE image's own .data never sees a sync
-; (qpc_last_sync stays 0 there, so the rip-relative stub fell back to the EC
-; body on every call: EXVS2, log 2026-10-25 12:58, build 465, 260k crossings/s
-; to ntdll+0x71aac with the stub in place).
-qpca:
+; qpcx: QueryPerformanceCounter from the stub's own state (imm64 before
+; qpcx_e_base: +0 the counter frequency, +8 the offset in 100 ns ticks, both
+; set by the installer from CNTFRQ_EL0, CNTVCT_EL0 and Wine's monotonic
+; counter, the same calibration Wine's RtlQueryPerformanceCounter does, and
+; refreshed from the unix side). Used when ntdll's ARM64EC code runs from
+; per-process JIT-pool copies: Wine's statics live in each copy, so neither
+; the image's (never written) nor one copy's (another process's) can be read
+; here. EXVS2 builds 465 (image statics) and 468 (the launcher's pool copy):
+; the stub fell back to the EC body on every call, 260k crossings/s. No
+; fallback: the counter and the clock are global.
+qpcx:
         mov     r10, 0x5a5a5a5a5a5a5a5a
-qpca_e_base:
-        cmp     byte [r10+0x7f7f7f7f], 0
-qpca_e_dis:
-        jne     qpca_end
-        mov     r8, [r10+0x7f7f7f7f]
-qpca_e_freq:
-        test    r8, r8
-        jz      qpca_end
-        mov     r9, [r10+0x7f7f7f7f]
-qpca_e_last:
-        test    r9, r9
-        jz      qpca_end
+qpcx_e_base:
         rdtsc
         shl     rdx, 32
         or      rax, rdx
         shr     rax, 6
-qpca_e_shift:
-        mov     r11, rax
-        sub     rax, r9
-        cmp     rax, r8
-        jae     qpca_end
-        mov     rax, r11
+qpcx_e_shift:
+        mov     r8, [r10]
         xor     edx, edx
         div     r8
         imul    r11, rax, 10000000
@@ -437,12 +423,11 @@ qpca_e_shift:
         xor     edx, edx
         div     r8
         add     rax, r11
-        add     rax, [r10+0x7f7f7f7f]
-qpca_e_off:
+        add     rax, [r10+8]
         mov     [rcx], rax
         mov     eax, 1
         ret
-qpca_end:
+qpcx_end:
 
 ;
 ; qpcw: spin throttle in front of the qpc stub (madeira.cfg qpc-spin-sleep-us).
