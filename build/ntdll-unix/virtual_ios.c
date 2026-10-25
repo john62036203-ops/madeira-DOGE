@@ -32126,6 +32126,26 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
                 return status;
             }
         }
+        /* madeira-doge: madeira.cfg x64-fast with MADEIRA_X64_IMAGE_NOCOPY -- a pure x64
+         * image with no JIT-pool copy (VPROT_X64DATA) never reaches the pool sync
+         * below, so its import slots were never pointed at the x64 stubs (EXVS2,
+         * log 2026-10-25 10:34, build 459: no "[x64-fast] x64 image" line; the
+         * game's QueryPerformanceCounter calls still crossed to ARM64EC at 200k/s).
+         * Same redirect on the image itself; it has no copy to update. */
+        if (x64f_mode == 1)
+        {
+            uintptr_t xb = 0;
+            size_t xs = 0;
+            server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+            if ((view = find_view( base, size )) && (view->protect & VPROT_X64DATA))
+            {
+                xb = (uintptr_t)view->base;
+                xs = view->size;
+            }
+            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+            if (xb && (uintptr_t)base >= xb && (uintptr_t)base + size <= xb + xs)
+                x64f_redirect_iat( (unsigned char *)xb, xs, (uintptr_t)base - xb, size );
+        }
         if (1)
         {
             int idx;
