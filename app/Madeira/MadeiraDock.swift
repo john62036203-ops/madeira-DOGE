@@ -3,6 +3,7 @@
 // Madeira Converter Exception: see LICENSE-EXCEPTION.md
 
 import Foundation
+import zlib
 import Darwin
 import Network
 
@@ -34,10 +35,18 @@ struct DockGame: Identifiable, Equatable, Sendable {
     let library: String         // drive-relative steamapps folder
     let installed: Bool         // StateFlags has "fully installed"
     let customExecutables: Bool // the install record lists per-user executables (CheckGuid)
+    /// madeira-doge: a non-Steam program started through Valve's client as one of the
+    /// account's shortcuts (desktop Steam's "Add a Non-Steam Game"): the program's Windows
+    /// path; `id` is then the shortcut's app id (MadeiraDock.shortcut). nil for a Steam game.
+    var shortcutExe: String? = nil
+    var shortcutArguments: String = ""
+
+    var isShortcut: Bool { shortcutExe != nil }
 
     /// Windows path of the game's folder, which Dock requires Valve's client to resolve to.
     var windowsInstallPath: String {
-        "C:\\" + (library + "/common/" + installDir).replacingOccurrences(of: "/", with: "\\")
+        if let exe = shortcutExe { return LibraryEntry.folder(of: exe) }
+        return "C:\\" + (library + "/common/" + installDir).replacingOccurrences(of: "/", with: "\\")
     }
 }
 
@@ -154,9 +163,131 @@ enum MadeiraDock {
         return (parts + ["steamapps"]).joined(separator: "/")
     }
 
+    // MARK: Non-Steam programs as shortcuts (madeira-doge)
+
+    /// The shortcut Valve's client would make for this program: its app id is
+    /// crc32(quoted exe + name) | 0x80000000, as the desktop client computes it, so the
+    /// client's own records and the id the Dock host launches agree.
+    static func shortcut(exe windowsPath: String, name: String, arguments: String) -> DockGame {
+        let quoted = "\"" + windowsPath + "\""
+        let bytes = Array((quoted + name).utf8)
+        let crc = bytes.withUnsafeBufferPointer { UInt32(crc32(0, $0.baseAddress, uInt($0.count))) }
+        let appID = Int(crc | 0x8000_0000)
+        return DockGame(id: appID, name: name, installDir: "", library: "", installed: true, customExecutables: false,
+                        shortcutExe: windowsPath, shortcutArguments: arguments)
+    }
+
+    /// Writes the account's shortcuts.vdf (binary KeyValues, the desktop client's own
+    /// file) with this one shortcut, so the client knows the program when the Dock host
+    /// asks it to start the shortcut's game id. Steam reads it at sign-in. Other entries
+    /// in an existing file are kept.
+    static func writeShortcut(_ game: DockGame, steamID: UInt64) throws {
+        guard let exe = game.shortcutExe else { return }
+        let account = steamID & 0xffff_ffff
+        let folder = clientRoot.appendingPathComponent("userdata/\(account)/config", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("shortcuts.vdf")
+        var entries = (try? Data(contentsOf: file)).flatMap(shortcutEntries) ?? []
+        entries.removeAll { $0.appID == UInt32(truncatingIfNeeded: game.id) }
+        entries.append(ShortcutEntry(appID: UInt32(truncatingIfNeeded: game.id), name: game.name, exe: "\"" + exe + "\"",
+                                     startDir: "\"" + LibraryEntry.folder(of: exe) + "\\\"", launchOptions: game.shortcutArguments))
+        var data = Data()
+        func str(_ key: String, _ value: String) {
+            data.append(1); data.append(contentsOf: Array(key.utf8)); data.append(0)
+            data.append(contentsOf: Array(value.utf8)); data.append(0)
+        }
+        func int(_ key: String, _ value: UInt32) {
+            data.append(2); data.append(contentsOf: Array(key.utf8)); data.append(0)
+            for i in 0..<4 { data.append(UInt8(truncatingIfNeeded: value >> (i * 8))) }
+        }
+        data.append(0); data.append(contentsOf: Array("shortcuts".utf8)); data.append(0)
+        for (index, e) in entries.enumerated() {
+            data.append(0); data.append(contentsOf: Array(String(index).utf8)); data.append(0)
+            int("appid", e.appID); str("AppName", e.name); str("Exe", e.exe); str("StartDir", e.startDir)
+            str("icon", ""); str("ShortcutPath", ""); str("LaunchOptions", e.launchOptions)
+            int("IsHidden", 0); int("AllowDesktopConfig", 1); int("AllowOverlay", 1); int("OpenVR", 0)
+            int("Devkit", 0); str("DevkitGameID", ""); int("DevkitOverrideAppID", 0); int("LastPlayTime", 0)
+            str("FlatpakAppID", "")
+            data.append(0); data.append(contentsOf: Array("tags".utf8)); data.append(0); data.append(8)
+            data.append(8)
+        }
+        data.append(8); data.append(8)
+        try data.write(to: file, options: .atomic)
+        SteamLog.event("[dock-shortcut] shortcuts.vdf entries=\(entries.count)")
+    }
+
+    struct ShortcutEntry { var appID: UInt32; var name: String; var exe: String; var startDir: String; var launchOptions: String }
+
+    /// The entries of an existing shortcuts.vdf (only the fields this file rewrites);
+    /// nil when the file is not the expected shape, so it is replaced.
+    static func shortcutEntries(_ data: Data) -> [ShortcutEntry]? {
+        var i = data.startIndex
+        func byte() -> UInt8? { guard i < data.endIndex else { return nil }; defer { i += 1 }; return data[i] }
+        func cstring() -> String? {
+            guard let end = data[i...].firstIndex(of: 0) else { return nil }
+            defer { i = end + 1 }
+            return String(decoding: data[i..<end], as: UTF8.self)
+        }
+        func u32() -> UInt32? {
+            guard i + 4 <= data.endIndex else { return nil }
+            defer { i += 4 }
+            return data[i..<i + 4].enumerated().reduce(UInt32(0)) { $0 | UInt32($1.element) << (8 * UInt32($1.offset)) }
+        }
+        guard byte() == 0, cstring() == "shortcuts" else { return nil }
+        var entries: [ShortcutEntry] = []
+        while let t = byte(), t == 0 {
+            guard cstring() != nil else { return nil }
+            var e = ShortcutEntry(appID: 0, name: "", exe: "", startDir: "", launchOptions: "")
+            while let k = byte(), k != 8 {
+                guard let key = cstring() else { return nil }
+                switch k {
+                case 1:
+                    guard let v = cstring() else { return nil }
+                    switch key.lowercased() {
+                    case "appname": e.name = v
+                    case "exe": e.exe = v
+                    case "startdir": e.startDir = v
+                    case "launchoptions": e.launchOptions = v
+                    default: break
+                    }
+                case 2:
+                    guard let v = u32() else { return nil }
+                    if key.lowercased() == "appid" { e.appID = v }
+                case 0:
+                    // a nested map (tags): skip to its end
+                    var depth = 1
+                    while depth > 0, let b = byte() {
+                        if b == 8 { depth -= 1; continue }
+                        guard cstring() != nil else { return nil }
+                        switch b {
+                        case 0: depth += 1
+                        case 1: guard cstring() != nil else { return nil }
+                        case 2: guard u32() != nil else { return nil }
+                        default: return nil
+                        }
+                    }
+                default: return nil
+                }
+            }
+            guard !e.exe.isEmpty else { continue }
+            entries.append(e)
+        }
+        return entries
+    }
+
     /// Everything a launch needs, checked before any sign-in is handed over.
     static func validate(_ game: DockGame, drive: URL, bundled: Bool = MadeiraDock.bundled) throws {
         guard bundled else { throw DockError.message("Madeira Dock is not built into this app. Run build/madeira-dock/build.sh.") }
+        if let exe = game.shortcutExe {
+            guard validAppID(game.id), !exe.isEmpty, exe.lowercased().hasPrefix("c:\\"), !exe.contains("\""),
+                  (1...200).contains(game.name.utf8.count), !game.name.contains("\0") else {
+                throw DockError.message("This program cannot be started as a Steam shortcut.")
+            }
+            guard FileManager.default.fileExists(atPath: drive.appendingPathComponent(SteamRuntimeFiles.relativeRoot + "/steamclient64.dll").path) else {
+                throw DockError.message("Steam's client files are missing. Download Valve's client components first.")
+            }
+            return
+        }
         guard validAppID(game.id), validFolderName(game.installDir) else {
             throw DockError.message("This game's Steam install record is invalid.")
         }
@@ -441,6 +572,8 @@ enum MadeiraDock {
             setenv(key, "1", 1)
         }
         setenv("MADEIRA_STEAM_HOST_APPID", String(game.id), 1)
+        // madeira-doge: a non-Steam program as the account's shortcut (tools/patch-dock-shortcut.py).
+        if game.isShortcut { setenv("MADEIRA_DOCK_SHORTCUT", "1", 1) } else { unsetenv("MADEIRA_DOCK_SHORTCUT") }
         setenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION", String(launchOption), 1)
         setenv("MADEIRA_STEAM_HOST_CLIENT_DIR", SteamRuntimeFiles.windowsRoot, 1)
         setenv("MADEIRA_STEAM_HOST_EXPECTED_INSTALL", game.windowsInstallPath, 1)

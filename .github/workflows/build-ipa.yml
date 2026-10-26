@@ -1077,7 +1077,15 @@ jobs:
           python3 tools/patch-dock-keep-alive.py madeira-dock/src/launch.c || echo "::warning::Dock keep-alive patch not applied"
           # env.MADEIRA_DOCK_PRESENCE (default 1 online, 7 invisible, 0 off): friends see the game being played
           python3 tools/patch-dock-presence.py madeira-dock/src/session.c || echo "::warning::Dock presence patch not applied"
+          # env MADEIRA_DOCK_SHORTCUT=1: a non-Steam program started through Valve's client as a shortcut
+          python3 tools/patch-dock-shortcut.py madeira-dock/src/session.c || echo "::warning::Dock shortcut patch (session.c) not applied"
+          python3 tools/patch-dock-shortcut.py madeira-dock/src/launch.c || echo "::warning::Dock shortcut patch (launch.c) not applied"
           bash build/madeira-dock/build.sh
+
+      # madeira-doge: the step above only warns; a Dock host that failed to compile would
+      # silently leave the IPA without Madeira Dock. Fail the build instead.
+      - name: Check the Dock host was built
+        run: test -s app/Madeira/arm64ec-windows/dockhost.exe && ls -la app/Madeira/arm64ec-windows/dockhost.exe
 
       # 30 and 40 FPS caps (pacing modes 3 and 4) for the Session panel.
       - name: Patch DXMT present pacing with 30/40 FPS modes

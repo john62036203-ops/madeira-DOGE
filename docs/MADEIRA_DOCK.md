@@ -506,3 +506,21 @@ passes `-friendsui` instead.
 `env.MADEIRA_DOCK_PRESENCE`: unset or `1` online (default), `3` away, `7`
 invisible, `0` leaves the persona state alone. `[dock-report] presence-before`
 and `presence-set` show the state before and the state asked for.
+
+## Non-Steam programs through Valve's client (madeira-doge)
+
+Desktop Steam's "Add a Non-Steam Game": a library program whose own config has
+`steam-shortcut = 1` (and optionally `steam-shortcut-name = <name shown to
+friends>`, default: the library title) starts through Madeira Dock instead of
+directly. Madeira writes the program into the account's
+`Steam\userdata\<accountid>\config\shortcuts.vdf` (the desktop client's own
+file; other entries are kept), signs Valve's client in as for a Steam game and
+asks it to start the shortcut (`tools/patch-dock-shortcut.py`,
+`MADEIRA_DOCK_SHORTCUT=1`: no licence check, no install-directory check, the
+shortcut's CGameID instead of an app id). The client starts the program and
+reports it to Steam, so friends see "playing <name>" (presence above). The
+entry's launch arguments become the shortcut's launch options; its own config
+lines apply as for any library program. Needs a network and Valve's client
+components; the client stays resident beside the program (memory as for a
+Steam game). Report field `launch-shortcut=1`.
+

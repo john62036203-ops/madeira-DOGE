@@ -2797,6 +2797,19 @@ struct ContentView: View {
             startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)
             return
         }
+        // madeira-doge: a non-Steam program started through Valve's client as one of the
+        // account's shortcuts (its config: steam-shortcut = 1, steam-shortcut-name = <name>),
+        // so friends see "playing <name>" as with desktop Steam's "Add a Non-Steam Game".
+        if entry.steamAppID == nil, entry.desktop != true, MadeiraDock.enabled,
+           GameProfile(windowsPath: entry.windowsPath).get("steam-shortcut") == "1" {
+            let profile = GameProfile(windowsPath: entry.windowsPath)
+            let name = profile.get("steam-shortcut-name") ?? entry.title
+            let game = MadeiraDock.shortcut(exe: entry.windowsPath, name: name, arguments: entry.launchArguments)
+            LogStore.shared.log("[dock-shortcut] \(entry.windowsPath) as Steam shortcut \"\(name)\" app=\(game.id)")
+            BCDLaunch.applyLibrary(entry, sessionLog: false)
+            startDock(game, compactPool: MadeiraDockModel.shared.compactPool, profile: entry)
+            return
+        }
         if let appID = entry.steamAppID {
             guard cloudClear(appID, name: entry.title, retry: { launchLibraryEntry(entry) }) else { return }
             guard entry.steamProgram?.isEmpty == false else {
@@ -3649,7 +3662,7 @@ struct ContentView: View {
         let inLibrary = library.enabled
         guard jitReadyForLaunch(inLibrary: inLibrary, entry: profile?.id,
                                 then: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
-        guard cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
+        guard game.isShortcut || cloudClear(game.id, name: game.name, retry: { startDock(game, compactPool: compactPool, profile: profile) }) else { return }
         guard wine_process_is_running() == 0, wineserver_is_running() == 0, !inLibrary || library.current == nil else {
             logStore.log("[madeira-dock] a session already ran in this app run; restart Madeira first", level: .error)
             if inLibrary { library.error = "A session is already running." }
@@ -3683,7 +3696,7 @@ struct ContentView: View {
             // Without a choice (no configuration to be had, or no entry whose .exe is on disk:
             // a launcher started through a .bat, say) it is key 0, which every Dock start
             // used before; Dock stops at once if Steam names that entry missing.
-            let options = await SteamOwnedLibrary.shared.launchOptions(appID: game.id)
+            let options = game.isShortcut ? nil : await SteamOwnedLibrary.shared.launchOptions(appID: game.id)
             let installFolder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
             let chosen = options.flatMap { SteamDirectStart.choose($0, installFolder: installFolder)?.launchIndex }
             let launchOption = chosen ?? 0
@@ -3698,6 +3711,9 @@ struct ContentView: View {
                 guard let signIn = SteamSignIn.credentialsForDock() else {
                     throw DockError.message("Sign in to Steam in Madeira before starting Dock.")
                 }
+                // madeira-doge: the shortcut goes into the account's shortcuts.vdf before the
+                // client signs in and reads it.
+                if game.isShortcut { try MadeiraDock.writeShortcut(game, steamID: MadeiraDock.subject(signIn.refreshToken)) }
                 try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
             } catch { fail(error); return }
             MadeiraDock.configure(game, launchOption: launchOption)
