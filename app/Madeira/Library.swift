@@ -222,6 +222,11 @@ struct LibraryEntry: Codable, Identifiable {
     /// which Steam-style launchers need) before the program, from a generated
     /// C:\madeira-games\<id>.bat (servicesScript).
     var startServices: Bool?
+    /// madeira-doge: start this (non-Steam) program through Valve's client as one of the
+    /// account's shortcuts, so Steam friends see it being played (ContentView.launchLibraryEntry).
+    var steamShortcut: Bool?
+    /// The name friends see; nil: the title.
+    var steamShortcutName: String?
     /// How a physical controller reaches this game: nil, the game's own support
     /// (XInput, as before); "dinput", XInput and a DirectInput joystick of the same
     /// pad (for games older than XInput; a game reading both APIs sees two
@@ -3164,6 +3169,21 @@ struct LibraryDetail: View {
                                     .foregroundStyle(.orange)
                             }
                         }
+                    }
+                }
+                // madeira-doge: a non-Steam program through Valve's client as a shortcut (presence).
+                if entry.desktop != true && entry.steamAppID == nil && MadeiraDock.enabled {
+                    Section {
+                        Toggle("Show friends on Steam", isOn: Binding(get: { entry.steamShortcut == true }, set: {
+                            entry.steamShortcut = $0 ? true : nil
+                        }))
+                        if entry.steamShortcut == true {
+                            TextField("Name friends see (default: the title)", text: Binding(get: { entry.steamShortcutName ?? "" }, set: {
+                                let t = $0.trimmingCharacters(in: .whitespaces); entry.steamShortcutName = t.isEmpty ? nil : t
+                            })).autocorrectionDisabled()
+                        }
+                    } header: { Text("Steam friends") } footer: {
+                        Text("Starts the program through Valve's Steam client as a non-Steam shortcut of your account (like desktop Steam's \"Add a Non-Steam Game\"), so friends see you playing it. Needs your Steam sign-in, Valve's client components and a network; the client stays running beside the program.")
                     }
                 }
                 // A Steam game starts with Steam's own launch option through Madeira Dock.

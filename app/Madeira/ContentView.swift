@@ -2801,9 +2801,9 @@ struct ContentView: View {
         // account's shortcuts (its config: steam-shortcut = 1, steam-shortcut-name = <name>),
         // so friends see "playing <name>" as with desktop Steam's "Add a Non-Steam Game".
         if entry.steamAppID == nil, entry.desktop != true, MadeiraDock.enabled,
-           GameProfile(windowsPath: entry.windowsPath).get("steam-shortcut") == "1" {
+           entry.steamShortcut == true || GameProfile(windowsPath: entry.windowsPath).get("steam-shortcut") == "1" {
             let profile = GameProfile(windowsPath: entry.windowsPath)
-            let name = profile.get("steam-shortcut-name") ?? entry.title
+            let name = entry.steamShortcutName ?? profile.get("steam-shortcut-name") ?? entry.title
             let game = MadeiraDock.shortcut(exe: entry.windowsPath, name: name, arguments: entry.launchArguments)
             LogStore.shared.log("[dock-shortcut] \(entry.windowsPath) as Steam shortcut \"\(name)\" app=\(game.id)")
             BCDLaunch.applyLibrary(entry, sessionLog: false)
