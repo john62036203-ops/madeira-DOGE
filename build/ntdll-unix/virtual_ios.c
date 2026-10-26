@@ -16853,6 +16853,38 @@ static int ios_wow_rwx_view_ok( const struct file_view *view )
     return 1;
 }
 
+/* madeira-doge: a 64-bit guest's own JIT code buffers as plain read/write memory.
+ *
+ * Same contract as ml1279, for a 64-bit process: x86 bytes a guest JIT emits are
+ * decoded by FEX and never fetched by the host, so EXEC on them is FEX bookkeeping.
+ * Through the JIT pool a large buffer simply does not fit: PCSX2 reserves a 305 MB
+ * code region and makes it PAGE_EXECUTE_READWRITE, the anon-RWX carve fails
+ * (EXHAUSTED), NtProtectVirtualMemory returns ACCESS_DENIED, FEX never records the
+ * range and the first recompiled block dies as NOEXEC. As plain memory the region is
+ * written freely until FEX arms a translated page (PROT_READ); the next store faults
+ * once, FEX invalidates and disarms it, as on Windows.
+ *
+ * Unlike MADEIRA_GUEST_RWX_DATA there is no allocation-protection or size heuristic:
+ * any anonymous guest view qualifies. Excluded: EC_CODE requests (FEX's own code
+ * buffers live in the pool tail), ARM64EC and system views, images, the pool and
+ * alias-backed ranges. Opt-in per game (env.MADEIRA_GUEST_RWX_CODE = 1), because a
+ * guest that patches its code with unaligned atomics may not like an armed plain page. */
+static int ios_guest_rwx_code_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        /* Default off. 1: a 64-bit guest's anonymous RWX memory (its own JIT code buffers, e.g. PCSX2's
+         * recompilers) is plain read/write to the host instead of a JIT-pool alias; FEX still tracks it as
+         * executable. Set it in the game's own file. */
+        const char *s = getenv( "MADEIRA_GUEST_RWX_CODE" );
+        cached = (s && *s == '1') ? 1 : 0;
+        if (cached) dprintf( 2, "[guest-rwx-code] MADEIRA_GUEST_RWX_CODE=1 -> a 64-bit guest's anonymous "
+                                "RWX memory is plain read/write (no JIT-pool alias)\n" );
+    }
+    return cached;
+}
+
 /* The range is host-page rounded (16 KB) and can run past the end of a guest
  * allocation (0x41000 -> 0x44000), so every view it touches must qualify. */
 static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
@@ -16876,6 +16908,22 @@ static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
             struct file_view *view = find_view( (const void *)a, 1 );
             if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
             if (!ios_wow_rwx_view_ok( view )) { any = -1; break; }
+            any = 1;
+            a = (uintptr_t)view->base + view->size;
+        }
+        if (any == 1) return 1;
+        any = 0;
+    }
+
+    if (ios_guest_rwx_code_enabled() && !ios_alloc_ec_code && arm64ec_view && !ios_wow_base() && e > b &&
+        !(rx && e > rx && b < rx + ios_jit_pool_size_global) &&
+        !ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx ))
+    {
+        for (a = b; a < e; )
+        {
+            struct file_view *view = find_view( (const void *)a, 1 );
+            if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
+            if (!ios_wow_rwx_view_ok( view ) || view->size < 0x10000) { any = -1; break; }
             any = 1;
             a = (uintptr_t)view->base + view->size;
         }
