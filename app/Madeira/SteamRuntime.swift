@@ -145,7 +145,9 @@ enum SteamRuntimeFiles {
 
     // Only fixed client-discovery paths are written. Never write user IDs,
     // licenses, login cache, tokens, or a value asserting ownership.
-    static func registry(_ text: String, machine: Bool) throws -> String {
+    /// `replace`: a value another client wrote (steam.exe rewrites SteamPath in its
+    /// own spelling) is replaced instead of stopping the setup (madeira-doge restore).
+    static func registry(_ text: String, machine: Bool, replace: Bool = false) throws -> String {
         guard text.hasPrefix("WINE REGISTRY Version 2") else { throw Failure.prefixMissing }
         let root = windowsRoot.replacingOccurrences(of: "\\", with: "\\\\")
         let sections: [(String, [(String, String)])] = machine
@@ -160,12 +162,20 @@ enum SteamRuntimeFiles {
             let starts = lines.indices.filter { lines[$0].lowercased().hasPrefix(header.lowercased()) }
             guard starts.count <= 1 else { throw Failure.conflict }
             if let start = starts.first {
-                let end = lines[(start + 1)...].firstIndex { $0.hasPrefix("[") } ?? lines.count
+                var end = lines[(start + 1)...].firstIndex { $0.hasPrefix("[") } ?? lines.count
                 var additions: [String] = []
                 for (name, value) in values {
                     let prefix = "\"\(name)\"="
                     let matches = lines[(start + 1)..<end].filter { $0.lowercased().hasPrefix(prefix.lowercased()) }
                     let expected = prefix + "\"\(value)\""
+                    if replace, !matches.isEmpty, matches != [expected] {
+                        // Drop the section's lines for this value; the expected one is added below.
+                        let kept = lines[(start + 1)..<end].filter { !$0.lowercased().hasPrefix(prefix.lowercased()) }
+                        lines.replaceSubrange((start + 1)..<end, with: kept)
+                        end = start + 1 + kept.count
+                        additions.append(expected)
+                        continue
+                    }
                     guard matches.isEmpty || matches == [expected] else { throw Failure.conflict }
                     if matches.isEmpty { additions.append(expected) }
                 }
@@ -194,7 +204,11 @@ actor SteamRuntimeInstaller {
     private var busy = false
 
     // Runs before any Wine session in this app run; no Wine/JIT run.
-    func prepare(prefix: URL, progress: @Sendable (String) async -> Void) async throws {
+    /// madeira-doge: `restore` puts the pinned client back after steam.exe updated it
+    /// (the Dock fails closed on any other client build): the client's own files are
+    /// removed (steamapps, userdata and config stay), the three packages are unpacked
+    /// over what is there, and the discovery keys are rewritten.
+    func prepare(prefix: URL, restore: Bool = false, progress: @Sendable (String) async -> Void) async throws {
         guard !busy, wine_process_is_running() == 0, wineserver_is_running() == 0 else {
             throw SteamRuntimeFiles.Failure.activeSession
         }
@@ -212,7 +226,7 @@ actor SteamRuntimeInstaller {
             throw SteamRuntimeFiles.Failure.conflict
         }
         // Existing installs are retained; this trial prepares missing files.
-        guard !fm.fileExists(atPath: root.appendingPathComponent("steam.exe").path) else {
+        guard restore || !fm.fileExists(atPath: root.appendingPathComponent("steam.exe").path) else {
             throw SteamRuntimeFiles.Failure.conflict
         }
         let stage = fm.temporaryDirectory.appendingPathComponent("madeira-runtime-" + UUID().uuidString)
@@ -262,13 +276,25 @@ actor SteamRuntimeInstaller {
                 throw SteamRuntimeFiles.Failure.conflict
             }
             let text = try String(contentsOf: url, encoding: .utf8)
-            pending.append((url, Data(try SteamRuntimeFiles.registry(text, machine: machine).utf8)))
+            pending.append((url, Data(try SteamRuntimeFiles.registry(text, machine: machine, replace: restore).utf8)))
         }
-        for name in files {
+        for name in files where !restore {
             let target = try SteamRuntimeFiles.destination(SteamRuntimeFiles.relativeRoot + "/" + name, under: drive)
             if fm.fileExists(atPath: target.path), !fm.contentsEqual(atPath: target.path, andPath: stage.appendingPathComponent(name).path) {
                 throw SteamRuntimeFiles.Failure.conflict
             }
+        }
+        if restore, fm.fileExists(atPath: root.path) {
+            await progress("Removing the updated client files…")
+            // Games, saves and the account's own configuration stay. Everything else
+            // under the client root is the client's (bin, package, appcache, cef, logs...).
+            let keep: Set<String> = ["steamapps", "userdata", "config"]
+            var removed = 0
+            for entry in try fm.contentsOfDirectory(atPath: root.path) where !keep.contains(entry.lowercased()) {
+                try fm.removeItem(at: root.appendingPathComponent(entry))
+                removed += 1
+            }
+            SteamLog.event("[dock-restore] client entries removed: \(removed)")
         }
         try Task.checkCancellation()
         // No suspension during commit. steam.exe is last, so a check for an installed
@@ -281,11 +307,14 @@ actor SteamRuntimeInstaller {
         }
         for name in files.sorted(by: { $0 == "steam.exe" ? false : ($1 == "steam.exe" ? true : $0 < $1) }) {
             let target = try SteamRuntimeFiles.destination(SteamRuntimeFiles.relativeRoot + "/" + name, under: drive)
-            if fm.fileExists(atPath: target.path) { continue }
+            if fm.fileExists(atPath: target.path) {
+                if !restore { continue }
+                try fm.removeItem(at: target)
+            }
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             try fm.moveItem(at: stage.appendingPathComponent(name), to: target)
         }
-        await progress("Steam components are ready.")
+        await progress(restore ? "The pinned Steam components are back." : "Steam components are ready.")
     }
 
     private static func hash(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }

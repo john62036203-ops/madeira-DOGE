@@ -51,18 +51,19 @@ final class MadeiraDockModel: ObservableObject {
     }
 
     /// Downloads and unpacks Valve's client components (no Wine session).
-    func prepareClient() {
+    /// madeira-doge: `restore` replaces a client steam.exe updated with the pinned one.
+    func prepareClient(restore: Bool = false) {
         guard !preparing else { return }
         preparing = true; error = nil; progress = "Starting…"
         Task { @MainActor in
             do {
-                try await SteamRuntimeInstaller.shared.prepare(prefix: MadeiraDock.prefix) { text in
+                try await SteamRuntimeInstaller.shared.prepare(prefix: MadeiraDock.prefix, restore: restore) { text in
                     await MainActor.run { self.progress = text }
                 }
-                SteamLog.event("[dock-setup] client components ready")
+                SteamLog.event(restore ? "[dock-restore] pinned client components restored" : "[dock-setup] client components ready")
             } catch {
                 self.error = error.localizedDescription
-                SteamLog.event("[dock-setup] client components failed")
+                SteamLog.event(restore ? "[dock-restore] failed" : "[dock-setup] client components failed")
             }
             preparing = false
             refresh()
@@ -130,6 +131,7 @@ struct MadeiraDockView: View {
     @ObservedObject private var signIn = SteamSignInModel.shared
     @Environment(\.dismiss) private var dismiss
     @State private var showSignIn = false
+    @State private var confirmRestore = false
     @AppStorage(MadeiraDock.noDesktopKey) private var noDesktop = false
     let start: (DockGame, Bool) -> Void
 
@@ -153,10 +155,17 @@ struct MadeiraDockView: View {
                     }
                 }
                 Section {
-                    if dock.clientInstalled {
-                        Label("Valve's client components are installed", systemImage: "checkmark.circle")
-                    } else if dock.preparing {
+                    if dock.preparing {
                         HStack(spacing: 12) { ProgressView(); Text(dock.progress).foregroundStyle(.secondary) }
+                    } else if dock.clientInstalled {
+                        Label("Valve's client components are installed", systemImage: "checkmark.circle")
+                        Button("Restore the pinned client components", role: .destructive) { confirmRestore = true }
+                            .confirmationDialog("Restore the pinned Steam client?", isPresented: $confirmRestore, titleVisibility: .visible) {
+                                Button("Remove the client files and download the pinned ones", role: .destructive) { dock.prepareClient(restore: true) }
+                                Button("Cancel", role: .cancel) {}
+                            } message: {
+                                Text("Use this after steam.exe updated itself: Madeira Dock only starts games with the client build it was verified against. Everything under Program Files (x86)\\Steam except steamapps, userdata and config is removed, then the three pinned packages (about 73 MB) are downloaded again. Installed games and saves stay.")
+                            }
                     } else {
                         Button("Download Valve's client components (about 73 MB)") { dock.prepareClient() }
                     }
