@@ -488,14 +488,17 @@ enum MadeiraDock {
     }
 
     /// madeira-doge: arguments on the host's own command line, which Valve's client
-    /// reads (tier0 CommandLine()). Without a Steam bootstrapper the client decides the
-    /// friends UI is off and holds the persona offline (CUserFriends +0x15: every
-    /// SetPersonaState is dropped; build 433 log 2026-10-24 15:06, no echo for the
-    /// account), so friends never saw a Dock session. "-friendsui" is the client's own
-    /// switch for "friends UI on". env.MADEIRA_DOCK_PRESENCE = 0 leaves it out.
+    /// reads (tier0 CommandLine()). With the friends UI ON, the client's SetPersonaState
+    /// only posts the request to its UI layer, which the Dock does not have (builds
+    /// 430-434: "-friendsui", no echo). With it OFF the client applies the state itself
+    /// unless its sign-in lock is set, which the Dock host now clears
+    /// (tools/patch-dock-presence.py, 2026-10-27). "-nofriendsui" is the client's own
+    /// switch for "friends UI off"; env.MADEIRA_DOCK_FRIENDSUI = 1 passes "-friendsui"
+    /// again. env.MADEIRA_DOCK_PRESENCE = 0 passes nothing.
     static var hostArguments: String {
         let presence = MadeiraConfig.get("env.MADEIRA_DOCK_PRESENCE")?.trimmingCharacters(in: .whitespaces)
-        return presence == "0" ? "" : " -friendsui"
+        if presence == "0" { return "" }
+        return MadeiraConfig.get("env.MADEIRA_DOCK_FRIENDSUI") == "1" ? " -friendsui" : " -nofriendsui"
     }
 
     /// Set on the main actor right before a Dock launch; read (and cleared) once by the

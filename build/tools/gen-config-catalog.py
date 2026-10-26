@@ -135,6 +135,12 @@ OVERLAY = {
     "cpu-count": {"title": "Reported CPU count (0 = device)"},
     "desktop-size": {"title": "Virtual desktop size (WxH)",
                      "note": "The developer interface's Wine desktop size (ml1127); its Resolution menu writes it (ml1157). Madeira Dock sessions without a game's Resolution use it too. Unset: this screen's shape at 1280x720's pixel count (ml1172: 1408x648 on a 19.5:9 iPhone, 1152x800 on an 11-inch iPad). Applies at the next app start."},
+    "env.MADEIRA_DOCK_FRIENDSUI": {"category": "Steam & Dock", "title": "Dock host: Valve client friends UI switch", "kind": "bool",
+             "default": "0",
+             "sources": ["app/Madeira/MadeiraDock.swift"],
+             "note": "madeira-doge: 0 (default) starts the Dock host with -nofriendsui, so Valve's client applies the persona "
+                     "state itself (the Dock host clears the client's sign-in lock first). 1 passes -friendsui as builds "
+                     "430-434 did (the client then only posts the state to a UI layer the Dock does not run)."},
     "env.MADEIRA_DOCK_PRESENCE": {"category": "Steam & Dock", "title": "Friends see you as (Madeira Dock)", "kind": "choice",
              "default": "1",
              "note": "madeira-doge: once Valve's client in a Dock session is signed in, it is asked to set this persona "

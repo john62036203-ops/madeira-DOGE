@@ -492,9 +492,16 @@ already reports the game it launched, so friends then see "playing <game>".
 Only the January 2026 client (layout 202601) is supported; any other client or
 a method pointer that does not match skips the call and changes nothing else.
 
-Without Steam's bootstrapper the client decides its friends UI is off and holds
-the persona offline, dropping every `SetPersonaState`; the app therefore starts the
-host with `-friendsui` (the client's own switch) unless presence is `0`.
+With its friends UI on, the client's `SetPersonaState` only posts the request to
+its UI layer (steamwebhelper), which the Dock does not run, so `-friendsui`
+(builds 430-434) changed nothing. With the friends UI off the client applies the
+state itself, but at sign-in it forces the persona offline and sets a lock byte
+on its `CUserFriends` object (+0x15) when an account feature flag is missing;
+the Dock host finds that object (two vtables + back-pointer signature, pinned
+client only) and clears the lock before asking for the state
+(`presence-object`, `presence-lock`, `presence-lock-cleared` in the report).
+The app starts the host with `-nofriendsui`; `env.MADEIRA_DOCK_FRIENDSUI = 1`
+passes `-friendsui` instead.
 
 `env.MADEIRA_DOCK_PRESENCE`: unset or `1` online (default), `3` away, `7`
 invisible, `0` leaves the persona state alone. `[dock-report] presence-before`
