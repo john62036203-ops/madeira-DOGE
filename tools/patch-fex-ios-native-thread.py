@@ -26,8 +26,12 @@ import sys
 
 path = sys.argv[1]
 s = open(path).read()
-if "madeira-doge: no CPU area, no thread state" in s:
-    print("already patched"); sys.exit(0)
+def apply(s, old, new, what):
+    if new.splitlines()[1] in s:
+        return s
+    if old not in s:
+        sys.exit("patch-fex-ios-native-thread: anchor not found (%s) in %s" % (what, path))
+    return s.replace(old, new, 1)
 
 old = """  FEXCore::Core::CpuStateFrame*& StateFrame() const {
     return reinterpret_cast<FEXCore::Core::CpuStateFrame*&>(Area->EmulatorData[0]);
@@ -59,8 +63,29 @@ new = """  /* madeira-doge: no CPU area, no thread state (tools/patch-fex-ios-na
     return reinterpret_cast<FEXCore::Core::InternalThreadState*&>(Area->EmulatorData[1]);
   }
 """
-if old not in s:
-    sys.exit("patch-fex-ios-native-thread: anchor not found in " + path)
-s = s.replace(old, new, 1)
+s = apply(s, old, new, "ThreadCPUArea")
+
+# Second half (build 483, log 2026-10-27 00:13): with the accessors fixed the child got
+# further -- ntdll's arm64ec_process_init ran in it and called pThreadInit on the native
+# thread; ThreadInit then stored the emulator stack into the NULL area
+# (stp x8,x0,[x27,#8], libarm64ecfex.dll+0x115210). A thread with no area is not an
+# emulated thread: answer success and leave it alone.
+old = """  const auto CPUArea = GetCPUArea();
+
+  static constexpr size_t EmulatorStackSize = 0x40000;
+"""
+new = """  const auto CPUArea = GetCPUArea();
+  if (!CPUArea.Area) {
+    /* madeira-doge: no CPU area, no thread state -- not an emulated thread (tools/patch-fex-ios-native-thread.py). */
+    FEX::Windows::DeinitCRTThread();
+#ifdef FEX_IOS_HOST
+    IosTiLog("[FEX-iOS] TI:no-cpu-area (native AArch64 thread) -- skipped\\n");
+#endif
+    return STATUS_SUCCESS;
+  }
+
+  static constexpr size_t EmulatorStackSize = 0x40000;
+"""
+s = apply(s, old, new, "ThreadInit")
 open(path, "w").write(s)
 print("Module.cpp: a thread without a CHPE CPU area reports no FEX thread state")
