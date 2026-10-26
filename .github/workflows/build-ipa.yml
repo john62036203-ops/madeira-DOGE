@@ -374,6 +374,13 @@ jobs:
       # build 222 switch (Ghost of Tsushima's "Failed to get GPU Driver Info").
       # Patches wine/dlls/ntdll/unix/file.c in place; the submodule pin and the
       # cache keys (wine revision) do not change. MADEIRA_GUEST_LOG=all|0.
+      # Upstream PR #427 (willfaust/wine #57): case-insensitive lookups answered
+      # from cached directory listings (TF2: 10 min -> 55 s to a map). Applied
+      # first, as a diff on the pinned file.c; the scripts below keep their
+      # anchors. MADEIRA_DIRCACHE=0 turns it off.
+      - name: Patch wine with the directory-listing cache (upstream #427)
+        run: python3 tools/patch-wine-dircache.py wine/dlls/ntdll/unix/file.c
+
       - name: Patch wine with the game text-log mirror
         run: |
           python3 tests/host/check-guest-log.py
@@ -421,6 +428,11 @@ jobs:
         run: |
           python3 tests/host/check-app-local-dll.py
           python3 tools/patch-wine-app-local-dll.py wine/dlls/ntdll/unix/file.c
+
+      # Upstream's host test for the cache (compiles the cut-out cache under ASan
+      # against real directories); runs after every file.c patch is in.
+      - name: Check the directory-listing cache
+        run: python3 tests/host/check-dircache.py
 
       - name: Check opt-in graphics DLL lifetime
         run: python3 tests/host/check-graphics-pin.py

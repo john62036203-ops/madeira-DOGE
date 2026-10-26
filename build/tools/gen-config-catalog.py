@@ -304,6 +304,20 @@ OVERLAY = {
                         "(a copy the server makes; it shares this process's descriptor table), the same descriptor "
                         "without a sendmsg, a recvmsg, an fcntl and two server log lines per file. 1: through the "
                         "process socket, as before. Read once per app run."},
+    "env.MADEIRA_DIRCACHE": {"category": "Wine core (ntdll)", "title": "Remember directory listings for file lookups",
+                "kind": "bool", "default": "1",
+                "sources": ["tools/patch-wine-dircache.py"],
+                "note": "Kill switch, default 1: a file name that does not match in its exact case is looked up in "
+                        "an in-memory copy of its directory instead of a volume query and a directory read each "
+                        "time (twice when the name is absent). Source-engine games such as Team Fortress 2 probe "
+                        "thousands of absent paths while loading and during play. 0: as before. Read once per app run. "
+                        "(upstream PR #427 / willfaust/wine #57, applied as a build-time patch.)"},
+    "env.MADEIRA_DIRCACHE_TTL_MS": {"category": "Wine core (ntdll)", "title": "Directory listing trust window (ms)",
+                "kind": "int", "default": "1000",
+                "sources": ["tools/patch-wine-dircache.py"],
+                "note": "How long a remembered listing is used without checking the directory, while no file was "
+                        "created, renamed, linked or deleted through Wine. After that one stat of the directory "
+                        "decides whether it is read again. 0 checks it on every lookup. Read once per app run."},
     "env.MADEIRA_SRV_LOG_ALL": {"category": "Wine server", "title": "Every per-descriptor server log line",
                 "kind": "bool", "default": "0",
                 "sources": ["build/wineserver/fd_ios.c", "build/wineserver/request_ios.c"],
