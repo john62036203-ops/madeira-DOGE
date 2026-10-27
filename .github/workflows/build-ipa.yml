@@ -674,6 +674,20 @@ jobs:
         continue-on-error: true
         run: bash build/win32u-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/win32u.log"; exit ${PIPESTATUS[0]}
 
+      # madeira-doge: the compiler's own words as annotations, as for ntdll-unix
+      # (a fork cannot read the job log through the API).
+      - name: Report win32u-unix compile errors
+        if: always()
+        shell: bash
+        run: |
+          set +e +o pipefail
+          for f in build/win32u-unix/obj/*.err; do
+            grep -q "error:" "$f" || continue
+            MSG=$(grep "error:" "$f" | sed 's#^.*/build/win32u-unix/##' | cut -c1-230 | sed -n '1,28p' | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::win32u $(basename "$f") :: $MSG"
+          done
+          exit 0
+
       - name: Restore llvm-mingw
         id: mingwcache
         uses: actions/cache/restore@v4

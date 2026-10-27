@@ -45,7 +45,8 @@ WANT="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcr110 msvcrt20 msvcrt40 msvcir
       d3dx10_33 d3dx10_34 d3dx10_35 d3dx10_36 d3dx10_37 d3dx10_38 d3dx10_39 d3dx10_40 d3dx10_41 d3dx10_42 d3dx10_43
       d3dx11_42 d3dx11_43
       winegstreamer msmpeg2vdec wmadmod wmvdecod
-      msauddecmft mp3dmod colorcnv resampledmo msvproc mferror"
+      msauddecmft mp3dmod colorcnv resampledmo msvproc mferror
+      winevulkan vulkan-1"
 for n in $(seq 24 42); do WANT="$WANT d3dx9_$n"; done
 
 shipped() { ls "$SHIP" | tr 'A-Z' 'a-z' | grep -qx "$1.dll"; }
@@ -74,10 +75,18 @@ fi
 # The cached tree may have disabled winegstreamer because macOS has no
 # GStreamer headers. Only its real PE frontend is needed here; the iOS unix
 # backend already lives in libntdll_unix.a. Reconfigure that older cache too.
+# madeira-doge (vulkan branch): the same for winevulkan + vulkan-1 (configure
+# disables both when the host has no libvulkan/MoltenVK; the PE side needs
+# neither). The unix side is compiled into libntdll_unix.a, the host library
+# is the app's static MoltenVK (build/win32u-unix/vulkan_ios.c). The real
+# vulkan-1.dll replaces the stand-in tools/build-stub-dlls.py used to make
+# (that script skips a DLL that is already shipped); with env.MADEIRA_VULKAN
+# unset it answers like a PC without a Vulkan driver, as the stand-in did.
 if [ ! -f "$B/Makefile" ] ||
-   ! grep -q '^dlls/winegstreamer/arm64ec-windows/winegstreamer.dll:' "$B/Makefile"; then
+   ! grep -q '^dlls/winegstreamer/arm64ec-windows/winegstreamer.dll:' "$B/Makefile" ||
+   ! grep -q '^dlls/winevulkan/arm64ec-windows/winevulkan.dll:' "$B/Makefile"; then
     mkdir -p "$B"
-    ( cd "$B" && "$R/wine/configure" --enable-archs=arm64ec --enable-winegstreamer --without-x --disable-tests \
+    ( cd "$B" && "$R/wine/configure" --enable-archs=arm64ec --enable-winegstreamer --enable-winevulkan --enable-vulkan-1 --without-x --disable-tests \
           --without-freetype --without-gnutls ${TOOLS:+--with-wine-tools="$TOOLS"} ) > "$B.cfg.log" 2>&1 \
         || { tail -20 "$B.cfg.log"; echo "::error::wine arm64ec configure failed"; exit 1; }
 fi

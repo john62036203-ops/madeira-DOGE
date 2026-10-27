@@ -11632,6 +11632,11 @@ extern const void *dwrite_unix_call_funcs[];
  * and Media Foundation's MP4 source; the wg_muxer entries return
  * STATUS_NOT_IMPLEMENTED. */
 extern const void *winegstreamer_unix_call_funcs[];
+/* madeira-doge (vulkan branch): dlls/winevulkan's unix side, compiled into
+ * this archive (build.sh); the host library is the static MoltenVK reached
+ * through win32u (build/win32u-unix/vulkan_ios.c). */
+extern const void *winevulkan_unix_call_funcs[];
+extern const void *winevulkan_unix_call_wow64_funcs[];
 
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
@@ -11962,6 +11967,15 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
                           : "winegstreamer (wma + wg_parser, libav*; 64-bit opted in)";
             funcs64 = (const void *)winegstreamer_unix_call_funcs;
             funcs_wow64 = (const void *)winegstreamer_unix_call_wow64_funcs;
+        } else if (match && strstr(match, "winevulkan")) {
+            /* madeira-doge (vulkan branch): Wine's own winevulkan unix side.
+             * Matched for both spellings ("winevulkan.so" / "winevulkan.dll").
+             * Without MADEIRA_VULKAN=1 its init_vulkan fails (win32u finds no
+             * host library) and the PE side answers like a machine without
+             * a Vulkan driver, so binding the table unconditionally is safe. */
+            libname = "winevulkan (MoltenVK via win32u)";
+            funcs64 = (const void *)winevulkan_unix_call_funcs;
+            funcs_wow64 = (const void *)winevulkan_unix_call_wow64_funcs;
         } else if (match && strstr(match, "nsi.dll")) {
             libname = "nsi (rev=ml472)";
             funcs64 = (const void *)nsi_unix_call_funcs;

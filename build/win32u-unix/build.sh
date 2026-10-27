@@ -107,6 +107,17 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
             compile_one "$BUILD_DIR/driver_ios.c" "driver"
             continue
             ;;
+        vulkan)
+            # madeira-doge (vulkan branch): wraps upstream vulkan.c with the
+            # statically linked MoltenVK as the host library and the wineios
+            # Vulkan driver (header comment in vulkan_ios.c). Opt-in at run
+            # time: env.MADEIRA_VULKAN = 1. vulkan_mvk_ios.c is the only TU
+            # that sees the real Vulkan headers.
+            compile_one "$BUILD_DIR/vulkan_ios.c" "vulkan"
+            compile_one "$BUILD_DIR/vulkan_mvk_ios.c" "vulkan_mvk_ios" \
+                -I"$REPO_ROOT/app/Madeira/vulkan/include"
+            continue
+            ;;
         message)
             compile_one "$BUILD_DIR/message_ios.c" "message"
             continue
