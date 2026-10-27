@@ -1736,6 +1736,8 @@ jobs:
 
       - name: Archive (unsigned)
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set +e
           xcodebuild -project app/Madeira.xcodeproj \
@@ -1754,6 +1756,17 @@ jobs:
             [ -n "$K" ] && echo "::error::xcodebuild other errors :: $K"
             F=$(sed -n '/The following build commands failed/,/failures)/p' "$GITHUB_WORKSPACE/archive.log" | cut -c1-200 | head -12 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
             [ -n "$F" ] && echo "::error::xcodebuild failing commands :: $F"
+            # madeira-doge: annotations are capped at 50 per job and the job log is not
+            # readable from the sessions, so the same lines also go into a commit comment.
+            {
+              echo "build ${{ github.run_number }} (${{ runner.name }}): xcodebuild archive failed (rc=$rc)"
+              echo; echo "compiler errors:"; grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | sed "s#^$GITHUB_WORKSPACE/##" | sort -u | head -40
+              echo; echo "linker:"; grep -E "Undefined symbol|^ld: |symbol\(s\) not found|referenced from|duplicate symbol|error: " "$GITHUB_WORKSPACE/archive.log" | grep -vE "^[^ ].*: (error|fatal error):" | sort -u | head -40
+              echo; echo "failing commands:"; sed -n '/The following build commands failed/,/failures)/p' "$GITHUB_WORKSPACE/archive.log" | cut -c1-200 | head -15
+              echo; echo "tail:"; tail -n 40 "$GITHUB_WORKSPACE/archive.log" | cut -c1-300
+            } > archive-errors.txt
+            gh api -X POST "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/comments" \
+              -f body="$(head -c 60000 archive-errors.txt)" >/dev/null 2>&1 || echo "::warning::could not post the archive errors as a commit comment"
             echo "===== compiler errors ====="
             grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | head -30
             # Linker diagnostics carry no "error:" prefix, so the undefined
