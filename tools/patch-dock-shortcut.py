@@ -32,6 +32,15 @@ MADEIRA_DOCK_SHORTCUT_EXE carry the name and the program's Windows path.
 Fields: launch-shortcut-record (1 found), launch-shortcut-appid (the client's),
 launch-shortcut-gameid-type (2 = shortcut); on any miss the computed id is used.
 
+Build 494 (log 19:35): the temporary shortcut registered (appid from the client,
+game id type 2) but LaunchApp on that game id still answered 5: the app
+manager's launch is for licensed apps. The desktop client starts shortcuts
+through IClientShortcuts::LaunchShortcut (slot 25, RVA 0x81c050, (app id, u32)
+-> CAPIJobLaunchShortcut), so the host now calls that for a registered shortcut
+(launch-shortcut-call = its return, non-zero taken as started) and keeps
+watching the game id; LaunchApp stays the fallback when the client could not
+register the shortcut.
+
 Usage: patch-dock-shortcut.py madeira-dock/src/session.c
        patch-dock-shortcut.py madeira-dock/src/launch.c   (both idempotent)
 """
@@ -125,6 +134,20 @@ static void *sh_shortcut_map(HMODULE module, void *friends)
     return matches == 1 ? found : NULL;
 }
 
+typedef uint64_t (__thiscall *sh_launch_shortcut_fn)(void *, uint32_t, uint32_t);
+static void *sh_shortcut_map_ptr;
+static uint32_t sh_shortcut_client_id;
+
+/* Starts a shortcut the client registered (IClientShortcuts::LaunchShortcut). */
+static uint64_t sh_shortcut_launch(HMODULE module, uint32_t launch_option, const struct sh_observer *o)
+{
+    if (!sh_shortcut_map_ptr || !sh_shortcut_client_id) return 0;
+    if (!dock_method_is((uintptr_t)module, sh_shortcut_map_ptr, 25, 0x81c050)) { o->event("launch-shortcut-call", -1); return 0; }
+    uint64_t r = ((sh_launch_shortcut_fn)(*(void ***)sh_shortcut_map_ptr)[25])(sh_shortcut_map_ptr, sh_shortcut_client_id, launch_option);
+    o->event("launch-shortcut-call", (int32_t)(r & 0x7fffffff));
+    return r ? r : 0;
+}
+
 /* Registers the program as a temporary shortcut with the client and returns its
  * game id; the computed id ((appid << 32) | shortcut type) when anything is missing. */
 static uint64_t sh_shortcut_register(HMODULE module, void *engine, int32_t user, int32_t pipe, uint32_t appid,
@@ -147,6 +170,7 @@ static uint64_t sh_shortcut_register(HMODULE module, void *engine, int32_t user,
     uint32_t id = ((sh_add_temp_shortcut_fn)(*(void ***)map)[8])(map, name, quoted, "");
     o->event("launch-shortcut-appid", (int32_t)id);
     if (!id) return computed;
+    sh_shortcut_map_ptr = map; sh_shortcut_client_id = id;
     uint64_t gid = 0;
     ((sh_gameid_for_app_fn)(*(void ***)map)[1])(map, &gid, id);
     o->event("launch-shortcut-gameid-type", (int32_t)((gid >> 24) & 0xff));
@@ -162,7 +186,12 @@ static uint64_t sh_shortcut_register(HMODULE module, void *engine, int32_t user,
                   '     * the client itself when possible (sh_shortcut_register). */\n'
                   '    uint64_t gameid = sh_launch_shortcut_mode() ? sh_shortcut_register(module, engine, user, pipe, appid, o)\n'
                   '                                                : (uint64_t)appid;\n')
-    for a in (anchor_fn, block_start, block_end, gameid):
+    launch_call = '    uint64_t call = ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, launch_option, 0, "");\n'
+    launch_call_new = ('    /* madeira-doge: a registered shortcut starts through IClientShortcuts::LaunchShortcut. */\n'
+                       '    uint64_t call = sh_launch_shortcut_mode() && sh_shortcut_client_id\n'
+                       '        ? sh_shortcut_launch(module, launch_option, o)\n'
+                       '        : ((launch_fn)(*(void ***)manager)[2])(manager, &gameid, launch_option, 0, "");\n')
+    for a in (anchor_fn, block_start, block_end, gameid, launch_call):
         if src.count(a) != 1:
             sys.exit("patch-dock-shortcut (launch.c): anchor changed (%r found %d times)" % (a.strip()[:50], src.count(a)))
     s = src.index(block_start); e = src.index(block_end) + len(block_end)
@@ -171,6 +200,7 @@ static uint64_t sh_shortcut_register(HMODULE module, void *engine, int32_t user,
                '    else {\n' + ''.join('    ' + l + '\n' if l else '\n' for l in block.rstrip('\n').split('\n')) + '    }\n')
     src = src[:s] + wrapped + src[e:]
     src = src.replace(gameid, gameid_new, 1)
+    src = src.replace(launch_call, launch_call_new, 1)
     src = src.replace(anchor_fn, helper + anchor_fn, 1)
     open(path, "w").write(src)
     print("madeira-dock: shortcut mode (MADEIRA_DOCK_SHORTCUT) patched into launch.c")
