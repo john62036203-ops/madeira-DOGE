@@ -750,7 +750,15 @@ final class SteamOwnedLibrary: ObservableObject {
         request.writeUInt32(fieldNumber: 1, value: UInt32(appID))    // appid
         request.writeString(fieldNumber: 2, value: entry.path)       // filename
         request.writeUInt32(fieldNumber: 3, value: 1)                // realm: Steam global (as the Steam client sends it)
-        let (body, eresult) = try await session.callServiceMethodWithResult(method: .cloudClientFileDownload, body: request.data, timeout: 20)
+        // madeira-doge: Steam answers Busy (10) or ServiceUnavailable (20) for a while
+        // after a game session ends (Mega Man X Legacy Collection's save, right after
+        // playing); both clear on their own, so ask again before giving up.
+        var (body, eresult) = try await session.callServiceMethodWithResult(method: .cloudClientFileDownload, body: request.data, timeout: 20)
+        for delay in [2, 5, 10] where eresult == 10 || eresult == 20 {
+            SteamLog.event("[steam-cloud] app=\(appID) file=\(entry.path) eresult=\(eresult), asking again in \(delay) s")
+            try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
+            (body, eresult) = try await session.callServiceMethodWithResult(method: .cloudClientFileDownload, body: request.data, timeout: 20)
+        }
         let info = try SteamCloudDownloadInfo.parse(body)
         if info.url == nil || info.encrypted || (eresult != 1 && eresult != 0) {
             SteamLog.event("[steam-cloud] app=\(appID) no address for file=\(entry.path) eresult=\(eresult) body=\(body.count)B host=\(info.host.isEmpty ? "-" : info.host) path=\(info.path.isEmpty ? 0 : 1) size=\(info.fileSize)/\(info.rawSize) list-size=\(entry.cloudSize) encrypted=\(info.encrypted ? 1 : 0)")
