@@ -141,6 +141,10 @@ OVERLAY = {
              "note": "madeira-doge: 0 (default) starts the Dock host with -nofriendsui, so Valve's client applies the persona "
                      "state itself (the Dock host clears the client's sign-in lock first). 1 passes -friendsui as builds "
                      "430-434 did (the client then only posts the state to a UI layer the Dock does not run)."},
+    "env.MADEIRA_DOCK_LANGUAGE": {"category": "Steam & Dock", "title": "Dock host: Valve client language", "kind": "text",
+             "default": "english",
+             "note": "madeira-doge: passed to the Dock host as -language <value>, so the client's own dialogs are in a "
+                     "language the prefix can draw (it has no CJK font). Empty: the account's own language."},
     "env.MADEIRA_DOCK_PRESENCE": {"category": "Steam & Dock", "title": "Friends see you as (Madeira Dock)", "kind": "choice",
              "default": "1",
              "note": "madeira-doge: once Valve's client in a Dock session is signed in, it is asked to set this persona "

@@ -636,8 +636,13 @@ enum MadeiraDock {
     /// again. env.MADEIRA_DOCK_PRESENCE = 0 passes nothing.
     static var hostArguments: String {
         let presence = MadeiraConfig.get("env.MADEIRA_DOCK_PRESENCE")?.trimmingCharacters(in: .whitespaces)
-        if presence == "0" { return "" }
-        return MadeiraConfig.get("env.MADEIRA_DOCK_FRIENDSUI") == "1" ? " -friendsui" : " -nofriendsui"
+        // "-language english": the client's own dialogs (a failed shortcut start, say) in a
+        // language the prefix can draw and the log can show; the prefix has no CJK font.
+        // env.MADEIRA_DOCK_LANGUAGE = <steam language> (or "" for the account's) changes it.
+        let language = MadeiraConfig.get("env.MADEIRA_DOCK_LANGUAGE") ?? "english"
+        let lang = language.isEmpty ? "" : " -language " + language
+        if presence == "0" { return lang }
+        return (MadeiraConfig.get("env.MADEIRA_DOCK_FRIENDSUI") == "1" ? " -friendsui" : " -nofriendsui") + lang
     }
 
     /// Set on the main actor right before a Dock launch; read (and cleared) once by the

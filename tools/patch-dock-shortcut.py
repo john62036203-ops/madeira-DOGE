@@ -166,8 +166,10 @@ static uint64_t sh_shortcut_register(HMODULE module, void *engine, int32_t user,
     if (!dock_method_is((uintptr_t)module, map, 8, 0x7096e0) || !dock_method_is((uintptr_t)module, map, 1, 0x756340)) {
         o->event("launch-shortcut-abi", 0); return computed;
     }
-    snprintf(quoted, sizeof(quoted), "\"%s\"", exe);
-    uint32_t id = ((sh_add_temp_shortcut_fn)(*(void ***)map)[8])(map, name, quoted, "");
+    /* The path unquoted: the client quotes it itself (build 495, log 20:43: a quoted path
+     * registered, LaunchShortcut returned a handle and the client showed an error box). */
+    (void)quoted;
+    uint32_t id = ((sh_add_temp_shortcut_fn)(*(void ***)map)[8])(map, name, exe, "");
     o->event("launch-shortcut-appid", (int32_t)id);
     if (!id) return computed;
     sh_shortcut_map_ptr = map; sh_shortcut_client_id = id;
