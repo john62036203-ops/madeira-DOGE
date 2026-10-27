@@ -1621,6 +1621,39 @@ jobs:
           rustup target add aarch64-apple-ios
           bash build/rppairing-ios/build.sh
 
+      # MoltenVK (Vulkan on Metal, Apache-2.0) for the Vulkan lab and the
+      # console-emulation work: the static iOS library from the pinned Khronos
+      # release, hash-checked, never committed. The C headers are vendored at
+      # app/Madeira/vulkan/include (SHA256SUMS there) and must match the release.
+      - name: Restore MoltenVK
+        id: mvk-cache
+        uses: actions/cache@v4
+        with:
+          path: build/moltenvk/MoltenVK-ios.tar
+          key: moltenvk-ios-1.4.2
+      - name: Fetch MoltenVK 1.4.2 (static, iOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          MVK_VERSION=1.4.2
+          MVK_SHA=b5d947b1660e6e9fed40b9cd2387e160aaab9e80b775c0cef7e14059405178c1
+          mkdir -p build/moltenvk
+          TAR=build/moltenvk/MoltenVK-ios.tar
+          if [ ! -f "$TAR" ]; then
+            curl -fL --retry 3 --retry-delay 5 -o "$TAR" \
+              "https://github.com/KhronosGroup/MoltenVK/releases/download/v$MVK_VERSION/MoltenVK-ios.tar"
+          fi
+          HAVE="$(shasum -a 256 "$TAR" | cut -d' ' -f1)"
+          [ "$HAVE" = "$MVK_SHA" ] || { echo "::error::MoltenVK-ios.tar hash mismatch (expected $MVK_SHA, found $HAVE)"; exit 1; }
+          rm -rf build/moltenvk/x && mkdir -p build/moltenvk/x
+          tar xf "$TAR" -C build/moltenvk/x MoltenVK/MoltenVK/static MoltenVK/MoltenVK/include
+          cp build/moltenvk/x/MoltenVK/MoltenVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a app/Madeira/libMoltenVK.a
+          # The vendored headers are the release's headers, no more and no less.
+          (cd build/moltenvk/x/MoltenVK/MoltenVK && find include -type f -name '*.h' | sort | xargs shasum -a 256) > build/moltenvk/release.sums
+          diff <(sort -k2 app/Madeira/vulkan/SHA256SUMS) <(sort -k2 build/moltenvk/release.sums) \
+            || { echo "::error::app/Madeira/vulkan/include differs from MoltenVK $MVK_VERSION's headers"; exit 1; }
+          echo "::notice::libMoltenVK.a $(wc -c < app/Madeira/libMoltenVK.a | tr -d ' ') bytes (MoltenVK $MVK_VERSION)"
+
       # Fail here with a clear list rather than deep inside a linker error.
       - name: Verify all linked archives exist
         shell: bash
@@ -1629,7 +1662,7 @@ jobs:
           MISSING=""
           for a in libgmp.a libgnutls.a libhogweed.a libnettle.a \
                    libntdll_unix.a libwin32u_unix.a libwineserver.a \
-                   libdxmt_combined.a libmadeira_rppairing.a; do
+                   libdxmt_combined.a libmadeira_rppairing.a libMoltenVK.a; do
             [ -f "app/Madeira/$a" ] || MISSING="$MISSING app/Madeira/$a"
           done
           for a in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a \

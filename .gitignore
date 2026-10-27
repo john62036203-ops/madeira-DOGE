@@ -190,3 +190,4 @@ app/Madeira/arm64ec-windows/dock-notices.txt
 
 # agent worktrees (Claude Code isolation), never part of the repo
 .claude/worktrees/
+app/Madeira/libMoltenVK.a

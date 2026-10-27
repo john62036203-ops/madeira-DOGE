@@ -2638,6 +2638,9 @@ struct LibraryView: View {
                     RuntimeMemorySyncSettings(open: { settingsSheet = $0 }, refresh: settingsRefresh)
                 }
             }
+            if settingsShow("Vulkan", "MoltenVK", "console", "PS4", "PS5", "address space", "lab") {
+                ConsoleLabSection(open: { settingsSheet = $0 })
+            }
             if SteamSettingsSection.shown, settingsShow("Steam", "Dock", "sign in", "account", "setup") {
                 SteamSettingsSection(open: { settingsSheet = $0 })
             }
@@ -2705,6 +2708,7 @@ struct LibraryView: View {
             case .allSettings: AllSettingsView()
             case .steamSignIn: SteamSignInView()
             case .dock: MadeiraDockView(start: startDock)
+            case .vulkanLab: VulkanLabView()
             }
         }
     }
@@ -3770,7 +3774,7 @@ struct MadeiraCredit: View {
 /// MADEIRA_RUNTIME_SETTINGS=0 hides this section.
 /// A sheet opened from Settings; LibraryView presents it from the Form itself.
 enum SettingsSheet: String, Identifiable {
-    case allSettings, steamSignIn, dock
+    case allSettings, steamSignIn, dock, vulkanLab
     var id: String { rawValue }
 }
 
