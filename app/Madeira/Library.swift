@@ -425,6 +425,13 @@ struct LibraryEntry: Codable, Identifiable {
 
     /// A Steam game that starts as its own program ("Start with: The game").
     var startsSteamGameDirectly: Bool { steamAppID != nil && steamStart == "game" }
+    /// madeira-doge: a non-Steam program started through Valve's client as the account's
+    /// shortcut (Game details > Steam friends, or steam-shortcut = 1 in its config). Such a
+    /// launch is a Dock session: Dock sets what starts (ContentView.launchLibraryEntry).
+    var startsAsSteamShortcut: Bool {
+        desktop != true && steamAppID == nil && MadeiraDock.enabled &&
+            (steamShortcut == true || GameProfile(windowsPath: windowsPath).get("steam-shortcut") == "1")
+    }
     /// What a launch starts, relative to drive_c: "The game"'s program inside the
     /// install folder, else `relativePath`.
     var launchRelativePath: String {
@@ -584,6 +591,12 @@ struct LibraryEntry: Codable, Identifiable {
                 GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
                 return
             }
+        }
+        // madeira-doge: a non-Steam program as a Steam shortcut is a Dock session too (build
+        // 492 log 08:13: this overrode Dock's host with the program and the client never ran).
+        if startsAsSteamShortcut {
+            GuestDisplay.configureSessionDefault(view: CGSize(width: 1280, height: 720), knob: resolution)
+            return
         }
         let command = desktop == true ? (exe: "explorer.exe", args: launchArguments) : launchCommand
         setenv("MADEIRA_EXE", command.exe, 1)

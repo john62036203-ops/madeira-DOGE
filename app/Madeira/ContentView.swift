@@ -2800,8 +2800,7 @@ struct ContentView: View {
         // madeira-doge: a non-Steam program started through Valve's client as one of the
         // account's shortcuts (its config: steam-shortcut = 1, steam-shortcut-name = <name>),
         // so friends see "playing <name>" as with desktop Steam's "Add a Non-Steam Game".
-        if entry.steamAppID == nil, entry.desktop != true, MadeiraDock.enabled,
-           entry.steamShortcut == true || GameProfile(windowsPath: entry.windowsPath).get("steam-shortcut") == "1" {
+        if entry.startsAsSteamShortcut {
             let profile = GameProfile(windowsPath: entry.windowsPath)
             let name = entry.steamShortcutName ?? profile.get("steam-shortcut-name") ?? entry.title
             let game = MadeiraDock.shortcut(exe: entry.windowsPath, name: name, arguments: entry.launchArguments)
