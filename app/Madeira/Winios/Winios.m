@@ -397,6 +397,13 @@ extern int winios_drv_census_owner(HWND hwnd, unsigned int *pid, unsigned int *s
 extern int winios_drv_process_image(unsigned int pid, char *out, unsigned int size);
 extern int winios_drv_post_restore(HWND hwnd);
 extern int winios_drv_foreground_if_owner(HWND hwnd);
+extern int winios_drv_close_desktop_if_owner(void);
+
+/* winios_close_desktop: the app asks explorer's desktop to close (a Dock
+ * session whose game and Steam have ended); the desktop's own thread does it
+ * from its event pump (winios_pProcessEvents). */
+static atomic_int g_close_desktop;
+void winios_close_desktop(void) { atomic_store(&g_close_desktop, 1); }
 
 /* A game's main window can be shown minimized the first time it is shown
  * (ShowWindow cmd 2, parked at -32000,-32000). On Windows the taskbar brings
@@ -727,6 +734,14 @@ BOOL winios_pProcessEvents(DWORD mask) {
         int r = winios_drv_foreground_if_owner((HWND)fg);
         if (r && atomic_compare_exchange_strong(&g_restore_foreground, &fg, 0)) {
             fprintf(stderr, "[born-minimized] hwnd=%p foreground=%d\n", (HWND)fg, r);
+            fflush(stderr);
+        }
+    }
+    if (atomic_load_explicit(&g_close_desktop, memory_order_relaxed)) {
+        int r = winios_drv_close_desktop_if_owner();
+        int expected = 1;
+        if (r && atomic_compare_exchange_strong(&g_close_desktop, &expected, 0)) {
+            fprintf(stderr, "[winios] desktop close posted=%d (the Dock session ends)\n", r);
             fflush(stderr);
         }
     }
@@ -1069,6 +1084,7 @@ void winios_note_game_metal_hwnd(void *hwnd) {
 /* Called at every Wine session start (WineProcessBridge): a game session
  * starts with no overlay windows and no known Metal windows. */
 void winios_session_reset(void) {
+    atomic_store(&g_close_desktop, 0);
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_game_metal removeAllObjects];
         if (g_comp_game) winios_drop_compositor("new session");

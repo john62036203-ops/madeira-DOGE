@@ -1376,8 +1376,7 @@ struct ContentView: View {
             .alert("Restart Madeira", isPresented: Binding(get: { library.restartNotice != nil },
                                                             set: { if !$0 { library.restartNotice = nil } })) {
                 Button("Close Madeira") {
-                    LogStore.shared.log("[session-once] closed by the user for a restart")
-                    exit(0)
+                    madeiraCloseApp("[session-once] closed by the user for a restart")
                 }
                 Button("Later", role: .cancel) { library.restartNotice = nil }
             } message: { Text(library.restartNotice ?? "") }
