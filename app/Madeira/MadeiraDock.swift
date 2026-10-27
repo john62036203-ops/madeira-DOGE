@@ -573,7 +573,13 @@ enum MadeiraDock {
         }
         setenv("MADEIRA_STEAM_HOST_APPID", String(game.id), 1)
         // madeira-doge: a non-Steam program as the account's shortcut (tools/patch-dock-shortcut.py).
-        if game.isShortcut { setenv("MADEIRA_DOCK_SHORTCUT", "1", 1) } else { unsetenv("MADEIRA_DOCK_SHORTCUT") }
+        if let exe = game.shortcutExe {
+            setenv("MADEIRA_DOCK_SHORTCUT", "1", 1)
+            setenv("MADEIRA_DOCK_SHORTCUT_NAME", game.name, 1)
+            setenv("MADEIRA_DOCK_SHORTCUT_EXE", exe, 1)
+        } else {
+            unsetenv("MADEIRA_DOCK_SHORTCUT"); unsetenv("MADEIRA_DOCK_SHORTCUT_NAME"); unsetenv("MADEIRA_DOCK_SHORTCUT_EXE")
+        }
         setenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION", String(launchOption), 1)
         setenv("MADEIRA_STEAM_HOST_CLIENT_DIR", SteamRuntimeFiles.windowsRoot, 1)
         setenv("MADEIRA_STEAM_HOST_EXPECTED_INSTALL", game.windowsInstallPath, 1)

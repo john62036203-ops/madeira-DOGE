@@ -17,6 +17,21 @@ With that variable the host (madeira-dock/src/session.c, launch.c):
   k_EGameIDTypeShortcut) instead of a plain app id, and watches that id.
 Report field launch-shortcut=1. Without the variable nothing changes.
 
+Build 493 (log 2026-10-27 14:00): the client answered LaunchApp for the
+computed shortcut game id with error 5 (no subscription): it did not know the
+shortcut from shortcuts.vdf. So the host now registers the shortcut with the
+client itself, through its IClientShortcuts (pinned client 71b391fe only):
+the per-user record holds the IClientFriendsMap at +0x20 and the
+IClientShortcutsMap at +0xf0 (both created by the record initialiser, RVA
+0x9ed400); the host finds the record by its friends pointer in private memory,
+checks the shortcuts map's vtable (RVA 0x12c87b0), calls slot 8
+AddTemporaryShortcut(name, "exe", "") (RVA 0x7096e0, returns the app id) and
+slot 1 GetGameIDForAppID(app id) (RVA 0x756340, 64-bit result through a hidden
+pointer), and launches that game id. MADEIRA_DOCK_SHORTCUT_NAME /
+MADEIRA_DOCK_SHORTCUT_EXE carry the name and the program's Windows path.
+Fields: launch-shortcut-record (1 found), launch-shortcut-appid (the client's),
+launch-shortcut-gameid-type (2 = shortcut); on any miss the computed id is used.
+
 Usage: patch-dock-shortcut.py madeira-dock/src/session.c
        patch-dock-shortcut.py madeira-dock/src/launch.c   (both idempotent)
 """
@@ -60,17 +75,93 @@ if path.endswith("launch.c"):
         print("already patched (launch.c)"); sys.exit(0)
     # The first definition (the Windows one; a stub follows under #else).
     anchor_fn = '/* madeira-bcd: see tools/patch-dock-game-scm.py. */\n'
-    helper = ('/* madeira-doge: MADEIRA_DOCK_SHORTCUT, see tools/patch-dock-shortcut.py. */\n'
-              'static bool sh_launch_shortcut_mode(void)\n'
-              '{\n'
-              '    wchar_t v[4] = {0};\n'
-              '    return GetEnvironmentVariableW(L"MADEIRA_DOCK_SHORTCUT", v, 4) == 1 && v[0] == L\'1\';\n'
-              '}\n\n')
+    helper = r'''/* madeira-doge: MADEIRA_DOCK_SHORTCUT, see tools/patch-dock-shortcut.py. */
+static bool sh_launch_shortcut_mode(void)
+{
+    wchar_t v[4] = {0};
+    return GetEnvironmentVariableW(L"MADEIRA_DOCK_SHORTCUT", v, 4) == 1 && v[0] == L'1';
+}
+
+typedef void *(__thiscall *sh_get_friends_fn)(void *, int32_t, int32_t);
+typedef uint32_t (__thiscall *sh_add_temp_shortcut_fn)(void *, const char *, const char *, const char *);
+typedef uint64_t *(__thiscall *sh_gameid_for_app_fn)(void *, uint64_t *, uint32_t);
+
+/* The per-user record (friends map at +0x20, shortcuts map at +0xf0): the one
+ * committed private read-write slot holding the friends pointer whose record
+ * carries a shortcuts map with the expected vtable. */
+static void *sh_shortcut_map(HMODULE module, void *friends)
+{
+    const uint64_t want = (uint64_t)(uintptr_t)friends, vt = (uint64_t)(uintptr_t)module + 0x12c87b0;
+    void *found = NULL;
+    int matches = 0;
+    uint64_t scanned = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    unsigned char *p = NULL;
+    while (VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        unsigned char *next = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= p) break;
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+            (mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_EXECUTE_READWRITE) &&
+            mbi.RegionSize >= 0x100 && mbi.RegionSize <= ((SIZE_T)1 << 32)) {
+            const uint64_t *q = (const uint64_t *)mbi.BaseAddress, *end = (const uint64_t *)(next - 0x100);
+            if (scanned + mbi.RegionSize > ((uint64_t)6 << 30)) break;
+            scanned += mbi.RegionSize;
+            for (; q < end; ++q) {
+                if (*q != want) continue;
+                const unsigned char *record = (const unsigned char *)q - 0x20;
+                if (record < (const unsigned char *)mbi.BaseAddress) continue;
+                uint64_t map, mapvt;
+                memcpy(&map, record + 0xf0, 8);
+                if (!map || map % 8) continue;
+                MEMORY_BASIC_INFORMATION m2;
+                if (VirtualQuery((void *)(uintptr_t)map, &m2, sizeof(m2)) != sizeof(m2) || m2.State != MEM_COMMIT) continue;
+                memcpy(&mapvt, (void *)(uintptr_t)map, 8);
+                if (mapvt != vt) continue;
+                if (++matches == 1) found = (void *)(uintptr_t)map;
+            }
+        }
+        p = next;
+    }
+    return matches == 1 ? found : NULL;
+}
+
+/* Registers the program as a temporary shortcut with the client and returns its
+ * game id; the computed id ((appid << 32) | shortcut type) when anything is missing. */
+static uint64_t sh_shortcut_register(HMODULE module, void *engine, int32_t user, int32_t pipe, uint32_t appid,
+                                     const struct sh_observer *o)
+{
+    uint64_t computed = ((uint64_t)appid << 32) | 0x02000000u;
+    static char name[512], exe[1024], quoted[1040];
+    if (!GetEnvironmentVariableA("MADEIRA_DOCK_SHORTCUT_NAME", name, sizeof(name)) ||
+        !GetEnvironmentVariableA("MADEIRA_DOCK_SHORTCUT_EXE", exe, sizeof(exe))) { o->event("launch-shortcut-env", 0); return computed; }
+    if (!dock_method_is((uintptr_t)module, engine, 13, 0x943510)) { o->event("launch-shortcut-record", -1); return computed; }
+    void *friends = ((sh_get_friends_fn)(*(void ***)engine)[13])(engine, user, pipe);
+    if (!friends) { o->event("launch-shortcut-record", -2); return computed; }
+    void *map = sh_shortcut_map(module, friends);
+    o->event("launch-shortcut-record", map ? 1 : 0);
+    if (!map) return computed;
+    if (!dock_method_is((uintptr_t)module, map, 8, 0x7096e0) || !dock_method_is((uintptr_t)module, map, 1, 0x756340)) {
+        o->event("launch-shortcut-abi", 0); return computed;
+    }
+    snprintf(quoted, sizeof(quoted), "\"%s\"", exe);
+    uint32_t id = ((sh_add_temp_shortcut_fn)(*(void ***)map)[8])(map, name, quoted, "");
+    o->event("launch-shortcut-appid", (int32_t)id);
+    if (!id) return computed;
+    uint64_t gid = 0;
+    ((sh_gameid_for_app_fn)(*(void ***)map)[1])(map, &gid, id);
+    o->event("launch-shortcut-gameid-type", (int32_t)((gid >> 24) & 0xff));
+    o->event("launch-shortcut-gameid-app", (int32_t)(gid & 0xffffff));
+    return gid ? gid : (((uint64_t)id << 32) | 0x02000000u);
+}
+
+'''
     block_start = '    static char actual_utf8[32768];\n'
     block_end = '    o->event("launch-install-directory-verified", 1);\n'
     gameid = '    uint64_t gameid = appid;\n'
-    gameid_new = ('    /* madeira-doge: a shortcut is launched and watched by its CGameID. */\n'
-                  '    uint64_t gameid = sh_launch_shortcut_mode() ? (((uint64_t)appid << 32) | 0x02000000u) : (uint64_t)appid;\n')
+    gameid_new = ('    /* madeira-doge: a shortcut is launched and watched by its CGameID, registered with\n'
+                  '     * the client itself when possible (sh_shortcut_register). */\n'
+                  '    uint64_t gameid = sh_launch_shortcut_mode() ? sh_shortcut_register(module, engine, user, pipe, appid, o)\n'
+                  '                                                : (uint64_t)appid;\n')
     for a in (anchor_fn, block_start, block_end, gameid):
         if src.count(a) != 1:
             sys.exit("patch-dock-shortcut (launch.c): anchor changed (%r found %d times)" % (a.strip()[:50], src.count(a)))
