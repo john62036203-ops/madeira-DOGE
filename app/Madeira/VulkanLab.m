@@ -10,7 +10,13 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+/* <mach/mach_vm.h> is "unsupported" on the iOS SDK (JITAllocator.c ml748);
+ * libsystem_kernel exports these all the same. */
+extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *,
+                                    vm_region_flavor_t, vm_region_info_t,
+                                    mach_msg_type_number_t *, mach_port_t *);
+extern kern_return_t mach_vm_allocate(vm_map_t, mach_vm_address_t *, mach_vm_size_t, int);
+extern kern_return_t mach_vm_deallocate(vm_map_t, mach_vm_address_t, mach_vm_size_t);
 #include <mach/mach_time.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
@@ -101,6 +107,9 @@ typedef struct {
 
 /// Pure C (no ObjC locals) so the goto-based cleanup is legal under ARC.
 static void lab_run(void *metal_layer, LogBlock log) {
+    // Declared first: pLayer is an ObjC pointer, so under ARC this struct is
+    // non-trivial and no goto may jump past its declaration.
+    VkMetalSurfaceCreateInfoEXT sci = { .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT, .pLayer = (__bridge const CAMetalLayer *)metal_layer };
     VkInstance instance = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -261,7 +270,6 @@ static void lab_run(void *metal_layer, LogBlock log) {
     }
 
     // 4. The surface on the sheet's CAMetalLayer.
-    VkMetalSurfaceCreateInfoEXT sci = { .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT, .pLayer = (__bridge const CAMetalLayer *)metal_layer };
     CHECK(vkCreateMetalSurfaceEXT(instance, &sci, NULL, &surface), "vkCreateMetalSurfaceEXT");
     VkBool32 supported = VK_FALSE;
     CHECK(vkGetPhysicalDeviceSurfaceSupportKHR(pd, gfx, surface, &supported), "vkGetPhysicalDeviceSurfaceSupportKHR");
