@@ -32911,6 +32911,81 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
 }
 
 
+#ifdef WINE_IOS
+/* madeira-doge (vulkan branch): host-aware VirtualQuery for addresses no Wine
+ * view covers.  Upstream reports every such address as MEM_FREE, although on
+ * iOS the host already holds much of the map (the 4 GB __PAGEZERO, the app
+ * image and dyld, malloc, the iOS 27 kernel placeholder above the shared
+ * region, Madeira's own holdbacks).  A program that walks the map with
+ * VirtualQuery and reserves what it is told is free -- KytyPS5's
+ * ReserveGuestRegions (memoryAddressSpace.inc) is one -- then dies on the
+ * first VirtualAlloc2 the host refuses ("failed to reserve guest address
+ * space at 0x40000, size 0x123ef0000", log 2026-10-27 23:47).  With
+ * MADEIRA_VQUERY_HOST=1 the host region that covers the address (or the
+ * __PAGEZERO) is reported as a reserved MEM_PRIVATE block, and a free run is
+ * cut at the next host region, so the walk sees what can actually be mapped.
+ * Opt-in, off by default: nothing changes for other programs. */
+static int ios_vquery_host_on( void )
+{
+    static const char key[] = "MADEIRA_VQUERY_HOST";
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( key );
+        on = e && e[0] == '1' && !e[1];
+    }
+    return on;
+}
+
+/* Clamps [*region_start, *region_end) -- the Wine-free run around `base` --
+ * to what the host map says, and sets *fake_reserved when the host already
+ * holds `base`.  Called under virtual_mutex with no view covering base. */
+static void ios_vquery_host_clamp( char *base, char **region_start, char **region_end, BOOL *fake_reserved )
+{
+    static unsigned said;
+    const unsigned long long pagezero_end = 0x100000000ULL;
+    mach_vm_address_t raddr = (mach_vm_address_t)(uintptr_t)base;
+    mach_vm_size_t rsize = 0;
+    natural_t rdepth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t icnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t kr;
+
+    if ((unsigned long long)(uintptr_t)base < pagezero_end)
+    {
+        if ((unsigned long long)(uintptr_t)*region_end > pagezero_end) *region_end = (char *)(uintptr_t)pagezero_end;
+        *fake_reserved = TRUE;
+        if (said++ < 4) dprintf( 2, "[vquery-host] madeira-doge %p: below __PAGEZERO's end -> reserved up to %p\n", base, *region_end );
+        return;
+    }
+    for (;;)
+    {
+        kr = mach_vm_region_recurse( mach_task_self(), &raddr, &rsize, &rdepth, (vm_region_recurse_info_t)&info, &icnt );
+        if (kr != KERN_SUCCESS) return;            /* nothing mapped at or above base: keep Wine's answer */
+        if (info.is_submap) { rdepth++; continue; }
+        break;
+    }
+    if (raddr <= (mach_vm_address_t)(uintptr_t)base)
+    {
+        /* the host holds base: report that region (clamped to the Wine-free run) as reserved */
+        char *hs = (char *)(uintptr_t)raddr, *he = (char *)(uintptr_t)(raddr + rsize);
+        if (hs > *region_start) *region_start = hs;
+        if (he < *region_end) *region_end = he;
+        *fake_reserved = TRUE;
+        if (said++ < 16)
+            dprintf( 2, "[vquery-host] madeira-doge %p: host region %p+0x%llx (tag %u prot %u) -> reserved %p..%p\n",
+                     base, hs, (unsigned long long)rsize, (unsigned)info.user_tag, (unsigned)info.protection,
+                     *region_start, *region_end );
+    }
+    else
+    {
+        /* free until the next host region */
+        char *he = (char *)(uintptr_t)raddr;
+        if (he < *region_end) *region_end = he;
+    }
+}
+#endif
+
 static struct file_view *get_memory_region_size( char *base, char **region_start, char **region_end,
                                                  BOOL *fake_reserved )
 {
@@ -32981,6 +33056,9 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
         }
         *fake_reserved = TRUE;
     }
+#endif
+#ifdef WINE_IOS
+    if (ios_vquery_host_on()) ios_vquery_host_clamp( base, region_start, region_end, fake_reserved );
 #endif
     return NULL;
 }
