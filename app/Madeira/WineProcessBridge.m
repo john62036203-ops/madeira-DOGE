@@ -428,6 +428,62 @@ static void madeira_ensure_locallow(NSString *prefix)
     ws_log( "[profile] users/%s/AppData/LocalLow %s", name, made ? "created" : "could NOT be created" );
 }
 
+/* Ported from BCD 0.1.611 (madeira_seed_fonts_and_vc80_amd64, fonts part).
+ * C:\windows\Fonts gets symbolic links to iOS system fonts under Windows file
+ * names, so Wine's font list has CJK and the common Latin families; the
+ * win32u font_ios.c wrapper (BCD 0.1.614) then maps MS Gothic / MingLiU /
+ * SimSun / Arial ... onto them. Without these, CJK text in Win32 dialogs
+ * (game error boxes, Valve's client) is drawn as boxes. pingfang.ttc is a
+ * madeira-doge addition so Traditional Chinese finds PingFang TC even when
+ * Hiragino served msgothic.ttc. Existing files are left alone. */
+static void madeira_seed_fonts(NSFileManager *fm, NSString *prefix)
+{
+    NSString *fontsDir = [prefix stringByAppendingPathComponent:@"drive_c/windows/Fonts"];
+    [fm createDirectoryAtPath:fontsDir withIntermediateDirectories:YES attributes:nil error:nil];
+    struct { const char *dst; const char *srcs[4]; } const fontMap[] = {
+        { "msgothic.ttc", { "/System/Library/Fonts/Core/HiraginoKakuGothic.ttc",
+                            "/System/Library/Fonts/Core/Hiragino Sans.ttc",
+                            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                            "/System/Library/Fonts/Core/PingFang.ttc" } },
+        { "msmincho.ttc", { "/System/Library/Fonts/AppFonts/HiraginoMincho.ttc",
+                            "/System/Library/Fonts/Core/HiraginoKakuGothic.ttc",
+                            "/System/Library/Fonts/Core/Hiragino Sans.ttc", NULL } },
+        { "pingfang.ttc", { "/System/Library/Fonts/Core/PingFang.ttc",
+                            "/System/Library/Fonts/PingFang.ttc", NULL, NULL } },
+        { "arial.ttf",    { "/System/Library/Fonts/CoreAddition/Arial.ttf",
+                            "/System/Library/Fonts/Supplemental/Arial.ttf", NULL, NULL } },
+        { "arialbd.ttf",  { "/System/Library/Fonts/CoreAddition/ArialBold.ttf",
+                            "/System/Library/Fonts/Supplemental/Arial Bold.ttf", NULL, NULL } },
+        { "verdana.ttf",  { "/System/Library/Fonts/CoreAddition/Verdana.ttf",
+                            "/System/Library/Fonts/Supplemental/Verdana.ttf", NULL, NULL } },
+        { "georgia.ttf",  { "/System/Library/Fonts/CoreAddition/Georgia.ttf",
+                            "/System/Library/Fonts/Supplemental/Georgia.ttf", NULL, NULL } },
+        { "cour.ttf",     { "/System/Library/Fonts/Core/CourierNew.ttf",
+                            "/System/Library/Fonts/Supplemental/Courier New.ttf", NULL, NULL } },
+        { "times.ttf",    { "/System/Library/Fonts/Core/TimesNewRoman.ttf",
+                            "/System/Library/Fonts/Supplemental/Times New Roman.ttf", NULL, NULL } },
+        { "trebuc.ttf",   { "/System/Library/Fonts/CoreUI/TrebuchetMS.ttf",
+                            "/System/Library/Fonts/Supplemental/Trebuchet MS.ttf", NULL, NULL } },
+    };
+    int linked = 0, kept = 0, missing = 0;
+    for (size_t i = 0; i < sizeof(fontMap) / sizeof(fontMap[0]); i++) {
+        NSString *dst = [fontsDir stringByAppendingPathComponent:[NSString stringWithUTF8String:fontMap[i].dst]];
+        if ([fm fileExistsAtPath:dst]) { kept++; continue; }
+        BOOL done = NO;
+        for (size_t j = 0; j < 4 && fontMap[i].srcs[j] && !done; j++) {
+            NSString *src = [NSString stringWithUTF8String:fontMap[i].srcs[j]];
+            if ([fm fileExistsAtPath:src]) {
+                [fm removeItemAtPath:dst error:nil];   /* a dangling link from an older iOS */
+                done = [fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil];
+            }
+        }
+        if (done) linked++; else missing++;
+    }
+    extern void ws_log(const char *fmt, ...);
+    ws_log( "[fonts] madeira-doge: C:\\windows\\Fonts system-font links: %d new, %d already there, %d without an iOS source",
+            linked, kept, missing );
+}
+
 /***********************************************************************
  *           madeira_seed_prefix_if_needed
  *
@@ -483,6 +539,7 @@ void madeira_seed_prefix_if_needed(const char *prefix_path) {
         /* ml581: see madeira_undo_appdata_skeleton() above. */
         madeira_undo_appdata_skeleton( prefix );
         madeira_ensure_locallow( prefix );
+        madeira_seed_fonts( fm, prefix );
     }
 }
 
