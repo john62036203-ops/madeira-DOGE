@@ -69,6 +69,11 @@ OVERLAY = {
                 "note": "Default off. If other image allocations fail, retired region-C code buffers up to 64 MB "
                         "may enter the image freelist after a 3-second grace, executable-page and thread-PC checks. "
                         "Requires pool-low; 64-bit processes only. Live buffers and the pool-low-margin stay unchanged."},
+    "env.MADEIRA_XENIA_GUEST_BASE": {"category": "Memory & JIT pool", "title": "Xenia/ReXGlue guest memory placement",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a fixed view past the device's 512 GB address map fails instead of "
+                        "being reported as mapped, and each refused 2^n guest-memory candidate of a "
+                        "Xenia-derived program (e.g. Ninja's Dawn) is logged with what occupies it."},
     "env.MADEIRA_X64_IMAGE_NOCOPY": {"category": "Memory & JIT pool", "title": "Pure-x64 images without a JIT-pool copy",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: an x64-only image (not ARM64EC hybrid, not a Wine builtin) in a 64-bit "

@@ -20086,6 +20086,71 @@ failed:
     return status;
 }
 
+/* madeira-doge [xgb] (env MADEIRA_XENIA_GUEST_BASE = 1; default off).
+ * Xenia-derived runtimes (ReXGlue: Ninja's Dawn) place the 360 guest space by
+ * trying MapViewOfFileEx at 2^32, 2^33, ... and take the first base where every
+ * view maps; the views cover [base, base+0x120000000). On this device the task
+ * map ends at 512 GB, so a base past host_addr_space_limit cannot exist, but
+ * upstream map_view answers it with STATUS_WORKING_SET_LIMIT_RANGE, an
+ * informational (success) status: the runtime then believes 0x800000000000 is
+ * mapped and its first guest write faults. With the switch on such a request
+ * fails as a conflict, and each refused power-of-two candidate is explained:
+ * the Wine views and host regions inside its window. */
+#define IOS_XGB_SPAN 0x120000000ULL
+static int ios_xgb_on( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_XENIA_GUEST_BASE" );
+        on = (e && e[0] == '1');
+        if (on) dprintf( 2, "[xgb] ON: fixed views past the %p task map fail as conflicts; "
+                         "refused 2^n candidates are explained\n", host_addr_space_limit );
+    }
+    return on;
+}
+
+static void ios_xgb_explain( void *base, size_t size, NTSTATUS status )
+{
+    static int budget = 48;
+    UINT_PTR b = (UINT_PTR)base, lo = b, hi = b + IOS_XGB_SPAN;
+    struct file_view *view;
+    int nv = 0, nr = 0;
+
+    if (b < 0x100000000ULL || (b & (b - 1)) || budget <= 0) return;  /* 2^n candidates only */
+    budget--;
+    dprintf( 2, "[xgb] candidate %p size=%p -> 0x%x; window [%p,%p)\n",
+             base, (void *)size, (unsigned)status, (void *)lo, (void *)hi );
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        UINT_PTR vs = (UINT_PTR)view->base, ve = vs + view->size;
+        if (ve <= lo || vs >= hi) continue;
+        if (nv++ < 6)
+            dprintf( 2, "[xgb]   view %p+%p protect=0x%x tid=%04x\n", view->base,
+                     (void *)view->size, view->protect, view->madeira_creator_tid );
+    }
+    if (nv > 6) dprintf( 2, "[xgb]   ... %d views in the window\n", nv );
+    {
+        mach_vm_address_t a = lo;
+        while (a < hi && nr < 6)
+        {
+            mach_vm_size_t sz = 0;
+            natural_t depth = 0;
+            vm_region_submap_info_data_64_t info;
+            mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (mach_vm_region_recurse( mach_task_self(), &a, &sz, &depth,
+                                        (vm_region_recurse_info_t)&info, &cnt ) != KERN_SUCCESS)
+                break;
+            if (a >= hi) break;
+            dprintf( 2, "[xgb]   host 0x%llx+0x%llx prot=%d/%d tag=%u\n", (unsigned long long)a,
+                     (unsigned long long)sz, info.protection, info.max_protection, info.user_tag );
+            nr++;
+            a += sz;
+        }
+    }
+    if (!nv && !nr) dprintf( 2, "[xgb]   window holds no views and no host regions\n" );
+}
+
 /***********************************************************************
  *           map_view
  *
@@ -20135,11 +20200,20 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
     if (base)
     {
+        if (ios_xgb_on() && is_beyond_limit( base, size, host_addr_space_limit ))
+        {
+            ios_xgb_explain( base, size, STATUS_CONFLICTING_ADDRESSES );
+            return STATUS_CONFLICTING_ADDRESSES;
+        }
         if (is_beyond_limit( base, size, address_space_limit )) return STATUS_WORKING_SET_LIMIT_RANGE;
         if (limit_low && base < (void *)limit_low) return STATUS_CONFLICTING_ADDRESSES;
         if (limit_high && is_beyond_limit( base, size, (void *)limit_high )) return STATUS_CONFLICTING_ADDRESSES;
         if (is_beyond_limit( base, size, host_addr_space_limit )) return STATUS_CONFLICTING_ADDRESSES;
-        if ((status = map_fixed_area( base, size, unix_prot ))) return status;
+        if ((status = map_fixed_area( base, size, unix_prot )))
+        {
+            if (ios_xgb_on()) ios_xgb_explain( base, size, status );
+            return status;
+        }
         if (is_beyond_limit( base, size, working_set_limit )) working_set_limit = address_space_limit;
         ptr = base;
     }
