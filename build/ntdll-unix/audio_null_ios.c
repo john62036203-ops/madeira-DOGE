@@ -1546,8 +1546,26 @@ static NTSTATUS ios_timer_loop(void *args) {
         if (pad > pad_max) pad_max = pad;
 
         if (pad < lead) {
+            /* madeira-doge MADEIRA_AUDIO_RESIGNAL_MS (1..10, default off): a client
+             * whose producer runs on its own thread answers a wake-up with nothing
+             * when the next block is not mixed yet, and the block it finishes a
+             * moment later then waited for the 10 ms beat. Ninja's Dawn's XAudio
+             * bridge writes one 256-sample frame per wake-up this way: 86-87% of
+             * real time, a 10 ms hole every ~75 ms (crackle). With this set the
+             * event is set again every N ms while the ring is short, answered or
+             * not; a client that ignores 100 of them in a row (paused) is still
+             * moved to the 10 ms beat. */
+            static int resig_ms = -1;
+            uint64_t resig_ns;
+            if (resig_ms < 0) {
+                const char *e = getenv("MADEIRA_AUDIO_RESIGNAL_MS");
+                int v = e ? atoi(e) : 0;
+                resig_ms = (v >= 1 && v <= 10) ? v : 0;
+                if (resig_ms) fprintf(stderr, "[ios_audio] re-signal every %d ms while the ring is short (MADEIRA_AUDIO_RESIGNAL_MS)\n", resig_ms);
+            }
+            resig_ns = resig_ms ? (uint64_t)resig_ms * 1000000ull : 10000000ull;
             if (wr != sig_wr) unanswered = 0;
-            if (wr != sig_wr || now - sig_ns >= 10000000) {
+            if (wr != sig_wr || now - sig_ns >= (unanswered >= (resig_ms ? 100u : 2u) ? 10000000ull : resig_ns)) {
                 if (wr == sig_wr) unanswered++;
                 NtSetEvent(s->event, NULL);
                 sig_wr = wr;
@@ -1557,7 +1575,7 @@ static NTSTATUS ios_timer_loop(void *args) {
             /* Look again for the client's answer in 1 ms; a client that left two
              * wake-ups unanswered (paused, starved) is looked at on the 10 ms beat
              * until it writes again, not 1000 times a second. */
-            sleep_ns = unanswered >= 2 ? 10000000 : 1000000;
+            sleep_ns = unanswered >= (resig_ms ? 100u : 2u) ? 10000000 : 1000000;
         } else {
             sleep_ns = (pad - lead) * 1000000000ull / rate;   /* until the lead is used up */
             if (sleep_ns < 1000000) sleep_ns = 1000000;
