@@ -32953,7 +32953,8 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
 
     {
         static unsigned long long calls;
-        if (++calls % 100000 == 0)
+        calls++;
+        if ((calls <= 50000 && calls % 5000 == 0) || calls % 100000 == 0)
             dprintf( 2, "[vquery-host] madeira-doge %llu queries so far, now at %p (Wine run %p..%p)\n",
                      calls, base, *region_start, *region_end );
     }
@@ -32982,7 +32983,7 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
          * at ~75k queries/s. Only MEM_FREE pieces matter to such a walk. */
         char *hs = (char *)(uintptr_t)raddr, *he = (char *)(uintptr_t)(raddr + rsize);
         unsigned merged = 0, tag = info.user_tag, prot = info.protection;
-        while (he < *region_end && merged < 4096)
+        while (he < *region_end && merged < 1024)
         {
             mach_vm_address_t naddr = (mach_vm_address_t)(uintptr_t)he;
             mach_vm_size_t nsize = 0;
@@ -33005,6 +33006,11 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
         if (hs > *region_start) *region_start = hs;
         if (he < *region_end) *region_end = he;
         *fake_reserved = TRUE;
+        if (merged >= 1024 && said < 32)
+        {
+            said++;
+            dprintf( 2, "[vquery-host] madeira-doge %p: merge cap hit at %p (1024 host regions)\n", base, he );
+        }
         if (said++ < 16)
             dprintf( 2, "[vquery-host] madeira-doge %p: host region %p+0x%llx (tag %u prot %u, %u more merged) -> reserved %p..%p\n",
                      base, hs, (unsigned long long)rsize, tag, prot, merged, *region_start, *region_end );
@@ -33116,7 +33122,20 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
     }
 #endif
 #ifdef WINE_IOS
-    if (ios_vquery_host_on()) ios_vquery_host_clamp( base, region_start, region_end, fake_reserved );
+    if (ios_vquery_host_on())
+    {
+        ios_vquery_host_clamp( base, region_start, region_end, fake_reserved );
+        if (*region_end <= base + page_mask)
+        {
+            /* never an empty region: FEX's InvalidationTracker constructor walks the map
+             * with Address = BaseAddress + RegionSize and would spin on RegionSize 0 */
+            static unsigned said_empty;
+            if (said_empty++ < 8)
+                dprintf( 2, "[vquery-host] madeira-doge %p: clamp left an empty region (end %p) -> one page reserved\n", base, *region_end );
+            *region_end = base + page_mask + 1;
+            *fake_reserved = TRUE;
+        }
+    }
 #endif
     return NULL;
 }
