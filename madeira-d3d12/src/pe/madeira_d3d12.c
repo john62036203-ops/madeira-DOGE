@@ -6672,6 +6672,18 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                 if (pso->backend == MADEIRA_IR_BACKEND_AIRCONV) {
                     static int t2d = -1; static LONG said_t2d, said_dim; int xv = -1; struct mad_resource *tr;
                     if (t2d < 0) t2d = mad_cfg_int_pe("dxbc-tex-2d", 1) ? 1 : 0;
+                    if (g_dump_tables) {   /* madeira-doge: what a captured dispatch's texture range really binds */
+                        int dxv = -1; struct mad_resource *dr = mad_texture_of_view(d, de.texture_view_id, &dxv);
+                        if (!dr) d3d12_log("[capture-draw]   %c%u: view %llu is NOT a known texture view\n", rg->type == MADEIRA_IR_AIR_SRV ? 't' : 'u',
+                                           rg->lower_bound, (unsigned long long)de.texture_view_id);
+                        else d3d12_log("[capture-draw]   %c%u: view %llu -> %s r#%u %ux%u layers %u type %u pf %u tex %p%s; xview %d type %u pf %u l%u+%u s%u+%u swz %08x tex %p\n",
+                                       rg->type == MADEIRA_IR_AIR_SRV ? 't' : 'u', rg->lower_bound, (unsigned long long)de.texture_view_id,
+                                       dr->name ? dr->name : "?", dr->serial, dr->width, dr->height, dr->tex_layers, (unsigned)dr->tex_type, (unsigned)dr->tex_pf,
+                                       (void *)(ULONG_PTR)dr->texture, dr->rts_x > 0.0f ? " RT-SCALED" : "", dxv,
+                                       dxv >= 0 ? dr->xview[dxv].type : 0u, dxv >= 0 ? dr->xview[dxv].pf : 0u, dxv >= 0 ? dr->xview[dxv].lvl0 : 0u,
+                                       dxv >= 0 ? dr->xview[dxv].nlvl : 0u, dxv >= 0 ? dr->xview[dxv].sl0 : 0u, dxv >= 0 ? dr->xview[dxv].nsl : 0u,
+                                       dxv >= 0 ? dr->xview[dxv].swz : 0u, dxv >= 0 ? (void *)(ULONG_PTR)dr->xview[dxv].tex : NULL);
+                    }
                     if (t2d && (tr = mad_texture_of_view(d, de.texture_view_id, &xv)) != NULL && tr->texture) {
                         /* The type the shader declared (the dimension bits come from
                          * tools/patch-airconv-range-dim.py; without them a plain 2D is assumed). */
@@ -6752,6 +6764,9 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                 tab[off + 0] = bind_id;
                 tab[off + 1] = ((UINT64)mad_air_array_len(d, bind_id) << 32)
                              | (de.metadata & 0xffffffffull);     /* min LOD clamp */
+                if (g_dump_tables)
+                    d3d12_log("[capture-draw]   %c%u: bound id %llu, word1 0x%llx\n", rg->type == MADEIRA_IR_AIR_SRV ? 't' : 'u', rg->lower_bound,
+                              (unsigned long long)tab[off + 0], (unsigned long long)tab[off + 1]);
                 /* madeira-doge: dxbc-tex-probe = 1 (madeira.cfg / game cfg): every texture the
                  * trace-ps pixel shaders sample is replaced by a 4x4 opaque WHITE RGBA8 texture
                  * of the runtime's own, so the quads come out in their vertex colour. EXVS2's
@@ -17808,6 +17823,21 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
             if ((dump_on || mad_cs_dump_on()) && ndump++ < 400) { snprintf(fn, sizeof fn, "cs_%p_%u.dxil", (void *)p, (unsigned)desc->CS.BytecodeLength); mad_dump_blob(fn, desc->CS.pShaderBytecode, desc->CS.BytecodeLength); }
         }
         snprintf(p->vs_name, sizeof p->vs_name, "%s", entry[0] ? entry : g_last_entry);   /* ml880 */
+        /* madeira-doge: a capture-cs target's bytecode goes to Documents/capture/ (cs_<entry>.dxbc),
+         * so it reaches the capture zip without a trip into the Wine prefix (Ninja's Dawn EDRAM dump) */
+        {
+            char want[512]; struct madeira_ctl_args ca; int got;
+            memset(want, 0, sizeof want);
+            got = mad_cfg_str_pe("capture-cs", want, sizeof want);
+            if (got && want[0] && mad_name_in_list(want, p->vs_name)) {
+                memset(&ca, 0, sizeof ca);
+                ca.op = 1; ca.ptr = (UINT64)(ULONG_PTR)desc->CS.pShaderBytecode; ca.len = desc->CS.BytecodeLength;
+                snprintf(ca.name, sizeof ca.name, "cs_%s_%u.dxbc", p->vs_name, (unsigned)desc->CS.BytecodeLength);
+                MadeiraCtl(&ca);
+                d3d12_log("[capture] compute bytecode of '%s' (%u bytes) %s Documents/capture/%s\n", p->vs_name,
+                          (unsigned)desc->CS.BytecodeLength, ca.ret ? "written to" : "FAILED to write to", ca.name);
+            }
+        }
         if (strstr(p->vs_name, "ClusterCulling") && mad_cfg_int_pe("cs-b64", 1)) {   /* madeira-doge: every variant of the wave-op culling kernel, for offline work */
             mad_fault_cs_load();
             if (g_fault_cs_nwant < 16) { g_fault_cs_want[g_fault_cs_nwant++] = p->cs_hash; mad_fault_cs_check(desc->CS.pShaderBytecode, p->cs_len, p->cs_hash); }
