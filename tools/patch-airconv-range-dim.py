@@ -16,8 +16,8 @@ Bits 7, 8, 9, 12, 13 and 14 of Flags are free in MTL_SM50_SHADER_ARGUMENT_FLAG:
   1 << 8   a 3D texture
   1 << 9   a cube (TextureCube / TextureCubeArray)
   1 << 12  a multisampled 2D texture
-  1 << 13  a typed buffer (Buffer<T> / RWBuffer<T>) of UNSIGNED integers
-  1 << 14  a typed buffer of SIGNED integers (neither bit: float)
+  1 << 13  a typed buffer or texture of UNSIGNED integers (Buffer<uint> / Texture2D<uint4>)
+  1 << 14  a typed buffer or texture of SIGNED integers (neither bit: float)
 Buffers and plain 2D textures set none of them. The typed-buffer scalar bits
 let the PE side build a texture-buffer view of the right format when a game
 binds a RAW or STRUCTURED descriptor to a Buffer<uint> (EXVS2's particle
@@ -77,12 +77,16 @@ NEW_SRV = """    case SM50BindingType::SRV: {
     case dxmt::shader::common::ResourceType::Texture2DMultisampled:
     case dxmt::shader::common::ResourceType::Texture2DMultisampledArray:
       dim_flags = 1u << 12; break;
-    case dxmt::shader::common::ResourceType::TextureBuffer:
-      if (sc == dxmt::shader::common::ScalerDataType::Uint) dim_flags = 1u << 13;
-      else if (sc == dxmt::shader::common::ScalerDataType::Int) dim_flags = 1u << 14;
-      break;
     default:
       break;
+    }
+    /* The scalar type of every typed resource -- typed buffers and, since
+     * madeira-doge build 534, textures too: a Texture2D<uint4> read of a UNORM
+     * view returns zeros on Apple GPUs (Xenia's EDRAM dump of Ninja's Dawn),
+     * so the PE side gives such a range an integer view of the same bits. */
+    if (dim != dxmt::shader::common::ResourceType::NonApplicable) {
+      if (sc == dxmt::shader::common::ScalerDataType::Uint) dim_flags |= 1u << 13;
+      else if (sc == dxmt::shader::common::ScalerDataType::Int) dim_flags |= 1u << 14;
     }
     if (pRanges && total < Capacity) {"""
 OLD_FLAGS = """      o.Flags = (uint32_t)arg.Flags;

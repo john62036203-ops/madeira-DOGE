@@ -6485,6 +6485,27 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
                                  UINT64 first, UINT64 num, int uav, struct mad_descriptor *e);   /* madeira-doge: dxbc-typed-fix uses it below */
 /* Build the two argument buffers for one dispatch. Returns 0 and logs the first
  * unresolvable range rather than dispatching against a half-filled table. */
+/* madeira-doge dxbc-tex-int: the integer pixel format with the same bits as a
+ * normalized/float one (0 when it already is integer, or has no twin). Metal
+ * views between ordinary colour formats of one size are allowed (every texture
+ * here carries PixelFormatView usage). */
+static UINT mad_pf_integer_twin(UINT pf, int sint) {
+    switch (pf) {
+    case 10: case 11: case 12:           return sint ? 14 : 13;    /* R8 unorm/srgb/snorm -> R8 int */
+    case 20: case 22: case 25:           return sint ? 24 : 23;    /* R16 unorm/snorm/float */
+    case 30: case 31: case 32:           return sint ? 34 : 33;    /* RG8 */
+    case 55:                             return sint ? 54 : 53;    /* R32Float */
+    case 60: case 62: case 65:           return sint ? 64 : 63;    /* RG16 */
+    case 70: case 71: case 72: case 80: case 81:
+                                         return sint ? 74 : 73;    /* RGBA8 / BGRA8 */
+    case 90:                             return sint ? 0 : 91;     /* RGB10A2 */
+    case 92:                             return sint ? 54 : 53;    /* RG11B10Float as one 32-bit word */
+    case 105:                            return sint ? 104 : 103;  /* RG32Float */
+    case 110: case 112: case 115:        return sint ? 114 : 113;  /* RGBA16 */
+    case 125:                            return sint ? 124 : 123;  /* RGBA32Float */
+    default:                             return 0;
+    }
+}
 static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
                                    const UINT32 (*consts)[64], const struct mad_pso *pso,
                                    UINT cb_bind, UINT arg_bind, UINT arg_qwords, UINT nair,
@@ -6691,6 +6712,40 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                                           mad_tex_type_name((UINT)want), arr ? " (array)" : "", tr->name ? tr->name : "?", tr->serial,
                                           tr->width, tr->height, tr->tex_layers, type, mad_tex_type_name(type));
                             }
+                        }
+                    }
+                }
+                /* madeira-doge dxbc-tex-int (default 1): the shader reads this texture as
+                 * INTEGERS (Texture2D<uint4>, RWTexture2D<uint>: airconv's range flags bits
+                 * 13/14, tools/patch-airconv-range-dim.py) but the view is a normalized or
+                 * float format. D3D12 hands such a shader a UINT view; on Apple GPUs an
+                 * integer read of a UNORM texture returns zeros. Ninja's Dawn: Xenia's EDRAM
+                 * dump read the title picture from its host render target as all zeros and
+                 * the screen stayed black (captures f1002/f771, build 532-533). Rebind a view
+                 * of the same bits in the integer format the shader expects. */
+                if (pso->backend == MADEIRA_IR_BACKEND_AIRCONV && (rg->flags & (MADEIRA_IR_AIR_F_TBUF_UINT | MADEIRA_IR_AIR_F_TBUF_SINT))) {
+                    static int ti_on = -1; static LONG said_ti, said_tif;
+                    int xv2 = -1; struct mad_resource *tr2;
+                    if (ti_on < 0) ti_on = mad_cfg_int_pe("dxbc-tex-int", 1) ? 1 : 0;
+                    if (ti_on && (tr2 = mad_texture_of_view(d, bind_id, &xv2)) != NULL && tr2->texture && !tr2->is_depth) {
+                        UINT vpf = xv2 >= 0 && tr2->xview[xv2].pf ? (UINT)tr2->xview[xv2].pf : (UINT)tr2->tex_pf;
+                        UINT ipf = mad_pf_integer_twin(vpf, (rg->flags & MADEIRA_IR_AIR_F_TBUF_SINT) != 0);
+                        if (ipf) {
+                            UINT vtype = xv2 >= 0 ? tr2->xview[xv2].type : (UINT)tr2->tex_type;
+                            UINT lvl0 = xv2 >= 0 ? tr2->xview[xv2].lvl0 + tr2->mip_drop : 0, nlvl = xv2 >= 0 ? tr2->xview[xv2].nlvl : 0;
+                            UINT sl0 = xv2 >= 0 ? tr2->xview[xv2].sl0 : 0, nsl = xv2 >= 0 ? tr2->xview[xv2].nsl : tr2->tex_layers;
+                            UINT vswz = xv2 >= 0 ? tr2->xview[xv2].swz : 0;
+                            UINT64 id3 = mad_texture_view_id(d, tr2, (enum WMTTextureType)vtype, lvl0, nlvl, sl0, nsl, (enum WMTPixelFormat)ipf, vswz);
+                            if (id3) {
+                                if (InterlockedIncrement(&said_ti) <= 12)
+                                    d3d12_log("[madeira-d3d12] dxbc-tex-int: %c%u of '%s' reads %s integers; %s r#%u %ux%u view pf%u -> pf%u (id %#llx -> %#llx)\n",
+                                              rg->type == MADEIRA_IR_AIR_SRV ? 't' : 'u', rg->lower_bound, pso->is_compute ? pso->vs_name : pso->ps_name,
+                                              (rg->flags & MADEIRA_IR_AIR_F_TBUF_SINT) ? "signed" : "unsigned", tr2->name ? tr2->name : "?", tr2->serial,
+                                              tr2->width, tr2->height, vpf, ipf, (unsigned long long)bind_id, (unsigned long long)id3);
+                                bind_id = id3;
+                            } else if (InterlockedIncrement(&said_tif) <= 8)
+                                d3d12_log("[madeira-d3d12] dxbc-tex-int: no pf%u view of %s r#%u (pf%u) for '%s'\n", ipf, tr2->name ? tr2->name : "?",
+                                          tr2->serial, vpf, pso->is_compute ? pso->vs_name : pso->ps_name);
                         }
                     }
                 }
