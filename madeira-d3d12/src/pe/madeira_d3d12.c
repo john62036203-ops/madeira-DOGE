@@ -1957,6 +1957,7 @@ struct mad_exec {
     struct mad_rtvp rtp[8], dp; struct mad_rtvp enc_rtp[8], enc_dp;            /* ml925: bound / encoded sub-views */
     struct mad_resource *enc_rt[8]; UINT enc_nrt; struct mad_resource *enc_depth; /* what the open encoder has */
     UINT enc_w, enc_h;              /* ml934b: and the area it was created with */
+    UINT8 area_cut;                 /* madeira-doge pass-area: enc_w/enc_h is smaller than the attachments (a draw outside reopens the pass) */
     struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; int is_depth; struct mad_rtvp v; } pend[16];
     unsigned npend;
     struct mad_pso *pso;
@@ -2660,7 +2661,7 @@ static void exec_end(struct mad_exec *e) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
         MTLCommandEncoder_endEncoding(e->renc);
         if (e->renc_retained) { NSObject_release(e->renc); e->renc_retained = 0; }   /* madeira-doge pass-carry */
-        e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
+        e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0; e->area_cut = 0;
         if (e->q->vis && e->q->vis->dirty) { e->q->vis->next++; e->q->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
         e->pass_draws = 0;
@@ -4560,16 +4561,94 @@ static void mad_fault_label_render(struct mad_exec *e) {
     if (e->diag_more && n < (int)sizeof s - 8) snprintf(s + n, sizeof s - n, " ...");
     mad_label(e->renc, "%s", s);
 }
+/* madeira-doge pass-area (game file / madeira.cfg pass-area = 1, default 0).
+ * Ninja's Dawn (NG2 recompiled, Xenia's host-render-target path, ROV not
+ * available on Apple GPUs) binds EDRAM-shaped targets -- 320x8192, 240x8192,
+ * 1040x2528, 1120x1176 -- and draws into a corner of them (scissor 280x146,
+ * 1120x584). Its render passes are cut ~220 times a frame by the resolve and
+ * texture-untile dispatches, and every pass loaded and stored the WHOLE
+ * attachment: ~1 GB in + ~1 GB out per frame (ml1137, build 544 log
+ * 2026-10-29), with the GPU 100 % busy at 17-24 fps. A Metal pass only loads
+ * and stores the tiles inside renderTargetWidth x renderTargetHeight, so the
+ * pass is opened at the union of the scissors of the draws it will hold: the
+ * recorded list is scanned ahead from the current command to the next command
+ * that ends the pass. Anything the scan cannot see (a later list, a draw
+ * after a command it stopped at, a draw with no scissor) is caught when the
+ * draw arrives: a draw outside the area closes the pass and reopens it (its
+ * stored corner is reloaded, the rest of the target was never touched). A
+ * pass that begins with a clear keeps the full area (the clear covers the
+ * whole view). */
+static int g_pass_area = -1;
+static LONG g_area_cut_n, g_area_regrow, g_area_full_n;
+static LONG64 g_area_saved_px;
+static void exec_area_need(const struct mad_exec *e, D3D12_RECT sc, int has, UINT fw, UINT fh, UINT *nw, UINT *nh) {
+    LONG x1 = has ? sc.right : (LONG)fw, y1 = has ? sc.bottom : (LONG)fh;
+    (void)e;
+    if (x1 > (LONG)fw) x1 = (LONG)fw; if (y1 > (LONG)fh) y1 = (LONG)fh;
+    if (x1 < 1) x1 = 1; if (y1 < 1) y1 = 1;
+    *nw = (UINT)x1; *nh = (UINT)y1;
+}
+static int exec_area_scan(const struct mad_exec *e, UINT fw, UINT fh, UINT *ow, UINT *oh) {
+    const struct mad_list *l = e->l;
+    D3D12_RECT sc = e->sc; int has = e->has_sc;
+    UINT mw = 0, mh = 0, nw, nh, i, ndraw = 0;
+    *ow = fw; *oh = fh;
+    if (!l || e->hoist) return 0;
+    for (i = e->cur; i < l->ncmds && i < e->cur + 8192; i++) {
+        const struct mad_cmd *c = &l->cmds[i];
+        switch (c->kind) {
+        case MC_SCISSOR: sc = c->u.scissor; has = 1; break;
+        case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
+            exec_area_need(e, sc, has, fw, fh, &nw, &nh);
+            if (nw > mw) mw = nw; if (nh > mh) mh = nh;
+            ndraw++;
+            if (mw >= fw && mh >= fh) return 0;
+            break;
+        case MC_RTS: {
+            UINT k; int same;
+            if (!c->u.rts.n && !c->u.rts.depth) break;   /* rts-null-lazy: the pass stays open across an unbind */
+            same = c->u.rts.n == e->nrt && c->u.rts.depth == e->depth && (!e->depth || mad_rtvp_eq(&c->u.rts.dv, &e->dp));
+            for (k = 0; k < e->nrt && same; k++) if (c->u.rts.rt[k] != e->rt[k] || !mad_rtvp_eq(&c->u.rts.v[k], &e->rtp[k])) same = 0;
+            if (!same) goto done;
+            break;
+        }
+        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT:
+        case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: case MC_RESOLVE:
+            goto done;
+        default: break;
+        }
+    }
+done:
+    if (!ndraw) return 0;
+    mw = (mw + 31) & ~31u; mh = (mh + 31) & ~31u;   /* whole tiles */
+    if (mw > fw) mw = fw; if (mh > fh) mh = fh;
+    if ((UINT64)mw * mh * 10 >= (UINT64)fw * fh * 9) return 0;   /* under 10 % to gain: not worth a reopen risk */
+    *ow = mw; *oh = mh;
+    return 1;
+}
+static int exec_area_fits(const struct mad_exec *e) {
+    UINT fw, fh, nw, nh;
+    if (!e->area_cut) return 1;
+    if (e->nrt && e->rt[0]) { fw = e->rt[0]->width >> e->rtp[0].level; fh = e->rt[0]->height >> e->rtp[0].level; }
+    else if (e->depth) { fw = e->depth->width >> e->dp.level; fh = e->depth->height >> e->dp.level; }
+    else return 1;
+    exec_area_need(e, e->sc, e->has_sc, fw, fh, &nw, &nh);
+    return nw <= e->enc_w && nh <= e->enc_h;
+}
 static int exec_begin_render(struct mad_exec *e) {
     struct WMTRenderPassInfo rpi;
     UINT i, w = 0, h = 0;
     unsigned k;
-    int attachless = 0;
-    if (exec_same_targets(e)) { InterlockedIncrement(&g_pass_reused); return 1; }
-    if (e->renc) InterlockedIncrement(&g_pass_end_rts);
+    int attachless = 0, regrow = 0;
+    if (exec_same_targets(e)) {
+        if (exec_area_fits(e)) { InterlockedIncrement(&g_pass_reused); return 1; }
+        InterlockedIncrement(&g_area_regrow);   /* madeira-doge pass-area: this draw reaches past the area; reopen */
+        regrow = 1;
+    } else if (e->renc) InterlockedIncrement(&g_pass_end_rts);
     e->f7_next_rts = 1;   /* ml1137: the pass being closed hands over to the targets bound now */
-    g_enc_why = e->renc ? "targets" : "pass";
+    g_enc_why = regrow ? "area" : e->renc ? "targets" : "pass";
     exec_end(e);
+    e->area_cut = 0;
     /* ml934: a render pass with NO colour target AND no depth is legal in
      * D3D12, and it is exactly what Nanite's hardware rasteriser uses: it
      * rasterises into UAVs -- the 64-bit-atomic visibility buffer -- and binds
@@ -4630,6 +4709,20 @@ static int exec_begin_render(struct mad_exec *e) {
         if (!w) { w = e->depth->width >> e->dp.level; h = e->depth->height >> e->dp.level; }
     }
     if (!w) w = 1; if (!h) h = 1;
+    if (g_pass_area < 0) { g_pass_area = mad_cfg_int_pe("pass-area", 0) ? 1 : 0;   /* 1: a render pass is opened only as large as the scissors of its draws, so the GPU loads and stores only that corner of a big target (Ninja's Dawn: EDRAM-shaped 8192-row targets drawn at 1120x584); 0: every pass covers the whole attachment */
+                           d3d12_log("[madeira-d3d12] pass-area = %d (render passes %s)\n", g_pass_area, g_pass_area ? "opened at the drawn area" : "cover the whole attachment"); }
+    if (g_pass_area && !attachless) {   /* madeira-doge pass-area */
+        int cleared = 0, scaled = 0; UINT aw, ah;
+        for (i = 0; i < e->nrt; i++) { if (rpi.colors[i].texture && rpi.colors[i].load_action == WMTLoadActionClear) cleared = 1;
+                                       if (e->rt[i] && e->rt[i]->rts_x > 0.0f) scaled = 1; }
+        if (rpi.depth.texture && rpi.depth.load_action == WMTLoadActionClear) cleared = 1;
+        if (rpi.stencil.texture && rpi.stencil.load_action == WMTLoadActionClear) cleared = 1;
+        if (e->depth && e->depth->rts_x > 0.0f) scaled = 1;
+        if (!cleared && !scaled && rpi.render_target_array_length <= 1 && exec_area_scan(e, w, h, &aw, &ah)) {
+            InterlockedExchangeAdd64(&g_area_saved_px, (LONG64)w * h - (LONG64)aw * ah);
+            w = aw; h = ah; e->area_cut = 1; InterlockedIncrement(&g_area_cut_n);
+        } else InterlockedIncrement(&g_area_full_n);
+    }
     rpi.render_target_width = w; rpi.render_target_height = h;
     rpi.default_raster_sample_count = (e->nrt && e->rt[0] && e->rt[0]->samples) ? e->rt[0]->samples
                                     : (e->depth && e->depth->samples) ? e->depth->samples : 1;
@@ -4659,8 +4752,8 @@ static int exec_begin_render(struct mad_exec *e) {
     if (e->renc) exec_fence_render(e, e->renc, 0);   /* ml1091 */
     if (e->renc) {   /* ml1070 */
         LONG64 bytes = 0;
-        for (i = 0; i < e->nrt; i++) if (e->rt[i]) bytes += (LONG64)e->rt[i]->width * e->rt[i]->height * 4 * (e->rt[i]->samples ? e->rt[i]->samples : 1);
-        if (e->depth) bytes += (LONG64)e->depth->width * e->depth->height * 4;
+        for (i = 0; i < e->nrt; i++) if (e->rt[i]) bytes += (LONG64)(e->area_cut ? w : e->rt[i]->width) * (e->area_cut ? h : e->rt[i]->height) * 4 * (e->rt[i]->samples ? e->rt[i]->samples : 1);
+        if (e->depth) bytes += (LONG64)(e->area_cut ? w : e->depth->width) * (e->area_cut ? h : e->depth->height) * 4;
         InterlockedIncrement(&g_pass_begun);
         InterlockedExchangeAdd64(&g_pass_attach_bytes, bytes * 2);   /* load + store */
     }
@@ -7613,6 +7706,7 @@ tess_go:
             x0 = (LONG)((float)x0 * rts_x); y0 = (LONG)((float)y0 * rts_y);
             x1 = (LONG)((float)x1 * rts_x + 0.5f); y1 = (LONG)((float)y1 * rts_y + 0.5f);
         }
+        if (e->area_cut) { tw = e->enc_w; th = e->enc_h; }   /* madeira-doge pass-area: Metal's scissor stays inside the render area */
         if (tw && x1 > (LONG)tw) x1 = (LONG)tw;
         if (th && y1 > (LONG)th) y1 = (LONG)th;
         if (x1 > x0 && y1 > y0) {
@@ -9206,7 +9300,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             unsigned k;
             e.renc = c->renc; e.renc_seq = c->renc_seq; e.renc_retained = c->renc_retained;
             e.enc_nrt = c->enc_nrt; memcpy(e.enc_rt, c->enc_rt, sizeof e.enc_rt); memcpy(e.enc_rtp, c->enc_rtp, sizeof e.enc_rtp);
-            e.enc_depth = c->enc_depth; e.enc_dp = c->enc_dp; e.enc_w = c->enc_w; e.enc_h = c->enc_h;
+            e.enc_depth = c->enc_depth; e.enc_dp = c->enc_dp; e.enc_w = c->enc_w; e.enc_h = c->enc_h; e.area_cut = c->area_cut;
             e.vis_prev = c->vis_prev; e.enc_vis_buf = c->enc_vis_buf; e.pass_draws = c->pass_draws;
             memcpy(e.diag_pso, c->diag_pso, sizeof e.diag_pso); e.diag_npso = c->diag_npso; e.diag_more = c->diag_more;
             e.f6_cur = c->f6_cur; e.f6_enc_synced = c->f6_enc_synced; e.f6_natt = c->f6_natt; memcpy(e.f6_att, c->f6_att, sizeof e.f6_att);
@@ -9432,6 +9526,10 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                       InterlockedExchange(&g_pass_end_clear, 0), InterlockedExchange(&g_pass_end_dispatch, 0), InterlockedExchange(&g_pass_end_blit, 0),
                       InterlockedExchange(&g_pass_end_list, 0), InterlockedExchange(&g_pass_end_attachless, 0), InterlockedExchange(&g_pass_clear_only, 0),
                       (long long)(InterlockedExchange64(&g_pass_attach_bytes, 0) >> 20));
+            if (g_pass_area > 0)
+                d3d12_log("[madeira-d3d12] pass-area in those lists: %ld passes opened at the drawn area (~%lld MB of attachment area skipped at 4 B/px, load+store), %ld at full size, %ld reopened for a draw outside the area\n",
+                          InterlockedExchange(&g_area_cut_n, 0), (long long)((InterlockedExchange64(&g_area_saved_px, 0) * 8) >> 20),
+                          InterlockedExchange(&g_area_full_n, 0), InterlockedExchange(&g_area_regrow, 0));
             d3d12_log("[madeira-d3d12] madeira-doge pass merging in those lists: %ld null-target unbinds kept the pass open (rts-null-lazy), %ld blit encoders kept open at a barrier (barrier-blit-open); pass-carry: %ld passes carried past a list end, %ld resumed by the next list, %ld ended before a commit; clear-defer: %ld clears left the pass open, %ld pending clears kept past another pass\n",
                       InterlockedExchange(&g_pass_rts_null_kept, 0), InterlockedExchange(&g_blit_barrier_kept, 0),
                       InterlockedExchange(&g_pass_carried, 0), InterlockedExchange(&g_pass_carry_resumed, 0), InterlockedExchange(&g_pass_carry_dropped, 0),

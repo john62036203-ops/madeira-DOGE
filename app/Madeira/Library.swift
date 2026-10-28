@@ -3198,6 +3198,12 @@ struct LibraryDetail: View {
                         Text("Shows a MetalFX-generated frame between every two rendered frames: twice the frames on screen, at the cost of GPU time, some latency and artifacts at edges and on the HUD. FPS limits do not apply while it is on.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge pass-area: per-game, stored in the game's own file
+                    Toggle("Render only the drawn area (experimental)", isOn: Binding(get: { bcd.value("pass-area") == "1" }, set: { setBCDKey("pass-area", $0 ? "1" : "") }))
+                    if bcd.value("pass-area") == "1" {
+                        Text("Each render pass loads and stores only the part of its target the game draws into, instead of the whole target. Saves GPU memory bandwidth in games with oversized targets (Ninja's Dawn). Turn it off if parts of the picture go missing.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-bcd: the D3D12 runtime's per-game switches, as the madeira-bcd
                     // home screen offers them (GameProfiles.swift choices).
                     bcdPicker("Tessellation detail (D3D12)", "dxil-tess-max-factor", GameProfile.tessChoices)
