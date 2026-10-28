@@ -1922,7 +1922,9 @@ jobs:
       # owner's decision: the release is public). The release URL is not printed.
       # Earlier build-* releases are deleted once the new one is up.
       - name: Publish the IPA as release build-${{ github.run_number }}
-        if: success() && github.repository_owner == 'john62036203-ops' && inputs.publish-release == true
+        # owner's decision (2026-10-28): only builds that carry everything are published;
+        # the vulkan branch is merged into exvs2, so a vulkan-branch build never becomes a release.
+        if: success() && github.repository_owner == 'john62036203-ops' && inputs.publish-release == true && github.ref_name != 'vulkan'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NOTES: ${{ inputs.release-notes }}
