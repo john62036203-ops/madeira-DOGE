@@ -17716,7 +17716,22 @@ static void STDMETHODCALLTYPE list_ClearRenderTargetView(ID3D12GraphicsCommandLi
     struct mad_resource *rt = mad_slot_resource(rtv.ptr);
     struct mad_cmd *c;
     static unsigned said_rects;
+    static int skip_partial = -1;   /* madeira-doge clear-rect-skip */
     if (!rt) return;
+    if (skip_partial < 0) skip_partial = mad_cfg_int_pe("clear-rect-skip", 0) ? 1 : 0;   /* madeira-doge: 1 = a clear whose rects leave part of the target out is skipped (Xenia/ReXGlue presenters clear only the letterbox bars after drawing) instead of clearing the whole target */
+    if (n && rects && skip_partial) {
+        UINT k, whole = 0;
+        for (k = 0; k < n; k++)
+            if (rects[k].left <= 0 && rects[k].top <= 0 &&
+                rects[k].right >= (LONG)rt->width && rects[k].bottom >= (LONG)rt->height) whole = 1;
+        if (!whole) {
+            static unsigned said_skip;
+            if (said_skip++ < 4)
+                d3d12_log("[madeira-d3d12] clear-rect-skip: ClearRenderTargetView with %u rect(s) on %ux%u (first %ld,%ld-%ld,%ld) skipped\n",
+                          n, rt->width, rt->height, (long)rects[0].left, (long)rects[0].top, (long)rects[0].right, (long)rects[0].bottom);
+            return;
+        }
+    }
     if (n && rects && !said_rects++) d3d12_log("[madeira-d3d12] ClearRenderTargetView: rects are ignored; the whole target is cleared\n");
     c = mad_list_push(l, MC_CLEAR_RT);
     if (!c) return;
