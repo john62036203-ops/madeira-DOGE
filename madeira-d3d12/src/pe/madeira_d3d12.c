@@ -8067,6 +8067,17 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.reserved[0] = (uint16_t)mad_aspect_opt(c->u.bt.tex, c->u.bt.plane);   /* the MTLBlitOption, see exec_copy_aspect */
         if (c->u.bt.tex->rts_x > 0.0f && !mad_rts_clip_bt(c->u.bt.tex, c->u.bt.level, &k.origin.x, &k.origin.y, &k.size.width, &k.size.height, "upload")) { MAD_SKIP(e); return; }   /* madeira-doge rt-scale */
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        /* madeira-doge cap-copy: during a CAP frame a large 2D upload (a video
+         * frame, a resolved picture copied into a texture) joins the contact
+         * sheet right after the copy, so "was the data already black before
+         * the GPU used it" is answered without a Mac (Ninja's Dawn black screen). */
+        if (g_capture_on && c->u.bt.tex->tex_type != WMTTextureType3D && c->u.bt.w >= 256 && c->u.bt.h >= 128) {
+            struct mad_rtvp cv; char what[64];
+            memset(&cv, 0, sizeof cv); cv.level = (UINT16)c->u.bt.level; cv.slice = (UINT16)c->u.bt.slice; cv.layers = 1; cv.plane = (UINT16)c->u.bt.plane;
+            snprintf(what, sizeof what, "buffer->texture copy %ux%u from r#%u +%llu", c->u.bt.w, c->u.bt.h,
+                     c->u.bt.buf->serial, (unsigned long long)c->u.bt.off);
+            mad_capture_one(e, e->benc, c->u.bt.tex, &cv, g_enc_seq, 10, "copy", 0, what);
+        }
         return;
     }
     case MC_FILL_TEX: {   /* madeira-bcd: texture UAV clear, copied from a pattern buffer in row bands */
