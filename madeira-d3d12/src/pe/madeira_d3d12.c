@@ -3269,6 +3269,32 @@ static void mad_capture_buffer(struct mad_exec *e, obj_handle_t benc, struct mad
               (unsigned long long)off, (unsigned long long)len, (unsigned long long)r->size, (unsigned long long)r->gpu_address);
 }
 static struct mad_resource *mad_texture_of_view(struct mad_device *d, UINT64 id, int *xv);
+/* madeira-doge capture-peek = <hex off>[+<hex len>][@<MB>][,...] (game cfg): during a
+ * capture-cs dispatch, the bytes of every bound buffer at each offset (default 4 KB, up to
+ * 16 MB), optionally only buffers of that size in MB. Ninja's Dawn: is the resolved picture
+ * in shared memory (512 MB) and in the EDRAM buffer (10 MB) before and after each kernel? */
+static int mad_cfg_str_pe(const char *key, char *out, size_t cap);
+static void mad_capture_peeks(struct mad_exec *e, obj_handle_t benc, struct mad_resource *r, unsigned idx, unsigned seq) {
+    static struct { struct mad_resource *r; UINT64 off; unsigned seq; } done[64]; static unsigned ndone;
+    char pk[256]; const char *q; unsigned u;
+    if (!r || !r->buffer) return;
+    mad_cfg_str_pe("capture-peek", pk, sizeof pk);
+    for (q = pk; *q; ) {
+        char *endp; unsigned long long po, len = 4096, mb = 0;
+        while (*q == ',' || *q == ' ') q++;
+        po = strtoull(q, &endp, 16); if (endp == q) break; q = endp;
+        if (*q == '+') { len = strtoull(q + 1, &endp, 16); q = endp; }
+        if (*q == '@') { mb = strtoull(q + 1, &endp, 10); q = endp; }
+        while (*q && *q != ',') q++;
+        if (mb && (r->size >> 20) != mb) continue;
+        if (po >= r->size || !len) continue;
+        if (len > 16u << 20) len = 16u << 20;
+        for (u = 0; u < ndone && !(done[u].r == r && done[u].off == po && done[u].seq == seq); u++) ;
+        if (u < ndone) continue;
+        if (ndone < 64) { done[ndone].r = r; done[ndone].off = po; done[ndone].seq = seq; ndone++; } else ndone = 0;
+        mad_capture_buffer(e, benc, r, po, len, "peek", idx, seq);
+    }
+}
 static struct mad_resource *mad_resolve_address(struct mad_device *d, UINT64 addr, UINT64 *off);
 static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, enum WMTTextureType want,
                                   UINT lvl0, UINT nlvl, UINT sl0, UINT nsl, enum WMTPixelFormat pf, UINT swz);   /* madeira-doge: dxbc-tex-2d */
@@ -3525,10 +3551,14 @@ static void mad_capture_rs_tables(struct mad_exec *e, obj_handle_t benc, unsigne
                           mad_capture_one(e, benc, r, &v, seq, i * 1000 + off + k, "tex", 0, NULL); }
                     } else if (de->gpu_va) {
                         UINT64 boff = 0; struct mad_resource *br = mad_resolve_address(d, de->gpu_va, &boff);
-                        d3d12_log("[%s] p%u %s %c%u space%u: buffer %s size %llu +%llu, metadata 0x%llx%s\n", tag, i, rn,
+                        int tvf = -1; UINT64 tvn = 0, tvo = 0;
+                        if (br && de->texture_view_id) { unsigned q; for (q = 0; q < br->ntview; q++) if (br->tview[q].id == de->texture_view_id) { tvf = (int)br->tview[q].fmt; tvn = br->tview[q].num; tvo = br->tview[q].off; break; } }
+                        d3d12_log("[%s] p%u %s %c%u space%u: buffer %s r#%u size %llu +%llu, metadata 0x%llx%s view %llu fmt %d num %llu off %llu\n", tag, i, rn,
                                   rg->range_type == 1 ? 'u' : rg->range_type == 2 ? 'b' : 't', reg, rg->register_space,
-                                  br ? (br->name ? br->name : "buffer") : "NOTHING LIVE", br ? (unsigned long long)br->size : 0ull,
-                                  (unsigned long long)boff, (unsigned long long)de->metadata, (de->metadata >> 63) ? " (typed)" : "");
+                                  br ? (br->name ? br->name : "buffer") : "NOTHING LIVE", br ? br->serial : 0u, br ? (unsigned long long)br->size : 0ull,
+                                  (unsigned long long)boff, (unsigned long long)de->metadata, (de->metadata >> 63) ? " (typed)" : "",
+                                  (unsigned long long)de->texture_view_id, tvf, (unsigned long long)tvn, (unsigned long long)tvo);
+                        if (br && br->buffer) mad_capture_peeks(e, benc, br, i * 1000 + off + k, seq);
                         if (br && br->buffer && rg->range_type == MADEIRA_IR_RANGE_CBV) mad_capture_buffer(e, benc, br, boff, 1024, "cb", i * 1000 + off + k, seq);
                         else if (br && br->buffer && (rg->range_type == MADEIRA_IR_RANGE_SRV || rg->range_type == MADEIRA_IR_RANGE_UAV) && nbufc < 16) {
                             /* madeira-doge: the first 2 KB of buffer SRVs/UAVs too (tile lists, visibility
@@ -3543,23 +3573,7 @@ static void mad_capture_rs_tables(struct mad_exec *e, obj_handle_t benc, unsigne
                         d3d12_log("[%s] p%u %s %c%u space%u: typed buffer view %llx, metadata 0x%llx -> %s r#%u size %llu\n", tag, i, rn, rg->range_type == 1 ? 'u' : 't',
                                   reg, rg->register_space, (unsigned long long)de->texture_view_id, (unsigned long long)de->metadata,
                                   tbr ? (tbr->name ? tbr->name : "buffer") : "NOTHING LIVE", tbr ? tbr->serial : 0u, tbr ? (unsigned long long)tbr->size : 0ull);
-                        /* madeira-doge capture-peek = <hex byte offset>[,...]: 4 KB of the buffer behind a
-                         * typed-buffer view at each offset (Ninja's Dawn: is the resolved picture in
-                         * shared memory before the texture load reads it?) */
-                        if (tbr && tbr->buffer && nbufc < 16) {
-                            char pk[256]; const char *q;
-                            mad_cfg_str_pe("capture-peek", pk, sizeof pk);
-                            for (q = pk; *q; ) {
-                                char *endp; unsigned long long po = strtoull(q, &endp, 16); unsigned u;
-                                if (endp == q) break;
-                                for (u = 0; u < nbufc && !(bufc[u].r == tbr && bufc[u].off == po); u++) ;
-                                if (u == nbufc && po < tbr->size && nbufc < 16) {
-                                    bufc[nbufc].r = tbr; bufc[nbufc].off = po; nbufc++;
-                                    mad_capture_buffer(e, benc, tbr, po, 4096, "peek", i * 1000 + off + k, seq);
-                                }
-                                q = endp; while (*q == ',' || *q == ' ') q++;
-                            }
-                        }
+                        if (tbr && tbr->buffer) mad_capture_peeks(e, benc, tbr, i * 1000 + off + k, seq);
                     }
                 }
             }
