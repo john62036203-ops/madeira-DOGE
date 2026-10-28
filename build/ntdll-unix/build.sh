@@ -146,6 +146,16 @@ compile_unixlib "$BUILD_DIR/dnsapi_unixlib_ios.c" "dnsapi_unixlib" "dnsapi" \
 FFMPEG_PREFIX="$REPO_ROOT/toolchains/ffmpeg-ios"
 compile_unixlib "$BUILD_DIR/winegstreamer_unixlib_ios.c" "winegstreamer_unixlib" "winegstreamer" \
     -I"$WINE_SRC/dlls/winegstreamer" -I"$FFMPEG_PREFIX/include"
+# madeira-doge (vulkan branch): winevulkan's unix side (Wine's own
+# dlls/winevulkan/vulkan.c + the generated vulkan_thunks.c, unchanged).  It
+# talks to the host Vulkan library through win32u's __wine_get_vulkan_driver
+# (build/win32u-unix/vulkan_ios.c -> the statically linked MoltenVK), so
+# it needs no libvulkan.  Bound to winevulkan.dll by name in
+# load_builtin_unixlib (virtual_ios.c).  Inert unless env.MADEIRA_VULKAN = 1.
+compile_unixlib "$WINE_SRC/dlls/winevulkan/vulkan.c" "winevulkan_unixlib" "winevulkan" \
+    -I"$WINE_SRC/dlls/winevulkan"
+compile_unixlib "$WINE_SRC/dlls/winevulkan/vulkan_thunks.c" "winevulkan_thunks" "winevulkan" \
+    -I"$WINE_SRC/dlls/winevulkan"
 # MADEIRA ml1990: the wg_parser's H.264/HEVC (VideoToolbox) and AAC
 # (AudioToolbox) decoders.  Its own translation unit with NO Wine header --
 # CoreFoundation and winnt.h disagree about several names -- so it is compiled
@@ -254,6 +264,7 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
     "$OBJ_DIR/dwrite_unixlib.o" "$OBJ_DIR/dnsapi_unixlib.o" \
     "$OBJ_DIR/winegstreamer_unixlib.o" "$OBJ_DIR/wg_parser_apple_ios.o" \
+    "$OBJ_DIR/winevulkan_unixlib.o" "$OBJ_DIR/winevulkan_thunks.o" \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
     "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \

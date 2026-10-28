@@ -2423,6 +2423,7 @@ struct ContentView: View {
             case .steamSignIn: SteamSignInView()
             case .dock: MadeiraDockView { startDock($0, compactPool: $1) }
             case .allSettings: AllSettingsView()
+            case .vulkanLab: VulkanLabView()
             }
         }
     }

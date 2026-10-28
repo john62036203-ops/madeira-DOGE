@@ -11632,6 +11632,11 @@ extern const void *dwrite_unix_call_funcs[];
  * and Media Foundation's MP4 source; the wg_muxer entries return
  * STATUS_NOT_IMPLEMENTED. */
 extern const void *winegstreamer_unix_call_funcs[];
+/* madeira-doge (vulkan branch): dlls/winevulkan's unix side, compiled into
+ * this archive (build.sh); the host library is the static MoltenVK reached
+ * through win32u (build/win32u-unix/vulkan_ios.c). */
+extern const void *winevulkan_unix_call_funcs[];
+extern const void *winevulkan_unix_call_wow64_funcs[];
 
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
@@ -11962,6 +11967,15 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
                           : "winegstreamer (wma + wg_parser, libav*; 64-bit opted in)";
             funcs64 = (const void *)winegstreamer_unix_call_funcs;
             funcs_wow64 = (const void *)winegstreamer_unix_call_wow64_funcs;
+        } else if (match && strstr(match, "winevulkan")) {
+            /* madeira-doge (vulkan branch): Wine's own winevulkan unix side.
+             * Matched for both spellings ("winevulkan.so" / "winevulkan.dll").
+             * Without MADEIRA_VULKAN=1 its init_vulkan fails (win32u finds no
+             * host library) and the PE side answers like a machine without
+             * a Vulkan driver, so binding the table unconditionally is safe. */
+            libname = "winevulkan (MoltenVK via win32u)";
+            funcs64 = (const void *)winevulkan_unix_call_funcs;
+            funcs_wow64 = (const void *)winevulkan_unix_call_wow64_funcs;
         } else if (match && strstr(match, "nsi.dll")) {
             libname = "nsi (rev=ml472)";
             funcs64 = (const void *)nsi_unix_call_funcs;
@@ -32897,6 +32911,171 @@ static NTSTATUS ios_na_inner_NtProtectVirtualMemory( HANDLE process, PVOID *addr
 }
 
 
+#ifdef WINE_IOS
+/* madeira-doge (vulkan branch): host-aware VirtualQuery for addresses no Wine
+ * view covers.  Upstream reports every such address as MEM_FREE, although on
+ * iOS the host already holds much of the map (the 4 GB __PAGEZERO, the app
+ * image and dyld, malloc, the iOS 27 kernel placeholder above the shared
+ * region, Madeira's own holdbacks).  A program that walks the map with
+ * VirtualQuery and reserves what it is told is free -- KytyPS5's
+ * ReserveGuestRegions (memoryAddressSpace.inc) is one -- then dies on the
+ * first VirtualAlloc2 the host refuses ("failed to reserve guest address
+ * space at 0x40000, size 0x123ef0000", log 2026-10-27 23:47).  With
+ * MADEIRA_VQUERY_HOST=1 the host region that covers the address (or the
+ * __PAGEZERO) is reported as a reserved MEM_PRIVATE block, and a free run is
+ * cut at the next host region, so the walk sees what can actually be mapped.
+ * Opt-in, off by default: nothing changes for other programs. */
+static int ios_vquery_host_on( void )
+{
+    static const char key[] = "MADEIRA_VQUERY_HOST";
+    static int on = -1;
+    if (on < 0)
+    {
+        const char *e = getenv( key );
+        on = e && e[0] == '1' && !e[1];
+    }
+    return on;
+}
+
+/* Clamps [*region_start, *region_end) -- the Wine-free run around `base` --
+ * to what the host map says, and sets *fake_reserved when the host already
+ * holds `base`.  Called under virtual_mutex with no view covering base. */
+static void ios_vquery_host_clamp( char *base, char **region_start, char **region_end, BOOL *fake_reserved )
+{
+    static unsigned said;
+    const unsigned long long pagezero_end = 0x100000000ULL;
+    mach_vm_address_t raddr = (mach_vm_address_t)(uintptr_t)base;
+    mach_vm_size_t rsize = 0;
+    natural_t rdepth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t icnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t kr;
+
+    {
+        static unsigned long long calls;
+        calls++;
+        if ((calls <= 50000 && calls % 5000 == 0) || calls % 100000 == 0)
+            dprintf( 2, "[vquery-host] madeira-doge %llu queries so far, now at %p (Wine run %p..%p)\n",
+                     calls, base, *region_start, *region_end );
+    }
+    if ((unsigned long long)(uintptr_t)base < pagezero_end)
+    {
+        if ((unsigned long long)(uintptr_t)*region_end > pagezero_end) *region_end = (char *)(uintptr_t)pagezero_end;
+        *fake_reserved = TRUE;
+        if (said++ < 4) dprintf( 2, "[vquery-host] madeira-doge %p: below __PAGEZERO's end -> reserved up to %p\n", base, *region_end );
+        return;
+    }
+    for (;;)
+    {
+        raddr = (mach_vm_address_t)(uintptr_t)base;     /* the call moves raddr: ask about base at every depth */
+        icnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kr = mach_vm_region_recurse( mach_task_self(), &raddr, &rsize, &rdepth, (vm_region_recurse_info_t)&info, &icnt );
+        if (kr != KERN_SUCCESS)
+        {
+            /* nothing mapped at or above base: the task's map ends here (0x8000000000 on
+             * iOS 27), nothing can be placed above it -- reserved to Wine's limit. Build 518,
+             * 13:12 log: KytyPS5 took Wine's "free to 0x7fffffff0000" at face value and died
+             * on "failed to reserve guest address space at 0x8000000000, size 0x7c00000000". */
+            *fake_reserved = TRUE;
+            if (said++ < 16) dprintf( 2, "[vquery-host] madeira-doge %p: above the task's map -> reserved up to %p\n", base, *region_end );
+            return;
+        }
+        if (info.is_submap && rdepth < 8) { rdepth++; continue; }
+        break;
+    }
+    /* Wine's own band [0x7000000000, 0x7400000000): the process's later views (DLLs,
+     * heaps, stacks, Metal) must find room there, so a guest that reserves every free
+     * piece it sees is told it is taken; FEX also refuses guest RIPs >= 0x7400000000,
+     * so the 32 GB above it is where a guest's data belongs. */
+    if ((mach_vm_address_t)(uintptr_t)base >= 0x7000000000ULL && (mach_vm_address_t)(uintptr_t)base < 0x7400000000ULL)
+    {
+        if ((char *)(uintptr_t)0x7400000000ULL < *region_end) *region_end = (char *)(uintptr_t)0x7400000000ULL;
+        *fake_reserved = TRUE;
+        if (said++ < 16) dprintf( 2, "[vquery-host] madeira-doge %p: inside Wine's own band -> reserved up to %p\n", base, *region_end );
+        return;
+    }
+    {
+        /* Report one block per RUN of host regions, absorbing gaps under 1 MB (build
+         * 516, 12:43 log: a 16 KB mapped / 16 KB free checkerboard at 0x134000000..
+         * cost one query per page, 35,000 queries in 45 s). A guest that walks the
+         * map (KytyPS5 reserves every free piece > 16 MB; FEX's InvalidationTracker
+         * constructor walks everything once) cannot use such slivers anyway. Below
+         * the lowest mapping above __PAGEZERO everything is reported reserved: iOS
+         * refuses fixed mappings there ("[va-scan] dead-hole #0", KytyPS5 died on
+         * "failed to reserve guest address space at 0x100000000"). */
+        static mach_vm_address_t lowest;
+        const mach_vm_size_t small_gap = 1u << 20;
+        char *hs = NULL, *he = NULL;
+        unsigned merged = 0, tag = 0, prot = 0;
+        mach_vm_address_t cur = (mach_vm_address_t)(uintptr_t)base;
+
+        if (!lowest)
+        {
+            mach_vm_address_t la = pagezero_end;
+            mach_vm_size_t ls = 0;
+            natural_t ld = 0;
+            vm_region_submap_info_data_64_t li;
+            mach_msg_type_number_t lc = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (mach_vm_region_recurse( mach_task_self(), &la, &ls, &ld, (vm_region_recurse_info_t)&li, &lc ) == KERN_SUCCESS)
+                lowest = la;
+            else
+                lowest = pagezero_end;
+            dprintf( 2, "[vquery-host] madeira-doge lowest host mapping above __PAGEZERO: %#llx (the gap below it is reported reserved)\n",
+                     (unsigned long long)lowest );
+        }
+        if (cur < lowest)
+        {
+            if ((char *)(uintptr_t)lowest < *region_end) *region_end = (char *)(uintptr_t)lowest;
+            *fake_reserved = TRUE;
+            if (said++ < 16) dprintf( 2, "[vquery-host] madeira-doge %p: below the lowest host mapping -> reserved up to %p\n", base, *region_end );
+            return;
+        }
+        /* raddr/rsize/info: the first host region at or above base (queried above) */
+        if (raddr > cur + small_gap)
+        {
+            /* a real free gap: free until that region */
+            char *ge = (char *)(uintptr_t)raddr;
+            if (ge < *region_end) *region_end = ge;
+            return;
+        }
+        hs = (char *)(uintptr_t)(raddr <= cur ? raddr : cur);
+        he = (char *)(uintptr_t)(raddr + rsize);
+        tag = info.user_tag; prot = info.protection;
+        while (he < *region_end && merged < 4096)
+        {
+            mach_vm_address_t naddr;
+            mach_vm_size_t nsize = 0;
+            natural_t ndepth = 0;
+            vm_region_submap_info_data_64_t ninfo;
+            mach_msg_type_number_t ncnt;
+            for (;;)
+            {
+                naddr = (mach_vm_address_t)(uintptr_t)he;
+                ncnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+                kr = mach_vm_region_recurse( mach_task_self(), &naddr, &nsize, &ndepth, (vm_region_recurse_info_t)&ninfo, &ncnt );
+                if (kr != KERN_SUCCESS) break;
+                if (ninfo.is_submap && ndepth < 8) { ndepth++; continue; }
+                break;
+            }
+            if (kr != KERN_SUCCESS || naddr > (mach_vm_address_t)(uintptr_t)he + small_gap) break;   /* a real gap: stop */
+            he = (char *)(uintptr_t)(naddr + nsize);
+            merged++;
+        }
+        if (hs > *region_start) *region_start = hs;
+        if (he < *region_end) *region_end = he;
+        *fake_reserved = TRUE;
+        if (merged >= 4096 && said < 32)
+        {
+            said++;
+            dprintf( 2, "[vquery-host] madeira-doge %p: merge cap hit at %p (4096 host regions)\n", base, he );
+        }
+        if (said++ < 16)
+            dprintf( 2, "[vquery-host] madeira-doge %p: host region %p+0x%llx (tag %u prot %u, %u more merged) -> reserved %p..%p\n",
+                     base, (void *)(uintptr_t)raddr, (unsigned long long)rsize, tag, prot, merged, *region_start, *region_end );
+    }
+}
+#endif
+
 static struct file_view *get_memory_region_size( char *base, char **region_start, char **region_end,
                                                  BOOL *fake_reserved )
 {
@@ -32966,6 +33145,22 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
             break;
         }
         *fake_reserved = TRUE;
+    }
+#endif
+#ifdef WINE_IOS
+    if (ios_vquery_host_on())
+    {
+        ios_vquery_host_clamp( base, region_start, region_end, fake_reserved );
+        if (*region_end <= base + page_mask)
+        {
+            /* never an empty region: FEX's InvalidationTracker constructor walks the map
+             * with Address = BaseAddress + RegionSize and would spin on RegionSize 0 */
+            static unsigned said_empty;
+            if (said_empty++ < 8)
+                dprintf( 2, "[vquery-host] madeira-doge %p: clamp left an empty region (end %p) -> one page reserved\n", base, *region_end );
+            *region_end = base + page_mask + 1;
+            *fake_reserved = TRUE;
+        }
     }
 #endif
     return NULL;

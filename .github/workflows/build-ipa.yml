@@ -674,6 +674,20 @@ jobs:
         continue-on-error: true
         run: bash build/win32u-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/win32u.log"; exit ${PIPESTATUS[0]}
 
+      # madeira-doge: the compiler's own words as annotations, as for ntdll-unix
+      # (a fork cannot read the job log through the API).
+      - name: Report win32u-unix compile errors
+        if: always()
+        shell: bash
+        run: |
+          set +e +o pipefail
+          for f in build/win32u-unix/obj/*.err; do
+            grep -q "error:" "$f" || continue
+            MSG=$(grep "error:" "$f" | sed 's#^.*/build/win32u-unix/##' | cut -c1-230 | sed -n '1,28p' | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::win32u $(basename "$f") :: $MSG"
+          done
+          exit 0
+
       - name: Restore llvm-mingw
         id: mingwcache
         uses: actions/cache/restore@v4
@@ -1621,6 +1635,39 @@ jobs:
           rustup target add aarch64-apple-ios
           bash build/rppairing-ios/build.sh
 
+      # MoltenVK (Vulkan on Metal, Apache-2.0) for the Vulkan lab and the
+      # console-emulation work: the static iOS library from the pinned Khronos
+      # release, hash-checked, never committed. The C headers are vendored at
+      # app/Madeira/vulkan/include (SHA256SUMS there) and must match the release.
+      - name: Restore MoltenVK
+        id: mvk-cache
+        uses: actions/cache@v4
+        with:
+          path: build/moltenvk/MoltenVK-ios.tar
+          key: moltenvk-ios-1.4.2
+      - name: Fetch MoltenVK 1.4.2 (static, iOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          MVK_VERSION=1.4.2
+          MVK_SHA=b5d947b1660e6e9fed40b9cd2387e160aaab9e80b775c0cef7e14059405178c1
+          mkdir -p build/moltenvk
+          TAR=build/moltenvk/MoltenVK-ios.tar
+          if [ ! -f "$TAR" ]; then
+            curl -fL --retry 3 --retry-delay 5 -o "$TAR" \
+              "https://github.com/KhronosGroup/MoltenVK/releases/download/v$MVK_VERSION/MoltenVK-ios.tar"
+          fi
+          HAVE="$(shasum -a 256 "$TAR" | cut -d' ' -f1)"
+          [ "$HAVE" = "$MVK_SHA" ] || { echo "::error::MoltenVK-ios.tar hash mismatch (expected $MVK_SHA, found $HAVE)"; exit 1; }
+          rm -rf build/moltenvk/x && mkdir -p build/moltenvk/x
+          tar xf "$TAR" -C build/moltenvk/x MoltenVK/MoltenVK/static MoltenVK/MoltenVK/include
+          cp build/moltenvk/x/MoltenVK/MoltenVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a app/Madeira/libMoltenVK.a
+          # The vendored headers are the release's headers, no more and no less.
+          (cd build/moltenvk/x/MoltenVK/MoltenVK && find include -type f -name '*.h' | sort | xargs shasum -a 256) > build/moltenvk/release.sums
+          diff <(sort -k2 app/Madeira/vulkan/SHA256SUMS) <(sort -k2 build/moltenvk/release.sums) \
+            || { echo "::error::app/Madeira/vulkan/include differs from MoltenVK $MVK_VERSION's headers"; exit 1; }
+          echo "::notice::libMoltenVK.a $(wc -c < app/Madeira/libMoltenVK.a | tr -d ' ') bytes (MoltenVK $MVK_VERSION)"
+
       # Fail here with a clear list rather than deep inside a linker error.
       - name: Verify all linked archives exist
         shell: bash
@@ -1629,7 +1676,7 @@ jobs:
           MISSING=""
           for a in libgmp.a libgnutls.a libhogweed.a libnettle.a \
                    libntdll_unix.a libwin32u_unix.a libwineserver.a \
-                   libdxmt_combined.a libmadeira_rppairing.a; do
+                   libdxmt_combined.a libmadeira_rppairing.a libMoltenVK.a; do
             [ -f "app/Madeira/$a" ] || MISSING="$MISSING app/Madeira/$a"
           done
           for a in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a \
@@ -1689,6 +1736,8 @@ jobs:
 
       - name: Archive (unsigned)
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set +e
           xcodebuild -project app/Madeira.xcodeproj \
@@ -1707,6 +1756,17 @@ jobs:
             [ -n "$K" ] && echo "::error::xcodebuild other errors :: $K"
             F=$(sed -n '/The following build commands failed/,/failures)/p' "$GITHUB_WORKSPACE/archive.log" | cut -c1-200 | head -12 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
             [ -n "$F" ] && echo "::error::xcodebuild failing commands :: $F"
+            # madeira-doge: annotations are capped at 50 per job and the job log is not
+            # readable from the sessions, so the same lines also go into a commit comment.
+            {
+              echo "build ${{ github.run_number }} (${{ runner.name }}): xcodebuild archive failed (rc=$rc)"
+              echo; echo "compiler errors:"; grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | sed "s#^$GITHUB_WORKSPACE/##" | sort -u | head -40
+              echo; echo "linker:"; grep -E "Undefined symbol|^ld: |symbol\(s\) not found|referenced from|duplicate symbol|error: " "$GITHUB_WORKSPACE/archive.log" | grep -vE "^[^ ].*: (error|fatal error):" | sort -u | head -40
+              echo; echo "failing commands:"; sed -n '/The following build commands failed/,/failures)/p' "$GITHUB_WORKSPACE/archive.log" | cut -c1-200 | head -15
+              echo; echo "tail:"; tail -n 40 "$GITHUB_WORKSPACE/archive.log" | cut -c1-300
+            } > archive-errors.txt
+            gh api -X POST "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/comments" \
+              -f body="$(head -c 60000 archive-errors.txt)" >/dev/null 2>&1 || echo "::warning::could not post the archive errors as a commit comment"
             echo "===== compiler errors ====="
             grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | head -30
             # Linker diagnostics carry no "error:" prefix, so the undefined

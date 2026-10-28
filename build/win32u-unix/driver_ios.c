@@ -70,6 +70,8 @@ static struct user_driver_funcs winios_user_driver;
  * program hides it, and where Wine's cursor is after clipping; it changes
  * nothing the program sees, and does nothing until the app has asked for the
  * reports (MADEIRA_DIRECT_CURSOR=0 or MADEIRA_HWINPUT=0 in the app: never). */
+extern UINT winios_VulkanInit( UINT version, void *vulkan_handle,
+                               const struct vulkan_driver_funcs **driver_funcs );  /* vulkan_ios.c */
 extern int winios_direct_cursor_wanted( void ) __attribute__((weak));
 extern void winios_direct_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
                                       const void *bgra ) __attribute__((weak));
@@ -1996,6 +1998,10 @@ static void load_display_driver(void)
                         "(MADEIRA_GAME_WINDOWS=0 hides them)\n" );
         }
         winios_user_driver.pUpdateDisplayDevices = winios_UpdateDisplayDevices;
+        /* madeira-doge (vulkan branch): Vulkan surfaces on the app's
+         * CAMetalLayer (vulkan_ios.c); inert unless MADEIRA_VULKAN=1 made
+         * win32u's loader find MoltenVK. */
+        winios_user_driver.pVulkanInit = winios_VulkanInit;
         __wine_set_user_driver( &winios_user_driver, WINE_GDI_DRIVER_VERSION );
 #else
         __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );

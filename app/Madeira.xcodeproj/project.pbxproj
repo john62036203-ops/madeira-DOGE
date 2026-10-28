@@ -101,6 +101,10 @@
 		A1000042 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000042 /* libz.tbd */; };
 		A1000050 /* IOSDisplayShim.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000050 /* IOSDisplayShim.m */; };
 		A1000051 /* libdxmt_combined.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000051 /* libdxmt_combined.a */; };
+		C1000701 /* libMoltenVK.a in Frameworks */ = {isa = PBXBuildFile; fileRef = C2000701 /* libMoltenVK.a */; };
+		C1000702 /* IOSurface.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C2000702 /* IOSurface.framework */; };
+		C1000703 /* VulkanLab.m in Sources */ = {isa = PBXBuildFile; fileRef = C2000703 /* VulkanLab.m */; };
+		C1000704 /* VulkanLabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2000704 /* VulkanLabView.swift */; };
 		A1000052 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000052 /* Metal.framework */; };
 		A1000053 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000053 /* QuartzCore.framework */; };
 		A1000054 /* MetalFX.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000054 /* MetalFX.framework */; };
@@ -317,6 +321,12 @@
 		A2000043 /* PrefixExtractor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = PrefixExtractor.h; sourceTree = "<group>"; };
 		A2000050 /* IOSDisplayShim.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = IOSDisplayShim.m; sourceTree = "<group>"; };
 		A2000051 /* libdxmt_combined.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libdxmt_combined.a; sourceTree = "<group>"; };
+		C2000701 /* libMoltenVK.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libMoltenVK.a; sourceTree = "<group>"; };
+		C2000702 /* IOSurface.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOSurface.framework; path = System/Library/Frameworks/IOSurface.framework; sourceTree = SDKROOT; };
+		C2000703 /* VulkanLab.m */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.objc; path = VulkanLab.m; sourceTree = "<group>"; };
+		C2000704 /* VulkanLabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VulkanLabView.swift; sourceTree = "<group>"; };
+		C2000705 /* VulkanLab.h */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.h; path = VulkanLab.h; sourceTree = "<group>"; };
+		C2000706 /* VulkanLabShaders.h */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.h; path = VulkanLabShaders.h; sourceTree = "<group>"; };
 		A2000052 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		A2000053 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		A2000054 /* MetalFX.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalFX.framework; path = System/Library/Frameworks/MetalFX.framework; sourceTree = SDKROOT; };
@@ -403,6 +413,8 @@
 				A1000052 /* Metal.framework in Frameworks */,
 				A1000053 /* QuartzCore.framework in Frameworks */,
 				A1000054 /* MetalFX.framework in Frameworks */,
+				C1000701 /* libMoltenVK.a in Frameworks */,
+				C1000702 /* IOSurface.framework in Frameworks */,
 				A1000055 /* libsqlite3.tbd in Frameworks */,
 				A1000615 /* liblzma.tbd in Frameworks */,
 				A1000060 /* libwin32u_unix.a in Frameworks */,
@@ -584,6 +596,10 @@
 				A2000007 /* Madeira.entitlements */,
 				A2000008 /* Info.plist */,
 				B31D214EB6F64F7E730134B5 /* MemoryHostTest.m */,
+				C2000703 /* VulkanLab.m */,
+				C2000705 /* VulkanLab.h */,
+				C2000706 /* VulkanLabShaders.h */,
+				C2000704 /* VulkanLabView.swift */,
 				32607841304656C675DB52CF /* MemoryHostTest.h */,
 				36023A5C635793C3C00F4FA5 /* MemoryHostProtocol.h */,
 				2027C80DC6F4BF37B7522656 /* MemoryPool.m */,
@@ -617,9 +633,11 @@
 				A2000035 /* IOKit.framework */,
 				A2000042 /* libz.tbd */,
 				A2000051 /* libdxmt_combined.a */,
+				C2000701 /* libMoltenVK.a */,
 				A2000052 /* Metal.framework */,
 				A2000053 /* QuartzCore.framework */,
 				A2000054 /* MetalFX.framework */,
+				C2000702 /* IOSurface.framework */,
 				A2000055 /* libsqlite3.tbd */,
 				A2000615 /* liblzma.tbd */,
 				A2000060 /* libwin32u_unix.a */,
@@ -937,6 +955,8 @@
 				B1000003 /* JITBuiltInMessages.swift in Sources */,
 				B1000040 /* JITPairing.swift in Sources */,
 				5A864326ABA078F978B4C2F1 /* MemoryHostTest.m in Sources */,
+				C1000703 /* VulkanLab.m in Sources */,
+				C1000704 /* VulkanLabView.swift in Sources */,
 				5271C4AE571BDF56B9E51EAA /* MemoryPool.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1084,6 +1104,7 @@
 					"$(SRCROOT)/../FEX/build-ios/include",
 					"$(SRCROOT)/../FEX/build-ios/FEXCore/Source",
 					"$(SRCROOT)/../FEX",
+					"$(SRCROOT)/Madeira/vulkan/include",
 				);
 				INFOPLIST_FILE = Madeira/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -1137,6 +1158,7 @@
 					"$(SRCROOT)/../FEX/build-ios/include",
 					"$(SRCROOT)/../FEX/build-ios/FEXCore/Source",
 					"$(SRCROOT)/../FEX",
+					"$(SRCROOT)/Madeira/vulkan/include",
 				);
 				INFOPLIST_FILE = Madeira/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
