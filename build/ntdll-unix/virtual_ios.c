@@ -32951,6 +32951,12 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
     mach_msg_type_number_t icnt = VM_REGION_SUBMAP_INFO_COUNT_64;
     kern_return_t kr;
 
+    {
+        static unsigned long long calls;
+        if (++calls % 100000 == 0)
+            dprintf( 2, "[vquery-host] madeira-doge %llu queries so far, now at %p (Wine run %p..%p)\n",
+                     calls, base, *region_start, *region_end );
+    }
     if ((unsigned long long)(uintptr_t)base < pagezero_end)
     {
         if ((unsigned long long)(uintptr_t)*region_end > pagezero_end) *region_end = (char *)(uintptr_t)pagezero_end;
@@ -32960,22 +32966,48 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
     }
     for (;;)
     {
+        raddr = (mach_vm_address_t)(uintptr_t)base;     /* the call moves raddr: ask about base at every depth */
+        icnt = VM_REGION_SUBMAP_INFO_COUNT_64;
         kr = mach_vm_region_recurse( mach_task_self(), &raddr, &rsize, &rdepth, (vm_region_recurse_info_t)&info, &icnt );
         if (kr != KERN_SUCCESS) return;            /* nothing mapped at or above base: keep Wine's answer */
-        if (info.is_submap) { rdepth++; continue; }
+        if (info.is_submap && rdepth < 8) { rdepth++; continue; }
         break;
     }
     if (raddr <= (mach_vm_address_t)(uintptr_t)base)
     {
-        /* the host holds base: report that region (clamped to the Wine-free run) as reserved */
+        /* the host holds base: report the run of CONTIGUOUS host regions from here as
+         * one reserved block (clamped to the Wine-free run). A guest that walks the
+         * map (KytyPS5 reserves every free piece > 16 MB) must not pay one query per
+         * dyld-cache or kernel-placeholder entry; the 07:57 / 08:11 logs spent a minute
+         * at ~75k queries/s. Only MEM_FREE pieces matter to such a walk. */
         char *hs = (char *)(uintptr_t)raddr, *he = (char *)(uintptr_t)(raddr + rsize);
+        unsigned merged = 0, tag = info.user_tag, prot = info.protection;
+        while (he < *region_end && merged < 4096)
+        {
+            mach_vm_address_t naddr = (mach_vm_address_t)(uintptr_t)he;
+            mach_vm_size_t nsize = 0;
+            natural_t ndepth = 0;
+            vm_region_submap_info_data_64_t ninfo;
+            mach_msg_type_number_t ncnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+            for (;;)
+            {
+                naddr = (mach_vm_address_t)(uintptr_t)he;
+                ncnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+                kr = mach_vm_region_recurse( mach_task_self(), &naddr, &nsize, &ndepth, (vm_region_recurse_info_t)&ninfo, &ncnt );
+                if (kr != KERN_SUCCESS) break;
+                if (ninfo.is_submap && ndepth < 8) { ndepth++; continue; }
+                break;
+            }
+            if (kr != KERN_SUCCESS || naddr != (mach_vm_address_t)(uintptr_t)he) break;   /* a gap: stop here */
+            he = (char *)(uintptr_t)(naddr + nsize);
+            merged++;
+        }
         if (hs > *region_start) *region_start = hs;
         if (he < *region_end) *region_end = he;
         *fake_reserved = TRUE;
         if (said++ < 16)
-            dprintf( 2, "[vquery-host] madeira-doge %p: host region %p+0x%llx (tag %u prot %u) -> reserved %p..%p\n",
-                     base, hs, (unsigned long long)rsize, (unsigned)info.user_tag, (unsigned)info.protection,
-                     *region_start, *region_end );
+            dprintf( 2, "[vquery-host] madeira-doge %p: host region %p+0x%llx (tag %u prot %u, %u more merged) -> reserved %p..%p\n",
+                     base, hs, (unsigned long long)rsize, tag, prot, merged, *region_start, *region_end );
     }
     else
     {
