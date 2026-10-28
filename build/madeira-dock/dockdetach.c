@@ -12,7 +12,10 @@
  * This GUI-subsystem program starts MADEIRA_DOCK_DETACH_EXE (with
  * MADEIRA_DOCK_DETACH_ARGS) DETACHED from any console, with no standard
  * handles, in the program's own folder, waits for it and returns its exit code,
- * so the client still sees the game run for as long as it runs. */
+ * so the client still sees the game run for as long as it runs. With
+ * MADEIRA_DOCK_NO_CONSOLE=1 in the program's environment Wine refuses conhost
+ * to it and its children (build 543: the PyInstaller child asked for a new
+ * console and died the same way). */
 #include <windows.h>
 #include <wchar.h>
 
@@ -36,6 +39,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR line, int show)
     /* the program's own children must not take this route again */
     SetEnvironmentVariableW(L"MADEIRA_DOCK_DETACH_EXE", NULL);
     SetEnvironmentVariableW(L"MADEIRA_DOCK_DETACH_ARGS", NULL);
+    /* the program and its children get no conhost console either (process_ios.c
+     * dock_conhost_refuse): a PyInstaller program's child asks for a new one */
+    SetEnvironmentVariableW(L"MADEIRA_DOCK_NO_CONSOLE", L"1");
     ZeroMemory(&si, sizeof si);
     si.cb = sizeof si;
     si.dwFlags = STARTF_USESTDHANDLES;   /* hStdInput/Output/Error stay NULL */

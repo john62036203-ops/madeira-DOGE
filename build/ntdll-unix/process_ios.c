@@ -991,6 +991,39 @@ static int ec_conhost_refuse( int arm64ec_session, const char *env, const WCHAR 
     return arm64ec_session && !(env && env[0] == '1') && ios_image_name_is( image, image_len, "conhost.exe" );
 }
 
+/* madeira-doge: a console for a program a Dock shortcut started. Valve's client
+ * starts the shortcut through dockdetach.exe (build/madeira-dock/dockdetach.c),
+ * which starts the program detached and puts MADEIRA_DOCK_NO_CONSOLE=1 in its
+ * environment. A detached console program, or the child a PyInstaller program
+ * starts (EXVS2IB_PC_Offline_Launcher.exe), then asks for a NEW console, and
+ * Python dies in init_sys_streams on a conhost console (log 2026-10-29 06:16,
+ * build 543: "can't initialize sys standard streams"). Started directly, such a
+ * program has no console (the ARM64EC refusal above) and runs. So conhost.exe
+ * whose environment carries that variable is refused the same way: the
+ * requester goes on without a console. */
+static int dock_conhost_refuse( const WCHAR *env, const WCHAR *image, int image_len )
+{
+    static const char want[] = "MADEIRA_DOCK_NO_CONSOLE=1";
+    const WCHAR *p = env;
+    if (!env || !ios_image_name_is( image, image_len, "conhost.exe" )) return 0;
+    while (*p)
+    {
+        const WCHAR *q = p;
+        size_t k = 0;
+        while (want[k] && *q)
+        {
+            WCHAR c = *q;
+            if (c >= 'a' && c <= 'z') c -= 32;
+            if (c != (WCHAR)(unsigned char)want[k]) break;
+            k++; q++;
+        }
+        if (!want[k] && !*q) return 1;
+        while (*p) p++;
+        p++;
+    }
+    return 0;
+}
+
 /* madeira-bcd: the JIT pool's variables in every child's environment. The app
  * exports WINE_IOS_JIT_RX/SIZE/RW (ContentView.swift) before Wine starts; the
  * first process imports the Unix environment and children inherit it. The
@@ -1860,6 +1893,14 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     /* conhost.exe is refused in an ARM64EC session, where it would crash the app (see
      * ec_conhost_refuse); MADEIRA_EC_CONHOST=1 starts it anyway. madeira-bcd: after
      * MADEIRA_CHILD_ARGS, before the Social Club gate. */
+    if (dock_conhost_refuse( params->Environment, params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR) ))
+    {
+        static int dock_conhost_n;
+        if (dock_conhost_n++ < 8)
+            dprintf( 2, "[dock-conhost] REFUSING conhost.exe for a program a Dock shortcut started "
+                        "(MADEIRA_DOCK_NO_CONSOLE=1): it goes on without a console, as when started directly\n" );
+        return STATUS_ACCESS_DENIED;
+    }
     if (ec_conhost_refuse( is_arm64ec(), getenv( "MADEIRA_EC_CONHOST" ), params->ImagePathName.Buffer,
                            params->ImagePathName.Length / sizeof(WCHAR) ))
     {
