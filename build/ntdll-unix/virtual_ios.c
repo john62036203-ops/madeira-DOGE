@@ -33132,6 +33132,7 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
                 break;
             }
             if (kr != KERN_SUCCESS || naddr > (mach_vm_address_t)(uintptr_t)he + small_gap) break;   /* a real gap: stop */
+            if (naddr + nsize <= (mach_vm_address_t)(uintptr_t)he) break;                            /* no progress: stop */
             he = (char *)(uintptr_t)(naddr + nsize);
             merged++;
         }
@@ -33225,6 +33226,15 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
     if (ios_vquery_host_on())
     {
         ios_vquery_host_clamp( base, region_start, region_end, fake_reserved );
+        {
+            static unsigned traced;
+            if (traced < 300)
+            {
+                traced++;
+                dprintf( 2, "[vquery-trace] #%u %p -> %p..%p %s\n", traced, base, *region_start, *region_end,
+                         *fake_reserved ? "reserved" : "free" );
+            }
+        }
         if (*region_end <= base + page_mask)
         {
             /* never an empty region: FEX's InvalidationTracker constructor walks the map
