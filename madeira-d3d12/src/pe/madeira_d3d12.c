@@ -2155,18 +2155,99 @@ static void f6_encode_st(obj_handle_t enc, int kind, const obj_handle_t *f, unsi
 static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigned nwait, obj_handle_t update) {
     f6_encode_st(enc, kind, f, nwait, update, (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject));
 }
+/* madeira-doge f6-sites: every mode-6 sync point by WHY it syncs and WHICH encoder
+ * follows it (pixel shader of a render pass, kernel of a compute encoder, "blit"),
+ * so the syncs can be tried away one by one (fence-chain 0 halved EXVS2's GPU
+ * time and broke effects: some of them matter, most may not).
+ *   reasons: L list start, B barrier, A a pending pass wrote one of my
+ *   attachments, T blit after blit, F 40 pending.
+ * madeira.cfg f6-skip = bits (1 L, 2 B, 4 A) skips every sync of that pure
+ * reason; f6-skip-names = <name>[,B:<name>,A:<name>,L:<name>...] skips those
+ * sites only. A skipped sync waits for nothing (a list start still waits for
+ * the device fence), leaves the pending set as it is, and the encoder counts as
+ * not synced, so the next barrier closes it and the next sync covers what was
+ * skipped. Experiment: a wrong skip shows as broken or flickering effects. */
+enum { F6R_L, F6R_B, F6R_A, F6R_T, F6R_F, F6R_N };
+static volatile LONG g_f6r_n[F6R_N], g_f6r_skip[F6R_N], g_f6r_fences;
+static struct { char name[48]; UINT8 why, kind, skipped; LONG n; } g_f6site[48];
+static volatile LONG g_f6site_lock;
+static int mad_cfg_str_pe(const char *key, char *out, size_t cap);
+static int g_f6_skip = -1; static char g_f6_skip_names[1024];
+static void mad_f6_site(int why, int kind, const char *name, int skipped) {
+    unsigned i;
+    while (InterlockedCompareExchange(&g_f6site_lock, 1, 0)) YieldProcessor();
+    for (i = 0; i < 48; i++) {
+        if (g_f6site[i].n && g_f6site[i].why == why && g_f6site[i].kind == kind && !strcmp(g_f6site[i].name, name)) break;
+        if (!g_f6site[i].n) { snprintf(g_f6site[i].name, sizeof g_f6site[i].name, "%s", name); g_f6site[i].why = (UINT8)why; g_f6site[i].kind = (UINT8)kind; break; }
+    }
+    if (i < 48) { g_f6site[i].n++; g_f6site[i].skipped = (UINT8)skipped; }
+    InterlockedExchange(&g_f6site_lock, 0);
+}
+static void mad_f6_site_report(double np) {
+    static const char rc[F6R_N] = { 'L', 'B', 'A', 'T', 'F' };
+    static const char *const kn[3] = { "render", "blit", "compute" };
+    int used[48] = { 0 }, k, i;
+    d3d12_log("[perf] f6-sites per frame: list-start %.1f (skipped %.1f), barrier %.1f (%.1f), attachment %.1f (%.1f), blit-after-blit %.1f, 40-pending %.1f; fences waited %.1f; f6-skip = %d\n",
+              g_f6r_n[F6R_L] / np, g_f6r_skip[F6R_L] / np, g_f6r_n[F6R_B] / np, g_f6r_skip[F6R_B] / np, g_f6r_n[F6R_A] / np, g_f6r_skip[F6R_A] / np,
+              g_f6r_n[F6R_T] / np, g_f6r_n[F6R_F] / np, g_f6r_fences / np, g_f6_skip < 0 ? 0 : g_f6_skip);
+    for (i = 0; i < F6R_N; i++) { InterlockedExchange(&g_f6r_n[i], 0); InterlockedExchange(&g_f6r_skip[i], 0); }
+    InterlockedExchange(&g_f6r_fences, 0);
+    while (InterlockedCompareExchange(&g_f6site_lock, 1, 0)) YieldProcessor();
+    for (k = 0; k < 16; k++) {
+        int bi = -1;
+        for (i = 0; i < 48; i++) if (g_f6site[i].n && !used[i] && (bi < 0 || g_f6site[i].n > g_f6site[bi].n)) bi = i;
+        if (bi < 0) break;
+        used[bi] = 1;
+        d3d12_log("[perf] f6-site %c:%s (%s) %.1f per frame%s\n", rc[g_f6site[bi].why], g_f6site[bi].name, kn[g_f6site[bi].kind < 3 ? g_f6site[bi].kind : 0],
+                  g_f6site[bi].n / np, g_f6site[bi].skipped ? " SKIPPED" : "");
+    }
+    memset((void *)g_f6site, 0, sizeof g_f6site);
+    InterlockedExchange(&g_f6site_lock, 0);
+}
 static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
     struct mad_queue *q = e->q;
     obj_handle_t waits[48];
     unsigned nw = 0, i, j, k;
-    int other = q->f6_npend >= 40, need;
+    int other = q->f6_npend >= 40, need, why_att = 0, why_blit = 0, why_full = other;
     for (i = 0; i < q->f6_npend && !other; i++) {
-        if (kind == F6_BLIT && q->f6_pend[i].kind == F6_BLIT) other = 1;
+        if (kind == F6_BLIT && q->f6_pend[i].kind == F6_BLIT) { other = 1; why_blit = 1; }
         for (j = 0; j < q->f6_pend[i].natt && !other; j++)
             for (k = 0; k < e->f6_natt; k++)
-                if (e->f6_att[k] && e->f6_att[k] == q->f6_pend[i].att[j]) { other = 1; if (!e->f6_sync_needed) InterlockedIncrement(&g_f6_att_sync); break; }
+                if (e->f6_att[k] && e->f6_att[k] == q->f6_pend[i].att[j]) { other = 1; why_att = 1; if (!e->f6_sync_needed) InterlockedIncrement(&g_f6_att_sync); break; }
     }
     need = e->f6_sync_needed || other;
+    if (need) {   /* madeira-doge f6-sites */
+        int why = why_full ? F6R_F : why_blit ? F6R_T : e->f6_list_start ? F6R_L : e->f6_sync_needed ? F6R_B : F6R_A, skip = 0;
+        const char *nm = kind == F6_BLIT ? "blit" : kind == F6_COMPUTE ? (e->cpso ? e->cpso->vs_name : "-") : (e->pso ? (e->pso->ps_name[0] ? e->pso->ps_name : e->pso->vs_name) : "-");
+        if (!nm || !nm[0]) nm = "-";
+        if (g_f6_skip < 0) {
+            g_f6_skip = (int)mad_cfg_int_pe("f6-skip", 0);
+            mad_cfg_str_pe("f6-skip-names", g_f6_skip_names, sizeof g_f6_skip_names);
+            if (g_f6_skip || g_f6_skip_names[0]) d3d12_log("[madeira-d3d12] f6-skip = %d, f6-skip-names = '%s' (EXPERIMENT: syncs skipped; broken effects mean a needed one)\n", g_f6_skip, g_f6_skip_names);
+        }
+        if ((why == F6R_L && !why_att) || why == F6R_B || (why == F6R_A && !e->f6_sync_needed)) {
+            static const char pfx[3] = { 'L', 'B', 'A' };
+            char pn[64];
+            if (g_f6_skip & (1 << why)) skip = 1;
+            else if (g_f6_skip_names[0]) {
+                snprintf(pn, sizeof pn, "%c:%s", pfx[why], nm);
+                if (mad_name_in_list(g_f6_skip_names, nm) || mad_name_in_list(g_f6_skip_names, pn)) skip = 1;
+            }
+        }
+        InterlockedIncrement(&g_f6r_n[why]);
+        if (skip) InterlockedIncrement(&g_f6r_skip[why]);
+        mad_f6_site(why, kind, nm, skip);
+        if (skip) {
+            if (e->f6_list_start && q->device->enc_fence) { obj_handle_t df = q->device->enc_fence; f6_encode(enc, kind, &df, 1, 0); }
+            e->f6_sync_needed = 0; e->f6_list_start = 0; e->f6_enc_synced = 0;
+            e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0;
+            InterlockedIncrement(&g_f6_begins);
+            g_f6_used = 1;
+            e->f6_cur = q->f6_next++ & 63;
+            return;
+        }
+        InterlockedExchangeAdd(&g_f6r_fences, (LONG)(q->f6_npend + (e->f6_list_start && q->device->enc_fence ? 1 : 0)));
+    }
     InterlockedIncrement(&g_f6_begins);
     g_f6_used = 1;
     if (need && e->f6_sync_needed && !other && (e->f7_reason & 1) && !(e->f7_reason & 2)) {   /* ml1137: a sync caused only by barriers */
@@ -9519,6 +9600,7 @@ static void mad_perf_present(void) {
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
                           "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; mode 7 fragment-stage waits %.1f; WAR entries %.1f, mode 8 WAR-only batches skipped %.1f; mode 9 hazard lookups %.1f, declarations %.1f, DXIL draws undeclared %.1f\n",
                           b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, fw / np, war / np, sk / np, hzl / np, hzd / np, hzx / np);
+                mad_f6_site_report(np);   /* madeira-doge f6-sites */
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
                 double np = (double)g_perf_presents;
