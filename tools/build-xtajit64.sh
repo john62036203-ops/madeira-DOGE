@@ -148,6 +148,8 @@ fi
 #    buffer (FFRS: the 128 MB tail carve crowded out system DLL copies).
 #  - patch-fex-ios-cpu-brand.py: MADEIRA_FEX_CPU_BRAND=1 gives the CPUID brand
 #    leaves an Intel string that matches the reported family/model.
+#  - patch-fex-ios-early-images.py: ProcessInit also registers the modules the
+#    loader mapped before xtajit64 (ucrtbase/kernel32/kernelbase) with the tracker.
 #  - patch-fex-ios-native-thread.py: a thread without a CHPE CPU area (a native
 #    AArch64 Wine child) has no FEX thread state; its memory notifications return.
 #  - patch-fex-ios-avx.py: AVX/AVX2 only when MADEIRA_FEX_AVX=1 at launch, so
@@ -181,6 +183,7 @@ python3 "$R/tools/patch-fex-ios-branch-history.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-reg-trace.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-launcher-smc.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-native-thread.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
+python3 "$R/tools/patch-fex-ios-early-images.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-code-max.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUBackend.cpp"
 build
 git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/CPUID.h FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/Source/Interface/Core/CPUBackend.cpp
