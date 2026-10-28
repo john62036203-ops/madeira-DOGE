@@ -33226,6 +33226,37 @@ static struct file_view *get_memory_region_size( char *base, char **region_start
     if (ios_vquery_host_on())
     {
         ios_vquery_host_clamp( base, region_start, region_end, fake_reserved );
+        /* Keep the top of the 32 GB hole below FEX's arena out of a guest's walk.
+         * KytyPS5 reserves every free piece it sees as placeholders, then maps its
+         * 13.5 GB direct-memory backing (CreateFileMapping + MapViewOfFile, NULL
+         * address) -- and that view has nowhere to go: build 525, 17:46 log,
+         * "[jumbo#1] size=0x800000000 hint=0x7400000000 -> granted", then
+         * "[mmap-place] NO GAP FITS size=0x360010000", "could not reserve 13824 MB
+         * for guest direct memory". The hole [0x7400000000, 0x7c00000000) is the
+         * only place a view that big fits, so the walk sees only its lower part:
+         * env.MADEIRA_VQUERY_HOST_KEEP_MB (default 16384) at the top is reported
+         * reserved, and stays free for the process's own large mappings. */
+        if (!*fake_reserved)
+        {
+            static unsigned long long keep_start;
+            if (!keep_start)
+            {
+                static const char key[] = "MADEIRA_VQUERY_HOST_KEEP_MB";
+                const char *v = getenv( key );
+                unsigned long long mb = v && *v ? strtoull( v, NULL, 0 ) : 16384;
+                if (mb > 32768) mb = 32768;
+                keep_start = 0x7c00000000ULL - (mb << 20);
+                dprintf( 2, "[vquery-host] madeira-doge [%#llx, 0x7c00000000) kept out of a guest's walk (%llu MB)\n",
+                         keep_start, mb );
+            }
+            if ((unsigned long long)(uintptr_t)base >= keep_start && (unsigned long long)(uintptr_t)base < 0x7c00000000ULL)
+            {
+                if ((char *)(uintptr_t)0x7c00000000ULL < *region_end) *region_end = (char *)(uintptr_t)0x7c00000000ULL;
+                *fake_reserved = TRUE;
+            }
+            else if ((unsigned long long)(uintptr_t)base < keep_start && (unsigned long long)(uintptr_t)*region_end > keep_start)
+                *region_end = (char *)(uintptr_t)keep_start;
+        }
         {
             static unsigned traced;
             if (traced < 300)
