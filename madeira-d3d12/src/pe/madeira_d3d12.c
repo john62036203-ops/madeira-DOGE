@@ -3539,8 +3539,27 @@ static void mad_capture_rs_tables(struct mad_exec *e, obj_handle_t benc, unsigne
                                 mad_capture_buffer(e, benc, br, boff, 2048, rg->range_type == MADEIRA_IR_RANGE_UAV ? "uavbuf" : "buf", i * 1000 + off + k, seq); }
                         }
                     } else if (de->texture_view_id) {
-                        d3d12_log("[%s] p%u %s %c%u space%u: typed buffer view %llx, metadata 0x%llx\n", tag, i, rn, rg->range_type == 1 ? 'u' : 't',
-                                  reg, rg->register_space, (unsigned long long)de->texture_view_id, (unsigned long long)de->metadata);
+                        struct mad_resource *tbr = mad_vmap_res(d, de->texture_view_id);
+                        d3d12_log("[%s] p%u %s %c%u space%u: typed buffer view %llx, metadata 0x%llx -> %s r#%u size %llu\n", tag, i, rn, rg->range_type == 1 ? 'u' : 't',
+                                  reg, rg->register_space, (unsigned long long)de->texture_view_id, (unsigned long long)de->metadata,
+                                  tbr ? (tbr->name ? tbr->name : "buffer") : "NOTHING LIVE", tbr ? tbr->serial : 0u, tbr ? (unsigned long long)tbr->size : 0ull);
+                        /* madeira-doge capture-peek = <hex byte offset>[,...]: 4 KB of the buffer behind a
+                         * typed-buffer view at each offset (Ninja's Dawn: is the resolved picture in
+                         * shared memory before the texture load reads it?) */
+                        if (tbr && tbr->buffer && nbufc < 16) {
+                            char pk[256]; const char *q;
+                            mad_cfg_str_pe("capture-peek", pk, sizeof pk);
+                            for (q = pk; *q; ) {
+                                char *endp; unsigned long long po = strtoull(q, &endp, 16); unsigned u;
+                                if (endp == q) break;
+                                for (u = 0; u < nbufc && !(bufc[u].r == tbr && bufc[u].off == po); u++) ;
+                                if (u == nbufc && po < tbr->size && nbufc < 16) {
+                                    bufc[nbufc].r = tbr; bufc[nbufc].off = po; nbufc++;
+                                    mad_capture_buffer(e, benc, tbr, po, 4096, "peek", i * 1000 + off + k, seq);
+                                }
+                                q = endp; while (*q == ',' || *q == ' ') q++;
+                            }
+                        }
                     }
                 }
             }
@@ -3553,7 +3572,7 @@ static void mad_capture_rs_tables(struct mad_exec *e, obj_handle_t benc, unsigne
                   (double)ss->min_lod, (double)ss->max_lod, (double)ss->mip_lod_bias, ss->max_anisotropy, ss->comparison, ss->border_color);
     }
 }
-static void mad_capture_dispatch_inputs(struct mad_exec *e, const struct mad_cmd *c) {
+static void mad_capture_dispatch_inputs(struct mad_exec *e, const struct mad_cmd *c, const char *tag) {
     const struct mad_rootsig *rs = e->crs;
     obj_handle_t benc; unsigned seq;
     if (!rs) return;
@@ -3561,12 +3580,12 @@ static void mad_capture_dispatch_inputs(struct mad_exec *e, const struct mad_cmd
     benc = MTLCommandBuffer_blitCommandEncoder(e->cb); if (!benc) return;
     seq = ++g_enc_seq;
     exec_fence_blit(e, benc, 0);
-    d3d12_log("[capture-cs] ml1141 ===== '%s' #%d list#%u enc#%u %s %ux%ux%u, %u root params =====\n", e->cpso->vs_name, g_capture_cs_shots,
+    d3d12_log("[%s] ml1141 ===== '%s' #%d list#%u enc#%u %s %ux%ux%u, %u root params =====\n", tag, e->cpso->vs_name, g_capture_cs_shots,
               g_list_seq, seq, c->kind == MC_DISPATCH_INDIRECT ? "indirect" : "direct",
               c->kind == MC_DISPATCH ? c->u.dispatch.x : 0, c->kind == MC_DISPATCH ? c->u.dispatch.y : 0, c->kind == MC_DISPATCH ? c->u.dispatch.z : 0,
               (unsigned)rs->nparams);
     if (c->kind == MC_DISPATCH_INDIRECT && c->u.ind.args) mad_capture_buffer(e, benc, c->u.ind.args, c->u.ind.off, 12, "iargs", 0, seq);
-    mad_capture_rs_tables(e, benc, seq, rs, e->croot, (const UINT32 (*)[64])e->cconsts, "capture-cs");
+    mad_capture_rs_tables(e, benc, seq, rs, e->croot, (const UINT32 (*)[64])e->cconsts, tag);
     exec_fence_blit(e, benc, 1);
     MTLCommandEncoder_endEncoding(benc);
 }
@@ -8158,6 +8177,8 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
             snprintf(what, sizeof what, "buffer->texture copy %ux%u from r#%u +%llu", c->u.bt.w, c->u.bt.h,
                      c->u.bt.buf->serial, (unsigned long long)c->u.bt.off);
             mad_capture_one(e, e->benc, c->u.bt.tex, &cv, g_enc_seq, 10, "copy", 0, what);
+            /* and the first 256 KB of the source: empty source, or a copy that lost it? */
+            mad_capture_buffer(e, e->benc, c->u.bt.buf, c->u.bt.off, 262144, "copysrc", 10, g_enc_seq);
         }
         return;
     }
@@ -8847,10 +8868,12 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
      * measurement in a census frame, and the census frames themselves, were
      * wrong because of that (Astra, 2026-09-16). */
     if (g_census_on) exec_capture_cs(e, c);   /* ml920 */
-    if (g_capture_on && g_capture_cs[0] && g_capture_cs_shots < g_capture_cs_max && e->cpso->backend != MADEIRA_IR_BACKEND_AIRCONV &&
+    int cap_cs = 0;   /* madeira-doge: DXBC (airconv) dispatches too -- Xenia's resolve and texture-load kernels */
+    if (g_capture_on && g_capture_cs[0] && g_capture_cs_shots < g_capture_cs_max &&
         (!g_capture_cs_ind || c->kind == MC_DISPATCH_INDIRECT) && mad_cs_match(e->cpso, g_capture_cs)) {   /* ml1141 */
         g_capture_cs_shots++;
-        mad_capture_dispatch_inputs(e, c);
+        mad_capture_dispatch_inputs(e, c, "capture-cs");
+        cap_cs = 1;
     }
     /* madeira-doge: RE Engine's Persistent*ClusterCulling is a wave-op work queue
      * kept in a 2064-byte buffer (512 slots, then count / workers / cursors at
@@ -8953,8 +8976,12 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
      * with a named reason rather than running against a half-filled table. */
     if (e->cpso->backend == MADEIRA_IR_BACKEND_AIRCONV) {
         static unsigned said_air_disp;
-        if (!mad_air_build_tables(e, e->crs, e->croot, (const UINT32 (*)[64])e->cconsts,
-                                  e->cpso, 0, &air_cb, &air_cboff, &air_arg, &air_argoff)) {
+        int ok_air;
+        g_dump_tables = cap_cs;   /* madeira-doge: the sm5 table words of a captured dispatch */
+        ok_air = mad_air_build_tables(e, e->crs, e->croot, (const UINT32 (*)[64])e->cconsts,
+                                      e->cpso, 0, &air_cb, &air_cboff, &air_arg, &air_argoff);
+        g_dump_tables = 0;
+        if (!ok_air) {
             MAD_SKIP(e); return;
         }
         if (said_air_disp++ < 8)
@@ -9033,6 +9060,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     mad_use_commit(e);
     e->draws++;
     if (g_capture_on && g_cap_uav) mad_capture_dispatch_outputs(e, c);   /* madeira-bcd: contact sheets */
+    if (cap_cs) mad_capture_dispatch_inputs(e, c, "capture-cs-after");   /* madeira-doge: the same tables after the dispatch ran */
     if (e->ncap_after_buf) {   /* ml922 */
         unsigned j; for (j = 0; j < e->ncap_after_buf; j++) exec_capture_bytes(e, e->cap_after_buf[j].label, e->cap_after_buf[j].r, e->cap_after_buf[j].off, 64, 15);
         e->ncap_after_buf = 0;
