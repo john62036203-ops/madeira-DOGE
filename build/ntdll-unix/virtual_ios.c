@@ -32970,9 +32970,29 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
         raddr = (mach_vm_address_t)(uintptr_t)base;     /* the call moves raddr: ask about base at every depth */
         icnt = VM_REGION_SUBMAP_INFO_COUNT_64;
         kr = mach_vm_region_recurse( mach_task_self(), &raddr, &rsize, &rdepth, (vm_region_recurse_info_t)&info, &icnt );
-        if (kr != KERN_SUCCESS) return;            /* nothing mapped at or above base: keep Wine's answer */
+        if (kr != KERN_SUCCESS)
+        {
+            /* nothing mapped at or above base: the task's map ends here (0x8000000000 on
+             * iOS 27), nothing can be placed above it -- reserved to Wine's limit. Build 518,
+             * 13:12 log: KytyPS5 took Wine's "free to 0x7fffffff0000" at face value and died
+             * on "failed to reserve guest address space at 0x8000000000, size 0x7c00000000". */
+            *fake_reserved = TRUE;
+            if (said++ < 16) dprintf( 2, "[vquery-host] madeira-doge %p: above the task's map -> reserved up to %p\n", base, *region_end );
+            return;
+        }
         if (info.is_submap && rdepth < 8) { rdepth++; continue; }
         break;
+    }
+    /* Wine's own band [0x7000000000, 0x7400000000): the process's later views (DLLs,
+     * heaps, stacks, Metal) must find room there, so a guest that reserves every free
+     * piece it sees is told it is taken; FEX also refuses guest RIPs >= 0x7400000000,
+     * so the 32 GB above it is where a guest's data belongs. */
+    if ((mach_vm_address_t)(uintptr_t)base >= 0x7000000000ULL && (mach_vm_address_t)(uintptr_t)base < 0x7400000000ULL)
+    {
+        if ((char *)(uintptr_t)0x7400000000ULL < *region_end) *region_end = (char *)(uintptr_t)0x7400000000ULL;
+        *fake_reserved = TRUE;
+        if (said++ < 16) dprintf( 2, "[vquery-host] madeira-doge %p: inside Wine's own band -> reserved up to %p\n", base, *region_end );
+        return;
     }
     {
         /* Report one block per RUN of host regions, absorbing gaps under 1 MB (build
