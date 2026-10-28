@@ -32974,56 +32974,21 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
         if (info.is_submap && rdepth < 8) { rdepth++; continue; }
         break;
     }
-    if (raddr <= (mach_vm_address_t)(uintptr_t)base)
     {
-        /* the host holds base: report the run of CONTIGUOUS host regions from here as
-         * one reserved block (clamped to the Wine-free run). A guest that walks the
-         * map (KytyPS5 reserves every free piece > 16 MB) must not pay one query per
-         * dyld-cache or kernel-placeholder entry; the 07:57 / 08:11 logs spent a minute
-         * at ~75k queries/s. Only MEM_FREE pieces matter to such a walk. */
-        char *hs = (char *)(uintptr_t)raddr, *he = (char *)(uintptr_t)(raddr + rsize);
-        unsigned merged = 0, tag = info.user_tag, prot = info.protection;
-        while (he < *region_end && merged < 1024)
-        {
-            mach_vm_address_t naddr = (mach_vm_address_t)(uintptr_t)he;
-            mach_vm_size_t nsize = 0;
-            natural_t ndepth = 0;
-            vm_region_submap_info_data_64_t ninfo;
-            mach_msg_type_number_t ncnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-            for (;;)
-            {
-                naddr = (mach_vm_address_t)(uintptr_t)he;
-                ncnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-                kr = mach_vm_region_recurse( mach_task_self(), &naddr, &nsize, &ndepth, (vm_region_recurse_info_t)&ninfo, &ncnt );
-                if (kr != KERN_SUCCESS) break;
-                if (ninfo.is_submap && ndepth < 8) { ndepth++; continue; }
-                break;
-            }
-            if (kr != KERN_SUCCESS || naddr != (mach_vm_address_t)(uintptr_t)he) break;   /* a gap: stop here */
-            he = (char *)(uintptr_t)(naddr + nsize);
-            merged++;
-        }
-        if (hs > *region_start) *region_start = hs;
-        if (he < *region_end) *region_end = he;
-        *fake_reserved = TRUE;
-        if (merged >= 1024 && said < 32)
-        {
-            said++;
-            dprintf( 2, "[vquery-host] madeira-doge %p: merge cap hit at %p (1024 host regions)\n", base, he );
-        }
-        if (said++ < 16)
-            dprintf( 2, "[vquery-host] madeira-doge %p: host region %p+0x%llx (tag %u prot %u, %u more merged) -> reserved %p..%p\n",
-                     base, hs, (unsigned long long)rsize, tag, prot, merged, *region_start, *region_end );
-    }
-    else
-    {
-        /* free until the next host region -- except below the lowest mapping above
-         * __PAGEZERO: iOS refuses fixed mappings there (build 510, 09:03 log:
-         * "[va-scan] dead-hole #0: [0x100000000,0x104700000) refused 1152
-         * consecutive requests"; KytyPS5 then died on "failed to reserve guest
-         * address space at 0x100000000"), so that gap is reported reserved too. */
+        /* Report one block per RUN of host regions, absorbing gaps under 1 MB (build
+         * 516, 12:43 log: a 16 KB mapped / 16 KB free checkerboard at 0x134000000..
+         * cost one query per page, 35,000 queries in 45 s). A guest that walks the
+         * map (KytyPS5 reserves every free piece > 16 MB; FEX's InvalidationTracker
+         * constructor walks everything once) cannot use such slivers anyway. Below
+         * the lowest mapping above __PAGEZERO everything is reported reserved: iOS
+         * refuses fixed mappings there ("[va-scan] dead-hole #0", KytyPS5 died on
+         * "failed to reserve guest address space at 0x100000000"). */
         static mach_vm_address_t lowest;
-        char *he = (char *)(uintptr_t)raddr;
+        const mach_vm_size_t small_gap = 1u << 20;
+        char *hs = NULL, *he = NULL;
+        unsigned merged = 0, tag = 0, prot = 0;
+        mach_vm_address_t cur = (mach_vm_address_t)(uintptr_t)base;
+
         if (!lowest)
         {
             mach_vm_address_t la = pagezero_end;
@@ -33038,14 +33003,55 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
             dprintf( 2, "[vquery-host] madeira-doge lowest host mapping above __PAGEZERO: %#llx (the gap below it is reported reserved)\n",
                      (unsigned long long)lowest );
         }
-        if ((mach_vm_address_t)(uintptr_t)base < lowest)
+        if (cur < lowest)
         {
             if ((char *)(uintptr_t)lowest < *region_end) *region_end = (char *)(uintptr_t)lowest;
             *fake_reserved = TRUE;
             if (said++ < 16) dprintf( 2, "[vquery-host] madeira-doge %p: below the lowest host mapping -> reserved up to %p\n", base, *region_end );
             return;
         }
+        /* raddr/rsize/info: the first host region at or above base (queried above) */
+        if (raddr > cur + small_gap)
+        {
+            /* a real free gap: free until that region */
+            char *ge = (char *)(uintptr_t)raddr;
+            if (ge < *region_end) *region_end = ge;
+            return;
+        }
+        hs = (char *)(uintptr_t)(raddr <= cur ? raddr : cur);
+        he = (char *)(uintptr_t)(raddr + rsize);
+        tag = info.user_tag; prot = info.protection;
+        while (he < *region_end && merged < 4096)
+        {
+            mach_vm_address_t naddr;
+            mach_vm_size_t nsize = 0;
+            natural_t ndepth = 0;
+            vm_region_submap_info_data_64_t ninfo;
+            mach_msg_type_number_t ncnt;
+            for (;;)
+            {
+                naddr = (mach_vm_address_t)(uintptr_t)he;
+                ncnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+                kr = mach_vm_region_recurse( mach_task_self(), &naddr, &nsize, &ndepth, (vm_region_recurse_info_t)&ninfo, &ncnt );
+                if (kr != KERN_SUCCESS) break;
+                if (ninfo.is_submap && ndepth < 8) { ndepth++; continue; }
+                break;
+            }
+            if (kr != KERN_SUCCESS || naddr > (mach_vm_address_t)(uintptr_t)he + small_gap) break;   /* a real gap: stop */
+            he = (char *)(uintptr_t)(naddr + nsize);
+            merged++;
+        }
+        if (hs > *region_start) *region_start = hs;
         if (he < *region_end) *region_end = he;
+        *fake_reserved = TRUE;
+        if (merged >= 4096 && said < 32)
+        {
+            said++;
+            dprintf( 2, "[vquery-host] madeira-doge %p: merge cap hit at %p (4096 host regions)\n", base, he );
+        }
+        if (said++ < 16)
+            dprintf( 2, "[vquery-host] madeira-doge %p: host region %p+0x%llx (tag %u prot %u, %u more merged) -> reserved %p..%p\n",
+                     base, (void *)(uintptr_t)raddr, (unsigned long long)rsize, tag, prot, merged, *region_start, *region_end );
     }
 }
 #endif
