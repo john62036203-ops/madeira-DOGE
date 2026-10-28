@@ -33136,6 +33136,22 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
             he = (char *)(uintptr_t)(naddr + nsize);
             merged++;
         }
+        {
+            /* never swallow the JIT pool: an address inside it is answered by the pool's
+             * own path (it reports the PE image a pool copy belongs to), so a reserved
+             * block that runs into the pool sent FEX's map walk back to that image and
+             * round again for ever (build 536, 23:29 log: [vquery-trace] #10-#14
+             * 0x13099a000 .. "reserved 0x13e008000..0x165ff8000" across pool A at
+             * 0x164000000, then 0x13099a000 again, 10,000 queries) */
+            extern void *ios_jit_rx_base_global;
+            extern size_t ios_jit_pool_size_global;
+            uintptr_t prx = (uintptr_t)ios_jit_rx_base_global;
+            if (prx && ios_jit_pool_size_global && prx > (uintptr_t)base && prx < (uintptr_t)he)
+            {
+                he = (char *)prx;
+                if (said < 32) { said++; dprintf( 2, "[vquery-host] madeira-doge %p: block stopped at the JIT pool %p\n", base, he ); }
+            }
+        }
         if (hs > *region_start) *region_start = hs;
         if (he < *region_end) *region_end = he;
         *fake_reserved = TRUE;
