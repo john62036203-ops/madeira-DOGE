@@ -33011,8 +33011,34 @@ static void ios_vquery_host_clamp( char *base, char **region_start, char **regio
     }
     else
     {
-        /* free until the next host region */
+        /* free until the next host region -- except below the lowest mapping above
+         * __PAGEZERO: iOS refuses fixed mappings there (build 510, 09:03 log:
+         * "[va-scan] dead-hole #0: [0x100000000,0x104700000) refused 1152
+         * consecutive requests"; KytyPS5 then died on "failed to reserve guest
+         * address space at 0x100000000"), so that gap is reported reserved too. */
+        static mach_vm_address_t lowest;
         char *he = (char *)(uintptr_t)raddr;
+        if (!lowest)
+        {
+            mach_vm_address_t la = pagezero_end;
+            mach_vm_size_t ls = 0;
+            natural_t ld = 0;
+            vm_region_submap_info_data_64_t li;
+            mach_msg_type_number_t lc = VM_REGION_SUBMAP_INFO_COUNT_64;
+            if (mach_vm_region_recurse( mach_task_self(), &la, &ls, &ld, (vm_region_recurse_info_t)&li, &lc ) == KERN_SUCCESS)
+                lowest = la;
+            else
+                lowest = pagezero_end;
+            dprintf( 2, "[vquery-host] madeira-doge lowest host mapping above __PAGEZERO: %#llx (the gap below it is reported reserved)\n",
+                     (unsigned long long)lowest );
+        }
+        if ((mach_vm_address_t)(uintptr_t)base < lowest)
+        {
+            if ((char *)(uintptr_t)lowest < *region_end) *region_end = (char *)(uintptr_t)lowest;
+            *fake_reserved = TRUE;
+            if (said++ < 16) dprintf( 2, "[vquery-host] madeira-doge %p: below the lowest host mapping -> reserved up to %p\n", base, *region_end );
+            return;
+        }
         if (he < *region_end) *region_end = he;
     }
 }
