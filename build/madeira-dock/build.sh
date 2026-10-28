@@ -132,5 +132,14 @@ section() { printf '\n\n==== %s ====\n\n' "$1"; }
 
 mkdir -p "$OUT"
 cp "$TMP/dockhost.exe" "$TMP/dock-notices.txt" "$OUT/"
+# madeira-doge: dockdetach.exe, the console-free starter for Dock shortcuts
+# (build/madeira-dock/dockdetach.c; MadeiraDock.swift copies it into the prefix).
+if "$CC" -std=c11 -O2 -Wall -Wextra -Werror -municode -mwindows \
+    -static -Wl,--strip-all -Wl,--no-insert-timestamp \
+    -o "$OUT/dockdetach.exe" "$DIR/dockdetach.c"; then
+    ls -la "$OUT/dockdetach.exe"
+else
+    echo "::warning::madeira-dock: dockdetach.exe did not build; Dock shortcuts start their program directly" >&2
+fi
 if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$OUT/dockhost.exe"; else sha256sum "$OUT/dockhost.exe"; fi
 ls -la "$OUT/dockhost.exe" "$OUT/dock-notices.txt"

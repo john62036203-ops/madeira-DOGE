@@ -566,6 +566,27 @@ enum MadeiraDock {
         } catch { try? file.close(); cleanup(); throw error }
     }
 
+    /// madeira-doge: dockdetach.exe (build/madeira-dock/dockdetach.c, bundled next to
+    /// dockhost.exe) as a real file in the prefix, so Valve's client finds the program it
+    /// starts for a shortcut. Copied when missing or different; nil without the bundle file.
+    static func detachStarter() -> String? {
+        guard let source = Bundle.main.url(forResource: "dockdetach", withExtension: "exe", subdirectory: "arm64ec-windows") else { return nil }
+        let fm = FileManager.default
+        let folder = drive.appendingPathComponent("windows/madeira", isDirectory: true)
+        let target = folder.appendingPathComponent("dockdetach.exe")
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            if !fm.contentsEqual(atPath: source.path, andPath: target.path) {
+                try? fm.removeItem(at: target)
+                try fm.copyItem(at: source, to: target)
+            }
+        } catch {
+            SteamLog.event("[dock-shortcut] detach starter not copied: \(error.localizedDescription)")
+            return nil
+        }
+        return "C:\\windows\\madeira\\dockdetach.exe"
+    }
+
     /// The host's environment for one launch.
     static func configure(_ game: DockGame, launchOption: UInt32 = 0) {
         for key in ["MADEIRA_STEAM_HOST_PROBE", "MADEIRA_STEAM_HOST_SESSION", "MADEIRA_STEAM_HOST_LOGIN", "MADEIRA_STEAM_HOST_LAUNCH"] {
@@ -576,9 +597,24 @@ enum MadeiraDock {
         if let exe = game.shortcutExe {
             setenv("MADEIRA_DOCK_SHORTCUT", "1", 1)
             setenv("MADEIRA_DOCK_SHORTCUT_NAME", game.name, 1)
-            setenv("MADEIRA_DOCK_SHORTCUT_EXE", exe, 1)
+            // madeira-doge: the client starts the shortcut as its own child, which inherits
+            // the host's console; a PyInstaller program then dies in Python's
+            // init_sys_streams (EXVS2IB, 2026-10-29 00:18, host result 46). The client
+            // starts dockdetach.exe instead, which starts the program with no console and
+            // waits for it. env.MADEIRA_DOCK_SHORTCUT_DETACH = 0 starts the program directly.
+            if SteamSignIn.flag("MADEIRA_DOCK_SHORTCUT_DETACH", default: true), let starter = detachStarter() {
+                setenv("MADEIRA_DOCK_SHORTCUT_EXE", starter, 1)
+                setenv("MADEIRA_DOCK_DETACH_EXE", exe, 1)
+                setenv("MADEIRA_DOCK_DETACH_ARGS", game.shortcutArguments, 1)
+                SteamLog.event("[dock-shortcut] detach=1 starter=\(starter)")
+            } else {
+                setenv("MADEIRA_DOCK_SHORTCUT_EXE", exe, 1)
+                unsetenv("MADEIRA_DOCK_DETACH_EXE"); unsetenv("MADEIRA_DOCK_DETACH_ARGS")
+                SteamLog.event("[dock-shortcut] detach=0")
+            }
         } else {
             unsetenv("MADEIRA_DOCK_SHORTCUT"); unsetenv("MADEIRA_DOCK_SHORTCUT_NAME"); unsetenv("MADEIRA_DOCK_SHORTCUT_EXE")
+            unsetenv("MADEIRA_DOCK_DETACH_EXE"); unsetenv("MADEIRA_DOCK_DETACH_ARGS")
         }
         setenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION", String(launchOption), 1)
         setenv("MADEIRA_STEAM_HOST_CLIENT_DIR", SteamRuntimeFiles.windowsRoot, 1)
