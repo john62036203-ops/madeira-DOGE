@@ -1630,6 +1630,12 @@ static void ios_xp_symbol( uint64_t a, char *out, size_t cap )
         }
     snprintf( out, cap, "%s!#%u+0x%x", m->name, best, rva - bestrva );
 }
+static int ios_xp_cmp_pair( const void *a, const void *b )   /* madeira-doge xp-callers */
+{
+    const uint64_t *x = a, *y = b;
+    if (x[0] != y[0]) return x[0] < y[0] ? -1 : 1;
+    return x[1] < y[1] ? -1 : x[1] > y[1];
+}
 static int ios_xp_cmp_u64( const void *a, const void *b )
 {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
@@ -1949,6 +1955,49 @@ static void ios_xp_api_report( const char *wall, double wall_s )
                 }
                 (void)run;
                 wine_log_write( "%s", line );
+                /* madeira-doge xp-callers: the x64 return address stored beside each
+                 * sampled target (tools/patch-fex-ios-xp-callers.py, ring at word 4496).
+                 * The busiest (target, caller) pairs, so a target that x64-fast should
+                 * have absorbed names the code still reaching it. */
+                {
+                    static uint64_t callers[4096], pairs[4096][2];
+                    uint64_t m = idx - pidx, j;
+                    if (m > 4096) m = 4096;
+                    if (m && ios_ts_read( ios_xp_fex_addr + IOS_XP_FEX_WORDS * 8, callers, sizeof(callers) ))
+                    {
+                        int shown2 = 0;
+                        for (j = 0; j < m; j++)
+                        {
+                            uint64_t slot = (idx - 1 - j) & 4095;
+                            pairs[j][0] = fex[400 + slot];
+                            pairs[j][1] = callers[slot];
+                        }
+                        qsort( pairs, (size_t)m, sizeof(pairs[0]), ios_xp_cmp_pair );
+                        n = snprintf( line, sizeof(line), "[xp-api-callers] %s %llu samples:", wall, (unsigned long long)m );
+                        while (shown2 < 12)
+                        {
+                            uint64_t bt = 0, bc = 0, bn = 0, x, run0 = 0;
+                            for (x = 1; x <= m; x++)
+                                if (x == m || pairs[x][0] != pairs[run0][0] || pairs[x][1] != pairs[run0][1])
+                                {
+                                    if (pairs[run0][0] != ~0ull && x - run0 > bn) { bn = x - run0; bt = pairs[run0][0]; bc = pairs[run0][1]; }
+                                    run0 = x;
+                                }
+                            if (!bn) break;
+                            {
+                                char st[160], sc[160];
+                                ios_xp_symbol( bt, st, sizeof(st) );
+                                ios_xp_symbol( bc, sc, sizeof(sc) );
+                                if (n > (int)sizeof(line) - 400) { wine_log_write( "%s", line ); n = snprintf( line, sizeof(line), "[xp-api-callers] %s (cont):", wall ); }
+                                n += snprintf( line + n, sizeof(line) - n, " %s<-%s=%.0f/s", st, sc, ecc / dt * (double)bn / (double)m );
+                            }
+                            for (x = 0; x < m; x++)
+                                if (pairs[x][0] == bt && pairs[x][1] == bc) pairs[x][0] = ~0ull;   /* retired; never merges with a live run */
+                            shown2++;
+                        }
+                        wine_log_write( "%s", line );
+                    }
+                }
             }
             /* QPC: per-thread gap distribution, busiest four slots */
             if (got_nt && have_nt)
