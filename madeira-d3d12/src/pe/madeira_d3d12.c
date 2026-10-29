@@ -1959,6 +1959,7 @@ struct mad_exec {
     struct mad_resource *enc_rt[8]; UINT enc_nrt; struct mad_resource *enc_depth; /* what the open encoder has */
     UINT enc_w, enc_h;              /* ml934b: and the area it was created with */
     UINT8 area_cut;                 /* madeira-doge pass-area: enc_w/enc_h is smaller than the attachments (a draw outside reopens the pass) */
+    UINT enc_full_w, enc_full_h;    /* madeira-doge pass-area: an attachment-less pass's viewport area before the cut */
     struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; int is_depth; struct mad_rtvp v; } pend[16];
     unsigned npend;
     struct mad_pso *pso;
@@ -4036,7 +4037,7 @@ static int exec_same_targets(struct mad_exec *e) {
      * 12288x2048), so the area has to be part of the comparison. */
     if (!e->nrt && !e->depth) {
         UINT w, h; exec_attachless_area(e, &w, &h);
-        if (w != e->enc_w || h != e->enc_h) return 0;
+        if (e->area_cut ? (w != e->enc_full_w || h != e->enc_full_h) : (w != e->enc_w || h != e->enc_h)) return 0;   /* madeira-doge pass-area */
     }
     for (i = 0; i < e->nrt; i++) if (e->enc_rt[i] != e->rt[i] || !mad_rtvp_eq(&e->enc_rtp[i], &e->rtp[i])) return 0;
     if (e->depth && !mad_rtvp_eq(&e->enc_dp, &e->dp)) return 0;
@@ -4632,7 +4633,7 @@ static int exec_area_fits(const struct mad_exec *e) {
     if (!e->area_cut) return 1;
     if (e->nrt && e->rt[0]) { fw = e->rt[0]->width >> e->rtp[0].level; fh = e->rt[0]->height >> e->rtp[0].level; }
     else if (e->depth) { fw = e->depth->width >> e->dp.level; fh = e->depth->height >> e->dp.level; }
-    else return 1;
+    else exec_attachless_area(e, &fw, &fh);   /* attachment-less: the viewport's area */
     exec_area_need(e, e->sc, e->has_sc, fw, fh, &nw, &nh);
     return nw <= e->enc_w && nh <= e->enc_h;
 }
@@ -4712,6 +4713,14 @@ static int exec_begin_render(struct mad_exec *e) {
     if (!w) w = 1; if (!h) h = 1;
     if (g_pass_area < 0) { g_pass_area = mad_cfg_int_pe("pass-area", 0) ? 1 : 0;   /* 1: a render pass is opened only as large as the scissors of its draws, so the GPU loads and stores only that corner of a big target (Ninja's Dawn: EDRAM-shaped 8192-row targets drawn at 1120x584); 0: every pass covers the whole attachment */
                            d3d12_log("[madeira-d3d12] pass-area = %d (render passes %s)\n", g_pass_area, g_pass_area ? "opened at the drawn area" : "cover the whole attachment"); }
+    if (g_pass_area && attachless) {   /* madeira-doge pass-area: Ninja's Dawn's vertex-only (memexport) draws open 8192x8192
+                                        * attachment-less passes behind a 16x16 scissor; the 1-2 ms each is the area, not the work */
+        UINT aw, ah, fw = w, fh = h;
+        if (!e->hoist && exec_area_scan(e, w, h, &aw, &ah)) {
+            InterlockedExchangeAdd64(&g_area_saved_px, (LONG64)w * h - (LONG64)aw * ah);
+            w = aw; h = ah; e->area_cut = 1; e->enc_full_w = fw; e->enc_full_h = fh; InterlockedIncrement(&g_area_cut_n);
+        } else InterlockedIncrement(&g_area_full_n);
+    }
     if (g_pass_area && !attachless) {   /* madeira-doge pass-area */
         int cleared = 0, scaled = 0; UINT aw, ah;
         for (i = 0; i < e->nrt; i++) { if (rpi.colors[i].texture && rpi.colors[i].load_action == WMTLoadActionClear) cleared = 1;
@@ -20461,6 +20470,9 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     InterlockedExchangeAdd64(&g_xp.t_flush, mad_qpc() - tf); }
     {   /* ml1098: manual frame capture -- finish the frame that just ended, then see whether the UI asked for another */
         struct madeira_ctl_args a;
+        if (g_capture_on && g_nf_draws - s->nf_draws < (g_nf_min > 0 ? g_nf_min : 8)) {   /* madeira-doge: a repeat of the last frame has nothing to show; keep capturing into the next real one */
+            static unsigned said; if (said++ < 8) d3d12_log("[capture] present #%llu only repeats the last frame; the capture runs on to the next new frame\n", (unsigned long long)s->presents);
+        } else
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
         memset(&a, 0, sizeof a); a.op = 0;
         if (!s->offscreen) MadeiraCtl(&a);
