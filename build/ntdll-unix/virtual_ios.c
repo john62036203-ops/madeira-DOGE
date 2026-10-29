@@ -36938,3 +36938,23 @@ unsigned long long ios_avail_phys( unsigned long long host_free )
     logged++;
     return left;
 }
+
+/* madeira-doge: upstream #461's ios_addr_max_prot (signal_arm64_ios.c ml1353
+ * pool-noexec give-up). Current protection through *prot, maximum protection
+ * as the result; -1 when addr is in no host region. */
+int ios_addr_max_prot( const void *addr, int *prot )
+{
+    mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)addr;
+    mach_vm_size_t rs = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+
+    if (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &cnt, &obj ) != KERN_SUCCESS)
+        return -1;
+    if (obj != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), obj );
+    if ((uintptr_t)addr < (uintptr_t)ra || (uintptr_t)addr >= (uintptr_t)(ra + rs)) return -1;
+    if (prot) *prot = info.protection;
+    return info.max_protection;
+}
