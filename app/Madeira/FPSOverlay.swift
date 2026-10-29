@@ -215,6 +215,8 @@ struct FPSOverlay: View {
     /// when the call reports nothing.
     @State private var limitMB: Int = 4096
     @State private var logTicks = 0
+    /// madeira-doge: battery temperature in degrees C (nil = not readable on this device/sandbox)
+    @State private var tempC: Double? = nil
     @State private var lastLoggedPresent: UInt64 = .max
 
     private func readLimitMB(footprintMB: Int) -> Int {
@@ -360,7 +362,8 @@ struct FPSOverlay: View {
     }
     private var thermalPill: some View {
         let color: Color = thermal == .nominal ? .green : thermal == .fair ? .yellow : thermal == .serious ? .orange : .red
-        return Text(Self.thermalName(thermal))
+        let label = Self.thermalName(thermal) + (tempC.map { String(format: " %.1f°C", $0) } ?? "")   // madeira-doge: battery temperature
+        return Text(verbatim: label)
             .foregroundColor(color)
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
@@ -511,10 +514,11 @@ struct FPSOverlay: View {
             // in the log too: every 2s, and only when it changes or is still
             // zero, so a steady run costs one line and a dead one is obvious.
             logTicks += 1
+            if logTicks % 8 == 1 { tempC = BatteryTemperature.read() }   // madeira-doge: every 2 s
             if logTicks % 8 == 0 {
                 let c = presentCount
                 if c != lastLoggedPresent || c == 0 {
-                    LogStore.shared.log("[present] count=\(c) fps=\(String(format: "%.1f", fps)) mem=\(memMB)/\(limitMB)MB thermal=\(Self.thermalName(thermal))\(ProcessInfo.processInfo.isLowPowerModeEnabled ? " lowpower" : "")",
+                    LogStore.shared.log("[present] count=\(c) fps=\(String(format: "%.1f", fps)) mem=\(memMB)/\(limitMB)MB thermal=\(Self.thermalName(thermal))\(tempC.map { String(format: " temp=%.1fC", $0) } ?? "")\(ProcessInfo.processInfo.isLowPowerModeEnabled ? " lowpower" : "")",
                                         level: c == 0 ? .debug : .info)
                     lastLoggedPresent = c
                 }
@@ -562,4 +566,42 @@ struct FPSOverlay: View {
 /// ml1137: process-wide fence-mode display state for the overlay pill.
 enum FPSOverlayFenceMode {
     static var current: Int = Int(MadeiraConfig.gameValue("fence-chain") ?? MadeiraConfig.get("fence-chain") ?? "1") ?? 1
+}
+
+
+/// madeira-doge: battery temperature for the FPS overlay (owner's request
+/// 2026-10-29). iOS has no public API for it; the AppleSmartBattery registry
+/// entry's "Temperature" (hundredths of a degree C) is read through IOKit,
+/// looked up at run time so nothing links against it. A sandbox that refuses
+/// the read returns nil and the overlay simply leaves the number out.
+enum BatteryTemperature {
+    private typealias MatchingFn = @convention(c) (UnsafePointer<CChar>) -> Unmanaged<CFMutableDictionary>?
+    private typealias GetServiceFn = @convention(c) (UInt32, CFMutableDictionary) -> UInt32
+    private typealias CreatePropFn = @convention(c) (UInt32, CFString, CFAllocator?, UInt32) -> Unmanaged<CFTypeRef>?
+    private typealias ReleaseFn = @convention(c) (UInt32) -> Int32
+    private static let fns: (MatchingFn, GetServiceFn, CreatePropFn, ReleaseFn)? = {
+        guard let h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY),
+              let m = dlsym(h, "IOServiceMatching"), let g = dlsym(h, "IOServiceGetMatchingService"),
+              let c = dlsym(h, "IORegistryEntryCreateCFProperty"), let r = dlsym(h, "IOObjectRelease") else { return nil }
+        return (unsafeBitCast(m, to: MatchingFn.self), unsafeBitCast(g, to: GetServiceFn.self),
+                unsafeBitCast(c, to: CreatePropFn.self), unsafeBitCast(r, to: ReleaseFn.self))
+    }()
+    private static var refused = false
+    /// Degrees C, or nil when the value cannot be read.
+    static func read() -> Double? {
+        let v = readOnce()
+        if v == nil && !said { said = true; LogStore.shared.log("[temp] battery temperature not readable here (IOKit \(fns == nil ? "not loaded" : "refused")); the overlay shows the thermal state only") }
+        return v
+    }
+    private static var said = false
+    private static func readOnce() -> Double? {
+        guard !refused, let f = fns,
+              let dict = f.0("AppleSmartBattery")?.takeUnretainedValue() else { refused = true; return nil }
+        let service = f.1(0, dict)   // kIOMainPortDefault; the call consumes the +1 reference IOServiceMatching returned (taken unretained above)
+        guard service != 0 else { refused = true; return nil }
+        defer { _ = f.3(service) }
+        guard let v = f.2(service, "Temperature" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue(),
+              let n = v as? NSNumber, n.intValue > 0 else { refused = true; return nil }
+        return n.doubleValue / 100.0
+    }
 }
