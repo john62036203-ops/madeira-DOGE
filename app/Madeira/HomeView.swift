@@ -235,6 +235,8 @@ enum LibraryPrefs {
     private static let avxKey = "madeira.library.avx"
     private static let vcrtKey = "madeira.library.wineVCRT"
     private static let nvidiaKey = "madeira.library.nvidia"
+    private static let olderNvidiaKey = "madeira.library.olderNvidia"
+    private static let realSuspendKey = "madeira.library.realSuspend"
     private static let safeSyncKey = "madeira.library.safeSync"
     private static let screenKey = "madeira.library.screen"
     /// Per-game virtual monitor sizes; "" = default (1024x768), "fill" = the
@@ -302,6 +304,12 @@ enum LibraryPrefs {
 
     static func nvidia(_ windowsPath: String) -> Bool { (dict(nvidiaKey) as [String: Bool])[windowsPath] ?? false }
     static func setNvidia(_ on: Bool, for windowsPath: String) { store(on ? true : nil, nvidiaKey, windowsPath) }
+    /// "Older NVIDIA card (Direct3D 9)" (upstream #461): D3D9 names a GeForce 7900 GS (D3D9Identity).
+    static func olderNvidia(_ windowsPath: String) -> Bool { (dict(olderNvidiaKey) as [String: Bool])[windowsPath] ?? false }
+    static func setOlderNvidia(_ on: Bool, for windowsPath: String) { store(on ? true : nil, olderNvidiaKey, windowsPath) }
+    /// "Pause threads fully" (BCDLaunch.realSuspend): nil is Automatic, true On, false Off.
+    static func realSuspend(_ windowsPath: String) -> Bool? { (dict(realSuspendKey) as [String: Bool])[windowsPath] }
+    static func setRealSuspend(_ on: Bool?, for windowsPath: String) { store(on, realSuspendKey, windowsPath) }
 
     static func safeSync(_ windowsPath: String) -> Bool { (dict(safeSyncKey) as [String: Bool])[windowsPath] ?? false }
     static func setSafeSync(_ on: Bool, for windowsPath: String) { store(on ? true : nil, safeSyncKey, windowsPath) }
