@@ -26,6 +26,7 @@
 #include <pwd.h>
 #include <limits.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <sys/sysctl.h>
@@ -1588,6 +1589,17 @@ static void *wine_process_thread(void *arg) {
                         fprintf(stderr, "[madeira-env] server switches: MADEIRA_SRV_ECO_FOLLOW=%d MADEIRA_SRV_DIRECT=%d "
                                 "MADEIRA_SRV_IDLE_US=%d MADEIRA_SRV_LOG_ALL=%d\n", g_madeira_srv_eco_follow,
                                 g_madeira_srv_direct, g_madeira_srv_idle_us, g_madeira_srv_log_all);
+                }
+                /* upstream #443: DXMT's shader caches persist for 64-bit games too: winemetal's
+                 * DXMT_IOS_CACHE_DIR defaults on only for a WoW64 caller, and the
+                 * upstream lookup a 64-bit caller keeps finds no cache directory in
+                 * the iOS sandbox, so every converted shader and Metal pipeline was
+                 * built again in each session (Rocket League stalled up to 327 ms on
+                 * goal explosions and replays). Never overrides a value already set
+                 * (env.DXMT_IOS_CACHE_DIR = 0 in madeira.cfg turns it off). */
+                if (!getenv("DXMT_IOS_CACHE_DIR")) {
+                    setenv("DXMT_IOS_CACHE_DIR", "1", 0);
+                    fprintf(stderr, "[madeira-env] DXMT_IOS_CACHE_DIR=1 (default: shader caches under Library/Caches)\n");
                 }
                 /* madeira-doge: no Steam Overlay in Madeira Dock sessions. Valve's client
                  * injects gameoverlayrenderer(64).dll into every game it starts; on iOS its
