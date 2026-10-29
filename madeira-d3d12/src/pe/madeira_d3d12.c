@@ -9049,6 +9049,22 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         MAD_SKIP(e);
         return;
     }
+    {   /* madeira-doge skip-cs: diagnostic, the compute twin of skip-ps (Ninja's Dawn black cutscenes:
+         * which of Xenia's EDRAM dump / resolve / untile kernels leaves the frame black) */
+        static char skip_cs[512]; static int skip_init; static LONG skip_n;
+        if (!skip_init) {
+            skip_init = 1;
+            mad_cfg_str_pe("skip-cs", skip_cs, sizeof skip_cs);   /* diagnostic: drop the dispatches of these compute entries (comma list, exact names) */
+            if (skip_cs[0]) d3d12_log("[madeira-d3d12] skip-cs = '%s' (diagnostic: these dispatches are dropped)\n", skip_cs);
+        }
+        if (skip_cs[0] && mad_name_in_list(skip_cs, e->cpso->vs_name)) {
+            LONG n = InterlockedIncrement(&skip_n);
+            if (n <= 4 || !(n % 1000)) d3d12_log("[madeira-d3d12] skip-cs: dropped '%s' %ux%ux%u (%ld so far)\n", e->cpso->vs_name,
+                                                 c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z, (long)n);
+            MAD_SKIP(e);
+            return;
+        }
+    }
     /* ml930: pre-dispatch captures FIRST. exec_capture_cs blits through
      * exec_begin_blit, which ends every open encoder; doing it after the
      * compute encoder was created left e->cenc = 0 and the dispatch encoded
