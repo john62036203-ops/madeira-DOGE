@@ -109,7 +109,8 @@ assert 'ios_jit_low_contains( (uintptr_t)frame->pc ))' in signal, 'NtContinue ke
 assert 'int in_low = rx && rw && sz && ios_jit_low_contains( (uintptr_t)fault_addr );' in signal
 assert 'fault_addr >= rx && fault_addr < rx + sz) || in_low;' in signal, 'Mach store emulation into C'
 assert 'fault_addr - ios_jit_low_rx_global <= ios_jit_low_size_global - cas_width' in signal, 'CASAL lock word in C, bounded by C'
-assert "(in_low && !ios_jit_low_contains( (uintptr_t)fault_addr + 31 ))" in signal, 'STP Q never leaves C'
+assert 'ios_alias_write( effective, values, sizeof(values), &alias_fault, honor_guest_prot )' in signal, \
+    'STP Q writes its whole 32 bytes through ios_alias_write, which resolves each byte\'s alias (never past C)'
 assert signal.count('ios_jit_low_contains( (uintptr_t)fault_pc )') >= 2, 'Mach exec-fault branch and LDAPR backpatch'
 assert 'ios_jit_low_rw_contains( (uintptr_t)fault_pc )))   /* madeira-bcd pool-low */' in signal, 'RW-alias pc redirect'
 assert 'ios_jit_low_contains( (uintptr_t)fa );   /* madeira-bcd pool-low */' in signal, 'exec recovery'

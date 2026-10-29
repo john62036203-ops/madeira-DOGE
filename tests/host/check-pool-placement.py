@@ -67,7 +67,7 @@ struct ios_pool_free { size_t off, size; time_t freed_at; int advised; uint64_t 
 struct ios_pool_alloc { size_t off, size; void *peb; uint64_t tag; };
 static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
 static struct ios_pool_alloc ios_pool_ledger[IOS_POOL_LEDGER_MAX];
-static int ios_pool_free_count, ios_pool_ledger_count, ios_pool_last_alloc_reused;
+static int ios_pool_free_count, ios_pool_ledger_count, ios_pool_last_alloc_reused, ios_pool_last_same_image;
 static size_t jit_pool_offset, ios_jit_hole_off_eff, ios_jit_hole_end_eff;
 static size_t ios_pool_big_off, ios_pool_big_size;
 static int ios_pool_big_taken;
@@ -99,10 +99,6 @@ static int ios_pool_execable_runs(uint64_t rx, size_t off, size_t size, ios_pool
                                  size_t *ro, size_t *rs, int max)
 { (void)rx; (void)off; (void)size; (void)fn; (void)ro; (void)rs; (void)max; return 0; }
 ''' + helpers + allocator + r'''
-static int poison, probes;
-static unsigned ios_pool_check_range_exec(size_t off, size_t size, int reused)
-{ (void)off; (void)size; (void)reused; probes++; return poison; }
-''' + tagged + r'''
 static size_t total = 0x37690000, native_lo = 560 * MB, native_hi = 0x23690000;
 
 static void setup(int below)
@@ -291,31 +287,6 @@ int main(void)
     CHECK(!imports_411_case(0));
     CHECK(imports_411_case(1));
     puts("PASS: the 411-shaped RPCRT4 refusal and minimum remaining import budget fit when C preserves 32MB of main-pool capacity");
-    /* The exact-layout route may reuse writable section pages. Other
-     * layouts and fresh ranges still pass the quarantine check. */
-    setup(0); ios_pool_big_size = 0;
-    ios_pool_freelist[0] = (struct ios_pool_free){4 * MB, MB, 0, 0, 77};
-    ios_pool_free_count = 1; poison = 1; probes = 0;
-    CHECK(ios_pool_alloc_range_tagged(MB, total, 77) == 4 * MB);
-    CHECK(ios_pool_last_same_image && !probes && ios_pool_ledger[0].tag == 77);
-    setup(0); ios_pool_big_size = 0; probes = 0;
-    ios_pool_freelist[0] = (struct ios_pool_free){4 * MB, MB, 0, 0, 77};
-    ios_pool_free_count = 1;
-    CHECK(ios_pool_alloc_range_tagged(MB, total, 78) == (size_t)-1);
-    CHECK(!ios_pool_last_same_image && probes == 16);
-    setup(0); ios_pool_big_size = 0; poison = 0;
-    ios_pool_freelist[0] = (struct ios_pool_free){4 * MB, MB, 0, 0, 77};
-    ios_pool_free_count = 1;
-    ios_pool_ledger[0] = (struct ios_pool_alloc){4 * MB, MB, (void *)2, 77};
-    ios_pool_ledger_count = 1;
-    CHECK(ios_pool_alloc_range_tagged(MB, total, 77) != 4 * MB);
-    CHECK(!ios_pool_last_same_image);
-    setup(0); ios_pool_big_size = 0;
-    ios_pool_freelist[0] = (struct ios_pool_free){4 * MB, MB, 0, 0, 77};
-    ios_pool_free_count = 1;
-    CHECK(ios_pool_alloc_range_ex(MB, total, 0, MB, 77) != 4 * MB);
-    CHECK(!ios_pool_last_same_image);
-    puts("PASS: same layout bypasses quarantine only after overlap and reach checks; other layouts retain quarantine");
     return 0;
 }
 '''

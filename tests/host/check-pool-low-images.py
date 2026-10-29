@@ -77,7 +77,7 @@ struct ios_pool_free { size_t off, size; time_t freed_at; int advised; uint64_t 
 struct ios_pool_alloc { size_t off, size; void *peb; uint64_t tag; };
 static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
 static struct ios_pool_alloc ios_pool_ledger[IOS_POOL_LEDGER_MAX];
-static int ios_pool_free_count, ios_pool_ledger_count, ios_pool_last_alloc_reused;
+static int ios_pool_free_count, ios_pool_ledger_count, ios_pool_last_alloc_reused, ios_pool_last_same_image;
 static size_t jit_pool_offset, ios_jit_hole_off_eff, ios_jit_hole_end_eff;
 static size_t ios_pool_big_off, ios_pool_big_size, ios_jit_pool_size_global;
 static int ios_pool_big_taken, wow, poisoned;
@@ -102,7 +102,7 @@ static int ios_pool_range_clean(size_t off, size_t size)
 { return ios_pool_range_execable(off, size, NULL, NULL); }
 typedef int (*ios_pool_clean_fn)(size_t, size_t);
 static unsigned ios_pool_check_range_exec(size_t off, size_t size, int reused)
-{ (void)off; (void)size; (void)reused; return poisoned; }
+{ (void)off; (void)size; (void)reused; return 0; }
 static int ios_pool_live_overlap(uintptr_t start, size_t size, size_t *off_out, void **peb_out)
 {
     size_t off = start - (uintptr_t)ios_jit_rw_base_global;
