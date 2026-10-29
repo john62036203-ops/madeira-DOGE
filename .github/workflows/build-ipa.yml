@@ -1170,6 +1170,25 @@ jobs:
       - name: Patch DXMT context state swap
         run: python3 tools/patch-dxmt-context-state-swap.py
 
+      # BCD 0.1.622/0.1.623 DXMT fixes (madeira-doge: continue on error, the fork's dxmt pin may differ).
+      # F1 2020: CopyStructureCount with an empty destination or counter crashed the encode thread; skipped and logged.
+      - name: Patch DXMT CopyStructureCount without a buffer
+        continue-on-error: true
+        run: python3 tools/patch-dxmt-copy-structure-count.py
+      # Frostbite 2 (Need for Speed: The Run): render target views on a buffer logged ([rtv-fail]);
+      # env.MADEIRA_BUFFER_RTV_EMPTY = 1 answers S_OK and no view (off by default).
+      - name: Patch DXMT render target views on a buffer
+        continue-on-error: true
+        run: python3 tools/patch-dxmt-buffer-rtv.py
+      # willfaust/dxmt d811847f2: the GS/TS draw-argument marshal loops never advanced (GPU timeout with 2+ draws).
+      - name: Patch DXMT GS/TS draw-argument marshal loops
+        continue-on-error: true
+        run: python3 tools/patch-dxmt-gsts-marshal.py
+      # willfaust/dxmt f25e5568d: d3d9.customDriver (Older NVIDIA card for Fallout 3 / New Vegas, D3D9Identity).
+      - name: Patch DXMT d3d9.customDriver
+        continue-on-error: true
+        run: python3 tools/patch-dxmt-d3d9-custom-driver.py
+
       # God of War died on a loading screen at 7.5 GB: 2.4 GB of native malloc in
       # two seconds while it created its shaders. DXMT keeps every shader with
       # airconv's parsed program; the parse is now dropped after creation and

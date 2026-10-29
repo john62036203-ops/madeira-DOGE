@@ -11721,7 +11721,8 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         elem_off = (byte_off - aligned) / bytes;
         width = num + elem_off;
         if (aligned + width * bytes > r->size) width = (r->size - aligned) / bytes;
-        if (!width || width > (1u << 28)) { LeaveCriticalSection(&d->view_lock); return 0; }
+        if (!width) { LeaveCriticalSection(&d->view_lock); return 0; }
+        if (width > (1u << 28)) width = (1u << 28);   /* BCD 0.1.623: clamp a texture-buffer view to Metal's 2^28-texel limit (gpu_va and size stay whole for raw-buffer shaders) */
         bpr = width * bytes;
         memset(&ti, 0, sizeof ti);
         ti.pixel_format = pf; ti.width = (uint32_t)width; ti.height = 1; ti.depth = 1; ti.array_length = 1;
@@ -12409,10 +12410,10 @@ static void mad_vis_flush(struct mad_queue *q, obj_handle_t cb) {
     LeaveCriticalSection(&d->vis_lock);
     (void)v;
 }
-static void mad_vis_complete(struct mad_device *d, struct mad_vis_batch *v) {
+static void mad_vis_complete(struct mad_device *d, struct mad_vis_batch *v, int wait_cb) {
     unsigned k, j;
     static unsigned said_nocpu;
-    MTLCommandBuffer_waitUntilCompleted(v->cb);
+    if (wait_cb) MTLCommandBuffer_waitUntilCompleted(v->cb);
     /* ml1092: a query's value is PUBLISHED at its End, in program order with
      * the resolves, so "End Q7 (37) / Resolve / reuse Q7, End (0) / Resolve"
      * delivers 37 then 0 -- the old two-pass form delivered 0 twice (Astra's
@@ -12461,7 +12462,7 @@ static void mad_vis_complete(struct mad_device *d, struct mad_vis_batch *v) {
 }
 /* At retire: every batch committed up to and including this one has completed
  * (one Metal queue, in order), so deliver all of them, in order. */
-static void mad_vis_retire(struct mad_device *d, obj_handle_t cb) {
+static void mad_vis_retire_ex(struct mad_device *d, obj_handle_t cb, int wait_cb) {
     struct mad_vis_batch *todo[64]; unsigned n = 0, k, upto = ~0u;
     EnterCriticalSection(&d->vis_pub_lock);   /* ml1092: one retirer at a time, so batches publish in commit order */
     EnterCriticalSection(&d->vis_lock);
@@ -12473,9 +12474,10 @@ static void mad_vis_retire(struct mad_device *d, obj_handle_t cb) {
         d->nvis_pending -= n;
     }
     LeaveCriticalSection(&d->vis_lock);
-    for (k = 0; k < n; k++) mad_vis_complete(d, todo[k]);
+    for (k = 0; k < n; k++) mad_vis_complete(d, todo[k], wait_cb);
     LeaveCriticalSection(&d->vis_pub_lock);
 }
+static void mad_vis_retire(struct mad_device *d, obj_handle_t cb) { mad_vis_retire_ex(d, cb, 1); }
 
 /* ---- queue queries --------------------------------------------------------- */
 static HRESULT STDMETHODCALLTYPE queue_GetTimestampFrequency(ID3D12CommandQueue *This, UINT64 *freq) {
