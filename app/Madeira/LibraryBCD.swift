@@ -463,3 +463,4 @@ enum D3D9Identity {
         }
         return changed ? lines.joined(separator: "\n") : nil
     }
+}
