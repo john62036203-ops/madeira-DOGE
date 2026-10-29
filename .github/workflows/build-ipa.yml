@@ -1955,7 +1955,7 @@ jobs:
         # the vulkan branch is merged into exvs2, so a vulkan-branch build never becomes a release.
         if: success() && github.repository_owner == 'john62036203-ops' && inputs.publish-release == true && github.ref_name != 'vulkan'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}   # madeira-doge (2026-10-30): the owner's fine-grained token when set; Actions' token got HTTP 403 on release create from build 556
           NOTES: ${{ inputs.release-notes }}
         run: |
           IPA="build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa"
