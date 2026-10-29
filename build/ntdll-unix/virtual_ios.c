@@ -7181,6 +7181,11 @@ int ios_image_section_describe( unsigned long long va, char *buf, size_t len, un
  * arbitrary bytes from the main EXE's TLS template. Keep the Unix call narrow:
  * it copies only the loader's four-byte index, and verifies the executable
  * copy before the newly loaded DLL is allowed to run. */
+/* madeira-doge: upstream #461 declares this in wine/dlls/ntdll/unixlib.h; this
+ * fork's wine submodule predates that change, so the layout is kept here (the
+ * PE side never issues call 13 until the submodule carries it as well). */
+struct ios_sync_pe_write_params { void *address; ULONG size, synced; };
+
 NTSTATUS unixcall_ios_sync_pe_write(void *args)
 {
     struct ios_sync_pe_write_params *p = args;
