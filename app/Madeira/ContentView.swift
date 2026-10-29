@@ -202,8 +202,14 @@ final class MetalBackedView: UIView {
     /// mapping uses the same rect, so letterboxing, cropping and stretching
     /// never skew input.
     private func gameRect() -> CGRect {
+        var area = bounds
+        if PortraitPad.active(bounds.size) {   // madeira-doge portrait pad: the picture in the top part, the controls below it
+            let top = safeAreaInsets.top
+            area = CGRect(x: bounds.minX, y: bounds.minY + top, width: bounds.width,
+                          height: max(bounds.height * (1 - PortraitPad.fraction) - top, 1))
+        }
         let r = GameSurfaceLayout.rect(guest: guestSize(), aspect: drawableAspect(),
-                                       bounds: bounds, mode: effectiveDisplayMode())
+                                       bounds: area, mode: effectiveDisplayMode())
         return CGRect(x: r.minX, y: r.minY, width: max(r.width, 1), height: max(r.height, 1))
     }
 
@@ -4403,6 +4409,51 @@ enum TouchControlsHost {
     }
 }
 
+/// madeira-doge portrait pad (owner's request 2026-10-29): in a library
+/// session held in portrait, the landscape layout is not stretched over the
+/// whole tall screen any more. The game picture sits in the top half and the
+/// controls -- the same layout, each keeping its left-right place and its
+/// top-to-bottom order -- fill the bottom `fraction` of the screen at `scale`
+/// of their size. Controls the squeeze brings too close are pushed apart
+/// vertically (portrait only; the saved landscape layout is never changed).
+enum PortraitPad {
+    static let fraction: CGFloat = 0.5
+    static let scale: CGFloat = 0.9
+    static let gap: CGFloat = 4
+    /// The picture keeps the top half whenever a portrait session shows the controls.
+    static func active(_ size: CGSize) -> Bool {
+        size.width < size.height && LibraryModel.shared.current != nil && TouchControlsModel.shared.visible
+    }
+    /// Centres in the bottom area (pad-local points), nudged apart where two
+    /// controls would overlap.
+    static func positions(_ controls: [TouchControl], pad: CGSize) -> [UUID: CGPoint] {
+        var p = controls.map { CGPoint(x: CGFloat($0.nx) * pad.width, y: CGFloat($0.ny) * pad.height) }
+        let s = controls.map { c -> CGSize in let z = TouchControlsModel.size(c); return CGSize(width: z.width * scale, height: z.height * scale) }
+        for _ in 0..<16 {
+            var moved = false
+            for i in 0..<p.count {
+                for j in (i + 1)..<p.count {
+                    let needX = (s[i].width + s[j].width) / 2 + gap, needY = (s[i].height + s[j].height) / 2 + gap
+                    let dx = p[j].x - p[i].x, dy = p[j].y - p[i].y
+                    guard abs(dx) < needX, abs(dy) < needY else { continue }
+                    let push = (needY - abs(dy)) / 2
+                    let dir: CGFloat = dy > 0 || (dy == 0 && controls[i].ny <= controls[j].ny) ? 1 : -1
+                    p[i].y -= dir * push; p[j].y += dir * push
+                    moved = true
+                }
+            }
+            for i in 0..<p.count {   // inside the bottom area
+                let h = s[i].height / 2
+                p[i].y = min(max(p[i].y, h), pad.height - h)
+            }
+            if !moved { break }
+        }
+        var out: [UUID: CGPoint] = [:]
+        for (i, c) in controls.enumerated() { out[c.id] = p[i] }
+        return out
+    }
+}
+
 struct TouchControlsOverlay: View {
     @ObservedObject private var m = TouchControlsModel.shared
     @ObservedObject private var library = LibraryModel.shared
@@ -4445,7 +4496,7 @@ struct TouchControlsOverlay: View {
             .onAppear { applyDefaultLayout(geo); configureGamepad(landscape: landscape); logState("appear", geo.size, landscape) }
             .onChange(of: geo.size) { _, _ in applyDefaultLayout(geo); configureGamepad(landscape: landscape); logState("size", geo.size, landscape) }
             .onChange(of: m.controls) { _, _ in configureGamepad(landscape: landscape); logState("controls", geo.size, landscape) }
-            .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape); logState("visible", geo.size, landscape) }
+            .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape); logState("visible", geo.size, landscape); MetalBackedView.refreshDisplayMode(reason: "portrait-pad") }
             .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape); logState("editing", geo.size, landscape) }
             .onChange(of: library.blocksGameplayTouch) { _, _ in configureGamepad(landscape: landscape); logState("blocked", geo.size, landscape) }
             .onChange(of: m.opacity) { _, _ in logState("opacity", geo.size, landscape) }
@@ -4465,19 +4516,27 @@ struct TouchControlsOverlay: View {
     @ViewBuilder private func controls(_ screen: CGSize, session: Bool) -> some View {
         // A library session's Control opacity; full while editing.
         let alpha = session && !m.editing ? library.opacity : 1
+        // madeira-doge portrait pad: the controls in the bottom part of a portrait session (the editor keeps the full screen)
+        let portrait = session && !m.editing && screen.width < screen.height
+        let pad = CGSize(width: screen.width, height: portrait ? screen.height * PortraitPad.fraction : screen.height)
+        let at = portrait ? PortraitPad.positions(m.controls, pad: pad) : [:]
         let buttons = ForEach(m.controls) { c in
-            TouchControlButton(control: c, screen: screen)
+            TouchControlButton(control: c, screen: pad, scale: portrait ? PortraitPad.scale : 1, at: at[c.id])
         }
         if #available(iOS 26.0, *) {
             // madeira-doge: the container composites every glass face as one layer,
             // so an opacity on a single button never showed; fade the container.
             GlassEffectContainer(spacing: 12) {
                 ZStack { buttons }
-                    .frame(width: screen.width, height: screen.height, alignment: .topLeading)
+                    .frame(width: pad.width, height: pad.height, alignment: .topLeading)
+                    .frame(width: screen.width, height: screen.height, alignment: .bottomLeading)
             }
             .opacity(alpha)
         } else {
-            buttons.opacity(alpha)
+            ZStack { buttons }
+                .frame(width: pad.width, height: pad.height, alignment: .topLeading)
+                .frame(width: screen.width, height: screen.height, alignment: .bottomLeading)
+                .opacity(alpha)
         }
     }
 
@@ -4667,6 +4726,9 @@ extension ControlAction {
 struct TouchControlButton: View {
     let control: TouchControl
     let screen: CGSize
+    /// madeira-doge portrait pad: drawn at this fraction of its size, centred at `at` when given
+    var scale: CGFloat = 1
+    var at: CGPoint? = nil
     @ObservedObject private var m = TouchControlsModel.shared
     @State private var isDown = false
     @State private var dragBase: CGPoint?
@@ -4810,8 +4872,9 @@ struct TouchControlButton: View {
         .onChange(of: control.action) { old, new in
             if old.isPad || new.isPad { padVector = .zero; isDown = false }
         }
-        .position(x: CGFloat(control.nx) * screen.width,
-                  y: CGFloat(control.ny) * screen.height)
+        .scaleEffect(scale)
+        .position(x: at?.x ?? CGFloat(control.nx) * screen.width,
+                  y: at?.y ?? CGFloat(control.ny) * screen.height)
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { v in
