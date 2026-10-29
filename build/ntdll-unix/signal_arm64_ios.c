@@ -2751,6 +2751,96 @@ static uint8_t exc_peek8( uint64_t addr )
     return v;
 }
 
+/* madeira-doge align-fast: see the call in ios_mach_exception_thread. Returns 1
+ * with state updated (result register, pc + 4) when insn at pc is an LSE atomic
+ * (LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}/SWP) or CAS whose own address is
+ * fault_addr; 0 leaves everything to the full handler. Runs only on the single
+ * exception-server thread, so emulations are serialised against each other. */
+static int ios_align_fast_enabled = -1;
+static unsigned long long ios_align_fast_n, ios_align_fast_ticks;
+static int ios_align_fast( arm_thread_state64_t *st, uint64_t fault_addr )
+{
+    uint64_t pc, addr, cur = 0, nv, szmask, opnd;
+    uint32_t insn, Size, Rs, Rn, Rt, nbytes;
+    mach_vm_size_t got = 0;
+    uint64_t t0;
+    int cas;
+
+    if (ios_align_fast_enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_ALIGN_FAST" );
+        ios_align_fast_enabled = !(e && *e == '0');
+        dprintf( 2, "[align-fast] madeira-doge misaligned guest atomics emulated before the full "
+                 "fault chain: %s (MADEIRA_ALIGN_FAST=0 turns it off)\n", ios_align_fast_enabled ? "on" : "off" );
+    }
+    if (!ios_align_fast_enabled || fault_addr < 0x100000000ULL) return 0;
+    t0 = mach_absolute_time();
+    pc = __darwin_arm_thread_state64_get_pc( *st );
+    if (!ios_fault_read_insn( pc, &insn )) return 0;
+    cas = (insn & 0x3FA07C00u) == 0x08A07C00u;
+    if (!cas && !((insn & 0x3F200C00u) == 0x38200000u &&
+                  (((insn >> 15) & 1) == 0 || ((insn >> 12) & 7) == 0)))
+        return 0;
+    Size = (insn >> 30) & 3; Rs = (insn >> 16) & 0x1F; Rn = (insn >> 5) & 0x1F; Rt = insn & 0x1F;
+    if (Rn == 30 || Rn == 29) return 0;   /* lr/fp live outside __x[] in this struct; leave to the full path */
+    addr = (Rn == 31) ? __darwin_arm_thread_state64_get_sp( *st ) : st->__x[Rn];
+    if (addr != fault_addr) return 0;
+    if (Rs == 29 || Rs == 30 || Rt == 29 || Rt == 30) return 0;
+    nbytes = 1u << Size;
+    szmask = (Size == 3) ? ~0ULL : ((1ULL << (8u << Size)) - 1);
+    if (mach_vm_read_overwrite( mach_task_self(), addr, nbytes, (mach_vm_address_t)&cur, &got ) != KERN_SUCCESS
+        || got != nbytes)
+        return 0;
+    cur &= szmask;
+    if (cas)
+    {
+        uint64_t cmp = ((Rs == 31) ? 0 : st->__x[Rs]) & szmask;
+        nv = ((Rt == 31) ? 0 : st->__x[Rt]) & szmask;
+        if (cur == cmp &&
+            mach_vm_write( mach_task_self(), addr, (vm_offset_t)(uintptr_t)&nv, nbytes ) != KERN_SUCCESS)
+            return 0;
+        if (Rs != 31) st->__x[Rs] = cur;
+    }
+    else
+    {
+        uint64_t sbit = 1ULL << ((8u << Size) - 1);
+        int64_t sc, so;
+        uint32_t o3 = (insn >> 15) & 1, opc = (insn >> 12) & 7;
+        opnd = ((Rs == 31) ? 0 : st->__x[Rs]) & szmask;
+        sc = (int64_t)((cur ^ sbit) - sbit);
+        so = (int64_t)((opnd ^ sbit) - sbit);
+        if (o3) nv = opnd;
+        else switch (opc)
+        {
+        case 0: nv = cur + opnd; break;
+        case 1: nv = cur & ~opnd; break;
+        case 2: nv = cur ^ opnd; break;
+        case 3: nv = cur | opnd; break;
+        case 4: nv = (sc > so) ? cur : opnd; break;
+        case 5: nv = (sc < so) ? cur : opnd; break;
+        case 6: nv = (cur > opnd) ? cur : opnd; break;
+        default: nv = (cur < opnd) ? cur : opnd; break;
+        }
+        nv &= szmask;
+        if (mach_vm_write( mach_task_self(), addr, (vm_offset_t)(uintptr_t)&nv, nbytes ) != KERN_SUCCESS)
+            return 0;
+        if (Rt != 31) st->__x[Rt] = cur;
+    }
+    __darwin_arm_thread_state64_set_pc_fptr( *st, (void *)(uintptr_t)(pc + 4) );
+    ios_align_fast_ticks += mach_absolute_time() - t0;
+    if ((++ios_align_fast_n & 0xFFFF) == 1)
+    {
+        struct { unsigned int numer, denom; } tb = {0, 0};
+        extern int mach_timebase_info(void *);
+        mach_timebase_info( &tb );
+        dprintf( 2, "[align-fast] n=%llu emulate avg=%llu ns (handler body only) last=%s pc=%#llx addr=%#llx size=%u\n",
+                 ios_align_fast_n,
+                 tb.denom ? (ios_align_fast_ticks * tb.numer / tb.denom) / ios_align_fast_n : 0ull,
+                 cas ? "CAS" : "LSE", (unsigned long long)pc, (unsigned long long)addr, nbytes );
+    }
+    return 1;
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -3258,6 +3348,21 @@ static void *ios_mach_exception_thread( void *arg )
         mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
         kr = thread_get_state( thread, ARM_THREAD_STATE64,
                                (thread_state_t)&state, &count );
+        /* madeira-doge align-fast: a misaligned guest atomic (x86 `xchg`/`lock
+         * add` on an operand that crosses 16 bytes; FF15 takes ~10,000 a second
+         * on 8-byte SWPs at ...5f/...7f) is emulated right here, before the NEON
+         * fetch and the long chain of other fault paths below, which it never
+         * needs. Same emulation as the UNALIGNED-LSE / UNALIGNED-EXCL CAS cases
+         * further down (they stay as the fallback). MADEIRA_ALIGN_FAST=0 turns
+         * it off. */
+        if (kr == KERN_SUCCESS && req->exception == EXC_BAD_ACCESS && req->code_count > 1 &&
+            (unsigned long long)req->code[0] == 0x101 /* EXC_ARM_DA_ALIGN */ &&
+            ios_align_fast( &state, (uint64_t)req->code[1] ))
+        {
+            thread_set_state( thread, ARM_THREAD_STATE64, (thread_state_t)&state, count );
+            handled = 1;
+            goto ios_exc_reply;
+        }
         /* Also fetch NEON (SIMD/FP) state for STR/STP-q emulation */
         arm_neon_state64_t neon_state;
         mach_msg_type_number_t neon_count = ARM_NEON_STATE64_COUNT;
@@ -8631,6 +8736,7 @@ dispatch_guest_fault:
             }
         }
 
+    ios_exc_reply: ;
         /* Build reply */
         ios_exc_reply_t reply;
         reply.head.msgh_bits = MACH_MSGH_BITS( MACH_MSGH_BITS_REMOTE(req->head.msgh_bits), 0 );
