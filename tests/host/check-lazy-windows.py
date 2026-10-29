@@ -81,6 +81,7 @@ typedef struct { unsigned long long max_address; } task_vm_info_data_t;
 struct region { ULONG_PTR lo, hi; int prot; };
 static struct region map[256]; static int nmap;
 static unsigned long long fake_max;
+unsigned long long ios_layerkit_lo, ios_layerkit_hi;   /* ml900 span, 0 = not measured (upstream #462 reads it in ios_wow_band) */
 static int mmap_calls, task_info_calls;
 static int ios_cage_holdback_live, ios_cage_window_tail_live;
 static const ULONG_PTR host_page_size = 0x4000;
