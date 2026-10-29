@@ -666,6 +666,7 @@ static void mad_xp_role(char role) {   /* tell the probe which thread this is (u
     memset(&a, 0, sizeof a); a.op = 4; a.len = (UINT64)(unsigned char)role; a.ptr = me; MadeiraCtl(&a);
 }
 static LONG64 mad_qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static volatile LONG64 g_nf_draws;   /* madeira-doge present-new: draws replayed so far, all queues */
 /* madeira-bcd eco-prio (opt-in, env.MADEIRA_ECO_PRIO; build/ntdll-unix/thread_ios.c
  * ios_eco_prio_note): the runtime's own latency-critical threads -- the fence
  * worker, which advances a fence once the GPU is done, and async-submit's
@@ -9513,6 +9514,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         LONG n = InterlockedIncrement(&acc_lists);
         InterlockedExchangeAdd(&acc_cmds, (LONG)l->ncmds);
         InterlockedExchangeAdd(&acc_draws, (LONG)e.draws);
+        InterlockedExchangeAdd64(&g_nf_draws, (LONG64)e.draws);   /* madeira-doge present-new */
         InterlockedExchangeAdd(&acc_skipped, (LONG)e.skipped);
         if ((LONG)e.draws > acc_max_draws) acc_max_draws = (LONG)e.draws;
         if ((n % 600) == 0) {
@@ -19998,6 +20000,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
 #define MAD_SWAP_MAX_BUFFERS 8
 struct mad_swapchain {
     IDXGISwapChain4Vtbl *vtbl; LONG refs; const IID *iid; const char *name;
+    LONG64 nf_draws, nf_shown, nf_last;   /* madeira-doge present-new: draws seen at the last present, qpc of the last shown and of the last present */
     struct mad_device *dev;
     struct mad_queue *queue;
     IDXGIFactory1 *factory;
@@ -20406,6 +20409,45 @@ static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags) {
 }
 /* ml1121: the Metal half of Present; runs on the queue's worker (async) or on the caller. */
 static void mad_mheap_reclaim(struct mad_device *d, int all);
+/* madeira-doge present-new (Ninja's Dawn, 2026-10-29). ng2recomp's presenter
+ * thread presents at every 60 Hz vblank whether or not the game finished a new
+ * frame, so Madeira's FPS counter (one per Metal present) read 62-65 while the
+ * game's own log said 11-13 guest fps ([swap] lines, build 548 log 14:45:56) --
+ * "40-50 fps but a slideshow". A present is NEW when at least present-new-draws
+ * draws (default 8) were replayed since the previous one; a repeat re-shows the
+ * last frame. Always counted and logged ([madeira-d3d12] present-new, every
+ * 300 presents). Game file / madeira.cfg present-dup-skip = 1 also drops the
+ * repeats (no drawable, no blit), so the FPS overlay counts the game's own
+ * frames; a repeat still reaches the screen at least every 250 ms (a screen
+ * that changes with very few draws keeps updating), and a dropped one waits
+ * out the rest of a 1/60 s so a presenter that paces by Present does not spin
+ * (on the caller's thread only, never on the async-submit worker). */
+static int g_nf_skip = -1, g_nf_min = -1;
+static LONG g_nf_new, g_nf_rep, g_nf_dropped, g_nf_n;
+static int mad_present_new_check(struct mad_swapchain *s) {
+    static LONG64 freq;
+    LONG64 d = g_nf_draws, now = mad_qpc(), nd = d - s->nf_draws;
+    int fresh;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 10000000; }
+    if (g_nf_skip < 0) { g_nf_skip = mad_cfg_int_pe("present-dup-skip", 0) ? 1 : 0;   /* 1: a present with (almost) no draws since the previous one is dropped, so the FPS overlay counts the game's own frames (Ninja's Dawn's presenter repeats frames at every vblank) */
+                         g_nf_min = (int)mad_cfg_int_pe("present-new-draws", 8);   /* draws since the previous present that make a present a new frame (present-new / present-dup-skip) */
+                         if (g_nf_min < 1) g_nf_min = 1;
+                         d3d12_log("[madeira-d3d12] present-dup-skip = %d, present-new-draws = %d\n", g_nf_skip, g_nf_min); }
+    s->nf_draws = d;
+    fresh = nd >= g_nf_min;
+    if (fresh) InterlockedIncrement(&g_nf_new); else InterlockedIncrement(&g_nf_rep);
+    if ((InterlockedIncrement(&g_nf_n) % 300) == 0)
+        d3d12_log("[madeira-d3d12] present-new: last 300 presents: %ld new frames, %ld repeats (%ld dropped by present-dup-skip)\n",
+                  InterlockedExchange(&g_nf_new, 0), InterlockedExchange(&g_nf_rep, 0), InterlockedExchange(&g_nf_dropped, 0));
+    if (fresh || !g_nf_skip || !s->nf_shown || now - s->nf_shown >= freq / 4) { s->nf_shown = now; s->nf_last = now; return 0; }
+    InterlockedIncrement(&g_nf_dropped);
+    if (s->nf_last && now - s->nf_last < freq / 60 && !(s->queue && s->queue->sub_thread)) {   /* never on the async-submit worker: it would hold up the next frame's lists */
+        DWORD ms = (DWORD)(((freq / 60) - (now - s->nf_last)) * 1000 / freq);
+        if (ms) Sleep(ms);
+    }
+    s->nf_last = mad_qpc();
+    return 1;
+}
 static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     struct mad_resource *src;
     obj_handle_t drawable, tex, cb, enc;
@@ -20549,6 +20591,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         s->presents++;
         return;
     }
+    if (mad_present_new_check(s)) { s->presents++; return; }   /* madeira-doge present-dup-skip: a repeat of the last frame is not shown */
     if (g_layer_cfg_layer == s->layer && g_layer_cfg_owner != s) {   /* madeira-bcd: shared layer taken over, see mad_swap_apply_layer */
         static LONG said;
         if (InterlockedIncrement(&said) <= 8)

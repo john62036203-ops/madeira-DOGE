@@ -3204,6 +3204,17 @@ struct LibraryDetail: View {
                         Text("Each render pass loads and stores only the part of its target the game draws into, instead of the whole target. Saves GPU memory bandwidth in games with oversized targets (Ninja's Dawn). Turn it off if parts of the picture go missing.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge present-dup-skip / perf-pass-split: per-game, in the game's own file
+                    Toggle("Show only new frames (FPS = the game's own)", isOn: Binding(get: { bcd.value("present-dup-skip") == "1" }, set: { setBCDKey("present-dup-skip", $0 ? "1" : "") }))
+                    if bcd.value("present-dup-skip") == "1" {
+                        Text("A present that repeats the last frame (no new drawing) is dropped, so the FPS counter shows the frames the game actually rendered. For games whose own presenter repeats frames at every refresh (Ninja's Dawn).")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("GPU time per pass in the log (diagnostic)", isOn: Binding(get: { !bcd.value("perf-pass-split").isEmpty && bcd.value("perf-pass-split") != "0" }, set: { setBCDKey("perf-pass-split", $0 ? "120" : "") }))
+                    if !bcd.value("perf-pass-split").isEmpty && bcd.value("perf-pass-split") != "0" {
+                        Text("Every 120th frame runs each render pass on its own, and the log lists the passes that take the most GPU time. That one frame is slower; turn it off for normal play.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-bcd: the D3D12 runtime's per-game switches, as the madeira-bcd
                     // home screen offers them (GameProfiles.swift choices).
                     bcdPicker("Tessellation detail (D3D12)", "dxil-tess-max-factor", GameProfile.tessChoices)
