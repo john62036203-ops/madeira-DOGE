@@ -317,6 +317,13 @@ static long long x64f_qpcw_us;
 static struct { uintptr_t entry, stub; } x64f_pairs[X64F_MAX_PAIRS];
 static int x64f_npairs;
 
+static int x64f_is_stub( uintptr_t a )
+{
+    int i, n = __atomic_load_n( &x64f_npairs, __ATOMIC_ACQUIRE );
+    for (i = 0; i < n; i++) if (x64f_pairs[i].stub == a) return 1;
+    return 0;
+}
+
 static uintptr_t x64f_stub_for( uintptr_t entry )
 {
     int i, n = __atomic_load_n( &x64f_npairs, __ATOMIC_ACQUIRE );
@@ -784,7 +791,7 @@ static uintptr_t x64f_stub_through_forwarder( uintptr_t entry )
  * (FF15's ffxv_s.exe: slots 0x143066448/50 held ntdll!RtlEnter/LeaveCritical-
  * Section, not the stubs, at ~1-3 M calls/s), so ios_x64f_rescan() looks again. */
 #define X64F_MAX_X64IMG 96
-static struct { unsigned char *img; size_t size; } x64f_x64img[X64F_MAX_X64IMG];
+static struct { unsigned char *img; size_t size; unsigned int scans; } x64f_x64img[X64F_MAX_X64IMG];
 static int x64f_nx64img;
 static int x64f_rescanning;
 
@@ -871,7 +878,7 @@ static void x64f_redirect_thunks( unsigned char *img, size_t size )
                 ios_jit_pool_image_pc( v, &pe );
                 for (mi = 0; mi < nm; mi++)
                     if (pe >= x64f_mods[mi].base && pe - x64f_mods[mi].base < x64f_mods[mi].size) break;
-                if (mi < nm && shown < 16)
+                if (mi < nm && shown < 16 && !x64f_is_stub( v ))
                 {
                     shown++;
                     dprintf( 2, "[x64-fast] x64 image %p slot rva 0x%x holds %#lx (module %#lx +0x%lx): no stub for it\n",
@@ -885,6 +892,55 @@ static void x64f_redirect_thunks( unsigned char *img, size_t size )
     }
     if (hits || fails)
         dprintf( 2, "[x64-fast] x64 image %p: %u import-descriptor slot(s) now call x64 stubs%s\n", img, hits,
+                 fails ? " (some image writes FAILED)" : "" );
+}
+
+/* madeira-doge: a protected executable can keep the pointers it calls through
+ * in neither its IAT directory nor its import descriptors (FF15's ffxv_s.exe:
+ * rva 0x3066448/50, `call [rip+...]`, holding ntdll!RtlLeave/EnterCritical-
+ * Section). Its non-executable sections are searched for 8-byte words equal to
+ * a placed entry; only such exact values change. Run a few times per image
+ * (see ios_x64f_rescan), never on images with a .hexpthk (hybrid). */
+static void x64f_redirect_data( unsigned char *img, size_t size )
+{
+    unsigned int pe, sec, i, hits = 0, fails = 0;
+    unsigned short nsec, opt;
+    int mi, nm = __atomic_load_n( &x64f_nmods, __ATOMIC_ACQUIRE );
+
+    if (!x64f_mode || !__atomic_load_n( &x64f_npairs, __ATOMIC_ACQUIRE ) || !nm) return;
+    if (size < 0x200 || img[0] != 'M' || img[1] != 'Z') return;
+    pe = *(const unsigned int *)(img + 0x3c);
+    if (!x64f_in( size, pe, 24 + 112 + 8 * 13 ) || memcmp( img + pe, "PE\0\0", 4 ) ||
+        *(const unsigned short *)(img + pe + 4) != 0x8664) return;
+    nsec = *(const unsigned short *)(img + pe + 6);
+    opt = *(const unsigned short *)(img + pe + 20);
+    sec = pe + 24 + opt;
+    if (!x64f_in( size, sec, nsec * 40u )) return;
+    for (i = 0; i < nsec; i++)
+        if (!memcmp( img + sec + 40 * i, ".hexpthk", 8 )) return;
+    for (i = 0; i < nsec; i++)
+    {
+        const unsigned char *h = img + sec + 40 * i;
+        unsigned int vsize = *(const unsigned int *)(h + 8), va = *(const unsigned int *)(h + 12);
+        unsigned int chars = *(const unsigned int *)(h + 36), t, end;
+        if (chars & 0x20000000) continue;            /* IMAGE_SCN_MEM_EXECUTE */
+        if (!(chars & 0x40000000)) continue;         /* not readable */
+        if (!vsize || !x64f_in( size, va, vsize )) continue;
+        end = (va + vsize) & ~7u;
+        for (t = (va + 7) & ~7u; t + 8 <= end; t += 8)
+        {
+            uintptr_t v = *(const uintptr_t *)(img + t), stub;
+            /* cheap filter: only values inside a module that got stubs */
+            for (mi = 0; mi < nm; mi++)
+                if (v - x64f_mods[mi].base < x64f_mods[mi].size) break;
+            if (mi == nm) continue;
+            if (!(stub = x64f_stub_for( v ))) continue;
+            if (x64f_poke_image( img, t, (const unsigned char *)&stub, 8 )) hits++;
+            else fails++;
+        }
+    }
+    if (hits || fails)
+        dprintf( 2, "[x64-fast] x64 image %p: %u data pointer(s) to placed entries now call x64 stubs%s\n", img, hits,
                  fails ? " (some image writes FAILED)" : "" );
 }
 
@@ -917,6 +973,10 @@ void ios_x64f_rescan( void )
             continue;
         x64f_redirect_iat( img, x64f_x64img[k].size, 0, x64f_x64img[k].size );
         x64f_redirect_thunks( img, x64f_x64img[k].size );
+        {   /* the data search costs a pass over the image's data: rescans 2, 5, 10, 20 and 40 only (~6 s .. 2 min) */
+            unsigned int sc = ++x64f_x64img[k].scans;
+            if (sc == 2 || sc == 5 || sc == 10 || sc == 20 || sc == 40) x64f_redirect_data( img, x64f_x64img[k].size );
+        }
     }
     x64f_rescanning = 0;
 }
