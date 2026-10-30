@@ -1013,7 +1013,8 @@ struct mad_pso {
     struct mad_deflib *vs_def, *ps_def;   /* madeira-doge: pso-lazy-libs; vs_fn/ps_fn are made from these at the first draw */
     UINT64 vs_k[2], ps_k[2];              /* madeira-doge: pso-archive, the stages' library keys (pso-share-libs hash); 0 = unknown */
     int uses_depth, uses_stencil;
-    UINT8 dbg_denable, dbg_dfunc, dbg_dwrite, dbg_wmask[8], dbg_senable, dbg_sfunc, dbg_srmask, dbg_swmask;   /* ml903/ml904: census only */
+    UINT8 dbg_denable, dbg_dfunc, dbg_dwrite, dbg_wmask[8], dbg_senable, dbg_sfunc, dbg_srmask, dbg_swmask;
+    UINT8 ds_overwrites;   /* madeira-doge depth-overwrite: depth ALWAYS + written, stencil off or ALWAYS/REPLACE with a full write mask, no pixel shader */   /* ml903/ml904: census only */
     obj_handle_t dsso;                              /* per-pipeline depth-stencil state */
     struct wmtcmd_render_setrasterizerstate raster;  /* applied at every draw */
     UINT vb_stride[16]; UINT vb_mask;               /* the strides the vertex descriptor assumed */
@@ -4632,6 +4633,38 @@ done:
     *ow = mw; *oh = mh;
     return 1;
 }
+/* madeira-doge depth-overwrite: does the pass's FIRST draw rewrite the whole
+ * depth (and stencil) attachment? Then the GPU need not load it. Coverage of
+ * the geometry itself is not checked: viewport and scissor must span the
+ * attachment, nothing else -- hence opt-in, per game. */
+static int exec_depth_overwritten(const struct mad_exec *e, UINT fw, UINT fh) {   /* 0 no, 1 depth, 2 depth + stencil */
+    const struct mad_list *l = e->l;
+    const struct mad_pso *pso = e->pso;
+    D3D12_RECT sc = e->sc; int has_sc = e->has_sc;
+    D3D12_VIEWPORT vp = e->vp; int has_vp = e->has_vp;
+    UINT i;
+    if (!l || e->hoist || e->nrt) return 0;
+    for (i = e->cur; i < l->ncmds && i < e->cur + 256; i++) {
+        const struct mad_cmd *c = &l->cmds[i];
+        switch (c->kind) {
+        case MC_PSO: if (c->u.pso && !c->u.pso->is_compute) pso = c->u.pso; break;
+        case MC_SCISSOR: sc = c->u.scissor; has_sc = 1; break;
+        case MC_VP: vp = c->u.vp; has_vp = 1; break;
+        case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
+            if (!pso || !pso->ds_overwrites) return 0;
+            if (!has_vp || vp.TopLeftX > 0.0f || vp.TopLeftY > 0.0f || vp.TopLeftX + vp.Width < (float)fw || vp.TopLeftY + vp.Height < (float)fh) return 0;
+            if (has_sc && (sc.left > 0 || sc.top > 0 || sc.right < (LONG)fw || sc.bottom < (LONG)fh)) return 0;
+            return pso->ds_overwrites;
+        case MC_RTS: case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT:
+        case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: case MC_RESOLVE:
+            return 0;
+        default: break;
+        }
+    }
+    return 0;
+}
+static int g_depth_ow = -1;
+static LONG g_depth_ow_n, g_depth_ow_said;
 static int exec_area_fits(const struct mad_exec *e) {
     UINT fw, fh, nw, nh;
     if (!e->area_cut) return 1;
@@ -4713,6 +4746,19 @@ static int exec_begin_render(struct mad_exec *e) {
         }
         if (p >= 0) { rpi.depth.clear_depth = e->pend[p].depth; exec_drop_pending(e, p); }
         if (!w) { w = e->depth->width >> e->dp.level; h = e->depth->height >> e->dp.level; }
+        int ow;
+        if (g_depth_ow < 0) { g_depth_ow = mad_cfg_int_pe("depth-overwrite-skip", 0) ? 1 : 0;   /* 1: a pass whose first draw rewrites the whole depth/stencil target (depth ALWAYS + write, stencil ALWAYS/REPLACE, no pixel shader, viewport and scissor over the whole target) does not load the old contents (Ninja's Dawn: full-target depth passes); 0: always load */
+                              d3d12_log("[madeira-d3d12] depth-overwrite-skip = %d\n", g_depth_ow); }
+        if (g_depth_ow && rpi.depth.load_action == WMTLoadActionLoad && e->dp.layers <= 1 &&
+            (ow = exec_depth_overwritten(e, e->depth->width >> e->dp.level, e->depth->height >> e->dp.level)) > 0) {
+            LONG n = InterlockedIncrement(&g_depth_ow_n);
+            rpi.depth.load_action = WMTLoadActionDontCare;
+            if (rpi.stencil.texture && ow >= 2 && rpi.stencil.load_action == WMTLoadActionLoad) rpi.stencil.load_action = WMTLoadActionDontCare;
+            if (n <= 8 || (n % 2000) == 0)
+                d3d12_log("[madeira-d3d12] depth-overwrite-skip: pass #%ld on %ux%u%s does not load the old depth%s\n", (long)n,
+                          e->depth->width >> e->dp.level, e->depth->height >> e->dp.level,
+                          e->depth->samples > 1 ? " (MSAA)" : "", rpi.stencil.texture && rpi.stencil.load_action == WMTLoadActionDontCare ? " and stencil" : (rpi.stencil.texture ? " (stencil still loaded)" : ""));
+        }
     }
     if (!w) w = 1; if (!h) h = 1;
     if (g_pass_area < 0) { g_pass_area = mad_cfg_int_pe("pass-area", 0) ? 1 : 0;   /* 1: a render pass is opened only as large as the scissors of its draws, so the GPU loads and stores only that corner of a big target (Ninja's Dawn: EDRAM-shaped 8192-row targets drawn at 1120x584); 0: every pass covers the whole attachment */
@@ -17972,6 +18018,15 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     { unsigned wi; for (wi = 0; wi < 8; wi++) p->dbg_wmask[wi] = desc->BlendState.RenderTarget[wi].RenderTargetWriteMask; }
     p->dbg_senable = desc->DepthStencilState.StencilEnable != 0; p->dbg_sfunc = (UINT8)desc->DepthStencilState.FrontFace.StencilFunc;
     p->dbg_srmask = desc->DepthStencilState.StencilReadMask; p->dbg_swmask = desc->DepthStencilState.StencilWriteMask;
+    {   /* madeira-doge depth-overwrite */
+        const D3D12_DEPTH_STENCIL_DESC *ds = &desc->DepthStencilState;
+        int d_ok = ds->DepthEnable && ds->DepthFunc == D3D12_COMPARISON_FUNC_ALWAYS && ds->DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
+        int s_ok = ds->StencilEnable && ds->StencilWriteMask == 0xff &&
+                   ds->FrontFace.StencilFunc == D3D12_COMPARISON_FUNC_ALWAYS && ds->FrontFace.StencilPassOp == D3D12_STENCIL_OP_REPLACE &&
+                   ds->BackFace.StencilFunc == D3D12_COMPARISON_FUNC_ALWAYS && ds->BackFace.StencilPassOp == D3D12_STENCIL_OP_REPLACE;
+        p->ds_overwrites = (UINT8)(d_ok ? (s_ok ? 2 : 1) : 0) ;   /* 1: depth only, 2: depth and stencil */
+        if (desc->PS.pShaderBytecode && desc->PS.BytecodeLength) p->ds_overwrites = 0;   /* a pixel shader may discard */
+    }
     if (desc->DepthStencilState.DepthEnable) {
         dsi.depth_compare_function = mad_compare(desc->DepthStencilState.DepthFunc);
         dsi.depth_write_enabled = desc->DepthStencilState.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;

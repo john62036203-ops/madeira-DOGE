@@ -3371,6 +3371,12 @@ struct LibraryDetail: View {
                         Text("Each render pass loads and stores only the part of its target the game draws into, instead of the whole target. Saves GPU memory bandwidth in games with oversized targets (Ninja's Dawn). Turn it off if parts of the picture go missing.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge depth-overwrite-skip: per-game, in the game's own file
+                    Toggle("Skip reloading depth the game overwrites (experimental)", isOn: Binding(get: { bcd.value("depth-overwrite-skip") == "1" }, set: { setBCDKey("depth-overwrite-skip", $0 ? "1" : "") }))
+                    if bcd.value("depth-overwrite-skip") == "1" {
+                        Text("A render pass whose first draw rewrites the whole depth buffer does not read the old one back first. Saves GPU memory bandwidth (Ninja's Dawn). Turn it off if shadows, outlines or parts of the picture flicker or break.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge present-dup-skip / perf-pass-split: per-game, in the game's own file
                     Toggle("Show only new frames (FPS = the game's own)", isOn: Binding(get: { bcd.value("present-dup-skip") == "1" }, set: { setBCDKey("present-dup-skip", $0 ? "1" : "") }))
                     if bcd.value("present-dup-skip") == "1" {
