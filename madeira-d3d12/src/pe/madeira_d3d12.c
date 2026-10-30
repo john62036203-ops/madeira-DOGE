@@ -236,6 +236,7 @@ static int g_occlusion_visible = -1;   /* ml1103: madeira.cfg occlusion-visible 
  * texture the pixel stage samples) and their resolved argument tables logged
  * range by range. Answers "bad source or bad composite" for one draw. */
 static char g_capture_ps[512]; static int g_capture_ps_loaded, g_capture_ps_shots, g_dump_tables;   /* ml1152: a comma list */
+static int g_capture_ps_max = 8, g_capture_ps_ind;   /* madeira-doge: capture-ps-max shots a captured frame, capture-ps-indirect = 1 only indirect draws (FFRS fire flicker) */
 /* ml1141: TARGETED DISPATCH CAPTURE, the compute twin of the above. madeira.cfg
  * capture-cs = <compute entry name> (capture-cs-indirect = 1 keeps only indirect
  * dispatches, capture-cs-max = N, default 12): during a CAP frame the first N
@@ -7752,7 +7753,8 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     if (g_skip_ps_state && mad_skip_ps_match(e->pso)) { MAD_SKIP(e); return; }   /* madeira-bcd: diagnostic, off unless skip-ps is set */
     g_dump_tables = 0;
     if (g_capture_on) mad_trace_draw(e);   /* madeira-doge: trace-ps, one line per draw, no pass split */
-    if (g_capture_on && g_capture_ps[0] && (mad_name_in_list(g_capture_ps, e->pso->ps_name) || mad_vs_in_list(g_capture_ps, e->pso->vs_name)) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots; madeira-bcd: exact names (a substring match let ps_SetColor eat the shots meant for ps_SetColor_MultiLight) */
+    if (g_capture_on && g_capture_ps[0] && (mad_name_in_list(g_capture_ps, e->pso->ps_name) || mad_vs_in_list(g_capture_ps, e->pso->vs_name)) && g_capture_ps_shots < g_capture_ps_max &&
+        (!g_capture_ps_ind || c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT)) {   /* ml1106; ml1152: any listed ps, 8 shots; madeira-bcd: exact names (a substring match let ps_SetColor eat the shots meant for ps_SetColor_MultiLight) */
         g_capture_ps_shots++;
         mad_capture_draw_inputs(e, c);
         if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
@@ -20844,6 +20846,12 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                 g_capture_ps_loaded = 1; mad_cfg_str_pe("capture-ps", g_capture_ps, sizeof g_capture_ps);
                 if (g_capture_ps[0]) d3d12_log("[capture] ml1106 targeted draw capture for ps='%s'\n", g_capture_ps); }
             g_capture_ps_shots = 0;
+            {   /* madeira-doge: per captured frame, re-read like capture-cs */
+                long long pm = mad_cfg_int_pe("capture-ps-max", 8);
+                g_capture_ps_max = pm < 1 ? 1 : pm > 64 ? 64 : (int)pm;
+                g_capture_ps_ind = mad_cfg_int_pe("capture-ps-indirect", 0) ? 1 : 0;
+                if (g_capture_ps[0]) d3d12_log("[capture] capture-ps-max = %d a frame, capture-ps-indirect = %d\n", g_capture_ps_max, g_capture_ps_ind);
+            }
             g_trace_ps_n = 0;
             {   /* ml1141: re-read every CAP, so the target can change between captures of one run */
                 mad_cfg_str_pe("capture-cs", g_capture_cs, sizeof g_capture_cs);
