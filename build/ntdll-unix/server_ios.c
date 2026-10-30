@@ -1990,6 +1990,14 @@ static void ios_xp_api_report( const char *wall, double wall_s )
                                 ios_xp_symbol( bc, sc, sizeof(sc) );
                                 if (n > (int)sizeof(line) - 400) { wine_log_write( "%s", line ); n = snprintf( line, sizeof(line), "[xp-api-callers] %s (cont):", wall ); }
                                 n += snprintf( line + n, sizeof(line) - n, " %s<-%s=%.0f/s", st, sc, ecc / dt * (double)bn / (double)m );
+                                if (shown2 < 6)
+                                {   /* the 8 bytes before the return address: ff 15 = call [rip+disp] (an import slot),
+                                     * ff d0..d7 / 41 ff d0.. = call reg, e8 = call rel32 (a jmp thunk) */
+                                    unsigned char cb[8];
+                                    if (bc > 8 && ios_ts_read( bc - 8, cb, 8 ))
+                                        n += snprintf( line + n, sizeof(line) - n, "[%02x%02x%02x%02x%02x%02x%02x%02x]",
+                                                       cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7] );
+                                }
                             }
                             for (x = 0; x < m; x++)
                                 if (pairs[x][0] == bt && pairs[x][1] == bc) pairs[x][0] = ~0ull;   /* retired; never merges with a live run */
