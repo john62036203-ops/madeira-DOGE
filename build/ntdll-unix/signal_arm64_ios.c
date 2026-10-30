@@ -4437,6 +4437,13 @@ static void *ios_mach_exception_thread( void *arg )
                         int ld_rt = -1, k, clobbered = 0;
                         uint64_t delta = 0;   /* what in-place ADD/SUB immediates added to it */
                         uint32_t prev;
+                        /* madeira-doge: one in-place logical op (AND/BIC/ORR/ORN/EOR/EON
+                         * Wd, Wd, Wm, no shift) between the load and the store — the
+                         * InterlockedAnd shape LDAXR W11, [X8]; AND W11, W11, W10;
+                         * STLXR W12, W11, [X8] (ntdll+0x28408, KytyPS5 22:40 log). The
+                         * loaded value is gone, so instead of a CAS against it the
+                         * handler performs the whole read-modify-write as a CAS loop. */
+                        uint32_t logic_insn = 0;
 
                         for (k = 1; k <= 8 && ld_rt < 0 && !clobbered; k++)
                         {
@@ -4465,10 +4472,53 @@ static void *ios_mach_exception_thread( void *arg )
                                     delta += (prev & 0x40000000) ? (uint64_t)0 - imm : imm;
                                     continue;
                                 }
+                                /* logical (shifted register), shift amount 0, not ANDS/BICS:
+                                 * sf opc 01010 sh N Rm imm6 Rn Rd */
+                                if ((prev & 0x1f000000) == 0x0a000000 && ((prev >> 29) & 3) != 3
+                                    && ((prev >> 10) & 0x3f) == 0 && (int)((prev >> 5) & 0x1f) == ld_rt
+                                    && (int)((prev >> 16) & 0x1f) != ld_rt
+                                    && (prev >> 31) == (size == 3) && !logic_insn)
+                                {
+                                    logic_insn = prev;
+                                    continue;
+                                }
                                 clobbered = 1;
                             }
                         }
-                        if (ld_rt >= 0 && ld_rt != 31 && !clobbered && rw_addr && !(ea & ((1u << size) - 1))
+                        if (logic_insn && (delta || rt != ld_rt || size < 2)) clobbered = 1;
+                        if (logic_insn && ld_rt >= 0 && ld_rt != 31 && !clobbered && rw_addr
+                            && !(ea & ((1u << size) - 1)) && (uint64_t)fault_addr == ea)
+                        {
+                            const int rm = (logic_insn >> 16) & 0x1f;
+                            const unsigned opc = (logic_insn >> 29) & 3, inv = (logic_insn >> 21) & 1;
+                            uint64_t other = IOS_STORE_SRC(rm) & mask, oldv, newv;
+                            int spins = 0;
+                            if (inv) other = ~other & mask;
+                            for (;;)
+                            {
+                                oldv = size == 3 ? __atomic_load_n( (uint64_t *)rw_addr, __ATOMIC_SEQ_CST )
+                                                 : __atomic_load_n( (uint32_t *)rw_addr, __ATOMIC_SEQ_CST );
+                                newv = (opc == 0 ? (oldv & other) : opc == 1 ? (oldv | other) : (oldv ^ other)) & mask;
+                                if (size == 3)
+                                {
+                                    uint64_t e = oldv;
+                                    if (__atomic_compare_exchange_n( (uint64_t *)rw_addr, &e, newv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST )) break;
+                                }
+                                else
+                                {
+                                    uint32_t e = (uint32_t)oldv;
+                                    if (__atomic_compare_exchange_n( (uint32_t *)rw_addr, &e, (uint32_t)newv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST )) break;
+                                }
+                                if (++spins > 1000000) break;
+                            }
+                            if (spins <= 1000000)
+                            {
+                                state.__x[ld_rt] = newv;   /* what the guest's own op left in Wd */
+                                if (rs != 31) state.__x[rs] = 0;
+                                emulated = 1;
+                            }
+                        }
+                        else if (ld_rt >= 0 && ld_rt != 31 && !clobbered && rw_addr && !(ea & ((1u << size) - 1))
                             && (uint64_t)fault_addr == ea)
                         {
                             const uint64_t expect = (state.__x[ld_rt] - delta) & mask, val = IOS_STORE_SRC(rt) & mask;
@@ -4485,11 +4535,11 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                         {
                             static int excl_n;
-                            if (excl_n < 8)
+                            if (excl_n < 8 || (logic_insn && excl_n < 16))
                                 dprintf(STDERR_FILENO,
-                                    "[excl-store] ml1284 #%d insn=0x%08x size=%u ea=0x%llx load-reg=%d delta=%lld%s %s\n",
+                                    "[excl-store] ml1284 #%d insn=0x%08x size=%u ea=0x%llx load-reg=%d delta=%lld logic=0x%08x%s %s\n",
                                     ++excl_n, insn, 1u << size, (unsigned long long)ea, ld_rt,
-                                    (long long)delta, clobbered ? " (overwritten)" : "",
+                                    (long long)delta, logic_insn, clobbered ? " (overwritten)" : "",
                                     emulated ? (rs != 31 && state.__x[rs] ? "emulated: value changed, retry" : "emulated")
                                              : "REFUSED: no matching LDXR/LDAXR");
                         }
