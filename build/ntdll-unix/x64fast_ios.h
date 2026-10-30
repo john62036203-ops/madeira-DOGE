@@ -320,7 +320,12 @@ static int x64f_npairs;
 static uintptr_t x64f_stub_for( uintptr_t entry )
 {
     int i, n = __atomic_load_n( &x64f_npairs, __ATOMIC_ACQUIRE );
+    uintptr_t pe = 0;
     for (i = 0; i < n; i++) if (x64f_pairs[i].entry == entry) return x64f_pairs[i].stub;
+    /* madeira-doge: a slot can hold the entry's JIT-pool copy address (where the
+     * copy executes) instead of its PE address; the stub is the same */
+    if (ios_jit_pool_image_pc( entry, &pe ) && pe != entry)
+        for (i = 0; i < n; i++) if (x64f_pairs[i].entry == pe) return x64f_pairs[i].stub;
     return 0;
 }
 
@@ -597,6 +602,7 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
     unsigned char blob[0x1000];
     unsigned int lo, hi, used = 0, i, n = 0, want = 0;
     struct { unsigned int entry, stub; } done[32];
+    char placed[512] = "";   /* madeira-doge: names of the placed stubs, for the log */
     unsigned int qpc_v[4] = { 0, 0, 0, 0 }, qpc_shift = 0;
     unsigned int qpcw_at = 0;
     int qpc_abs = 0;
@@ -712,6 +718,8 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
             else dprintf( 2, "[x64-fast] %s: QPC spin throttle left out (NtDelayExecution stub not the known shape or no room)\n", mn );
         }
     qpcw_skip:
+        if (strlen( placed ) + strlen( x64f_targets[i].name ) + 2 < sizeof(placed))
+        { if (placed[0]) strcat( placed, "," ); strcat( placed, x64f_targets[i].name ); }
         n++;
         used += need;
     }
@@ -741,6 +749,7 @@ static void x64f_patch_image( unsigned char *img, size_t size, unsigned char *po
     }
     dprintf( 2, "[x64-fast] %s @%p: %u of %u x64 stubs placed (+0x%x, %u bytes, spin %d); x64 modules' import slots are pointed at them\n",
              mn, img, n, want, lo, used, x64f_spin );
+    dprintf( 2, "[x64-fast] %s @%p: placed %s\n", mn, img, placed );
     if (qpc_v[1])
         dprintf( 2, "[x64-fast] %s: QueryPerformanceCounter in x64 (statics +0x%x/+0x%x/+0x%x/+0x%x %s, tsc >> %u)\n",
                  mn, qpc_v[0], qpc_v[1], qpc_v[2], qpc_v[3], qpc_abs ? "not read: own calibrated state" : "in the image", qpc_shift );
@@ -854,7 +863,22 @@ static void x64f_redirect_thunks( unsigned char *img, size_t size )
             uintptr_t v = *(const uintptr_t *)(img + t), stub;
             if (!v) break;
             if (!(stub = x64f_stub_for( v ))) stub = x64f_stub_through_forwarder( v );
-            if (!stub) continue;
+            if (!stub)
+            {   /* madeira-doge: a slot into a stubbed module that has no stub (shown once each, 16 at most) */
+                static int shown;
+                int mi, nm = __atomic_load_n( &x64f_nmods, __ATOMIC_ACQUIRE );
+                uintptr_t pe = v;
+                ios_jit_pool_image_pc( v, &pe );
+                for (mi = 0; mi < nm; mi++)
+                    if (pe >= x64f_mods[mi].base && pe - x64f_mods[mi].base < x64f_mods[mi].size) break;
+                if (mi < nm && shown < 16)
+                {
+                    shown++;
+                    dprintf( 2, "[x64-fast] x64 image %p slot rva 0x%x holds %#lx (module %#lx +0x%lx): no stub for it\n",
+                             img, t, (unsigned long)v, (unsigned long)x64f_mods[mi].base, (unsigned long)(pe - x64f_mods[mi].base) );
+                }
+                continue;
+            }
             if (x64f_poke_image( img, t, (const unsigned char *)&stub, 8 )) hits++;
             else fails++;
         }
