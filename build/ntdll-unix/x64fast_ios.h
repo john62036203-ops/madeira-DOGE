@@ -826,6 +826,44 @@ static void x64f_redirect_iat( unsigned char *img, size_t size, size_t off, size
                  fails ? " (some image writes FAILED)" : "" );
 }
 
+/* madeira-doge: the import descriptors' FirstThunk arrays, which a protected
+ * executable can keep outside its IAT data directory (FF15's ffxv_s.exe: the
+ * critical-section slots at rva 0x3066448/50 were never in it, so neither the
+ * IAT sync nor a rescan of that directory reached them). Only 8-byte slots that
+ * hold a placed entry change, as in x64f_redirect_iat. */
+static void x64f_redirect_thunks( unsigned char *img, size_t size )
+{
+    unsigned int pe, imp, imp_size, d, hits = 0, fails = 0;
+
+    if (!x64f_mode || !__atomic_load_n( &x64f_npairs, __ATOMIC_ACQUIRE )) return;
+    if (size < 0x200 || img[0] != 'M' || img[1] != 'Z') return;
+    pe = *(const unsigned int *)(img + 0x3c);
+    if (!x64f_in( size, pe, 24 + 112 + 8 * 13 ) || memcmp( img + pe, "PE\0\0", 4 ) ||
+        *(const unsigned short *)(img + pe + 4) != 0x8664 ||
+        *(const unsigned short *)(img + pe + 24) != 0x20b) return;
+    imp = *(const unsigned int *)(img + pe + 24 + 112 + 8 * 1);
+    imp_size = *(const unsigned int *)(img + pe + 24 + 112 + 8 * 1 + 4);
+    if (!imp || !x64f_in( size, imp, 20 )) return;
+    for (d = imp; x64f_in( size, d, 20 ) && (!imp_size || d + 20 <= imp + imp_size); d += 20)
+    {
+        unsigned int name = *(const unsigned int *)(img + d + 12), ft = *(const unsigned int *)(img + d + 16), t;
+        if (!name && !ft) break;
+        if (!ft || (ft & 7)) continue;
+        for (t = ft; x64f_in( size, t, 8 ) && t < ft + 0x10000; t += 8)
+        {
+            uintptr_t v = *(const uintptr_t *)(img + t), stub;
+            if (!v) break;
+            if (!(stub = x64f_stub_for( v ))) stub = x64f_stub_through_forwarder( v );
+            if (!stub) continue;
+            if (x64f_poke_image( img, t, (const unsigned char *)&stub, 8 )) hits++;
+            else fails++;
+        }
+    }
+    if (hits || fails)
+        dprintf( 2, "[x64-fast] x64 image %p: %u import-descriptor slot(s) now call x64 stubs%s\n", img, hits,
+                 fails ? " (some image writes FAILED)" : "" );
+}
+
 /* madeira-doge x64-fast rescan (see x64f_x64img): every x64 image's whole import
  * table again, at most every 3 s. A slot that already holds a stub is left as
  * it is, so this only changes slots the program filled in after the IAT sync.
@@ -854,6 +892,7 @@ void ios_x64f_rescan( void )
             got != 2 || hdr[0] != 'M' || hdr[1] != 'Z')
             continue;
         x64f_redirect_iat( img, x64f_x64img[k].size, 0, x64f_x64img[k].size );
+        x64f_redirect_thunks( img, x64f_x64img[k].size );
     }
     x64f_rescanning = 0;
 }
