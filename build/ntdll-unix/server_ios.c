@@ -1997,6 +1997,16 @@ static void ios_xp_api_report( const char *wall, double wall_s )
                                     if (bc > 8 && ios_ts_read( bc - 8, cb, 8 ))
                                         n += snprintf( line + n, sizeof(line) - n, "[%02x%02x%02x%02x%02x%02x%02x%02x]",
                                                        cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7] );
+                                    if (bc > 8 && cb[2] == 0xff && cb[3] == 0x15)
+                                    {   /* call [rip+disp32]: name what the import slot holds (an x64-fast stub or the entry) */
+                                        int32_t disp; uint64_t slotv = 0; char sv[160];
+                                        memcpy( &disp, cb + 4, 4 );
+                                        if (ios_ts_read( bc + (int64_t)disp, &slotv, 8 ))
+                                        {
+                                            ios_xp_symbol( slotv, sv, sizeof(sv) );
+                                            n += snprintf( line + n, sizeof(line) - n, "{slot %#llx=%s}", (unsigned long long)(bc + (int64_t)disp), sv );
+                                        }
+                                    }
                                 }
                             }
                             for (x = 0; x < m; x++)
