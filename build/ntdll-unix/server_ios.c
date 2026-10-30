@@ -663,7 +663,23 @@ static uintptr_t ios_reply_rw_alias( uintptr_t addr )
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
     size_t size = ios_jit_pool_size_global;
 
-    if (rx && rw && size && addr >= rx && addr - rx < size) return rw + (addr - rx);
+    if (rx && rw && size && addr >= rx && addr - rx < size)
+    {
+        /* madeira-doge: pool-split leaves the main thread's stack band inside
+         * [rx, rx+size), and a child's pthread stack can land there too; such a
+         * page is plain writable memory with no RW alias (the alias is a hole).
+         * FF15 build 573: a reply into a child's stack went to the hole and the
+         * game process died before its first instruction. */
+        mach_vm_address_t q = addr & ~(mach_vm_address_t)0x3fff;
+        mach_vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        if (mach_vm_region( mach_task_self(), &q, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                            &cnt, &obj ) == KERN_SUCCESS && q <= addr && (info.protection & VM_PROT_WRITE))
+            return 0;
+        return rw + (addr - rx);
+    }
     return ios_jit_anon_alias_lookup( addr );
 }
 
