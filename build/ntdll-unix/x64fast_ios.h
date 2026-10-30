@@ -770,6 +770,15 @@ static uintptr_t x64f_stub_through_forwarder( uintptr_t entry )
 /* A pure x64 image (no .hexpthk): point its import slots that hold a placed
  * entry at the stub. Called from the IAT sync with the region whose
  * protection was just restored, before the region is copied to the pool. */
+/* madeira-doge x64-fast rescan: x64 images whose import slots were looked at.
+ * A protected executable can fill its import table itself after the IAT sync
+ * (FF15's ffxv_s.exe: slots 0x143066448/50 held ntdll!RtlEnter/LeaveCritical-
+ * Section, not the stubs, at ~1-3 M calls/s), so ios_x64f_rescan() looks again. */
+#define X64F_MAX_X64IMG 96
+static struct { unsigned char *img; size_t size; } x64f_x64img[X64F_MAX_X64IMG];
+static int x64f_nx64img;
+static int x64f_rescanning;
+
 static void x64f_redirect_iat( unsigned char *img, size_t size, size_t off, size_t len )
 {
     unsigned int pe, iat, iat_size, sec, i, hits = 0, fails = 0;
@@ -791,6 +800,17 @@ static void x64f_redirect_iat( unsigned char *img, size_t size, size_t off, size
     iat = *(const unsigned int *)(img + pe + 24 + 112 + 8 * 12);
     iat_size = *(const unsigned int *)(img + pe + 24 + 112 + 8 * 12 + 4);
     if (!iat || !x64f_in( size, iat, iat_size )) return;
+    if (!x64f_rescanning)
+    {
+        int k, n = __atomic_load_n( &x64f_nx64img, __ATOMIC_ACQUIRE );
+        for (k = 0; k < n; k++) if (x64f_x64img[k].img == img) break;
+        if (k == n && n < X64F_MAX_X64IMG)
+        {
+            x64f_x64img[n].img = img;
+            x64f_x64img[n].size = size;
+            __atomic_store_n( &x64f_nx64img, n + 1, __ATOMIC_RELEASE );
+        }
+    }
     a = iat > off ? iat : off;
     b = (size_t)iat + iat_size < off + len ? (size_t)iat + iat_size : off + len;
     for (a = (a + 7) & ~(size_t)7; a + 8 <= b; a += 8)
@@ -805,3 +825,36 @@ static void x64f_redirect_iat( unsigned char *img, size_t size, size_t off, size
         dprintf( 2, "[x64-fast] x64 image %p: %u import slot(s) now call x64 stubs%s\n", img, hits,
                  fails ? " (some image writes FAILED)" : "" );
 }
+
+/* madeira-doge x64-fast rescan (see x64f_x64img): every x64 image's whole import
+ * table again, at most every 3 s. A slot that already holds a stub is left as
+ * it is, so this only changes slots the program filled in after the IAT sync.
+ * env.MADEIRA_X64F_RESCAN = 0 turns it off. */
+void ios_x64f_rescan( void )
+{
+    static int enabled = -1;
+    static uint64_t last;
+    uint64_t now = mach_absolute_time();
+    int k, n;
+
+    if (enabled < 0) { const char *e = getenv( "MADEIRA_X64F_RESCAN" ); enabled = !(e && e[0] == '0'); }
+    if (!enabled || x64f_mode != 1) return;
+    if (last && now - last < 3ull * 24000000ull) return;   /* 24 MHz timebase on Apple silicon */
+    last = now;
+    n = __atomic_load_n( &x64f_nx64img, __ATOMIC_ACQUIRE );
+    x64f_rescanning = 1;
+    for (k = 0; k < n; k++)
+    {
+        unsigned char hdr[2];
+        mach_vm_size_t got = 0;
+        unsigned char *img = x64f_x64img[k].img;
+        /* an image that was unloaded since: its header no longer reads as MZ */
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)img, 2,
+                                    (mach_vm_address_t)(uintptr_t)hdr, &got ) != KERN_SUCCESS ||
+            got != 2 || hdr[0] != 'M' || hdr[1] != 'Z')
+            continue;
+        x64f_redirect_iat( img, x64f_x64img[k].size, 0, x64f_x64img[k].size );
+    }
+    x64f_rescanning = 0;
+}
+

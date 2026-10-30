@@ -1833,6 +1833,7 @@ static void ios_xp_heap_lock_watch( const char *wall )
         wine_log_write( "[heap-lock]   no thread of this process has the cs on its guest stack top (256 slots); owner lookup only" );
 }
 
+extern void ios_x64f_rescan( void );   /* virtual_ios.c (x64fast_ios.h) */
 static void ios_xp_api_report( const char *wall, double wall_s )
 {
     extern volatile long long ios_xp_set_event, ios_xp_reset_event, ios_xp_pulse_event;
@@ -1847,6 +1848,7 @@ static void ios_xp_api_report( const char *wall, double wall_s )
 
     if (!fex) { fex = calloc( IOS_XP_FEX_WORDS, 8 ); fex_prev = calloc( IOS_XP_FEX_WORDS, 8 ); nt = calloc( 1, sizeof(*nt) ); nt_prev = calloc( 1, sizeof(*nt) ); }
     if (!fex || !fex_prev || !nt || !nt_prev) return;
+    ios_x64f_rescan();   /* madeira-doge: import slots a program filled in after the IAT sync */
     {   /* ml1131c: the fallback moved to another process: its counters start a new series */
         static unsigned seen_rebind;
         if (seen_rebind != ios_xp_rebind) { seen_rebind = ios_xp_rebind; have_fex = have_nt = 0; map_age = 1000; }
