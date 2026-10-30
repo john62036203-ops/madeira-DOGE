@@ -3355,6 +3355,38 @@ static void *ios_mach_exception_thread( void *arg )
          * needs. Same emulation as the UNALIGNED-LSE / UNALIGNED-EXCL CAS cases
          * further down (they stay as the fallback). MADEIRA_ALIGN_FAST=0 turns
          * it off. */
+        /* madeira-doge el0-mrs: a read of an EL1 identification register or of
+         * CurrentEL (MRS op0=3 op1=0 CRn=0, or CurrentEL) traps on iOS; Windows
+         * answers it for user code. Microsoft's own ARM64X d3dcompiler_47.dll
+         * (SDK 10.0.28000) reads CurrentEL while it starts and died here
+         * (FF15, 2026-10-30 14:46 log). It reads as 0 -- EL0, no optional
+         * feature fields -- and the program carries on at the next
+         * instruction. MADEIRA_EL0_MRS=0 turns it off. */
+        if (kr == KERN_SUCCESS && req->exception == EXC_BAD_INSTRUCTION)
+        {
+            static int el0_mrs = -1;
+            uint32_t minsn = 0;
+            uint64_t mpc = __darwin_arm_thread_state64_get_pc( state );
+            if (el0_mrs < 0) { const char *e = getenv( "MADEIRA_EL0_MRS" ); el0_mrs = !(e && e[0] == '0'); }
+            if (el0_mrs && ios_fault_read_insn( mpc, &minsn ) && (minsn & 0xfff80000u) == 0xd5380000u)
+            {
+                uint32_t crn = (minsn >> 12) & 0xf, crm = (minsn >> 8) & 0xf, op2 = (minsn >> 5) & 7, rt = minsn & 0x1f;
+                if (crn == 0 || (crn == 4 && crm == 2 && op2 == 2))
+                {
+                    static int said;
+                    if (rt < 29) state.__x[rt] = 0;
+                    else if (rt == 29) state.__fp = 0;
+                    else if (rt == 30) state.__lr = 0;
+                    __darwin_arm_thread_state64_set_pc_fptr( state, (void *)(uintptr_t)(mpc + 4) );
+                    thread_set_state( thread, ARM_THREAD_STATE64, (thread_state_t)&state, count );
+                    if (said++ < 8)
+                        dprintf( STDERR_FILENO, "[el0-mrs] madeira-doge pc=%#llx insn=%#x (S3_0_C%u_C%u_%u) read as 0\n",
+                                 (unsigned long long)mpc, minsn, crn, crm, op2 );
+                    handled = 1;
+                    goto ios_exc_reply;
+                }
+            }
+        }
         if (kr == KERN_SUCCESS && req->exception == EXC_BAD_ACCESS && req->code_count > 1 &&
             (unsigned long long)req->code[0] == 0x101 /* EXC_ARM_DA_ALIGN */ &&
             ios_align_fast( &state, (uint64_t)req->code[1] ))
