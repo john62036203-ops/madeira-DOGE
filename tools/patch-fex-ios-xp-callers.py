@@ -31,7 +31,8 @@ if 'madeira-doge xp-callers' not in s:
         sys.exit('patch-fex-ios-xp-callers: ring store not found in Module.S')
     s = s.replace(anchor, anchor +
         '  // madeira-doge xp-callers: the x64 return address, same slot, ring at word 4496\n'
-        '  ldr x4, [sp]\n'
+        '  mov x4, sp            // sp is the x64 RSP here (8 mod 16 after a CALL): an SP-based load would SP-alignment-fault\n'
+        '  ldr x4, [x4]\n'
         '  add x17, x16, #8, lsl #12\n'
         '  add x17, x17, #3200\n'
         '  str x4, [x17, x23, lsl #3]\n')
