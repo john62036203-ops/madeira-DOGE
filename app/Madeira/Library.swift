@@ -3383,6 +3383,12 @@ struct LibraryDetail: View {
                         Text("Unreal Engine's worker pools (Background/Foreground Worker, IoDispatcher, AsyncLoading, AudioMixer) run at a lower iOS priority, so the game thread, render thread and RHI thread keep the two performance cores (Dark Souls III's main thread spent 19 % of its time on the efficiency cores before). Turn it off if loading gets slower or the sound crackles.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD FEX ARM64EC transition overlays (opt-in, tools/patch-fex-ios-ec-*.py)
+                    Toggle("Faster calls between game code and Windows code (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_EC_FAST") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_EC_FAST", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_EC_FAST") == "1" {
+                        Text("Shorter FEX code paths each time the x86-64 game calls into or returns from the ARM64 Windows libraries (from BCD; Playport measured a few percent more fps with a similar change). Turn it off if the game crashes or behaves differently.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge pool-spare-guard: per-game, in the game's own file
                     Toggle("Use the memory pool when spare memory allows (experimental)", isOn: Binding(get: { bcd.value("pool-spare-guard") == "1" }, set: { setBCDKey("pool-spare-guard", $0 ? "1" : "") }))
                     if bcd.value("pool-spare-guard") == "1" {

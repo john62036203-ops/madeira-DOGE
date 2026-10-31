@@ -191,8 +191,13 @@ python3 "$R/tools/patch-fex-ios-xp-callers.py" "$R/FEX"
 # without CodeInvalidationMutex, so the access violation it raises leaves no write-owned mutex behind.
 python3 "$R/tools/patch-fex-ios-mono-bp-unlocked-miss.py" "$R/FEX/FEXCore/Source/Interface/Core/Core.cpp" \
     || echo "::warning::patch-fex-ios-mono-bp-unlocked-miss.py did not apply (MADEIRA_MONO_BP_UNLOCKED_MISS has no effect)"
+# BCD ARM64EC transition overlays, opt-in (MADEIRA_FEX_EC_FAST=1, or each MADEIRA_FEX_EC_* =1).
+for ec in ec-ret ec-bitmap-cache ec-exit-lean ec-ret-direct; do
+    python3 "$R/tools/patch-fex-ios-$ec.py" "$R/FEX" \
+        || { echo "::warning::patch-fex-ios-$ec.py did not apply; later EC overlays skipped"; break; }
+done
 build
-git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/ARM64EC/Module.S Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/CPUID.h FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/Source/Interface/Core/CPUBackend.cpp FEXCore/Source/Interface/Core/Core.cpp
+git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/ARM64EC/Module.S Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/CPUID.h FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/Source/Interface/Core/CPUBackend.cpp FEXCore/Source/Interface/Core/Core.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
 git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
 cp "$B/Bin/libarm64ecfex.dll" "$AVX"
