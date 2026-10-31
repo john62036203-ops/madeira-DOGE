@@ -6552,10 +6552,32 @@ static int ios_img_off_is_exec( const void *img, size_t img_size, size_t off )
  * the importer's IAT directory is touched, and only slots whose target is a
  * non-executable section of an ARM64EC/ARM64 module. x64 targets keep PE
  * addresses: FEX runs their code at PE VAs, so their PE copy is the live one. */
+/* madeira-doge: pure x64 images mapped without a pool copy (MADEIRA_X64_IMAGE_NOCOPY,
+ * [x64-image]) are not in ios_jit_mappings, so ml1244/1245 below never saw them
+ * as importers. DRAGON BALL Sparking! ZERO (2026-10-31 02:08 log, build 578):
+ * its exe read MSVCP140's ?cout@std@@3V... export at the PE address, whose
+ * vbtable pointer stayed NULL (msvcp140's DllMain builds cout in the pool copy),
+ * and the CRT static initialiser faulted reading address 4; the only
+ * [x64-data-imp] window logged was steamdrmp.dll's. Playport fixes the same
+ * crash (En Garde!, UE 5.1) in the PE loader (patches/wine-pe/0010); here the
+ * no-copy images are remembered when mapped and bound like the others. */
+#define IOS_X64NC_MAX 128
+static struct { uintptr_t base; size_t size; } ios_x64nc[IOS_X64NC_MAX];
+static int ios_x64nc_n;
+static void ios_x64nc_note( const void *base, size_t size )
+{
+    int i, n = __atomic_load_n( &ios_x64nc_n, __ATOMIC_ACQUIRE );
+    for (i = 0; i < n; i++)
+        if (ios_x64nc[i].base == (uintptr_t)base) { ios_x64nc[i].size = size; return; }
+    if (n >= IOS_X64NC_MAX) return;
+    ios_x64nc[n].base = (uintptr_t)base; ios_x64nc[n].size = size;
+    __atomic_store_n( &ios_x64nc_n, n + 1, __ATOMIC_RELEASE );
+}
 static void ios_x64_iat_bind_live_data( char *base, size_t size )
 {
     static int said, calls;
     uintptr_t rs = (uintptr_t)base, re = rs + size, pe, lo, hi, page = 0;
+    size_t img_size = 0;
     IMAGE_NT_HEADERS64 nt;
     IMAGE_DATA_DIRECTORY dir;
     unsigned int lfanew = 0;
@@ -6568,16 +6590,31 @@ static void ios_x64_iat_bind_live_data( char *base, size_t size )
         uintptr_t b = (uintptr_t)ios_jit_mappings[i].pe_base;
         if (b && rs >= b && re <= b + ios_jit_mappings[i].size) { imp = i; break; }
     }
-    /* ml1245: a pure x64 importer only; an EC module reads its pool-side IAT */
-    if (imp < 0 || ios_jit_mapping_machine( imp ) != 0x8664 || ios_jit_mapping_is_hybrid( imp )) return;
+    if (imp >= 0)
+    {
+        /* ml1245: a pure x64 importer only; an EC module reads its pool-side IAT */
+        if (ios_jit_mapping_machine( imp ) != 0x8664 || ios_jit_mapping_is_hybrid( imp )) return;
+        pe = (uintptr_t)ios_jit_mappings[imp].pe_base;
+        img_size = ios_jit_mappings[imp].size;
+    }
+    else
+    {
+        /* madeira-doge: a no-copy pure x64 image (marked pure x64 when mapped) */
+        int n = __atomic_load_n( &ios_x64nc_n, __ATOMIC_ACQUIRE );
+        for (i = 0; i < n; i++)
+            if (rs >= ios_x64nc[i].base && re <= ios_x64nc[i].base + ios_x64nc[i].size) break;
+        if (i == n) return;
+        pe = ios_x64nc[i].base;
+        img_size = ios_x64nc[i].size;
+    }
 
     /* The importer's headers are read fault-safe too, like its IAT pages below:
      * this runs on every protection change inside an x64 image, and a packer or
      * DRM stub may have made its own header page PAGE_NOACCESS. */
-    pe = (uintptr_t)ios_jit_mappings[imp].pe_base;
     if (!ios_safe_read( pe + offsetof( IMAGE_DOS_HEADER, e_lfanew ), &lfanew, sizeof(lfanew) )
-        || (size_t)lfanew + sizeof(nt) > ios_jit_mappings[imp].size
+        || (size_t)lfanew + sizeof(nt) > img_size
         || !ios_safe_read( pe + lfanew, &nt, sizeof(nt) )) return;
+    if (nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return;
     if (nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
         nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IAT) return;
     dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
@@ -24668,6 +24705,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     {
         static int x64_images;
         view->protect |= VPROT_X64DATA;
+        ios_x64nc_note( ptr, total_size );   /* madeira-doge: its data imports get bound too (ios_x64_iat_bind_live_data) */
         if (x64_images++ < 64)
             dprintf( 2, "[x64-image] %s %p+0x%lx mapped without a pool copy (pure x64: the emulator runs "
                         "it at the PE VA; MADEIRA_X64_IMAGE_NOCOPY)\n",

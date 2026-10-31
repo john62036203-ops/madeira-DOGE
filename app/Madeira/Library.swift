@@ -3377,6 +3377,12 @@ struct LibraryDetail: View {
                         Text("A render pass whose first draw rewrites the whole depth buffer does not read the old one back first. Saves GPU memory bandwidth (Ninja's Dawn). Turn it off if shadows, outlines or parts of the picture flicker or break.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge MADEIRA_THREAD_QOS (upstream 0ebb11c) with an Unreal Engine preset: per-game
+                    Toggle("Keep Unreal Engine worker threads off the performance cores (experimental)", isOn: Binding(get: { !bcd.value("env.MADEIRA_THREAD_QOS").isEmpty }, set: { setBCDKey("env.MADEIRA_THREAD_QOS", $0 ? "Background Worker*=utility;IoDispatcher*=utility;Foreground Worker*=user-initiated;AsyncLoading*=user-initiated;AudioMixer*=user-initiated" : "") }))
+                    if !bcd.value("env.MADEIRA_THREAD_QOS").isEmpty {
+                        Text("Unreal Engine's worker pools (Background/Foreground Worker, IoDispatcher, AsyncLoading, AudioMixer) run at a lower iOS priority, so the game thread, render thread and RHI thread keep the two performance cores (Dark Souls III's main thread spent 19 % of its time on the efficiency cores before). Turn it off if loading gets slower or the sound crackles.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge pool-spare-guard: per-game, in the game's own file
                     Toggle("Use the memory pool when spare memory allows (experimental)", isOn: Binding(get: { bcd.value("pool-spare-guard") == "1" }, set: { setBCDKey("pool-spare-guard", $0 ? "1" : "") }))
                     if bcd.value("pool-spare-guard") == "1" {

@@ -6,7 +6,10 @@
 # fwpuclnt (madeira-doge, from BCD 0.1.591's opt-in): FINAL FANTASY XV's ffxv_s.exe imports
 # it and stops with c0000135 without it; Wine's stub set, shipped for every program.
 # gamingtcui (Forza Horizon 4, api-ms-win-gaming-tcui-l1-1-0) and qwave (Unity games' Discord
-# Social SDK plugin), BCD 0.1.623's opt-ins, also shipped for every program here. Configured the way
+# Social SDK plugin), BCD 0.1.623's opt-ins, also shipped for every program here.
+# dxva2 (madeira-doge; BCD's dxva2 opt-in, upstream #462's farm list, Playport's builtins):
+# DRAGON BALL Sparking! ZERO's exe imports DXVA2CreateDirect3DDeviceManager9 and stops with
+# c0000135 without it (2026-10-31 02:01 log); Fort Solis and Zenless Zone Zero do too. Configured the way
 # upstream's build/wine-pe/build-ntdll.sh configures wine/build-arm64ec;
 # stripped and padded by 64 KB past SizeOfImage like the shipped builtins.
 # comctl32_v6: Common Controls 6 (TaskDialogIndirect, ordinal 345). Without it
@@ -51,7 +54,8 @@ WANT="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcr110 msvcrt20 msvcrt40 msvcir
       winegstreamer msmpeg2vdec wmadmod wmvdecod
       msauddecmft mp3dmod colorcnv resampledmo msvproc mferror
       winevulkan vulkan-1
-      fwpuclnt gamingtcui qwave"
+      fwpuclnt gamingtcui qwave
+      dxva2"
 for n in $(seq 24 42); do WANT="$WANT d3dx9_$n"; done
 
 shipped() { ls "$SHIP" | tr 'A-Z' 'a-z' | grep -qx "$1.dll"; }
