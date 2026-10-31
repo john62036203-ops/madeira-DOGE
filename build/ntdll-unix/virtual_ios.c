@@ -21700,12 +21700,50 @@ static uint64_t ios_pool_system_free( void )
     if (host_statistics64( mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count ) != KERN_SUCCESS) return 0;
     return (uint64_t)vm.free_count * vm_kernel_page_size;
 }
+/* madeira-doge pool-spare-guard (opt-in, per game): the guard above counts only
+ * free pages, which stay under the 1 GB margin for the whole session in a game
+ * near the limit (DRAGON BALL Sparking! ZERO, 2026-10-31 09:48 log: 12 x 512 MB
+ * registered, "0 MB in use, 245 guarded", while the tier file-backed ~1.4 GB).
+ * Playport's donor pool (GPL-3, app/Sources/S1Probe/DonorRounds.swift and
+ * PlayportKit DonorPoolSizing) gates on spare memory instead: free + inactive +
+ * speculative + purgeable pages, floor max(768 MB, 12 % of RAM), and only a
+ * critical pressure event stops it. madeira.cfg / game file pool-spare-guard = 1
+ * selects that rule; MADEIRA_POOL_MARGIN_MB still overrides the floor. */
+static int ios_pool_spare_guard( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        on = madeira_cfg_int( "pool-spare-guard", 0 ) == 1;   /* madeira-doge: 1 = gate the memory pool on spare memory (free + inactive + speculative + purgeable, floor max(768 MB, 12 % of RAM)) and stop it only at critical pressure, as Playport's donor pool does */
+        if (on)
+        {
+            uint64_t memsize = 0; size_t len = sizeof(memsize);
+            uint64_t floor = 768ull << 20;
+            if (!getenv( "MADEIRA_POOL_MARGIN_MB" ) && !sysctlbyname( "hw.memsize", &memsize, &len, NULL, 0 ) &&
+                memsize / 100 * 12 > floor)
+                floor = memsize / 100 * 12;
+            if (!getenv( "MADEIRA_POOL_MARGIN_MB" )) ios_pool_margin = floor;
+            dprintf( 2, "[swap] ml1150 pool: spare guard on (free+inactive+speculative+purgeable >= %llu MB; critical pressure only)\n",
+                     (unsigned long long)(ios_pool_margin >> 20) );
+        }
+    }
+    return on;
+}
+static uint64_t ios_pool_system_spare( void )
+{
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64( mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count ) != KERN_SUCCESS) return 0;
+    return ((uint64_t)vm.free_count + vm.inactive_count + vm.speculative_count + vm.purgeable_count) * vm_kernel_page_size;
+}
 /* A pool offset for len bytes inside one region, or -1 (the guard, or no room). */
 static uint64_t ios_pool_take( size_t len )
 {
     unsigned i, best = ~0u, n = __atomic_load_n( &ios_pool_nreg, __ATOMIC_ACQUIRE );
     if (!n || len > ios_pool_region) return (uint64_t)-1;
-    if (__atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ) || ios_pool_system_free() < ios_pool_margin)
+    if (ios_pool_spare_guard()
+        ? (__atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ) >= 2 || ios_pool_system_spare() < ios_pool_margin + len)
+        : (__atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ) || ios_pool_system_free() < ios_pool_margin))
     {
         ios_pool_guarded++;
         return (uint64_t)-1;

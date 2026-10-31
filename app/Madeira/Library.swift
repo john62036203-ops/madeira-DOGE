@@ -3377,6 +3377,12 @@ struct LibraryDetail: View {
                         Text("A render pass whose first draw rewrites the whole depth buffer does not read the old one back first. Saves GPU memory bandwidth (Ninja's Dawn). Turn it off if shadows, outlines or parts of the picture flicker or break.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge pool-spare-guard: per-game, in the game's own file
+                    Toggle("Use the memory pool when spare memory allows (experimental)", isOn: Binding(get: { bcd.value("pool-spare-guard") == "1" }, set: { setBCDKey("pool-spare-guard", $0 ? "1" : "") }))
+                    if bcd.value("pool-spare-guard") == "1" {
+                        Text("The swap tier takes RAM-speed memory from the memory pool (Settings, mempool-mb) whenever the phone has spare memory, counting memory iOS can reclaim, instead of only when 1 GB is completely free (as Playport's donor memory does). Needs Swap and Memory pool set. Turn it off if the game or other apps get closed more often.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge present-dup-skip / perf-pass-split: per-game, in the game's own file
                     Toggle("Show only new frames (FPS = the game's own)", isOn: Binding(get: { bcd.value("present-dup-skip") == "1" }, set: { setBCDKey("present-dup-skip", $0 ? "1" : "") }))
                     if bcd.value("present-dup-skip") == "1" {
