@@ -10,8 +10,8 @@ jobs:
     steps:
       - name: Download and diff NutsEmu builds
         env:
-          OLD: "1596"
-          NEW: "1650"
+          OLD: "1650"
+          NEW: "1748"
         run: |
           set -e
           B=https://nutsdeveloping.com/source/downloads
@@ -45,5 +45,5 @@ jobs:
           git add -A && git commit -qm "NutsEmu $OLD vs $NEW diff"
           git push -f https://x-access-token:${{ github.token }}@github.com/${{ github.repository }} nuts-diff-out 2>&1 | tail -5 | while read l; do echo "::notice::$l"; done
         env:
-          OLD: "1596"
-          NEW: "1650"
+          OLD: "1650"
+          NEW: "1748"
