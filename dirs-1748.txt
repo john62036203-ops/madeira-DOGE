@@ -1,0 +1,11 @@
+.
+./_build
+./_build/nutsemu-lgpl-build-1748
+./_build/nutsemu-lgpl-build-1748/platform
+./wine-11.18-nutsemu-1748
+./wine-11.18-nutsemu-1748/patches
+./wine-11.18-nutsemu-1748/patches/wine
+./wine-11.18-nutsemu-1748/platform
+./wine-11.18-nutsemu-1748/platform/ios-compat
+./wine-11.18-nutsemu-1748/third_party
+./wine-11.18-nutsemu-1748/third_party/wine
