@@ -541,6 +541,12 @@ jobs:
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 
+      # NutsEmu 1748 patches 0161/0162 (LGPL), opt-in per game: MADEIRA_YIELD_KEEP_PRIO=1
+      # (yield keeps the thread priority), MADEIRA_VOL_QUERY_CACHE=1 (volume queries cached).
+      # After every other sync.c / file.c patch script.
+      - name: Patch wine with NutsEmu's yield and volume-query changes (opt-in)
+        run: python3 tools/patch-wine-nuts-io.py wine/dlls/ntdll/unix/sync.c wine/dlls/ntdll/unix/file.c
+
       # Opt-in (madeira.cfg avail-phys = 1): GlobalMemoryStatusEx reports what is
       # left before the app's own memory limit (ios_avail_phys in virtual_ios.c).
       - name: Patch wine with avail-phys

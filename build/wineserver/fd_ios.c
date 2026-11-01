@@ -3066,6 +3066,88 @@ void set_fd_user( struct fd *fd, const struct fd_ops *user_ops, struct object *u
     fd->user   = user;
 }
 
+/* madeira-doge srv-realpath (NutsEmu build 1748, Wine patch 0160, LGPL): realpath() of an
+ * opened file with its directory's real path cached. Apple's realpath asks the file system
+ * for each component's name (getattrlist), a dozen calls for a game file deep in a Steam
+ * library, on every open: NutsEmu measured ~60% of the server's time there while Farming
+ * Simulator 25 streamed its files. A cached directory is used while stat() still finds the
+ * same one at both its asked and its real path; a symbolic link, or anything that is not a
+ * plain "<directory>/<name>", goes to realpath() as before. Opt-in per game:
+ * MADEIRA_SRV_REALPATH_CACHE=1 (read on every open, so a game's line applies even when the
+ * server was started earlier for Steam). */
+#define SRV_REALPATH_CACHE 512
+static struct srv_realpath_dir
+{
+    char  *dir;       /* the path as asked, up to its last '/' */
+    char  *resolved;  /* realpath() of it */
+    dev_t  dev;
+    ino_t  ino;
+} srv_realpath_dirs[SRV_REALPATH_CACHE];
+static unsigned long srv_realpath_hits, srv_realpath_misses;
+static os_unfair_lock srv_realpath_lock = OS_UNFAIR_LOCK_INIT;   /* srv-direct runs some requests on other threads */
+
+static unsigned int srv_realpath_hash( const char *str, size_t len )
+{
+    unsigned int hash = 2166136261u;
+    while (len--) hash = (hash ^ (unsigned char)*str++) * 16777619u;
+    return hash % SRV_REALPATH_CACHE;
+}
+
+static char *srv_cached_realpath( const char *path )
+{
+    const char *e = getenv( "MADEIRA_SRV_REALPATH_CACHE" );
+    const char *slash, *base;
+    struct srv_realpath_dir *entry;
+    struct stat st;
+    size_t dir_len;
+    char *dir, *ret;
+    static int said;
+
+    if (!e || *e != '1') return realpath( path, NULL );
+    if (!said) { said = 1; fprintf( stderr, "[nuts-io] server: opened files' real paths from a directory cache (MADEIRA_SRV_REALPATH_CACHE=1)\n" ); }
+    slash = strrchr( path, '/' );
+    base = slash ? slash + 1 : NULL;
+    if (!slash || slash == path || path[0] != '/' || !*base || !strcmp( base, "." ) || !strcmp( base, ".." ))
+        return realpath( path, NULL );
+    if (lstat( path, &st ) || S_ISLNK( st.st_mode )) return realpath( path, NULL );
+
+    dir_len = slash - path;
+    os_unfair_lock_lock( &srv_realpath_lock );
+    entry = &srv_realpath_dirs[srv_realpath_hash( path, dir_len )];
+    if (!entry->dir || strlen( entry->dir ) != dir_len || memcmp( entry->dir, path, dir_len ) ||
+        stat( entry->resolved, &st ) || st.st_dev != entry->dev || st.st_ino != entry->ino ||
+        stat( entry->dir, &st ) || st.st_dev != entry->dev || st.st_ino != entry->ino)
+    {
+        if (!(dir = malloc( dir_len + 1 ))) { os_unfair_lock_unlock( &srv_realpath_lock ); return realpath( path, NULL ); }
+        memcpy( dir, path, dir_len );
+        dir[dir_len] = 0;
+        if (!(ret = realpath( dir, NULL )) || stat( ret, &st ))
+        {
+            os_unfair_lock_unlock( &srv_realpath_lock );
+            free( dir );
+            free( ret );
+            return realpath( path, NULL );
+        }
+        free( entry->dir );
+        free( entry->resolved );
+        entry->dir = dir;
+        entry->resolved = ret;
+        entry->dev = st.st_dev;
+        entry->ino = st.st_ino;
+        srv_realpath_misses++;
+    }
+    else if (!(++srv_realpath_hits & 0xffff))
+        fprintf( stderr, "[nuts-io] server realpath cache: %lu hits, %lu directory lookups\n", srv_realpath_hits, srv_realpath_misses );
+
+    dir_len = strlen( entry->resolved );
+    if (!(ret = malloc( dir_len + strlen( base ) + 2 ))) { os_unfair_lock_unlock( &srv_realpath_lock ); return NULL; }
+    memcpy( ret, entry->resolved, dir_len );
+    ret[dir_len] = '/';
+    strcpy( ret + dir_len + 1, base );
+    os_unfair_lock_unlock( &srv_realpath_lock );
+    return ret;
+}
+
 char *dup_fd_name( struct fd *root, const char *name )
 {
     char *ret;
@@ -3292,7 +3374,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
 
         if ((path = dup_fd_name( root, name )))
         {
-            fd->unix_name = realpath( path, NULL );
+            fd->unix_name = srv_cached_realpath( path );   /* madeira-doge srv-realpath */
             free( path );
         }
 

@@ -3389,6 +3389,17 @@ struct LibraryDetail: View {
                         Text("Shorter FEX code paths each time the x86-64 game calls into or returns from the ARM64 Windows libraries (from BCD; Playport measured a few percent more fps with a similar change). Turn it off if the game crashes or behaves differently.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge NutsEmu 1748 patches (LGPL): per-game, in the game's own file
+                    Toggle("Threads keep their priority when they yield (NutsEmu, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_YIELD_KEEP_PRIO") == "1" }, set: { setBCDKey("env.MADEIRA_YIELD_KEEP_PRIO", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_YIELD_KEEP_PRIO") == "1" {
+                        Text("A game thread that yields the CPU (Sleep(0), SwitchToThread) is not pushed to the lowest priority, so a main thread waiting for its workers is not stuck behind every busy thread (NutsEmu measured this on Elden Ring). Turn it off if the game gets slower or hotter.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Faster file opening and disk queries (NutsEmu, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_SRV_REALPATH_CACHE") == "1" }, set: { setBCDKey("env.MADEIRA_SRV_REALPATH_CACHE", $0 ? "1" : ""); setBCDKey("env.MADEIRA_VOL_QUERY_CACHE", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_SRV_REALPATH_CACHE") == "1" {
+                        Text("Caches the real folder path of opened files and the drive answers of disk queries for a few seconds, instead of asking the file system on every open (NutsEmu measured this on games that stream many files). May shorten loading. Turn it off if the game cannot find or save files.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge swap-low-room-mb: per-game, in the game's own file
                     Toggle("Move small allocations to disk when memory runs short (experimental)", isOn: Binding(get: { !bcd.value("swap-low-room-mb").isEmpty }, set: { setBCDKey("swap-low-room-mb", $0 ? "512" : "") }))
                     if !bcd.value("swap-low-room-mb").isEmpty {
