@@ -3389,6 +3389,12 @@ struct LibraryDetail: View {
                         Text("Shorter FEX code paths each time the x86-64 game calls into or returns from the ARM64 Windows libraries (from BCD; Playport measured a few percent more fps with a similar change). Turn it off if the game crashes or behaves differently.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge swap-low-room-mb: per-game, in the game's own file
+                    Toggle("Move small allocations to disk when memory runs short (experimental)", isOn: Binding(get: { !bcd.value("swap-low-room-mb").isEmpty }, set: { setBCDKey("swap-low-room-mb", $0 ? "512" : "") }))
+                    if !bcd.value("swap-low-room-mb").isEmpty {
+                        Text("While the game is within 512 MB of its memory limit, right after a sudden jump in its memory use (a loading screen) or when the phone is critically low on memory, small allocations are file-backed as well, so a load burst is less likely to get the game closed. Needs Swap set. Loading may be a little slower while it is active.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge pool-spare-guard: per-game, in the game's own file
                     Toggle("Use the memory pool when spare memory allows (experimental)", isOn: Binding(get: { bcd.value("pool-spare-guard") == "1" }, set: { setBCDKey("pool-spare-guard", $0 ? "1" : "") }))
                     if bcd.value("pool-spare-guard") == "1" {

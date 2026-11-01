@@ -21854,6 +21854,78 @@ static uint64_t ios_swap_now_ns( void )
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* madeira-doge swap-low-room-mb (opt-in, madeira.cfg / Game details): the coverage
+ * floor drops to swap-low-room-min-kb (default 256 KB), so the small reservations
+ * and commits of a load burst are file-backed too, while
+ *  - the process is within N MB of its footprint limit (task_info
+ *    limit_bytes_remaining; back up above N + 128 MB), or
+ *  - its footprint grew by swap-low-room-burst-mb (default 256) within the last
+ *    second (held 10 s after the last such burst), or
+ *  - the device reports critical memory pressure.
+ * Sampled at most every 100 ms. Sparking Zero (2026-10-31/11-01 logs) died at scene
+ * changes and at startup with a mod: band:guest +809 MB anonymous in seconds, mostly
+ * commits under the 4 MB broad floor, while battle sits ~780 MB under the limit. A
+ * permanently low floor costs fps (swap-min-kb 256: the UE page allocator spent
+ * 9-23 % of the game thread in file faults), hence only during bursts / short room. */
+static size_t ios_swap_min_eff( void )
+{
+    static int cfg = -1, low;
+    static size_t low_min;
+    static uint64_t low_room, burst, last_ns, hold_until, ring[10];
+    static unsigned said, flips, ri;
+    if (cfg < 0)
+    {
+        long long mb = madeira_cfg_int( "swap-low-room-mb", 0 ), kb = madeira_cfg_int( "swap-low-room-min-kb", 256 );
+        long long bmb = madeira_cfg_int( "swap-low-room-burst-mb", 256 );
+        if (kb < 64) kb = 64;
+        low_room = mb > 0 ? (uint64_t)mb << 20 : 0;
+        low_min = (size_t)kb << 10;
+        burst = bmb > 0 ? (uint64_t)bmb << 20 : 0;
+        cfg = 1;
+        if (low_room)
+            dprintf( 2, "[swap] madeira-doge low-room floor on: within %llu MB of the limit, after a %llu MB/s burst or at critical pressure the floor is %zu KB instead of %zu KB\n",
+                     (unsigned long long)(low_room >> 20), (unsigned long long)(burst >> 20), low_min >> 10, ios_swap_min >> 10 );
+    }
+    if (!low_room || low_min >= ios_swap_min) return ios_swap_min;
+#ifdef __APPLE__
+    {
+        uint64_t now = ios_swap_now_ns();
+        if (now - last_ns > 100000000ull)
+        {
+            task_vm_info_data_t vmi;
+            mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+            int was = low, why = 0;
+            last_ns = now;
+            vmi.limit_bytes_remaining = 0; vmi.phys_footprint = 0;
+            if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) == KERN_SUCCESS &&
+                cnt >= TASK_VM_INFO_REV4_COUNT)
+            {
+                uint64_t left = vmi.limit_bytes_remaining, fp = vmi.phys_footprint, old = ring[ri % 10];
+                ring[ri % 10] = fp; ri++;
+                if (burst && ri > 10 && old && fp > old + burst) { hold_until = now + 10000000000ull; why = 2; }
+                if (left && left < low_room) why = 1;
+                else if (left && left > low_room + (128ull << 20) && now >= hold_until) low = 0;
+                if (why || now < hold_until) low = 1;
+            }
+            if (__atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ) >= 2) low = 1;
+            if (low != was)
+            {
+                flips++;
+                if (said < 40 || !(flips % 100))
+                {
+                    said++;
+                    dprintf( 2, "[swap] madeira-doge low-room floor %s (%llu MB left, footprint %llu MB, %s, pressure %d, change %u)\n",
+                             low ? "DOWN" : "back up", (unsigned long long)(vmi.limit_bytes_remaining >> 20),
+                             (unsigned long long)(vmi.phys_footprint >> 20), why == 2 ? "burst" : why == 1 ? "room" : "-",
+                             __atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ), flips );
+                }
+            }
+        }
+    }
+#endif
+    return low ? low_min : ios_swap_min;
+}
+
 /* ml1291: the swap file's F_PUNCHHOLE off the virtual lock.
  *
  * Ori and the Will of the Wisps, 2026-10-07: two freezes of 18 s and 13 s with
@@ -22128,7 +22200,7 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
         if (!(ios_swap_smallmap_on() && b >= 0x100000000ULL && ios_swap_proc_is_game() &&
               (b + size <= 0xc00000000ULL || (high && size != (16u << 20))))) return IOS_SW_BAND;
     }
-    if (size < ios_swap_min) return IOS_SW_SMALL;
+    if (size < ios_swap_min_eff()) return IOS_SW_SMALL;
     if (ios_swap_churny( size )) { ios_swap_churn_skips++; return IOS_SW_CHURN; }   /* ml1258 */
     return IOS_SW_BACKED;
 }
@@ -22496,7 +22568,7 @@ static int ios_swap_whole_resv( struct file_view *view, unsigned int vprot )
     if (!is_view_valloc( view ) || (view->protect & (SEC_FILE | SEC_IMAGE | SEC_RESERVE | VPROT_SYSTEM | VPROT_WRITEWATCH |
                                                      VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER | VPROT_ARM64EC)))
     { ios_swap_skip_bytes[IOS_SWK_VIEW] += view->size; return 0; }
-    if (view->size < ios_swap_min) { ios_swap_skip_bytes[IOS_SWK_SMALL] += view->size; return 0; }
+    if (view->size < ios_swap_min_eff()) { ios_swap_skip_bytes[IOS_SWK_SMALL] += view->size; return 0; }
     if (view->size > ios_swap_resv_max) { ios_swap_skip_bytes[IOS_SWK_BIG] += view->size; return 0; }
     if (ios_swap_is_fexjit( b, view->size ) || b + view->size > 0x7c00000000ULL)
     { ios_swap_skip_bytes[IOS_SWK_FEXJIT] += view->size; return 0; }
