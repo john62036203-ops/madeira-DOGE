@@ -24,6 +24,13 @@ to this tree (willfaust/wine madeira-lgpl, Wine 11.4 plus the iOS changes):
             once by the loader where the i386 heap policy is read (counting always
             runs; without the switch the old limit of 32 kept groups stays).
 
+  exception.c  (madeira-doge diagnostic, no behaviour change) [veh-add] logs every
+            vectored handler a process registers (first flag, handler, caller), and
+            the existing [veh] call/return lines also cover STATUS_ILLEGAL_INSTRUCTION
+            (Age of Empires IV's Aegis protection decodes its fake instructions from
+            an exception handler; 2026-11-01 logs end on an unhandled c000001d), with
+            a [veh] line when no vectored handler is registered at all.
+
 The shipped ntdll.dll is untouched. tools/build-wine-extra-dlls.sh first checks
 that this tree, unpatched, rebuilds the shipped ntdll.dll apart from its time
 stamps (--same-as), then builds the patched one and ships it as ntdll-proton.dll;
@@ -141,11 +148,40 @@ def patch(wine):
          "        RtlInterlockedPushEntrySList( &bin->groups, &group->entry );\n        return STATUS_SUCCESS;\n    }\n\n"
          "    InterlockedIncrement( &bin->group_freed );\n    return group_release( heap, flags, bin, group );", 1),
     ])
+    edit(wine + "/dlls/ntdll/exception.c", [
+        ("        if (first) InsertHeadList( handler_list, &handler->entry );\n"
+         "        else InsertTailList( handler_list, &handler->entry );\n"
+         "        RtlLeaveCriticalSection( &vectored_handlers_section );\n    }\n",
+         "        if (first) InsertHeadList( handler_list, &handler->entry );\n"
+         "        else InsertTailList( handler_list, &handler->entry );\n"
+         "        RtlLeaveCriticalSection( &vectored_handlers_section );\n    }\n"
+         "    {   /* madeira-doge: [veh-add] */\n"
+         "        static LONG vadd_n;\n"
+         "        if (vadd_n < 40 && InterlockedIncrement( &vadd_n ) <= 40)\n"
+         "            ERR( \"[veh-add] %s first=%lu func=%p entry=%p\\n\",\n"
+         "                 handler_list == &vectored_exception_handlers ? \"exception\" : \"continue\",\n"
+         "                 (unsigned long)first, func, handler );\n"
+         "    }\n", 1),
+        ("    except_ptrs.ExceptionRecord = rec;\n    except_ptrs.ContextRecord = context;\n\n"
+         "    RtlEnterCriticalSection( &vectored_handlers_section );\n",
+         "    except_ptrs.ExceptionRecord = rec;\n    except_ptrs.ContextRecord = context;\n\n"
+         "    RtlEnterCriticalSection( &vectored_handlers_section );\n"
+         "    if (rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION &&\n"
+         "        vectored_exception_handlers.Flink == &vectored_exception_handlers)\n"
+         "        ERR( \"[veh] no vectored exception handler registered for code %lx at %p\\n\",\n"
+         "             (unsigned long)rec->ExceptionCode, rec->ExceptionAddress );  /* madeira-doge */\n", 1),
+        ("        if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)\n        {\n            static LONG veh_n;",
+         "        if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION || rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)\n"
+         "        {\n            static LONG veh_n;", 1),
+        ("        if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)\n        {\n            static LONG vehr_n;",
+         "        if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION || rec->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)\n"
+         "        {\n            static LONG vehr_n;", 1),
+    ])
     edit(wine + "/dlls/ntdll/ntdll_misc.h", [
         ("extern void heap_init_madeira_policy(void);\n",
          "extern void heap_init_madeira_policy(void);\nextern void heap_init_proton_policy(void);\n", 1),
     ])
-    print("patched dlls/ntdll/loader.c (TLS layout), heap.c (LFH groups, MADEIRA_HEAP_LFH_KEEP) and ntdll_misc.h")
+    print("patched dlls/ntdll/loader.c (TLS layout), heap.c (LFH groups, MADEIRA_HEAP_LFH_KEEP), exception.c ([veh-add], [veh] for c000001d) and ntdll_misc.h")
 
 
 def stamp_offsets(data, path):
