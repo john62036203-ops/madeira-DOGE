@@ -396,6 +396,12 @@ jobs:
       - name: Patch wine with the guest file trace
         run: python3 tools/patch-wine-file-trace.py wine/dlls/ntdll/unix/file.c
 
+      # madeira-doge: \??\GLOBALROOT\??\C:\... opens as \??\C:\... (Age of
+      # Empires IV's Aegis reads its own exe through that name; Wine answered
+      # c000003a and the protection declined every fake instruction).
+      - name: Patch wine for \??\GLOBALROOT file names
+        run: python3 tools/patch-wine-globalroot.py wine/dlls/ntdll/unix/file.c
+
       # MHR asked for 12on7\d3d12.dll (Direct3D 12 for Windows 7); the loader's
       # fallback handed it the system d3d12.dll and the game took the wrong path.
       - name: Patch wine so a missing 12on7 d3d12 stays missing
