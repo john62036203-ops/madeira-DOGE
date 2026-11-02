@@ -36135,11 +36135,25 @@ void virtual_fill_image_information( const struct pe_image_info *pe_info, SECTIO
  * Report such an image as built for another machine, so open_dll_file ->
  * is_valid_binary rejects it and the search goes on to system32 / the sysx64
  * mixed-arch fallback. MADEIRA_APP_UCRT=1 turns this off. */
+static int ios_app_msvcrt_allowed(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        /* Default off. 1: an x64 program's own msvcrt.dll (in its folder) may load, as before; by default
+         * it is refused and the system msvcrt is used, as on Windows where msvcrt is a KnownDLL. */
+        const char *e = getenv( "MADEIRA_APP_MSVCRT" );
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
 static BOOL ios_ucrt_shadow_refused( HANDLE handle, const struct pe_image_info *pi )
 {
     extern int ios_is_arm64ec_cur(void);
     static const char ucrt[] = "ucrtbase.dll";
-    static int opt = -1, logged;
+    static const char msvcrt[] = "msvcrt.dll";
+    static int opt = -1, logged, logged_msvcrt;
     struct pe_image_info *info = NULL;
     unsigned int sec_flags;
     mem_size_t full_size;
@@ -36180,6 +36194,28 @@ static BOOL ios_ucrt_shadow_refused( HANDLE handle, const struct pe_image_info *
                             "x64 (ARM64EC) process -- reported as not loadable so the loader keeps "
                             "searching and binds the system UCRT, as Windows 10+ does "
                             "(MADEIRA_APP_UCRT=1 reverts)\n", debugstr_us(&nt_name) );
+        }
+    }
+    /* madeira-doge [msvcrt-shadow]: msvcrt.dll is a KnownDLL on Windows, so a copy in
+     * the program's folder is never loaded. Age of Empires IV ships one; once the
+     * game loaded it, advapi32's write_credential_blob called its memcpy and jumped
+     * to advapi32's pool base (2026-11-02 11:44 log, c000001d). Same refusal as the
+     * app-local UCRT above. */
+    if (!ret && name && len == sizeof(msvcrt) - 1 && !ios_app_msvcrt_allowed())
+    {
+        for (i = 0; i < len; i++)
+        {
+            WCHAR c = name[i];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (WCHAR)msvcrt[i]) break;
+        }
+        if (i == len)
+        {
+            ret = TRUE;
+            if (logged_msvcrt++ < 8)
+                dprintf( 2, "[msvcrt-shadow] %s: plain x64 msvcrt.dll in a program folder -- not loadable, "
+                            "the system msvcrt is bound as on Windows (a KnownDLL; MADEIRA_APP_MSVCRT=1 reverts)\n",
+                         debugstr_us(&nt_name) );
         }
     }
     free( info );
