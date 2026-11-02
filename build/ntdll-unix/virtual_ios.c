@@ -17266,6 +17266,44 @@ static int ios_guest_rwx_code_enabled(void)
     return cached;
 }
 
+/* madeira-doge: anonymous guest code pages stay writable on the host.
+ *
+ * Age of Empires IV's protection (Aegis) writes its decoded instructions into a
+ * 16 MB PAGE_EXECUTE_READWRITE region from its exception handler, several threads
+ * at once, and flips 4 KB pages of it between PAGE_EXECUTE_READWRITE and
+ * PAGE_EXECUTE_READ as it goes. A host page here is 16 KB, so one thread's
+ * PAGE_EXECUTE_READ makes the whole host page read-only while another thread's
+ * handler is still storing into it: the store faults inside the handler, the
+ * fake instruction is redelivered and the process ends after 2000 identical
+ * redeliveries (2026-11-02 08:32 log, build 589: [guest-rwx] r-x -> r--, then
+ * [bus-data-av] NON-IMAGE writes at 0x149e03020.., rip in the handler).
+ *
+ * With this switch EXEC-carrying protections on qualifying anonymous guest memory
+ * keep host write. Only honoured with FEX_SMCCHECKS=full, where FEX validates code
+ * bytes before running a block and does not rely on write faults to notice
+ * self-modifying code; without it the switch is ignored (said once in the log).
+ * Opt-in per game (env.MADEIRA_GUEST_RX_WRITABLE = 1). */
+static int ios_guest_rx_writable_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        /* Default off. 1: with env.FEX_SMCCHECKS = full, a 64-bit guest's anonymous code memory stays
+         * writable to the host when the guest makes it PAGE_EXECUTE_READ (Age of Empires IV's Aegis
+         * protection writes into such pages from several threads). Set it in the game's own file. */
+        const char *s = getenv( "MADEIRA_GUEST_RX_WRITABLE" );
+        const char *smc = getenv( "FEX_SMCCHECKS" );
+        int want = (s && *s == '1') ? 1 : 0;
+        int full = (smc && !strcasecmp( smc, "full" )) ? 1 : 0;
+        cached = want && full;
+        if (want)
+            dprintf( 2, "[guest-rx-writable] MADEIRA_GUEST_RX_WRITABLE=1 %s\n",
+                     full ? "-> anonymous guest code pages keep host write (FEX_SMCCHECKS=full)"
+                          : "IGNORED: needs env.FEX_SMCCHECKS = full" );
+    }
+    return cached;
+}
+
 /* The range is host-page rounded (16 KB) and can run past the end of a guest
  * allocation (0x41000 -> 0x44000), so every view it touches must qualify. */
 static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
@@ -17522,6 +17560,14 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                      (unix_prot & PROT_WRITE) ? 'w' : '-' );
         unix_prot &= ~PROT_EXEC;
         if (!unix_prot) unix_prot = PROT_READ;
+        if (ios_guest_rx_writable_enabled() && !(unix_prot & PROT_WRITE))
+        {
+            static unsigned long grw_n;
+            if (++grw_n <= 24 && !ios_in_mach_exc)
+                dprintf( 2, "[guest-rx-writable] #%lu %p+0x%lx keeps host write\n",
+                         grw_n, base, (unsigned long)size );
+            unix_prot |= PROT_READ | PROT_WRITE;
+        }
     }
 
     /* madeira-bcd [x64-image]: see ios_x64_image_is_host_data. Same contract as
