@@ -185,6 +185,8 @@ python3 "$R/tools/patch-fex-ios-launcher-smc.py" "$R/FEX/Source/Windows/ARM64EC/
 python3 "$R/tools/patch-fex-ios-native-thread.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-early-images.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-code-max.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUBackend.cpp"
+# madeira-doge: a zeroed Pointers.ExitFunctionLink is logged ([exitlink-null]) and refilled instead of branching to 0 (Age of Empires IV).
+python3 "$R/tools/patch-fex-ios-exitlink-null.py" "$R/FEX"
 # madeira-doge: x64 caller beside each sampled x64->EC target ([xp-api-callers]).
 python3 "$R/tools/patch-fex-ios-xp-callers.py" "$R/FEX"
 # BCD 0.1.623: opt-in (MADEIRA_MONO_BP_UNLOCKED_MISS=1): MonoBackpatcherWrite stores an alias-table miss
