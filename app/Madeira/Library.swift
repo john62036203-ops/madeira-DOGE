@@ -3400,6 +3400,12 @@ struct LibraryDetail: View {
                         Text("Caches the real folder path of opened files and the drive answers of disk queries for a few seconds, instead of asking the file system on every open (NutsEmu measured this on games that stream many files). May shorten loading. Turn it off if the game cannot find or save files.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge exe-window-mb: per-game, in the game's own file (StikJITHelper)
+                    Toggle("Smaller executable window: 160 MB (more JIT pool, experimental)", isOn: Binding(get: { bcd.value("exe-window-mb") == "160" }, set: { setBCDKey("exe-window-mb", $0 ? "160" : "") }))
+                    if bcd.value("exe-window-mb") == "160" {
+                        Text("With \"Room for a large game executable\" on (Settings), Madeira keeps 576 MB at 0x140000000 for the game's main executable. A game whose executable is under 160 MB (Sparking Zero: 150 MB) does not need most of it; this gives the rest to the JIT pool before it is placed, so the translated-code cache is larger and has to be rebuilt less often (fewer ~1 s stalls). Do not use it for a game whose main executable is bigger than 160 MB.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge swap-low-room-mb: per-game, in the game's own file
                     Toggle("Move small allocations to disk when memory runs short (experimental)", isOn: Binding(get: { !bcd.value("swap-low-room-mb").isEmpty }, set: { setBCDKey("swap-low-room-mb", $0 ? "512" : "") }))
                     if !bcd.value("swap-low-room-mb").isEmpty {

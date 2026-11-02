@@ -359,7 +359,7 @@ enum StikJITHelper {
         // of >=64MB that fits, and reads the size from WINE_IOS_EXE_WINDOW.
         // madeira-doge: or the larger window JITAllocator.c held at image load
         // (Documents/madeira-exe-window-mb, for a big non-relocatable game exe).
-        let exeWinSize: vm_address_t = madeira_early_window_base == 0x140000000 && madeira_early_window_size > 0x8000000
+        var exeWinSize: vm_address_t = madeira_early_window_base == 0x140000000 && madeira_early_window_size > 0x8000000
             ? vm_address_t(madeira_early_window_size) : 0x8000000           // 128MB
         func overlapsExeWindow(_ base: vm_address_t, _ len: vm_address_t) -> Bool {
             return base < exeWinBase + exeWinSize && base + len > exeWinBase
@@ -369,6 +369,28 @@ enum StikJITHelper {
         if !skipWindow && madeira_early_window_base == UInt(exeWinBase) && madeira_early_window_size == UInt(exeWinSize) {
             // ml1040: already held since image load (JITAllocator.c constructor).
             windowHeld = true
+            // madeira-doge: exe-window-mb = N in a game's file (or madeira.cfg) gives the
+            // part of the image-load window above N MB back before the pool is placed.
+            // The 576 MB window ("Room for a large game executable", for re9.exe) took the
+            // band the JIT pool needs: Sparking Zero's 150 MB executable left ~420 MB of it
+            // unused and the pool came out at 352-416 MB with 385-525 code-cache rebuilds
+            // a session (2026-11-02 20:47/20:54); with a smaller window the pool was 512 MB.
+            // Only shrinks, never below 128 MB, 16 MB steps; the window is released to the
+            // first fixed map that fits (ntdll reads WINE_IOS_EXE_WINDOW below).
+            if let raw = MadeiraConfig.gameValue("exe-window-mb") ?? MadeiraConfig.get("exe-window-mb"),
+               let mb = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)), mb >= 128 {
+                let want = vm_address_t((mb + 15) / 16 * 16) << 20
+                if want < exeWinSize {
+                    let kr = vm_deallocate(mach_task_self_, exeWinBase + want, vm_size_t(exeWinSize - want))
+                    if kr == KERN_SUCCESS {
+                        LogStore.shared.log("[exe-window] madeira-doge: exe-window-mb = \(mb): window cut from \(exeWinSize >> 20)MB to \(want >> 20)MB; [0x\(String(Int(exeWinBase + want), radix: 16)),+\((exeWinSize - want) >> 20)MB) is free for the JIT pool", level: .success)
+                        exeWinSize = want
+                        madeira_early_window_size = UInt(want)
+                    } else {
+                        LogStore.shared.log("[exe-window] madeira-doge: exe-window-mb = \(mb): could not release the top of the window (kr=\(kr)); keeping \(exeWinSize >> 20)MB", level: .error)
+                    }
+                }
+            }
             setenv("WINE_IOS_EXE_WINDOW", String(format: "%lx:%lx", Int(exeWinBase), Int(exeWinSize)), 1)
             LogStore.shared.log("ml1040: executable window [0x140000000,+\(exeWinSize >> 20)MB) held since image load", level: .success)
             // madeira-doge: P3R (363MB exe, no relocations) died with c0000018 while the
