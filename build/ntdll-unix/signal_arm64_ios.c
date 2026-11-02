@@ -10642,6 +10642,16 @@ dispatch:
         static struct { uint64_t thread, key; uint32_t n; } redeliv[16];
         static volatile int ios_redeliv_terminating;
         uint64_t rkey = ((uint64_t)thread << 48) ^ pc ^ ((uint64_t)fault_addr << 1);
+        /* madeira-doge: every invalid x86 instruction FEX meets exits through ONE host stub
+         * (same pc, addr = the stub's own HLT encoding), so for c000001d the host key cannot
+         * tell a guest that keeps making progress from a storm. FEX leaves the guest RIP in
+         * x6 there ([ill_handler] "guest==x6"); fold it in. Age of Empires IV's Aegis
+         * protection runs 225 fake instructions through its exception handler on every pass
+         * of a loop: one thread cycling 0x14407f93a..0x14407f948 reached 2000 "identical"
+         * deliveries and was killed while the game was loading (2026-11-02 10:08 log,
+         * build 592). A real storm on one instruction still has one RIP and still counts. */
+        if (rec.ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)
+            rkey ^= (uint64_t)state->__x[6] * 0x9E3779B97F4A7C15ull;
         int rslot = (int)(((uint64_t)thread * 0x9E3779B97F4A7C15ull) >> 60);
         if (redeliv[rslot].thread != (uint64_t)thread || redeliv[rslot].key != rkey)
         {
