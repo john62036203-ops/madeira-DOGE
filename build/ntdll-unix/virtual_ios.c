@@ -17290,7 +17290,8 @@ static int ios_guest_rx_writable_enabled(void)
     {
         /* Default off. 1: with env.FEX_SMCCHECKS = full, a 64-bit guest's anonymous code memory stays
          * writable to the host when the guest makes it PAGE_EXECUTE_READ (Age of Empires IV's Aegis
-         * protection writes into such pages from several threads). Set it in the game's own file. */
+         * protection writes into such pages, and into its exe's code, from several threads; pure-x64
+         * image pages are covered too). Set it in the game's own file. */
         const char *s = getenv( "MADEIRA_GUEST_RX_WRITABLE" );
         const char *smc = getenv( "FEX_SMCCHECKS" );
         int want = (s && *s == '1') ? 1 : 0;
@@ -17579,6 +17580,18 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
         /* madeira-doge: an EXECUTE|WRITE section's backing stays writable, as
          * it does with a pool copy (see ios_x64_image_note_rwx_section). */
         int keep_write = !(unix_prot & PROT_WRITE) && ios_x64_image_in_rwx_section( base, size );
+        /* madeira-doge: MADEIRA_GUEST_RX_WRITABLE (with FEX_SMCCHECKS=full) covers pure-x64 image
+         * pages too: Aegis patches RelicCardinal.exe's .text from several threads while flipping 4 KB
+         * pages between writable and PAGE_EXECUTE_READ; one 16 KB host page holds four of them
+         * (2026-11-02 09:23 log, build 591: PROTECTION_FAILURE stores at 0x143fa8000, entryprot=1). */
+        int rx_writable = !(unix_prot & PROT_WRITE) && !keep_write && ios_guest_rx_writable_enabled();
+        if (rx_writable)
+        {
+            static unsigned long x64_rxw_n;
+            if (++x64_rxw_n <= 16 && !ios_in_mach_exc)
+                dprintf( 2, "[guest-rx-writable] x64-image %p+0x%lx keeps host write\n", base, (unsigned long)size );
+            keep_write = 1;
+        }
         if (++x64_n <= 24 && !ios_in_mach_exc)
             dprintf( 2, "[x64-image] #%lu %p+0x%lx prot=%c%c%c -- pure-x64 image page, EXEC has no host "
                         "meaning here (the emulator runs it at the PE VA); applying %c%c- (MADEIRA_X64_IMAGE_NOCOPY)\n",
