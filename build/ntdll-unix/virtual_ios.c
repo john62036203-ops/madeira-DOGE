@@ -21861,7 +21861,7 @@ static uint64_t ios_swap_now_ns( void )
  *    limit_bytes_remaining; back up above N + 128 MB), or
  *  - its footprint grew by swap-low-room-burst-mb (default 256) within the last
  *    second (held 10 s after the last such burst), or
- *  - the device reports critical memory pressure.
+ *  - (only with swap-low-room-pressure = 1) the device reports critical pressure.
  * Sampled at most every 100 ms. Sparking Zero (2026-10-31/11-01 logs) died at scene
  * changes and at startup with a mod: band:guest +809 MB anonymous in seconds, mostly
  * commits under the 4 MB broad floor, while battle sits ~780 MB under the limit. A
@@ -21907,7 +21907,16 @@ static size_t ios_swap_min_eff( void )
                 else if (left && left > low_room + (128ull << 20) && now >= hold_until) low = 0;
                 if (why || now < hold_until) low = 1;
             }
-            if (__atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ) >= 2) low = 1;
+            /* build 585: device-wide critical pressure no longer holds the floor down. On
+             * 2026-11-02 08:11 (Sparking Zero, battle) the device sat at CRITICAL for minutes
+             * with 1.1 GB of room left; the floor stayed at 256 KB through the whole battle
+             * and fps fell to 13-20 (small UE commits file-backed). Only madeira.cfg
+             * swap-low-room-pressure = 1 brings the old rule back. */
+            {
+                static int usep = -1;
+                if (usep < 0) usep = madeira_cfg_int( "swap-low-room-pressure", 0 ) == 1;
+                if (usep && __atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ) >= 2) low = 1;
+            }
             if (low != was)
             {
                 flips++;
