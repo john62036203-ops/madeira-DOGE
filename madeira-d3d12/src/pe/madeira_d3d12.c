@@ -8381,6 +8381,63 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     k2.reserved[0] = (uint16_t)mad_aspect_opt(d, c->u.tt.dplane);   /* the MTLBlitOption; winemetal honours it for a combined depth-stencil destination */
     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
 }
+/* madeira-doge block-copy: a texture copy between an UNCOMPRESSED texture and a
+ * BLOCK-COMPRESSED one of the same bytes per block/texel (R32G32B32A32_UINT <->
+ * BC3/BC5/BC7, R32G32_UINT <-> BC1/BC4). D3D12 allows it and UE5's runtime virtual
+ * texture compressor relies on it: a compute shader writes BC blocks into an
+ * RGBA32_UINT texture (one texel per block) and CopyTextureRegion moves a 68x68-
+ * texel region into a 272x272-pixel tile of the BC3 physical texture. Metal's
+ * texture-to-texture copy wants one pixel format on both sides; passed the 68x68
+ * source size it wrote 17x17 BLOCKS (68x68 pixels, a sixteenth of the tile) and
+ * the rest of every tile stayed zero -- Sparking! ZERO's ground was black on every
+ * stage (CAP 2026-11-03 00:51, r#7028: 114 tiles, each filled 68x68 of 272x272).
+ * The copy goes through the staging buffer instead: texture -> bytes -> texture,
+ * where both halves are plain block copies with the same bytes per row. Sizes are
+ * in SOURCE texels (the D3D box), the destination region is the same number of
+ * blocks in destination pixels. */
+static void exec_copy_block(struct mad_exec *e, const struct mad_cmd *c, UINT bytes, UINT sblock, UINT dblock) {
+    const struct mad_resource *s = c->u.tt.src, *d = c->u.tt.dst;
+    struct mad_device *dev = e->q->device;
+    UINT bw = (c->u.tt.w + sblock - 1) / sblock, bh = (c->u.tt.h + sblock - 1) / sblock;   /* blocks */
+    UINT dd = c->u.tt.d ? c->u.tt.d : 1, dw = bw * dblock, dh = bh * dblock, mw, mh, md;
+    UINT64 row = (UINT64)bw * bytes, img = row * bh, need = img * dd;
+    struct wmtcmd_blit_copy_from_texture_to_buffer k1; struct wmtcmd_blit_copy_from_buffer_to_texture k2;
+    static LONG said;
+    mad_mip_dims(d, c->u.tt.dlevel + d->mip_drop, &mw, &mh, &md);
+    if (!bw || !bh || c->u.tt.dx >= mw || c->u.tt.dy >= mh) { MAD_SKIP(e); return; }
+    if (c->u.tt.dx + dw > mw) dw = mw - c->u.tt.dx;   /* the last block row/column of a texture may be partial */
+    if (c->u.tt.dy + dh > mh) dh = mh - c->u.tt.dy;
+    EnterCriticalSection(&dev->heap_lock);
+    if (dev->ds_scratch_size < need) {
+        struct WMTBufferInfo bi; UINT64 sz = need < (4u << 20) ? (4u << 20) : (need + 0xffff) & ~(UINT64)0xffff;
+        if (dev->ds_scratch) NSObject_release(dev->ds_scratch);   /* an in-flight command buffer keeps its own reference */
+        memset(&bi, 0, sizeof bi); bi.length = sz; bi.options = WMTResourceStorageModePrivate;
+        dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
+        dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
+    }
+    LeaveCriticalSection(&dev->heap_lock);
+    if (!dev->ds_scratch) { MAD_SKIP(e); return; }
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] block-copy: r#%u (fmt %u, %u B x %u) %ux%u at %u,%u -> r#%u (fmt %u, block %u) %ux%u at %u,%u through the staging buffer\n",
+                  s->serial, (unsigned)s->desc.Format, bytes, sblock, c->u.tt.w, c->u.tt.h, c->u.tt.sx, c->u.tt.sy,
+                  d->serial, (unsigned)d->desc.Format, dblock, dw, dh, c->u.tt.dx, c->u.tt.dy);
+    memset(&k1, 0, sizeof k1);
+    k1.type = WMTBlitCommandCopyFromTextureToBuffer;
+    k1.src = s->texture; k1.slice = c->u.tt.sslice; k1.level = c->u.tt.slevel;
+    k1.origin.x = c->u.tt.sx; k1.origin.y = c->u.tt.sy; k1.origin.z = c->u.tt.sz;
+    k1.size.width = c->u.tt.w; k1.size.height = c->u.tt.h; k1.size.depth = dd;
+    k1.dst = dev->ds_scratch; k1.offset = 0; k1.bytes_per_row = (UINT32)row; k1.bytes_per_image = (UINT32)img;
+    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k1);
+    exec_end(e);   /* the staging buffer is written, then read: two encoders */
+    if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+    memset(&k2, 0, sizeof k2);
+    k2.type = WMTBlitCommandCopyFromBufferToTexture;
+    k2.src = dev->ds_scratch; k2.src_offset = 0; k2.bytes_per_row = (UINT32)row; k2.bytes_per_image = (UINT32)img;
+    k2.size.width = dw; k2.size.height = dh; k2.size.depth = dd;
+    k2.dst = d->texture; k2.slice = c->u.tt.dslice; k2.level = c->u.tt.dlevel;
+    k2.origin.x = c->u.tt.dx; k2.origin.y = c->u.tt.dy; k2.origin.z = c->u.tt.dz;
+    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
+}
 static void mad_u10_dirty(struct mad_resource *r);   /* madeira-doge */
 #define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
 /* madeira-doge copy-compute (default 1): a small buffer-to-buffer copy while a
@@ -8567,6 +8624,12 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
             (c->u.tt.src->tex_pf != c->u.tt.dst->tex_pf || c->u.tt.splane || c->u.tt.dplane)) {
             exec_copy_aspect(e, c);   /* a depth or stencil plane to or from a colour texture */
             return;
+        }
+        if (!c->u.tt.src->is_depth && !c->u.tt.dst->is_depth) {   /* madeira-doge block-copy, see exec_copy_block */
+            UINT sbytes = 0, sblock = 1, dbytes = 0, dblock = 1;
+            mad_format_info(c->u.tt.src->desc.Format, &sbytes, &sblock);
+            mad_format_info(c->u.tt.dst->desc.Format, &dbytes, &dblock);
+            if (sblock != dblock && sbytes == dbytes) { exec_copy_block(e, c, sbytes, sblock, dblock); return; }
         }
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromTextureToTexture;
