@@ -1667,6 +1667,89 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
     }
 
+    /* madeira-doge: env.MADEIRA_CHILD_IMAGE = "<launcher exe name>=<program>" starts
+     * <program> in place of <launcher exe name> whenever that launcher is started
+     * (any directory, ASCII case ignored): the same environment, the same parent,
+     * the same process as far as the starter is concerned. <program> is a Windows
+     * path relative to the launcher's folder (or absolute with a drive letter);
+     * the command line's first token and the working directory follow it, the
+     * arguments stay. DRAGON BALL FighterZ (678950): Steam's only launch option
+     * is the EasyAntiCheat bootstrap DBFighterZ.exe, which cannot run here, while
+     * RED\Binaries\Win64\RED-Win64-Shipping.exe can -- started as a Steam
+     * shortcut it ended itself after 35 s (the process is not app 678950 to
+     * Valve's client), so it has to be the process Valve's client starts for
+     * 678950. Nothing about Steam's own authorisation changes: the client decides
+     * to start the app and hands it its environment; only the file that runs
+     * differs. */
+    {
+        const char *spec = getenv( "MADEIRA_CHILD_IMAGE" );
+        const WCHAR *ip = params->ImagePathName.Buffer;
+        int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
+        const char *eq = spec ? strchr( spec, '=' ) : NULL;
+        char lname[64];
+
+        if (eq && eq - spec > 0 && eq - spec < (int)sizeof(lname) && eq[1])
+        {
+            int k, base = 0, absolute = (eq[1] && eq[2] == ':'), nlen = (int)strlen( eq + 1 );
+            for (k = 0; k < eq - spec; k++)
+            {
+                char c = spec[k];
+                lname[k] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+            }
+            lname[k] = 0;
+            while (k > 0 && lname[k - 1] == ' ') lname[--k] = 0;
+            if (ios_image_name_is( ip, ip_len, lname ))
+            {
+                const WCHAR *cl = params->CommandLine.Buffer;
+                int cl_len = params->CommandLine.Length / sizeof(WCHAR), rest = 0, dir_len, new_len, o, j;
+                WCHAR *npath, *ncl, *ncwd, *nnt;
+
+                for (k = 0; k < ip_len; k++) if (ip[k] == '\\' || ip[k] == '/') base = k + 1;
+                /* the launcher's command line: a quoted or a bare first token, then the arguments */
+                if (cl && cl_len > 0)
+                {
+                    if (cl[0] == '"') { for (rest = 1; rest < cl_len && cl[rest] != '"'; rest++); if (rest < cl_len) rest++; }
+                    else for (rest = 0; rest < cl_len && cl[rest] != ' ' && cl[rest] != '\t'; rest++);
+                }
+                new_len = (absolute ? 0 : base) + nlen;
+                npath = malloc( (new_len + 1) * sizeof(WCHAR) );             /* all four leak once per start */
+                ncl = malloc( (new_len + 2 + (cl_len - rest) + 1) * sizeof(WCHAR) );
+                ncwd = malloc( (new_len + 1) * sizeof(WCHAR) );
+                nnt = malloc( (new_len + 5) * sizeof(WCHAR) );
+                if (npath && ncl && ncwd && nnt)
+                {
+                    o = 0;
+                    if (!absolute) { memcpy( npath, ip, base * sizeof(WCHAR) ); o = base; }
+                    for (k = 0; k < nlen; k++) npath[o++] = (WCHAR)(unsigned char)(eq[1 + k] == '/' ? '\\' : eq[1 + k]);
+                    npath[o] = 0;
+                    for (dir_len = 0, k = 0; k < new_len; k++) if (npath[k] == '\\') dir_len = k + 1;
+                    if (dir_len > 3) dir_len--;   /* "C:\dir" not "C:\dir\"; the root keeps its backslash */
+                    memcpy( ncwd, npath, dir_len * sizeof(WCHAR) ); ncwd[dir_len] = 0;
+                    nnt[0] = '\\'; nnt[1] = '?'; nnt[2] = '?'; nnt[3] = '\\';
+                    memcpy( nnt + 4, npath, (new_len + 1) * sizeof(WCHAR) );
+                    o = 0;
+                    ncl[o++] = '"'; memcpy( ncl + o, npath, new_len * sizeof(WCHAR) ); o += new_len; ncl[o++] = '"';
+                    for (j = rest; j < cl_len; j++) ncl[o++] = cl[j];
+                    ncl[o] = 0;
+                    dprintf( 2, "[child-image] env.MADEIRA_CHILD_IMAGE: %s starts as %s (cwd %s)\n",
+                             debugstr_us( &params->ImagePathName ), debugstr_w( npath ), debugstr_w( ncwd ) );
+                    params->ImagePathName.Buffer = npath;
+                    params->ImagePathName.Length = new_len * sizeof(WCHAR);
+                    params->ImagePathName.MaximumLength = params->ImagePathName.Length + sizeof(WCHAR);
+                    params->CommandLine.Buffer = ncl;
+                    params->CommandLine.Length = o * sizeof(WCHAR);
+                    params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+                    params->CurrentDirectory.DosPath.Buffer = ncwd;
+                    params->CurrentDirectory.DosPath.Length = dir_len * sizeof(WCHAR);
+                    params->CurrentDirectory.DosPath.MaximumLength = params->CurrentDirectory.DosPath.Length + sizeof(WCHAR);
+                    path.Buffer = nnt;
+                    path.Length = (new_len + 4) * sizeof(WCHAR);
+                    path.MaximumLength = path.Length + sizeof(WCHAR);
+                }
+            }
+        }
+    }
+
     /* ml526: stamp every accepted spawn on the startup timeline. This is the
      * boundary the coarse phase accounting could not see — steam.exe -> the
      * webhelper spawn was a ~16s block with no internal detail. */

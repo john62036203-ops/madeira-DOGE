@@ -44,10 +44,19 @@ python3 - "$TMP/src/launch.c" <<'PY' || echo "madeira-dock: launch arguments not
 import sys
 p = sys.argv[1]
 s = open(p).read()
-call = '(manager, &gameid, 0, 0, "")'
-if s.count(call) != 2:
-    sys.exit("madeira-dock build: LaunchApp call sites changed (%d found); launch arguments not added" % s.count(call))
-s = s.replace(call, '(manager, &gameid, 0, 0, madeira_user_args())')
+# madeira-doge: upstream's launch.c passes the chosen launch option since
+# 72558e4 ("launch_option, 0"); the older call had a literal 0 there. Both forms
+# are accepted. Before this, the stale string made the whole patch (user
+# arguments AND the exit grace period below) silently fall away: build 604 and
+# earlier logged "launch arguments not added (sources changed)".
+call = None
+for candidate in ('(manager, &gameid, launch_option, 0, "")', '(manager, &gameid, 0, 0, "")'):
+    if s.count(candidate) == 2:
+        call = candidate
+        break
+if call is None:
+    sys.exit("madeira-dock build: LaunchApp call sites changed; launch arguments not added")
+s = s.replace(call, call.replace(', "")', ', madeira_user_args())'))
 anchor = '#include <wchar.h>\n'
 helper = anchor + """
 /* madeira-doge: the game's launch arguments, as LaunchApp's user arguments. */
