@@ -37,6 +37,51 @@
 #include "madeira_ir_abi.h"
 #include "madeira_graphics_entry.h"
 
+/* madeira-doge mem-spike: WHO allocates Metal buffers. Sparking! ZERO (build 599,
+ * log 07:47): the graphics ledger jumped 1329 -> 2020 MB in one monitor cycle and
+ * jetsam followed, while the ml1057 categories (the game's resources) were 950 MB
+ * and Metal's currentAllocatedSize 1550 MB. So ~600 MB of Metal buffers are ours
+ * (rings, descriptor heaps, gpu-store, scratch, wrapped guest memory) and were
+ * never attributed. Every MTLDevice_newBuffer in this file goes through this
+ * wrapper, which keeps cumulative bytes and counts per CALL SITE (source line);
+ * the ml1150 census prints what each site created since the previous census, so
+ * a spike names its allocator. Releases are not tracked: this is a rate, not a
+ * balance (the categories above are the balance). No behaviour change. */
+static obj_handle_t mad_newbuf_traced(obj_handle_t dev, struct WMTBufferInfo *bi, unsigned line);
+static void d3d12_log(const char *fmt, ...);
+#define MTLDevice_newBuffer(dev_, bi_) mad_newbuf_traced((dev_), (bi_), __LINE__)
+#define MAD_MNEW_SITES 32
+static struct { unsigned line; LONG64 bytes, bytes_prev; LONG n, n_prev; } g_mnew[MAD_MNEW_SITES];
+static LONG g_mnew_sites; static LONG64 g_mnew_total, g_mnew_total_prev;
+static void mad_mnew_report(void) {
+    char buf[900]; int n = 0; unsigned i; LONG64 tot = g_mnew_total, delta = tot - g_mnew_total_prev;
+    g_mnew_total_prev = tot;
+    for (i = 0; i < (unsigned)g_mnew_sites && i < MAD_MNEW_SITES; i++) {
+        LONG64 b = g_mnew[i].bytes, db = b - g_mnew[i].bytes_prev; LONG c = g_mnew[i].n, dc = c - g_mnew[i].n_prev;
+        g_mnew[i].bytes_prev = b; g_mnew[i].n_prev = c;
+        if (db >= (1 << 20) && n < (int)sizeof buf - 48)
+            n += snprintf(buf + n, sizeof buf - n, " L%u:+%lldMB/%ld", g_mnew[i].line, (long long)(db >> 20), dc);
+    }
+    d3d12_log("[madeira-d3d12] mem-spike: Metal buffers created since the last census +%lld MB (cumulative %lld MB); by site:%s\n",
+              (long long)(delta >> 20), (long long)(tot >> 20), n ? buf : " nothing over 1 MB");
+}
+static obj_handle_t mad_newbuf_traced(obj_handle_t dev, struct WMTBufferInfo *bi, unsigned line) {
+    obj_handle_t h = (MTLDevice_newBuffer)(dev, bi);   /* the parentheses keep the macro out */
+    unsigned i;
+    if (!h || !bi) return h;
+    for (i = 0; i < MAD_MNEW_SITES; i++) {
+        LONG have = (LONG)g_mnew[i].line;
+        if (have == (LONG)line) break;
+        if (!have) {
+            if (InterlockedCompareExchange((LONG *)&g_mnew[i].line, (LONG)line, 0) == 0) { InterlockedIncrement(&g_mnew_sites); break; }
+            if (g_mnew[i].line == line) break;
+        }
+    }
+    if (i < MAD_MNEW_SITES) { InterlockedExchangeAdd64(&g_mnew[i].bytes, (LONG64)bi->length); InterlockedIncrement(&g_mnew[i].n); }
+    InterlockedExchangeAdd64(&g_mnew_total, (LONG64)bi->length);
+    return h;
+}
+
 /* madeira-bcd: MAD_PACK_ID names the CI run that built this DLL ("ipa 215" or
  * "pack 7 (abc1234)"), so a log says which runtime ran -- the IPA's own or one
  * an update pack installed over it. */
@@ -9795,6 +9840,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (e.q && e.q->device)
                 d3d12_log("[madeira-d3d12] ml1150 Metal currentAllocatedSize %llu MB\n",
                           (unsigned long long)(MTLDevice_currentAllocatedSize(e.q->device->mtl_device) >> 20));
+            mad_mnew_report();   /* madeira-doge mem-spike */
         }
     }
     {

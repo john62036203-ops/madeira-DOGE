@@ -1362,10 +1362,21 @@ static void *ios_pool_warmer_thread( void *arg )
              * so nothing named what grew. A few 0.4 s stalls per run is the price. */
             static unsigned long long phys_next_mb = 3072;
             int phys_milestone = ios_last_footprint_mb >= phys_next_mb;
+            /* madeira-doge mem-spike: above 4 GB the 512 MB milestones are too coarse.
+             * Sparking! ZERO (build 599, 07:47) walked at 5651 MB and then jumped
+             * 5338 -> 6041 MB in ONE cycle (graphics ledger +690 MB) and died with no
+             * walk in between, so nothing named the spike. From 4 GB up a walk also
+             * runs whenever the footprint is 256 MB above the last walk (whichever
+             * direction it went in between), at most once per cycle. */
+            static unsigned long long phys_last_walk_mb;
+            if (!phys_milestone && ios_last_footprint_mb >= 4096 && phys_last_walk_mb &&
+                ios_last_footprint_mb >= phys_last_walk_mb + 256)
+                phys_milestone = 2;
             if (phys_milestone) phys_next_mb = (ios_last_footprint_mb / 512 + 1) * 512;
             clock_gettime( CLOCK_MONOTONIC, &phys_t0 );
             if (phys_milestone || (!phys_walk_off && (cycle == 2 || (cycle % 5) == 0)))
             {
+                phys_last_walk_mb = ios_last_footprint_mb;
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];
                 /* ml677: DIRTY IS NOT RESIDENCY. The top[12] rows carry res/swap
