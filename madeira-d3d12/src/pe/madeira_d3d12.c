@@ -484,6 +484,16 @@ struct mad_device {
     LUID adapter_luid;   /* madeira-bcd: GetAdapterLuid, the DXGI adapter it was created on */
 };
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
+static LONG g_tview_whole_n;   /* madeira-doge tview-whole */
+static long long mad_cfg_int_pe(const char *key, long long dflt);
+static int mad_tview_whole(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = mad_cfg_int_pe("tview-whole", 0) ? 1 : 0;   /* 1: one texture-buffer view per (buffer, format) from offset 0, the descriptor carries the range; 0: one view per distinct range as before */
+        d3d12_log("[madeira-d3d12] tview-whole = %d (%s)\n", on, on ? "one typed-buffer view per buffer and format; ranges live in the descriptor" : "one typed-buffer view per distinct range");
+    }
+    return on;
+}
 static LONG g_resolve_locked, g_resolve_miss;   /* ml1132: address lookups that took live_lock */
 static LONG g_res_added, g_res_removed, g_tess_psos, g_tess_draws, g_tess_built, g_tess_drawn, g_tess_nonidx;
 static volatile LONG g_dtess_drawn, g_dtess_bad_cps, g_dtess_ind_drawn;   /* madeira-bcd: DXIL tessellation */
@@ -827,8 +837,8 @@ static void mad_skip_report(void) {
               "%ld draws dropped, %ld drawn (%ld non-indexed); ml1147 DXBC geometry: %ld mesh pipelines, %ld draws; DXIL tessellation: %ld drawn (%ld indirect)\n",
               g_res_added, g_res_removed, g_res_added - g_res_removed, g_tess_psos, g_tess_built,
               g_tess_draws, g_tess_drawn, g_tess_nonidx, g_gs_built, g_gs_drawn, g_dtess_drawn, g_dtess_ind_drawn);   /* ml1083, ml1147, madeira-bcd */
-    d3d12_log("[madeira-d3d12] ml1126 views: %ld typed-buffer views live (%ld made; kept OUT of the residency set, their buffer is in it), %ld texture views live\n",
-              g_tview_live, g_tview_made, g_xview_live);
+    d3d12_log("[madeira-d3d12] ml1126 views: %ld typed-buffer views live (%ld made, %ld of them whole-buffer; kept OUT of the residency set, their buffer is in it), %ld texture views live\n",
+              g_tview_live, g_tview_made, g_tview_whole_n, g_xview_live);
     d3d12_log("[madeira-d3d12] ml1132 address lookups on the locked path: %ld (true misses %ld); every other lookup was lock-free\n",
               g_resolve_locked, g_resolve_miss);
 }
@@ -6917,6 +6927,11 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                 if (!mad_air_texbuf(d, de.texture_view_id, &count, &first)) {
                     why = "typed buffer view not found"; goto bad;
                 }
+                if (first == 0xffffffffu) {   /* madeira-doge tview-whole: the descriptor carries the range */
+                    UINT32 bpe = count ? count : 1;
+                    count = (UINT32)((de.metadata & 0xffffffffull) / bpe);
+                    first = (UINT32)((de.metadata >> 32) & 0x7fffffffull);
+                }
                 tab[off + 0] = de.texture_view_id;
                 tab[off + 1] = ((UINT64)count << 32) | (UINT64)first;
             } else {
@@ -11867,16 +11882,34 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
     struct WMTTextureInfo ti;
     obj_handle_t tex;
     static unsigned said_fail, said_ok;
+    int whole = 0; UINT64 wwidth = 0;
     if (!r->buffer || !mad_map_texture_format(fmt, 0, &pf, &is_depth) || is_depth) return 0;
     mad_format_info(fmt, &bytes, &block);
     if (!bytes || block != 1) return 0;
     byte_off = first * bytes;
+    /* madeira-doge tview-whole (opt-in): ONE texture-buffer view per (resource, format,
+     * uav) covering the buffer from offset 0, the descriptor carrying the range
+     * (element offset and byte length in metadata, as the converter's
+     * IRBufferView does). Sparking! ZERO (599, 21:18): 575,790 typed-buffer views
+     * made, 271,692 live after 49 minutes -- UE5 sub-allocates typed ranges out of
+     * long-lived pools at ever-new offsets, each a Metal texture object -- and the
+     * IOAccelerator-tagged "pa" band grew 23 -> 655 MB with them until jetsam. The
+     * view's width is the whole buffer (<= 2^28 texels), so a load past the
+     * descriptor's own count reads the buffer instead of zero; everything else is
+     * the same. The DXBC path takes count/first from the metadata (vmap record b =
+     * ~0 marks such a view, a = bytes per element). Buffers too long for one view
+     * keep the per-range views. */
+    if (mad_tview_whole() && !(byte_off % bytes)) {
+        wwidth = r->size / bytes;
+        if (wwidth > (1u << 28)) wwidth = (1u << 28);
+        if (wwidth && byte_off / bytes + num <= wwidth) whole = 1;
+    }
     EnterCriticalSection(&d->view_lock);   /* ml1049: creation races creation on another thread */
-    k = mad_tvh_find(r, (UINT)fmt, byte_off, num, (UINT)uav);   /* madeira-bcd tv-hash */
+    k = mad_tvh_find(r, (UINT)fmt, whole ? 0 : byte_off, whole ? wwidth : num, (UINT)uav);   /* madeira-bcd tv-hash */
     if (k == r->ntview) {
-        aligned = byte_off & ~(UINT64)63;                   /* linear texture alignment on Apple GPUs is <= 64 */
+        aligned = whole ? 0 : (byte_off & ~(UINT64)63);     /* linear texture alignment on Apple GPUs is <= 64 */
         elem_off = (byte_off - aligned) / bytes;
-        width = num + elem_off;
+        width = whole ? wwidth : num + elem_off;
         if (aligned + width * bytes > r->size) width = (r->size - aligned) / bytes;
         if (!width) { LeaveCriticalSection(&d->view_lock); return 0; }
         if (width > (1u << 28)) width = (1u << 28);   /* BCD 0.1.623: clamp a texture-buffer view to Metal's 2^28-texel limit (gpu_va and size stay whole for raw-buffer shaders) */
@@ -11917,19 +11950,20 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
          * reclaimed pool pages). */
         InterlockedIncrement(&g_tview_live); InterlockedIncrement(&g_tview_made);
         k = r->ntview;
-        r->tview[k].fmt = (UINT)fmt; r->tview[k].off = byte_off; r->tview[k].num = num; r->tview[k].uav = (UINT8)uav;
+        r->tview[k].fmt = (UINT)fmt; r->tview[k].off = whole ? 0 : byte_off; r->tview[k].num = whole ? wwidth : num; r->tview[k].uav = (UINT8)uav;
         r->tview[k].tex = tex; r->tview[k].id = ti.gpu_resource_id;
         r->ntview = k + 1;   /* published last: a reader never sees a half-written entry */
         mad_tvh_add(r, k);   /* madeira-bcd tv-hash */
-        mad_vmap_put_locked_r(d, ti.gpu_resource_id, (UINT32)num, (UINT32)elem_off, r);
+        if (whole) { mad_vmap_put_locked_r(d, ti.gpu_resource_id, (UINT32)bytes, 0xffffffffu, r); InterlockedIncrement(&g_tview_whole_n); }
+        else mad_vmap_put_locked_r(d, ti.gpu_resource_id, (UINT32)num, (UINT32)elem_off, r);
         mad_view_census("typed-buffer", r, r->ntview);
         if (said_ok++ < 12)
             d3d12_log("[madeira-d3d12] typed buffer view: fmt %u first %llu num %llu%s -> %ux1 texture buffer, element offset %llu\n",
                       (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, uav ? " (UAV)" : "",
                       (unsigned)width, (unsigned long long)elem_off);
     }
-    aligned = r->tview[k].off & ~(UINT64)63; elem_off = (r->tview[k].off - aligned) / bytes;
-    e->gpu_va = r->gpu_address + r->tview[k].off;
+    if (whole) { elem_off = byte_off / bytes; e->gpu_va = r->gpu_address + byte_off; }
+    else { aligned = r->tview[k].off & ~(UINT64)63; elem_off = (r->tview[k].off - aligned) / bytes; e->gpu_va = r->gpu_address + r->tview[k].off; }
     e->texture_view_id = r->tview[k].id;
     e->metadata = ((num * bytes) & 0xffffffffull) | ((elem_off & 0x7fffffffull) << 32) | (1ull << 63);
     LeaveCriticalSection(&d->view_lock);
