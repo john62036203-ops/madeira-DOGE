@@ -3395,6 +3395,12 @@ struct LibraryDetail: View {
                         Text("FEX watches for game code that rewrites itself on the iPhone's 16 KB memory pages instead of 4 KB pieces, so a rewrite next to other code is no longer missed (from upstream Madeira; JIT and anti-cheat code such as Age of Empires IV's or an emulator inside Madeira). May let \"Check every instruction\" style settings (FEX_SMCCHECKS = full) be removed. Turn it off if the game gets slower or crashes.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge steamac 0006/0007: opt-in (tools/patch-winemetal-null-pso.py, tools/patch-d3d11src-null-pso.py)
+                    Toggle("Skip drawing with shaders that failed to build (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_NULL_PSO_SKIP") == "1" }, set: { setBCDKey("env.MADEIRA_NULL_PSO_SKIP", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_NULL_PSO_SKIP") == "1" {
+                        Text("When Metal cannot build one of the game's shaders, the draws that needed it are left out instead of crashing the game or drawing with the wrong shader (from steamac). The D3D11 half needs \"env.MADEIRA_D3D11_SRC = 1\". Turn it off if parts of the picture go missing.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge NutsEmu 1748 patches (LGPL): per-game, in the game's own file
                     Toggle("Threads keep their priority when they yield (NutsEmu, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_YIELD_KEEP_PRIO") == "1" }, set: { setBCDKey("env.MADEIRA_YIELD_KEEP_PRIO", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_YIELD_KEEP_PRIO") == "1" {

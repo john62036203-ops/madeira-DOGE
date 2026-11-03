@@ -1250,6 +1250,13 @@ jobs:
       - name: Patch winemetal to name a command buffer a wait is stuck on
         run: python3 tools/patch-winemetal-wait-watch.py
 
+      # madeira-doge (steamac 0006/0007): opt-in env.MADEIRA_NULL_PSO_SKIP = 1: draws and
+      # dispatches whose pipeline failed to compile are dropped instead of crashing or
+      # running on the previous pipeline. Native only.
+      - name: Patch winemetal to drop draws of failed pipelines
+        continue-on-error: true
+        run: python3 tools/patch-winemetal-null-pso.py dxmt/src/winemetal/unix/winemetal_unix.c
+
       # God of War darkens outdoors (iPhone) and draws a black scene on an M1
       # iPad. Switches, all off by default: MADEIRA_PS_CLAMP=1|2 (pixel output
       # clamp like D3D's float16 conversion), MADEIRA_PRECISE_MINMAX=1
