@@ -24,7 +24,9 @@ git -C FEX diff --name-only | while read -r f; do git -C FEX checkout -- "$f"; d
 python3 "$R/tools/patch-fex-ios-cpuid-index.py" "$R/FEX/$CPUIDF"
 python3 "$R/tools/patch-fex-ios-cpuid-mask.py" "$R/FEX/FEXCore/Source/Interface/Core/CPUID.h"
 python3 "$R/tools/patch-fex-ios-teb-tsd.py" "$R/FEX/Source/Windows/Common/Priv.h"
-restore() { git -C "$R/FEX" checkout -- "$CPUIDF" FEXCore/Source/Interface/Core/CPUID.h Source/Windows/Common/Priv.h; }
+# madeira-doge (upstream #518): opt-in (MADEIRA_FEX_SMC_16K=1): SMC write traps per 16 KB host page.
+python3 "$R/tools/patch-fex-ios-smc-16k.py" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp"
+restore() { git -C "$R/FEX" checkout -- "$CPUIDF" FEXCore/Source/Interface/Core/CPUID.h Source/Windows/Common/Priv.h Source/Windows/Common/InvalidationTracker.cpp; }
 trap restore EXIT
 
 # A cached tree configured on another runner (Apple silicon vs Intel: ninja in

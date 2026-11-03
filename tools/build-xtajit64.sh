@@ -193,6 +193,9 @@ python3 "$R/tools/patch-fex-ios-xp-callers.py" "$R/FEX"
 # without CodeInvalidationMutex, so the access violation it raises leaves no write-owned mutex behind.
 python3 "$R/tools/patch-fex-ios-mono-bp-unlocked-miss.py" "$R/FEX/FEXCore/Source/Interface/Core/Core.cpp" \
     || echo "::warning::patch-fex-ios-mono-bp-unlocked-miss.py did not apply (MADEIRA_MONO_BP_UNLOCKED_MISS has no effect)"
+# madeira-doge (upstream #518): opt-in (MADEIRA_FEX_SMC_16K=1): SMC write traps per 16 KB host page.
+python3 "$R/tools/patch-fex-ios-smc-16k.py" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp" \
+    || echo "::warning::patch-fex-ios-smc-16k.py did not apply (MADEIRA_FEX_SMC_16K has no effect in 64-bit programs)"
 # BCD ARM64EC transition overlays, opt-in (MADEIRA_FEX_EC_FAST=1, or each MADEIRA_FEX_EC_* =1).
 for ec in ec-ret ec-bitmap-cache ec-exit-lean ec-ret-direct; do
     python3 "$R/tools/patch-fex-ios-$ec.py" "$R/FEX" \

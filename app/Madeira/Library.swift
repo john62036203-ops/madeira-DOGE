@@ -3389,6 +3389,12 @@ struct LibraryDetail: View {
                         Text("Shorter FEX code paths each time the x86-64 game calls into or returns from the ARM64 Windows libraries (from BCD; Playport measured a few percent more fps with a similar change). Turn it off if the game crashes or behaves differently.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge upstream #518: opt-in (tools/patch-fex-ios-smc-16k.py)
+                    Toggle("Catch code the game rewrites on whole 16 KB pages (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_SMC_16K") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_SMC_16K", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_SMC_16K") == "1" {
+                        Text("FEX watches for game code that rewrites itself on the iPhone's 16 KB memory pages instead of 4 KB pieces, so a rewrite next to other code is no longer missed (from upstream Madeira; JIT and anti-cheat code such as Age of Empires IV's or an emulator inside Madeira). May let \"Check every instruction\" style settings (FEX_SMCCHECKS = full) be removed. Turn it off if the game gets slower or crashes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge NutsEmu 1748 patches (LGPL): per-game, in the game's own file
                     Toggle("Threads keep their priority when they yield (NutsEmu, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_YIELD_KEEP_PRIO") == "1" }, set: { setBCDKey("env.MADEIRA_YIELD_KEEP_PRIO", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_YIELD_KEEP_PRIO") == "1" {
