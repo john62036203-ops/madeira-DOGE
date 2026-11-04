@@ -4616,12 +4616,14 @@ enum PortraitPad {
         put("D↑", dcx, cy - arm); put("D←", dcx - arm, cy); put("D→", dcx + arm, cy); put("D↓", dcx, cy + arm)
         put("Y", fcx, cy - o); put("X", fcx - o, cy); put("B", fcx + o, cy); put("A", fcx, cy + o)
 
-        // View / Menu: between the cross and the diamond.
+        // View / Menu: between the cross and the diamond, one row lower (level
+        // with D-down / A) so they clear D-right and X.
         let vw = sz("View") ?? .zero, mw = sz("Menu") ?? .zero
         let viewX = W / 2 - vw.width / 2 - 5, menuX = W / 2 + mw.width / 2 + 5
-        if (vw.width > 0 && viewX - vw.width / 2 < dcx + arm + dp / 2 + 6) ||
-           (mw.width > 0 && menuX + mw.width / 2 > fcx - o - face / 2 - 6) { return [:] }
-        put("View", viewX, cy); put("Menu", menuX, cy)
+        let sysY = cy + max(arm, o)
+        if (vw.width > 0 && viewX - vw.width / 2 < dcx + dp / 2 + 6) ||
+           (mw.width > 0 && menuX + mw.width / 2 > fcx - face / 2 - 6) { return [:] }
+        put("View", viewX, sysY); put("Menu", menuX, sysY)
 
         // Sticks and their clicks.
         put("LS", dcx, stickY); put("RS", fcx, stickY)
