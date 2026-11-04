@@ -4529,20 +4529,31 @@ enum PortraitPad {
     static func positions(_ controls: [TouchControl], pad: CGSize) -> [UUID: CGPoint] {
         var p = controls.map { CGPoint(x: CGFloat($0.nx) * pad.width, y: CGFloat($0.ny) * pad.height) }
         let s = controls.map { c -> CGSize in let z = TouchControlsModel.size(c); return CGSize(width: z.width * scale, height: z.height * scale) }
+        // madeira-doge portrait pad v2 (owner's request 2026-11-04): the controller's
+        // own buttons get a portrait arrangement instead of the squeezed landscape one.
+        let fixed = controllerLayout(controls, sizes: s, pad: pad)
+        for (i, q) in fixed { p[i] = q }
         for _ in 0..<16 {
             var moved = false
             for i in 0..<p.count {
                 for j in (i + 1)..<p.count {
+                    let fi = fixed[i] != nil, fj = fixed[j] != nil
+                    if fi && fj { continue }
                     let needX = (s[i].width + s[j].width) / 2 + gap, needY = (s[i].height + s[j].height) / 2 + gap
                     let dx = p[j].x - p[i].x, dy = p[j].y - p[i].y
                     guard abs(dx) < needX, abs(dy) < needY else { continue }
-                    let push = (needY - abs(dy)) / 2
                     let dir: CGFloat = dy > 0 || (dy == 0 && controls[i].ny <= controls[j].ny) ? 1 : -1
-                    p[i].y -= dir * push; p[j].y += dir * push
+                    if fi || fj {   // only the other control moves
+                        let push = needY - abs(dy)
+                        if fi { p[j].y += dir * push } else { p[i].y -= dir * push }
+                    } else {
+                        let push = (needY - abs(dy)) / 2
+                        p[i].y -= dir * push; p[j].y += dir * push
+                    }
                     moved = true
                 }
             }
-            for i in 0..<p.count {   // inside the bottom area
+            for i in 0..<p.count where fixed[i] == nil {   // inside the bottom area
                 let h = s[i].height / 2
                 p[i].y = min(max(p[i].y, h), pad.height - h)
             }
@@ -4550,6 +4561,75 @@ enum PortraitPad {
         }
         var out: [UUID: CGPoint] = [:]
         for (i, c) in controls.enumerated() { out[c.id] = p[i] }
+        return out
+    }
+
+    /// Pad-local centres for the controller buttons (index -> point), in the
+    /// owner's portrait arrangement (concept 2026-11-04):
+    ///
+    ///   LT LB                RB RT
+    ///   D-pad   View Menu   A/B/X/Y   (a little below the middle)
+    ///   LS        L3   R3         RS
+    ///
+    /// Sizes are the controls' own (their scale × `scale`), so nothing about
+    /// how a button looks changes. Empty when the arrangement does not fit
+    /// the pad (a narrow phone, or buttons scaled up in the editor): the
+    /// squeezed landscape layout is used then, as before.
+    static func controllerLayout(_ controls: [TouchControl], sizes s: [CGSize], pad: CGSize) -> [Int: CGPoint] {
+        var idx: [String: Int] = [:]
+        for (i, c) in controls.enumerated() {
+            if case .pad(let n) = c.action, idx[n] == nil { idx[n] = i }
+        }
+        func sz(_ n: String) -> CGSize? { idx[n].map { s[$0] } }
+        let W = pad.width, H = pad.height
+        let m: CGFloat = 16, top: CGFloat = 8, bottom: CGFloat = 40
+        var out: [Int: CGPoint] = [:]
+        func put(_ n: String, _ x: CGFloat, _ y: CGFloat) { if let i = idx[n] { out[i] = CGPoint(x: x, y: y) } }
+
+        // Shoulders: one row along the top.
+        let lt = sz("LT") ?? .zero, lb = sz("LB") ?? .zero, rb = sz("RB") ?? .zero, rt = sz("RT") ?? .zero
+        let rowH = max(lt.height, lb.height, rb.height, rt.height)
+        let rowY = top + 6 + rowH / 2
+        let ltX = m + lt.width / 2, lbX = ltX + lt.width / 2 + 8 + lb.width / 2
+        let rtX = W - m - rt.width / 2, rbX = rtX - rt.width / 2 - 8 - rb.width / 2
+        if lbX + lb.width / 2 + 8 > rbX - rb.width / 2 { return [:] }
+        put("LT", ltX, rowY); put("LB", lbX, rowY); put("RB", rbX, rowY); put("RT", rtX, rowY)
+        let rowBottom = rowH > 0 ? rowY + rowH / 2 : top
+
+        // Sticks: bottom corners, under the D-pad and the face diamond.
+        let ls = sz("LS") ?? .zero, rsz = sz("RS") ?? .zero
+        let stickH = max(ls.height, rsz.height)
+        let stickY = H - bottom - stickH / 2
+        let stickTop = stickH > 0 ? stickY - stickH / 2 : H - bottom
+
+        // D-pad cross and face diamond, a little below the middle of the free band.
+        let dp = max(sz("D↑")?.width ?? 0, sz("D←")?.width ?? 0, sz("D→")?.width ?? 0, sz("D↓")?.width ?? 0)
+        let arm = dp + 6
+        let face = max(sz("A")?.width ?? 0, sz("B")?.width ?? 0, sz("X")?.width ?? 0, sz("Y")?.width ?? 0)
+        let o = face / 2 + 22
+        let half = max(arm + dp / 2, o + face / 2)
+        var cy = rowBottom + (stickTop - rowBottom) * 0.53
+        cy = min(cy, stickTop - 6 - half)
+        if cy - half < rowBottom + 6 { return [:] }
+        let dcx = max(m + arm + dp / 2, m + ls.width / 2)
+        let fcx = min(W - m - o - face / 2, W - m - rsz.width / 2)
+        put("D↑", dcx, cy - arm); put("D←", dcx - arm, cy); put("D→", dcx + arm, cy); put("D↓", dcx, cy + arm)
+        put("Y", fcx, cy - o); put("X", fcx - o, cy); put("B", fcx + o, cy); put("A", fcx, cy + o)
+
+        // View / Menu: between the cross and the diamond.
+        let vw = sz("View") ?? .zero, mw = sz("Menu") ?? .zero
+        let viewX = W / 2 - vw.width / 2 - 5, menuX = W / 2 + mw.width / 2 + 5
+        if (vw.width > 0 && viewX - vw.width / 2 < dcx + arm + dp / 2 + 6) ||
+           (mw.width > 0 && menuX + mw.width / 2 > fcx - o - face / 2 - 6) { return [:] }
+        put("View", viewX, cy); put("Menu", menuX, cy)
+
+        // Sticks and their clicks.
+        put("LS", dcx, stickY); put("RS", fcx, stickY)
+        let l3 = sz("L3") ?? .zero, r3 = sz("R3") ?? .zero
+        let l3X = max(W / 2 - 44, dcx + ls.width / 2 + 10 + l3.width / 2)
+        let r3X = min(W / 2 + 44, fcx - rsz.width / 2 - 10 - r3.width / 2)
+        if l3.width > 0 && r3.width > 0 && l3X + l3.width / 2 + 6 > r3X - r3.width / 2 { return [:] }
+        put("L3", l3X, stickY + 18); put("R3", r3X, stickY + 18)
         return out
     }
 }
