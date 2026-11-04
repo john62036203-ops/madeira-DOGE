@@ -296,7 +296,9 @@ struct SteamRequirements {
     enum Verdict: Int { case perfect, normal, barely, no, unknown }
 
     static var chinese: Bool { (Locale.preferredLanguages.first ?? "en").lowercased().hasPrefix("zh") }
-    static var deviceRAM: Double { (Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824).rounded() }
+    /// The phone's RAM as sold (8 GB, 12 GB): iOS reports a little less than that
+    /// (an 8 GB iPhone 16 Pro Max reads about 7.4 GiB), which rounded showed "7 GB".
+    static var deviceRAM: Double { (Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824).rounded(.up) }
     static var freeDisk: Double? {
         let home = URL(fileURLWithPath: NSHomeDirectory())
         guard let v = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
