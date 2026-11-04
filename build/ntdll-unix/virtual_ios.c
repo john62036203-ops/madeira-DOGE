@@ -37227,6 +37227,27 @@ unsigned long long ios_avail_phys( unsigned long long host_free )
     return left;
 }
 
+/* madeira-doge: env.MADEIRA_PAGEFILE_MB = N (per game). get_performance_info()
+ * (tools/patch-wine-avail-phys.py) adds this to the swap total and the free swap,
+ * so GlobalMemoryStatusEx reports a page file of N MB: ullTotalPageFile =
+ * physical + N, ullAvailPageFile = free + N. iOS has no swap, so without it a
+ * program sees a commit limit equal to physical memory, i.e. no page file.
+ * Digimon Story Time Stranger refuses to start then ("Insufficient memory or
+ * disk space"); on Linux a larger swap file is the known fix. Only what the
+ * program is told changes; what it can commit does not. */
+unsigned long long ios_fake_swap( void )
+{
+    static long long mb = -1;
+    if (mb < 0)
+    {
+        const char *env = getenv( "MADEIRA_PAGEFILE_MB" );
+        mb = (env && *env) ? strtoll( env, NULL, 10 ) : 0;
+        if (mb < 0) mb = 0;
+        if (mb) dprintf( 2, "[pagefile] MADEIRA_PAGEFILE_MB=%lld -> reporting a %lld MB page file (ullTotalPageFile = physical + %lld MB)\n", mb, mb, mb );
+    }
+    return (unsigned long long)mb << 20;
+}
+
 /* madeira-doge: upstream #461's ios_addr_max_prot (signal_arm64_ios.c ml1353
  * pool-noexec give-up). Current protection through *prot, maximum protection
  * as the result; -1 when addr is in no host region. */

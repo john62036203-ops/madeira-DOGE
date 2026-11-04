@@ -3424,6 +3424,12 @@ struct LibraryDetail: View {
                         Text("A game that reserves 64 GB or more of address space at once (Digimon Story Time Stranger asks for 256 GB) gets the reserve with a real 16 GB part at its start, instead of a failure it does not check and crashes on. Turn it off for games that start without it.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge MADEIRA_PAGEFILE_MB: per-game, in the game's own file (virtual_ios.c ios_fake_swap)
+                    Toggle("Report a 16 GB page file to this game (experimental)", isOn: Binding(get: { !bcd.value("env.MADEIRA_PAGEFILE_MB").isEmpty }, set: { setBCDKey("env.MADEIRA_PAGEFILE_MB", $0 ? "16384" : "") }))
+                    if !bcd.value("env.MADEIRA_PAGEFILE_MB").isEmpty {
+                        Text("iOS has no page file, so a game that insists on one sees a commit limit equal to physical memory and may refuse to start (Digimon Story Time Stranger: \"Insufficient memory or disk space\"). This adds 16 GB of page file to what GlobalMemoryStatusEx reports. Only what the game is told changes, not what it can use.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge swap-low-room-mb: per-game, in the game's own file
                     Toggle("Move small allocations to disk when memory runs short (experimental)", isOn: Binding(get: { !bcd.value("swap-low-room-mb").isEmpty }, set: { setBCDKey("swap-low-room-mb", $0 ? "512" : "") }))
                     if !bcd.value("swap-low-room-mb").isEmpty {

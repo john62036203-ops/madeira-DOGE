@@ -26,7 +26,15 @@ src = src.replace(anchor, """#ifdef __APPLE__
     {
         /* madeira-doge: avail-phys (tools/patch-wine-avail-phys.py) */
         extern unsigned long long ios_avail_phys( unsigned long long host_free );
+        /* madeira-doge: env.MADEIRA_PAGEFILE_MB = N adds an N MB page file to the commit
+         * limit (ullTotalPageFile / ullAvailPageFile). iOS has no swap, so a program that
+         * requires a page file (Digimon Story Time Stranger: "Insufficient memory or
+         * disk space") otherwise sees none. */
+        extern unsigned long long ios_fake_swap( void );
+        unsigned long long fake_swap = ios_fake_swap();
         freeram = ios_avail_phys( freeram );
+        totalswap += fake_swap;
+        freeswap += fake_swap;
     }
 #endif
 """ + anchor)
