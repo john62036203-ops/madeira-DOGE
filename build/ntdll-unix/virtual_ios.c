@@ -26026,6 +26026,7 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
      * failure for another. That trade needs measuring, not guessing. */
     {
         static unsigned long long cached_limit = ~0ull;
+        static int explicit_raise;   /* madeira-doge: MADEIRA_TOTAL_PHYS_MB may also RAISE the total (games that refuse to start under 8 GB) */
 
         if (cached_limit == ~0ull)
         {
@@ -26035,6 +26036,7 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
             if (env && *env)
             {
                 cached_limit = strtoull( env, NULL, 10 ) * 1024ull * 1024ull;
+                explicit_raise = cached_limit != 0;
                 dprintf( 2, "ml992: MADEIRA_TOTAL_PHYS_MB=%s -> %llu MB (override)\n",
                          env, cached_limit >> 20 );
             }
@@ -26120,6 +26122,15 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
                      ((unsigned long long)info->MmHighestPhysicalPage * page_size) >> 20,
                      cached_limit >> 20 ); }
             info->MmHighestPhysicalPage = max( 1, cached_limit / page_size );
+        }
+        else if (explicit_raise && cached_limit / page_size > (unsigned long long)info->MmHighestPhysicalPage)
+        {
+            static int raise_said;
+            if (!raise_said++)
+                dprintf( 2, "ml992: raising reported physical memory %llu MB -> %llu MB (MADEIRA_TOTAL_PHYS_MB; "
+                         "the real limit is unchanged)\n",
+                         ((unsigned long long)info->MmHighestPhysicalPage * page_size) >> 20, cached_limit >> 20 );
+            info->MmHighestPhysicalPage = cached_limit / page_size;
         }
     }
 #elif defined(_SC_PHYS_PAGES)
@@ -37191,6 +37202,20 @@ unsigned long long ios_avail_phys( unsigned long long host_free )
     static unsigned int logged;
     unsigned long long left;
 
+    /* madeira-doge: env.MADEIRA_AVAIL_PHYS_MB = N reports exactly N MB free, whatever
+     * the phone has (Digimon Story Time Stranger refuses to start, "Insufficient
+     * memory or disk space", after reading the memory figures; which figure it
+     * gates on is not known, so each can be forced). */
+    {
+        static long long forced = -1;
+        if (forced < 0)
+        {
+            const char *env = getenv( "MADEIRA_AVAIL_PHYS_MB" );
+            forced = (env && *env) ? strtoll( env, NULL, 10 ) : 0;
+            if (forced > 0) dprintf( 2, "[avail-phys] MADEIRA_AVAIL_PHYS_MB=%lld -> reporting %lld MB available (forced)\n", forced, forced );
+        }
+        if (forced > 0) return (unsigned long long)forced << 20;
+    }
     if (on < 0) on = madeira_cfg_bool( "avail-phys", 0 );
     if (!on) return host_free;
     left = (unsigned long long)os_proc_available_memory();

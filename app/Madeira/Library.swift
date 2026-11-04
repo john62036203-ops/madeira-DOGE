@@ -3418,6 +3418,12 @@ struct LibraryDetail: View {
                         Text("With \"Room for a large game executable\" on (Settings), Madeira keeps 576 MB at 0x140000000 for the game's main executable. A game whose executable is under 160 MB (Sparking Zero: 150 MB) does not need most of it; this gives the rest to the JIT pool before it is placed, so the translated-code cache is larger and has to be rebuilt less often (fewer ~1 s stalls). Do not use it for a game whose main executable is bigger than 160 MB.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge ml1298 oversize-reserve: per-game, in the game's own file (virtual_ios.c)
+                    Toggle("Large memory reservations (experimental)", isOn: Binding(get: { bcd.value("oversize-reserve") == "1" }, set: { setBCDKey("oversize-reserve", $0 ? "1" : "") }))
+                    if bcd.value("oversize-reserve") == "1" {
+                        Text("A game that reserves 64 GB or more of address space at once (Digimon Story Time Stranger asks for 256 GB) gets the reserve with a real 16 GB part at its start, instead of a failure it does not check and crashes on. Turn it off for games that start without it.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge swap-low-room-mb: per-game, in the game's own file
                     Toggle("Move small allocations to disk when memory runs short (experimental)", isOn: Binding(get: { !bcd.value("swap-low-room-mb").isEmpty }, set: { setBCDKey("swap-low-room-mb", $0 ? "512" : "") }))
                     if !bcd.value("swap-low-room-mb").isEmpty {
