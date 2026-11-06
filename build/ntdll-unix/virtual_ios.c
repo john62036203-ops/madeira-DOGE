@@ -32337,6 +32337,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                        alloc_size <= ios_jit_low_size_global &&
                        ios_jit_low_reserved <= ios_jit_low_size_global - alloc_size;
         int kept_large_carve = 0, kept_big_carve = 0, reuse_all_carves = 0;
+        (void)kept_big_carve;   /* upstream #556: read by the tail path's retry, after the region-C attempt */
         size_t tail_cap = ~(size_t)0;
         /* ml459 (#75): cap a single EC code buffer at 16MB. FEX asks for 32MB
          * once its buffers get hot, but an old generation stays pinned by any

@@ -41,6 +41,7 @@ helpers = ''.join(function(native, signature) for signature in (
     'static int ios_pool_low_take(',
     'static int ios_tail_carve_in_low(',
     'static int ios_pool_preserve_code_carve(',
+    'static int ios_pool_preserve_big_carve(',
 ))
 
 c_fixture = r'''
@@ -49,6 +50,8 @@ c_fixture = r'''
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <string.h>
+#include <time.h>
 #define MB ((size_t)1 << 20)
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "failed line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
 #define STATUS_SUCCESS 0
@@ -56,6 +59,7 @@ c_fixture = r'''
 #define FALLBACK_TAIL 2
 #define IOS_POOL_LOW_CARVE_MAX 0x8000000u
 #define IOS_TAIL_CARVE_MAX 256
+#define IOS_POOL_REUSE_GRACE_SEC 3
 static void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
 static uintptr_t ios_jit_low_rx_global, ios_jit_low_rw_global;
 static size_t ios_jit_low_size_global, ios_jit_pool_size_global;
@@ -65,8 +69,9 @@ static size_t ios_jit_hole_off_eff, ios_jit_hole_end_eff;
 static int ios_jit_low_full_logged, wow, lose_race;
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct { size_t off, size; int free; time_t freed_at; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
+static struct { size_t off, size; int free; time_t freed_at; int retired; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
 static uintptr_t ios_wow_base(void) { return wow; }
+static int ios_tail_carve_scan(const void *base, size_t size, int strict) { (void)base; (void)size; (void)strict; return 0; }
 ''' + helpers + r'''
 static int racing_low_take(volatile size_t *used, size_t total, size_t want, size_t *off)
 {
@@ -102,6 +107,8 @@ static void reset(void *memory)
 int main(void)
 {
     void *memory = NULL, *ret = NULL;
+    /* the existing scenarios are the policy without upstream #556's big-carve rule */
+    setenv("MADEIRA_POOL_CODE_KEEP_BIG", "0", 1);
     CHECK(!posix_memalign(&memory, 0x4000, 312 * MB));
     reset(memory);
     size_t request = 0x4000;
@@ -184,6 +191,27 @@ int main(void)
         CHECK(jit_pool_offset == 0x2dea8000);
     }
     puts("PASS: fitting C to 312MB keeps the helper's 32MB buffer and game startup allocations outside the main pool; 304MB reproduces the fallback");
+
+    /* upstream #556 big-carve rule: with C full a 16KB request keeps the 16MB carve
+     * back and goes to the tail path (which retries with every carve if that fails) */
+    setenv("MADEIRA_POOL_CODE_KEEP_BIG", "1", 1);
+    reset(memory);
+    ios_jit_low_reserved = ios_jit_low_size_global;
+    request = 0x4000;
+    CHECK(allocate(&request, &ret) == FALLBACK_TAIL);
+    CHECK(ios_tail_carves[0].free && !ios_jit_tail_reserved);
+    reset(memory);
+    ios_tail_carves[0].retired = 1;
+    ios_tail_carves[0].freed_at = time(NULL);
+    ios_jit_low_reserved = ios_jit_low_size_global;
+    request = 16 * MB;
+    CHECK(allocate(&request, &ret) == FALLBACK_TAIL);
+    CHECK(ios_tail_carves[0].free && ios_tail_carves[0].retired);
+    ios_tail_carves[0].freed_at -= 10;
+    CHECK(allocate(&request, &ret) == STATUS_SUCCESS && request == 16 * MB);
+    CHECK(!ios_tail_carves[0].free && !ios_tail_carves[0].retired);
+    setenv("MADEIRA_POOL_CODE_KEEP_BIG", "0", 1);
+    puts("PASS: a big free carve is kept back for a small request; a carve freed while occupied waits out the grace");
 
     reset(memory);
     wow = 1;

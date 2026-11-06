@@ -86,7 +86,7 @@ assert 'ios_pool_freelist[ios_pool_free_count].off = jit_pool_offset;' in bump
 warmer = function(native, 'static void *ios_pool_warmer_thread(')
 assert warmer.count('if (IOS_POOL_IN_HOLE(o)) continue;') == 4, 'all four warmer loops skip the hole'
 
-tail = native[native.index('size_t reserve_offset, tail_added, tail_skipped = 0;'):][:12000]
+tail = native[native.index('size_t reserve_offset, tail_added, tail_skipped = 0;'):][:14000]
 assert 'ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,' in tail
 # three rollbacks: tail exhausted, and (madeira-doge, MADEIRA_TAIL_CARVE_EXEC_CHECK) a carve that cannot execute
 assert tail.count('ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,') == 3
