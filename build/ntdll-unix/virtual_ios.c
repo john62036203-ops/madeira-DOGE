@@ -3849,7 +3849,7 @@ static volatile size_t ios_jit_tail_reserved = 0;
  * (1..32MB after the ml437 MAX_CODE_SIZE cap), so first-fit-larger waste is
  * bounded and reuse is usually exact. */
 #define IOS_TAIL_CARVE_MAX 256
-static struct { size_t off; size_t size; int free; time_t freed_at; } ios_tail_carves[IOS_TAIL_CARVE_MAX];
+static struct { size_t off; size_t size; int free; time_t freed_at; int retired; } ios_tail_carves[IOS_TAIL_CARVE_MAX];   /* retired: upstream #556, freed while a thread ran in it */
 
 /* madeira-bcd pool-low: 1 for a carve offset in region C (`off` is its wrapping
  * distance from the pool's RX base, see ios_jit_low_rx_global). */
@@ -3864,6 +3864,20 @@ static int ios_tail_carve_in_low( size_t off )
 static int ios_pool_preserve_code_carve( size_t available, size_t want, int low_fits )
 {
     return low_fits && want <= 0x10000 && available >= 0x100000 && available / 4 >= want;
+}
+
+/* upstream willfaust/Madeira #556: nor should any request take a free carve four or more
+ * times its size while a fresh carve of the size asked can still be made: the carve stays
+ * with its taker for that process's life. Persona 5 Royal's crashpad_handler.exe took a
+ * 16 MB carve for its 16 KB dispatcher and a 128 MB one for a 16 MB code buffer. When the
+ * fresh carve fails anyway, the allocator retries with every carve allowed
+ * (reuse_all_carves). MADEIRA_POOL_CODE_KEEP_BIG=0 restores the old policy. */
+static int ios_pool_preserve_big_carve( size_t available, size_t want )
+{
+    const char *env = getenv( "MADEIRA_POOL_CODE_KEEP_BIG" );   /* 0: a code buffer request takes the smallest free buffer that fits, however much larger, as before */
+
+    if (env && !strcmp( env, "0" )) return 0;
+    return want && available / 4 >= want;
 }
 
 /* ml557 (#74 REGRESSION): is any thread's PC currently INSIDE this tail carve?
@@ -32322,7 +32336,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         int low_fits = low_ok && alloc_size <= IOS_POOL_LOW_CARVE_MAX &&
                        alloc_size <= ios_jit_low_size_global &&
                        ios_jit_low_reserved <= ios_jit_low_size_global - alloc_size;
-        int kept_large_carve = 0, reuse_all_carves = 0;
+        int kept_large_carve = 0, kept_big_carve = 0, reuse_all_carves = 0;
         size_t tail_cap = ~(size_t)0;
         /* ml459 (#75): cap a single EC code buffer at 16MB. FEX asks for 32MB
          * once its buffers get hot, but an old generation stays pinned by any
@@ -32403,15 +32417,34 @@ retry_code_carve_reuse:
         {
             unsigned i, best = ~0u;
             pthread_mutex_lock( &ios_tail_carve_lock );
+            time_t carve_now = time( NULL );
             for (i = 0; i < ios_tail_carve_n; i++)
                 if (ios_tail_carves[i].free && ios_tail_carves[i].size >= alloc_size &&
                     (low_ok || !ios_tail_carve_in_low( ios_tail_carves[i].off )) &&   /* madeira-bcd pool-low */
                     (best == ~0u || ios_tail_carves[i].size < ios_tail_carves[best].size))
+                {
+                    /* upstream #556: a carve freed while a thread ran in it waits out the
+                     * grace and the strict thread scan before it is reused */
+                    if (ios_tail_carves[i].retired)
+                    {
+                        if (carve_now - ios_tail_carves[i].freed_at < IOS_POOL_REUSE_GRACE_SEC ||
+                            ios_tail_carve_scan( (char *)ios_jit_rx_base_global + ios_tail_carves[i].off,
+                                                 ios_tail_carves[i].size, 1 ))
+                            continue;
+                        ios_tail_carves[i].retired = 0;
+                    }
                     best = i;
+                }
             if (best != ~0u && !reuse_all_carves &&
                 ios_pool_preserve_code_carve( ios_tail_carves[best].size, alloc_size, low_fits ))
             {
                 kept_large_carve = 1;
+                best = ~0u;
+            }
+            else if (best != ~0u && !reuse_all_carves &&
+                     ios_pool_preserve_big_carve( ios_tail_carves[best].size, alloc_size ))
+            {
+                kept_big_carve = 1;
                 best = ~0u;
             }
             if (best != ~0u)
@@ -32455,7 +32488,7 @@ retry_code_carve_reuse:
                     ios_tail_carves[ios_tail_carve_n].off = (size_t)((uintptr_t)jit_rx - (uintptr_t)ios_jit_rx_base_global);
                     ios_tail_carves[ios_tail_carve_n].size = alloc_size;
                     ios_tail_carves[ios_tail_carve_n].free = 0;
-                    ios_tail_carves[ios_tail_carve_n].freed_at = 0;
+                    ios_tail_carves[ios_tail_carve_n].freed_at = 0; ios_tail_carves[ios_tail_carve_n].retired = 0;
                     ios_tail_carve_n++;
                 }
                 pthread_mutex_unlock( &ios_tail_carve_lock );
@@ -32546,7 +32579,7 @@ retry_code_carve_reuse:
                         ios_tail_carves[ios_tail_carve_n].off = foff;
                         ios_tail_carves[ios_tail_carve_n].size = alloc_size;
                         ios_tail_carves[ios_tail_carve_n].free = 0;
-                        ios_tail_carves[ios_tail_carve_n].freed_at = 0;
+                        ios_tail_carves[ios_tail_carve_n].freed_at = 0; ios_tail_carves[ios_tail_carve_n].retired = 0;
                         ios_tail_carve_n++;
                     }
                     pthread_mutex_unlock( &ios_tail_carve_lock );
@@ -32571,6 +32604,12 @@ retry_code_carve_reuse:
              * tail reservation — the old path leaked it on every refusal. */
             ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,
                                      ios_jit_hole_end > ios_jit_hole_off );
+            /* upstream #556: a free carve was kept back for a bigger request: use it after all */
+            if ((kept_large_carve || kept_big_carve) && !reuse_all_carves)
+            {
+                reuse_all_carves = 1;
+                goto retry_code_carve_reuse;
+            }
             ERR("NtAllocateVirtualMemoryEx iOS: JIT-pool tail exhausted for FEX EC_CODE %zu bytes\n",
                 (size_t)*size_ptr);
             /* ml459 (#75): dump the carve table on the FIRST refusal — the
@@ -32681,7 +32720,7 @@ retry_code_carve_reuse:
                 ios_tail_carves[ios_tail_carve_n].off = pool_tail_off;
                 ios_tail_carves[ios_tail_carve_n].size = alloc_size;
                 ios_tail_carves[ios_tail_carve_n].free = 0;
-                ios_tail_carves[ios_tail_carve_n].freed_at = 0;
+                ios_tail_carves[ios_tail_carve_n].freed_at = 0; ios_tail_carves[ios_tail_carve_n].retired = 0;
                 ios_tail_carve_n++;
             }
             /* madeira-bcd split pool: this carve went below the hole; the span it
@@ -32691,7 +32730,7 @@ retry_code_carve_reuse:
                 ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end_eff;
                 ios_tail_carves[ios_tail_carve_n].size = tail_skipped & ~(size_t)0x3fff;
                 ios_tail_carves[ios_tail_carve_n].free = 1;
-                ios_tail_carves[ios_tail_carve_n].freed_at = 0;   /* never executed, outside region C */
+                ios_tail_carves[ios_tail_carve_n].freed_at = 0; ios_tail_carves[ios_tail_carve_n].retired = 0;   /* never executed, outside region C */
                 ios_tail_carve_n++;
             }
             pthread_mutex_unlock( &ios_tail_carve_lock );
@@ -33440,16 +33479,29 @@ static NTSTATUS ios_na_inner_NtFreeVirtualMemory( HANDLE process, PVOID *addr_pt
         for (i = 0; i < ios_tail_carve_n; i++)
         {
             if (ios_tail_carves[i].off != off || ios_tail_carves[i].free) continue;
-            /* ml557: do NOT recycle a carve a thread is still executing in. */
+            /* ml557: do NOT recycle a carve a thread is still executing in. Refusing the
+             * release leaked it for good, though: FEX releases a buffer once and never
+             * again (upstream #556: Persona 5 Royal lost a 128 MB buffer that way). It is
+             * freed as retired instead: reuse waits out the grace and the strict thread
+             * scan. MADEIRA_POOL_CODE_DEFER_FREE=0 refuses it as before. */
             if (ios_tail_carve_occupied( base, ios_tail_carves[i].size ))
             {
                 static unsigned long occ_n;
+                const char *defer_env = getenv( "MADEIRA_POOL_CODE_DEFER_FREE" );   /* 0: a FEX code buffer released while a thread runs in it is refused and stays live, as before */
+                if (defer_env && !strcmp( defer_env, "0" ))
+                {
+                    if (++occ_n <= 16 || (occ_n % 256) == 0)
+                        dprintf(2, "[jit-pool] tail FREE REFUSED rx=%p size=0x%lx — a thread's "
+                                   "PC is inside it (occupied=%lu) rev=ml557\n",
+                                base, (unsigned long)ios_tail_carves[i].size, occ_n);
+                    carve_size = 0;
+                    break;
+                }
                 if (++occ_n <= 16 || (occ_n % 256) == 0)
-                    dprintf(2, "[jit-pool] tail FREE REFUSED rx=%p size=0x%lx — a thread's "
-                               "PC is inside it (occupied=%lu) rev=ml557\n",
+                    dprintf(2, "[jit-pool] tail FREE deferred rx=%p size=0x%lx — a thread's "
+                               "PC is inside it (occupied=%lu): retired until it leaves rev=ml557\n",
                             base, (unsigned long)ios_tail_carves[i].size, occ_n);
-                carve_size = 0;
-                break;
+                ios_tail_carves[i].retired = 1;
             }
             ios_tail_carves[i].free = 1;
             ios_tail_carves[i].freed_at = time( NULL );
