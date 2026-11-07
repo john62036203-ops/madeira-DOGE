@@ -3395,6 +3395,12 @@ struct LibraryDetail: View {
                         Text("FEX watches for game code that rewrites itself on the iPhone's 16 KB memory pages instead of 4 KB pieces, so a rewrite next to other code is no longer missed (from upstream Madeira; JIT and anti-cheat code such as Age of Empires IV's or an emulator inside Madeira). May let \"Check every instruction\" style settings (FEX_SMCCHECKS = full) be removed. Turn it off if the game gets slower or crashes.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge pso-async (from BCD 0.1.634): opt-in, madeira-d3d12 only
+                    Toggle("Build new shaders in the background (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("pso-async") == "1" }, set: { setBCDKey("pso-async", $0 ? "1" : "") }))
+                    if bcd.value("pso-async") == "1" {
+                        Text("A shader the game uses for the first time is compiled on two background threads instead of holding up the frame, so entering a new area or a cutscene stutters less (from BCD). Until it is ready, that object or effect is left out for a few frames. Turn it off if things pop in or flicker.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge steamac 0006/0007: opt-in (tools/patch-winemetal-null-pso.py, tools/patch-d3d11src-null-pso.py)
                     Toggle("Skip drawing with shaders that failed to build (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_NULL_PSO_SKIP") == "1" }, set: { setBCDKey("env.MADEIRA_NULL_PSO_SKIP", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_NULL_PSO_SKIP") == "1" {
