@@ -18400,6 +18400,34 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     p->raster.depth_bias = (float)desc->RasterizerState.DepthBias;
     p->raster.scole_scale = desc->RasterizerState.SlopeScaledDepthBias;
     p->raster.depth_bias_clamp = desc->RasterizerState.DepthBiasClamp;
+    {   /* madeira-doge: madeira.cfg depth-test-bias = N (0 = off, the default). A pipeline that
+         * only TESTS depth (write mask zero) against a depth pre-pass with LESS/LESS_EQUAL or
+         * GREATER/GREATER_EQUAL gets N units of Metal depth bias in the direction that makes
+         * the test pass (towards the viewer). DRAGON BALL Sparking! ZERO draws its characters
+         * in a depth pre-pass and again in the base pass with GREATER_EQUAL (reversed Z, no
+         * write): on Metal the two vertex shaders (different functions, the same position
+         * math) round the depth differently at some pixels, the base pass loses them, and every
+         * G-buffer target keeps the clear colour there -- the "dirty" dark specks along the
+         * characters' contours and creases (captures f2244/f4384, 2026-11-09). The game's own
+         * rasterizer bias is kept and the extra is added to it. EQUAL cannot be helped this way. */
+        static int dtb = -1; static LONG said;
+        if (dtb < 0) { long long v = mad_cfg_int_pe("depth-test-bias", 0); dtb = v > 0 && v <= 64 ? (int)v : 0; }
+        if (dtb && desc->DepthStencilState.DepthEnable && desc->DepthStencilState.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ALL &&
+            desc->PS.pShaderBytecode && desc->PS.BytecodeLength) {
+            int sign = 0;
+            switch (desc->DepthStencilState.DepthFunc) {
+            case D3D12_COMPARISON_FUNC_GREATER: case D3D12_COMPARISON_FUNC_GREATER_EQUAL: sign = 1; break;
+            case D3D12_COMPARISON_FUNC_LESS: case D3D12_COMPARISON_FUNC_LESS_EQUAL: sign = -1; break;
+            default: break;
+            }
+            if (sign) {
+                p->raster.depth_bias += (float)(sign * dtb);
+                if (InterlockedIncrement(&said) <= 8)
+                    d3d12_log("[madeira-d3d12] depth-test-bias %d: pipeline vs '%s' ps '%s' (depth func %u, no write) rasterizes with bias %+d\n",
+                              dtb, p->vs_name, p->ps_name, (unsigned)desc->DepthStencilState.DepthFunc, sign * dtb);
+            }
+        }
+    }
 
     if (said_pso < 8) {
         said_pso++;
