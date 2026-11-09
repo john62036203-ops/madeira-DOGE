@@ -128,6 +128,14 @@ enum BCDLaunch {
         return nil
     }
 
+    /// madeira-doge: upstream's automatic switches are opt-in here: on when the game's own
+    /// file (Game details toggle) or madeira.cfg sets env.NAME = 1; off when unset.
+    static func gameOptIn(_ windowsPath: String, _ name: String) -> Bool {
+        if let v = GameProfile(windowsPath: windowsPath).values["env." + name] { return v == "1" }
+        return MadeiraConfig.flag(name, fallback: false)
+    }
+
+
     /// A Unity IL2CPP build keeps GameAssembly.dll next to its exe. A direct Steam
     /// launch can select an exe below its install folder; Dock keeps the root check.
     /// (upstream willfaust/Madeira #540)
@@ -471,5 +479,62 @@ enum D3D9Identity {
             changed = true
         }
         return changed ? lines.joined(separator: "\n") : nil
+    }
+}
+
+/// A library game that ran out of JIT pool (`[jit-pool] EXHAUSTED`, which ends many
+/// big games at start: Slay the Spire 2 with Steam code 45, Satisfactory before its
+/// logo) gets the two lines that fixed those games added to its own config:
+/// `pool-split = 1` (about 880 MB instead of 560-630 MB) and
+/// `env.MADEIRA_X64_IMAGE_NOCOPY = 1` (pure-x64 DLLs are not copied into the pool).
+/// The pool is set up once per app run, so they apply after Madeira is reopened, and
+/// the alert at the end of the session says so. A key the game's config already sets,
+/// to any value, is left alone, so a player's `pool-split = 0` stays.
+/// `env.MADEIRA_JIT_POOL_AUTO = 0` turns this off.
+enum JITPoolAuto {
+    static let lines: [(key: String, value: String)] = [("pool-split", "1"), ("env.MADEIRA_X64_IMAGE_NOCOPY", "1")]
+
+    /// The lines `text` does not set yet.
+    static func missing(_ text: String) -> [(key: String, value: String)] {
+        let values = GameProfile.parse(text)
+        return lines.filter { values[$0.key] == nil }
+    }
+
+    /// `text` with the missing lines added, or nil when nothing is missing.
+    static func added(to text: String) -> String? {
+        let add = missing(text)
+        guard !add.isEmpty else { return nil }
+        var out = text
+        if !out.isEmpty, !out.hasSuffix("\n") { out += "\n" }
+        out += "# Added by Madeira: this game ran out of JIT memory\n"
+        out += add.map { "\($0.key) = \($0.value)" }.joined(separator: "\n") + "\n"
+        return out
+    }
+
+    /// Adds the missing lines to the game's config. Returns true when it changed it.
+    static func apply(windowsPath: String, title: String) -> Bool {
+        guard BCDLaunch.gameOptIn(windowsPath, "MADEIRA_JIT_POOL_AUTO") else {
+            LogStore.shared.log("[jit-pool-auto] \(title): ran out of JIT memory; automatic settings are off (Game details toggle, env.MADEIRA_JIT_POOL_AUTO = 1)")
+            return false
+        }
+        let file = GameProfile(windowsPath: windowsPath)
+        let text = file.text
+        guard let out = added(to: text) else {
+            LogStore.shared.log("[jit-pool-auto] \(title): ran out of JIT memory; its config already sets pool-split and MADEIRA_X64_IMAGE_NOCOPY")
+            return false
+        }
+        let keys = missing(text).map(\.key).joined(separator: ", ")
+        file.text = out
+        guard file.text == out else {
+            LogStore.shared.log("[jit-pool-auto] \(title): could not write its config", level: .error)
+            return false
+        }
+        LogStore.shared.log("[jit-pool-auto] \(title): ran out of JIT memory; added \(keys) to its config for the next start")
+        return true
+    }
+
+    /// The alert after the session.
+    static func message(_ title: String) -> String {
+        "\(title) ran out of JIT memory, so Madeira gave it bigger JIT memory settings. To use them, close Madeira (swipe it away in the app switcher), open it again and start \(title)."
     }
 }

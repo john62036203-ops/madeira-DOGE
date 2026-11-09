@@ -79,6 +79,12 @@ OVERLAY = {
                 "note": "Default off. 1: a fixed view past the device's 512 GB address map fails instead of "
                         "being reported as mapped, and each refused 2^n guest-memory candidate of a "
                         "Xenia-derived program (e.g. Ninja's Dawn) is logged with what occupies it."},
+    "env.MADEIRA_JIT_POOL_AUTO": {"category": "Memory & JIT pool", "title": "Bigger JIT pool for a game that ran out",
+                "kind": "bool", "default": "0",
+                "note": "madeira-doge (upstream SirDank 3cf97ae, opt-in here): 1 in a game's file (Game details toggle) or "
+                        "madeira.cfg: when the session logs [jit-pool] EXHAUSTED, pool-split = 1 and "
+                        "env.MADEIRA_X64_IMAGE_NOCOPY = 1 are added to the game's own config (a key it already sets stays), "
+                        "and the alert after the session asks for Madeira to be reopened. Unset or 0: nothing is added."},
     "env.MADEIRA_X64_IMAGE_NOCOPY": {"category": "Memory & JIT pool", "title": "Pure-x64 images without a JIT-pool copy",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: an x64-only image (not ARM64EC hybrid, not a Wine builtin) in a 64-bit "

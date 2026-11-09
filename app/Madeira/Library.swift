@@ -704,6 +704,9 @@ final class LibraryModel: ObservableObject {
     @Published var error: String?
     @Published var sessionMessage = ""
     private var smallPoolNoted = false
+    /// The session's JIT pool ran out and was checked (JITPoolAuto); the game whose config got the lines.
+    private var poolAutoChecked = false
+    private var poolAutoTitle: String?
     /// Quit game was asked for and the program is still running after `forceCloseAfter`
     /// seconds: a frozen program never handles Alt+F4, so the menu offers to close Madeira.
     @Published var forceCloseOffered = false
@@ -1154,7 +1157,7 @@ final class LibraryModel: ObservableObject {
     /// `dock`: the game a Madeira Dock start launches (DockStartScreen).
     func begin(_ entry: LibraryEntry, remember: Bool = true, dock: DockGame? = nil) {
         wine_exit_status_reset()
-        JITPoolMeter.reset(); smallPoolNoted = false
+        JITPoolMeter.reset(); smallPoolNoted = false; poolAutoChecked = false; poolAutoTitle = nil
         quitRequested = false; quitRequestedAt = nil; forceCloseOffered = false; dockGameEnded = false; dockGameEndedAt = nil
         LibraryController.shared.configure(enabled: enabled, ownsInput: false)
         Self.sessionsThisRun += 1
@@ -1217,6 +1220,14 @@ final class LibraryModel: ObservableObject {
             sessionMessage = words
             DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
                 if self?.sessionMessage == words { self?.sessionMessage = "" }
+            }
+        }
+        // The JIT pool ran out: a library game gets the bigger-pool lines for its next start.
+        if !poolAutoChecked, JITPoolMeter.current.exhausted > 0 {
+            poolAutoChecked = true
+            if let entry = activeEntry, entry.desktop != true, entries.contains(where: { $0.id == entry.id }),
+               JITPoolAuto.apply(windowsPath: entry.windowsPath, title: entry.title) {
+                poolAutoTitle = entry.title
             }
         }
         if wine_process_is_running() != 0 {
@@ -1345,7 +1356,9 @@ final class LibraryModel: ObservableObject {
     }
     private func finish() {
         if sawProcess, let next = steamRunRequest() { restartNotice = next }
+        else if let title = poolAutoTitle { error = JITPoolAuto.message(title) }
         else if sawProcess, let report = exitReport() { error = report }
+        poolAutoTitle = nil
         timer?.invalidate(); timer = nil
         saveCurrentProfile()
         controllerMode = nil
@@ -3399,6 +3412,24 @@ struct LibraryDetail: View {
                     Toggle("Build new shaders in the background (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("pso-async") == "1" }, set: { setBCDKey("pso-async", $0 ? "1" : "") }))
                     if bcd.value("pso-async") == "1" {
                         Text("A shader the game uses for the first time is compiled on two background threads instead of holding up the frame, so entering a new area or a cutscene stutters less (from BCD). Until it is ready, that object or effect is left out for a few frames. Turn it off if things pop in or flicker.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge upstream #586: opt-in, madeira-d3d12 only
+                    Toggle("Run compute work side by side (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("cs-concurrent") == "1" }, set: { setBCDKey("cs-concurrent", $0 ? "1" : "") }))
+                    if bcd.value("cs-concurrent") == "1" {
+                        Text("The GPU may overlap the game's compute passes between two sync points instead of running them one after another, which cut GPU time per frame by 15-27% in upstream Madeira's tests (Path of Exile 2). Not used with fence-chain 6-9. Turn it off if shadows, lighting or effects flicker or look wrong.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge upstream SirDank d5acd4e: opt-in here (upstream default on)
+                    Toggle("Report compressed texture sizes in whole blocks (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("bc-footprint-align") == "1" }, set: { setBCDKey("bc-footprint-align", $0 ? "1" : "") }))
+                    if bcd.value("bc-footprint-align") == "1" {
+                        Text("The smallest mip levels of block-compressed textures are reported as 4x4 like real Direct3D 12, which Unreal Engine games check when they upload textures (from upstream Madeira's test build; fixed Satisfactory). Turn it off if textures look wrong.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge upstream SirDank 3cf97ae: opt-in (LibraryBCD.swift JITPoolAuto)
+                    Toggle("Bigger JIT memory after the game runs out (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_JIT_POOL_AUTO") == "1" }, set: { setBCDKey("env.MADEIRA_JIT_POOL_AUTO", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_JIT_POOL_AUTO") == "1" {
+                        Text("When a session runs out of JIT memory ([jit-pool] EXHAUSTED in the log), Madeira adds pool-split = 1 and env.MADEIRA_X64_IMAGE_NOCOPY = 1 to this game's settings and asks you to reopen Madeira (from upstream Madeira's test build). Settings the game already has are left alone.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     // madeira-doge steamac 0006/0007: opt-in (tools/patch-winemetal-null-pso.py, tools/patch-d3d11src-null-pso.py)
