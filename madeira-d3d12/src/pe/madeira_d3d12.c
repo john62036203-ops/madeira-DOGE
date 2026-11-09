@@ -3423,6 +3423,47 @@ static void mad_trace_draw(struct mad_exec *e) {
                                    r->xview[xv].lvl0, r->xview[xv].nlvl, r->xview[xv].sl0, r->xview[xv].nsl);
     }
     d3d12_log("%s\n", line);
+    /* madeira-doge: trace-cb = <first>-<last> (vector indices, default 0-63; madeira.cfg / game
+     * cfg): for the first 4 traced draws also log the CONTENTS of every constant buffer the pixel
+     * stage declares, those float4 vectors, 4 per line, as the shader will read them (the buffer's
+     * host mapping; a buffer this process cannot read says so). Sparking! ZERO's character
+     * material discards by a dither that compares against cb2[62].x; the capture dumps the root
+     * addresses only, so the values decided nothing until this. */
+    {
+        static char rng[32]; static int rng_loaded, lo = 0, hi = 63; static LONG cb_draws;
+        if (!rng_loaded) {
+            rng_loaded = 1;
+            if (mad_cfg_str_pe("trace-cb", rng, sizeof rng) && rng[0]) {
+                int a = 0, b = 0; if (sscanf(rng, "%d-%d", &a, &b) == 2 && a >= 0 && b >= a && b < 4096) { lo = a; hi = b; }
+            }
+        }
+        if (InterlockedIncrement(&cb_draws) <= 4) {
+            for (k = 0; k < e->pso->ps_nair; k++) {
+                const struct madeira_ir_air_range *rg = &e->pso->ps_air[k]; struct mad_descriptor de; UINT64 direct = 0, off = 0; const char *why = "?";
+                struct mad_resource *r; UINT64 va; int v, vlast;
+                if (rg->type != MADEIRA_IR_AIR_CBV) continue;
+                if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg,
+                                     (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_PIXEL), &de, &direct, &why)) {
+                    d3d12_log("[trace-cb] enc#%u ps '%s' cb%u: UNRESOLVED (%s)\n", e->renc_seq, e->pso->ps_name, rg->lower_bound, why ? why : "?"); continue; }
+                va = direct ? direct : de.gpu_va;
+                r = mad_resolve_address(d, va, &off);
+                if (!r || !r->cpu) {
+                    d3d12_log("[trace-cb] enc#%u ps '%s' cb%u: va %#llx %s\n", e->renc_seq, e->pso->ps_name, rg->lower_bound,
+                              (unsigned long long)va, r ? "has no host mapping (not an upload buffer)" : "resolves to no buffer"); continue; }
+                vlast = (int)((r->size - off) / 16) - 1; if (vlast > hi) vlast = hi;
+                d3d12_log("[trace-cb] enc#%u ps '%s' cb%u: va %#llx = r#%u + %llu (%llu bytes to the end), vectors %d..%d:\n", e->renc_seq, e->pso->ps_name,
+                          rg->lower_bound, (unsigned long long)va, r->serial, (unsigned long long)off, (unsigned long long)(r->size - off), lo, vlast);
+                for (v = lo; v <= vlast; v += 4) {
+                    char cl[600]; int cn = snprintf(cl, sizeof cl, "[trace-cb]   [%3d]", v); int w;
+                    for (w = v; w < v + 4 && w <= vlast; w++) {
+                        const float *f = (const float *)((const char *)r->cpu + off + (UINT64)w * 16); const UINT32 *u = (const UINT32 *)f;
+                        cn += snprintf(cl + cn, sizeof cl - cn, "  %g %g %g %g (%08x %08x %08x %08x)", f[0], f[1], f[2], f[3], u[0], u[1], u[2], u[3]);
+                    }
+                    d3d12_log("%s\n", cl);
+                }
+            }
+        }
+    }
 }
 /* ml1106: everything the matched draw will read, copied out BEFORE it runs
  * (after its producers: the blit is in the fence chain). */
