@@ -210,12 +210,17 @@ done
 python3 "$R/tools/patch-fex-ios-split-lock.py" "$R/FEX" || echo "::warning::the split-lock fast path was not applied (FEX anchor changed); xtajit64.dll is built without it"
 python3 "$R/tools/patch-fex-ios-pause.py" "$R/FEX" || echo "::warning::the PAUSE mode opt-in was not applied (FEX anchor changed); xtajit64.dll is built without it"
 python3 "$R/tools/patch-fex-ios-rdtsc-selfsync.py" "$R/FEX" || echo "::warning::the RDTSC self-sync opt-in was not applied (FEX anchor changed); xtajit64.dll is built without it"
-# A build error from these three opt-ins must not cost the module every other fix: rebuild without them.
-if ! cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1; then
-    echo "::warning::xtajit64.dll did not build with the madeira-doge FEX opt-ins (split lock, PAUSE, RDTSC self-sync); rebuilding without them :: $(grep -m 4 'error' "$B.build.log" | tr '\n' ' ' | cut -c1-900)"
-    git -C "$R/FEX" checkout -- FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
-    build
-fi
+# A build error from these three opt-ins must not cost the module every other fix: the final build
+# retries without them.
+build() {
+    if ! cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1; then
+        echo "::warning::xtajit64.dll did not build with the madeira-doge FEX opt-ins (split lock, PAUSE, RDTSC self-sync); rebuilding without them :: $(grep -m 4 'error' "$B.build.log" | tr '\n' ' ' | cut -c1-900)"
+        git -C "$R/FEX" checkout -- FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+        cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1 \
+            || { grep -m 20 "error" "$B.build.log"; exit 1; }
+    fi
+}
+build
 git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/ARM64EC/Module.S Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/CPUID.h FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/Source/Interface/Core/CPUBackend.cpp FEXCore/Source/Interface/Core/Core.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
 git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"

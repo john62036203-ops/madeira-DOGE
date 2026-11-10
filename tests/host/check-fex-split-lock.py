@@ -348,8 +348,8 @@ else:
 ec = (root / "tools/build-xtajit64.sh").read_text()
 line = 'python3 "$R/tools/patch-fex-ios-split-lock.py" "$R/FEX" || echo "::warning::the split-lock fast path was not applied'
 check("the ARM64EC FEX build applies the patch (a refusal is a warning) and restores AtomicOps.cpp",
-      line in ec and ec.index(line) < ec.rindex("\n    build\nfi\n")
-      and "FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp" in ec[ec.rindex("\n    build\nfi\n"):])
+      line in ec and ec.index(line) < ec.rindex("\nbuild\n")
+      and "FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp" in ec[ec.rindex("\nbuild\n"):])
 gen = (root / "build/tools/gen-config-catalog.py").read_text()
 cat = (root / "app/Madeira/ConfigCatalog.generated.swift").read_text()
 bridge = (root / "app/Madeira/WineProcessBridge.m").read_text()
