@@ -313,11 +313,26 @@ PY
             rm -f "$SHIP/ntdll-proton.dll.tmp"
             echo "::warning::ntdll-proton.dll :: did not build; not shipped (games map the shipped ntdll.dll) :: $(grep -m 6 -E 'error|expected' "$B.ntdll-proton.log" | tr '\n' ' ' | cut -c1-900)"
         fi
+        # madeira-doge: ntdll-x64fast.dll, the same stock tree with Playport's x64
+        # critical-section and QueryPerformanceCounter stubs (tools/patch-wine-ntdll-x64fast.py);
+        # mapped only with env.MADEIRA_X64_CS_FASTPATH = 1 or env.MADEIRA_X64_QPC_FASTPATH = 1
+        # (build/ntdll-unix/loader_ios.c). MADEIRA_NTDLL_X64FAST_BUILD=0 skips it.
+        git -C "$R/wine" checkout -- dlls/ntdll/loader.c dlls/ntdll/heap.c dlls/ntdll/ntdll_misc.h dlls/ntdll/exception.c dlls/ntdll/time.c
+        if [ "${MADEIRA_NTDLL_X64FAST_BUILD:-1}" != 0 ]; then
+            if python3 "$R/tools/patch-wine-ntdll-x64fast.py" "$R/wine" >> "$B.ntdll-proton.log" 2>&1 &&
+               ntp_make && ntp_ship "$SHIP/ntdll-x64fast.dll.tmp"; then
+                mv "$SHIP/ntdll-x64fast.dll.tmp" "$SHIP/ntdll-x64fast.dll"
+                echo "::notice::ntdll-x64fast.dll (x64 critical-section / QueryPerformanceCounter stubs from Playport): built next to the shipped ntdll.dll, mapped only with env.MADEIRA_X64_CS_FASTPATH = 1 or env.MADEIRA_X64_QPC_FASTPATH = 1"
+            else
+                rm -f "$SHIP/ntdll-x64fast.dll.tmp"
+                echo "::warning::ntdll-x64fast.dll :: did not build; not shipped (the x64 fast-path switches have no effect) :: $(grep -m 6 -E 'error|expected' "$B.ntdll-proton.log" | tr '\n' ' ' | cut -c1-900)"
+            fi
+        fi
     else
         echo "::warning::ntdll-proton.dll :: this tree does not rebuild the shipped ntdll.dll apart from time stamps; not shipped :: $(grep -m 4 -E 'same-as|error' "$B.ntdll-proton.log" | tr '\n' ' ' | cut -c1-900)"
         [ -f "$B/ntdll-stock.dll" ] && echo "::warning::ntdll-proton.dll :: $(python3 "$R/tools/patch-wine-ntdll-proton.py" --explain "$B/ntdll-stock.dll" "$SHIP/ntdll.dll" 2>&1 | cut -c1-1500) :: build line: $(grep -m 1 -E 'clang .*-c -o dlls/ntdll/arm64ec-windows/loader.o' "$B.ntdll-proton.log" | cut -c1-600)"
     fi
-    git -C "$R/wine" checkout -- dlls/ntdll/loader.c dlls/ntdll/heap.c dlls/ntdll/ntdll_misc.h dlls/ntdll/exception.c
+    git -C "$R/wine" checkout -- dlls/ntdll/loader.c dlls/ntdll/heap.c dlls/ntdll/ntdll_misc.h dlls/ntdll/exception.c dlls/ntdll/time.c
     for f in $ntp_changed; do cp "$ntp_saved/$f" "$R/wine/$f"; done
     rm -rf "$ntp_saved"
     rm -f "$nt" "$B"/dlls/ntdll/arm64ec-windows/*.o "$B/ntdll-stock.dll"

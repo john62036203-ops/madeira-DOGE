@@ -79,6 +79,35 @@ OVERLAY = {
                 "note": "Default off. 1: a fixed view past the device's 512 GB address map fails instead of "
                         "being reported as mapped, and each refused 2^n guest-memory candidate of a "
                         "Xenia-derived program (e.g. Ninja's Dawn) is logged with what occupies it."},
+    "env.MADEIRA_FEX_SPLIT_LOCK": {"category": "x86 emulation (FEX)", "title": "Atomics across a 16-byte boundary done inline",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-split-lock.py"],
+                "note": "madeira-doge (BCD PR #46, opt-in here; BCD: on by default). 1 in a game's file (Game details toggle) or "
+                        "madeira.cfg: an x86 atomic (xchg with memory, lock xadd/add/sub/and/or/xor) whose operand crosses a 16-byte "
+                        "boundary faults on Apple's processors and was done by the exception thread ([mach_exc] UNALIGNED-LSE, "
+                        "25-30 microseconds each); with this the 64-bit emulator tests the operand first and does such an operation "
+                        "inline under a lock, with the same result. Unset or 0: the trap, as before. Read when each program starts."},
+    "env.MADEIRA_FEX_PAUSE": {"category": "x86 emulation (FEX)", "title": "What x86 PAUSE compiles to",
+                "kind": "choice", "default": "", "sources": ["tools/patch-fex-ios-pause.py"],
+                "choices": [("", "YIELD (default)"), ("wfe", "WFE"), ("isb", "ISB")],
+                "note": "madeira-doge (Playport fex 0083). Unset: PAUSE is YIELD, which Apple's cores treat as a NOP, so a game's "
+                        "spin-wait loop runs flat out. wfe: the core waits for the next event (Playport: The Witcher 3 22.4 -> 24.4 fps, "
+                        "the other cores got the power back). isb: a short pipeline flush. 64-bit programs; read when each program "
+                        "starts; a [fex-pause] line says it is on."},
+    "env.MADEIRA_X64_CS_FASTPATH": {"category": "Wine core (ntdll)", "title": "x64 critical sections without leaving the emulator",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-wine-ntdll-x64fast.py", "build/ntdll-unix/loader_ios.c"],
+                "note": "madeira-doge (Playport wine-pe 0050). 1: ntdll-x64fast.dll is mapped (unless MADEIRA_NTDLL_PROTON = 1) and "
+                        "an x64 module's EnterCriticalSection/LeaveCriticalSection imports go to x64 stubs the emulator runs inline: a "
+                        "free section is taken and a section held once with no waiter is released without an x64->ARM64EC transition; "
+                        "every other case goes on to ntdll as before (Playport, RDR2: about 145,000 calls a second; fps +2-6 %, "
+                        "CPU power -5 to -11 % with its other changes). [x64-cs] lines list the imports bound."},
+    "env.MADEIRA_X64_QPC_FASTPATH": {"category": "Wine core (ntdll)", "title": "x64 QueryPerformanceCounter without leaving the emulator",
+                "kind": "bool", "default": "0",
+                "sources": ["tools/patch-wine-ntdll-x64fast.py", "tools/patch-fex-ios-rdtsc-selfsync.py", "build/ntdll-unix/loader_ios.c"],
+                "note": "madeira-doge (Playport wine-pe 0052 and fex 0061). 1: ntdll-x64fast.dll is mapped (unless "
+                        "MADEIRA_NTDLL_PROTON = 1) and an x64 module's QueryPerformanceCounter import goes to an x64 stub that counts "
+                        "with RDTSC and gives what ntdll would for the same count (it falls back to ntdll before the first resync, "
+                        "when one is due, or when the emulator's TSC scale is unknown); RDTSC is made self-synchronizing so a "
+                        "thread's counts never go back. [x64-qpc] lines say what was bound."},
     "env.MADEIRA_JIT_POOL_AUTO": {"category": "Memory & JIT pool", "title": "Bigger JIT pool for a game that ran out",
                 "kind": "bool", "default": "0",
                 "note": "madeira-doge (upstream SirDank 3cf97ae, opt-in here): 1 in a game's file (Game details toggle) or "

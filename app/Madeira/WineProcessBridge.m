@@ -1993,6 +1993,28 @@ static void *wine_process_thread(void *arg) {
                             use_arm64ec ? "system32 + sysx64" : "sysx64 only");
                 } else if (ntProtonOn) {
                     dprintf(STDERR_FILENO, "[WineProc] MADEIRA_NTDLL_PROTON=1 but this build has no ntdll-proton.dll -- the shipped ntdll.dll stays\n");
+                } else {
+                    /* madeira-doge: ntdll-x64fast.dll (Playport's x64 critical-section and
+                     * QueryPerformanceCounter stubs), the same rule as loader_ios.c's
+                     * ios_ec_ntdll_name: either switch 1 and PROTON not 1. */
+                    const char *xcs = getenv("MADEIRA_X64_CS_FASTPATH"), *xqpc = getenv("MADEIRA_X64_QPC_FASTPATH");
+                    BOOL fastOn = (xcs && xcs[0] == '1' && !xcs[1]) || (xqpc && xqpc[0] == '1' && !xqpc[1]);
+                    NSString *fastDll = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"]
+                                         stringByAppendingPathComponent:@"ntdll-x64fast.dll"];
+                    if (fastOn && [fm fileExistsAtPath:fastDll]) {
+                        NSMutableArray *dirs = [NSMutableArray arrayWithObject:
+                            [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];
+                        if (use_arm64ec) [dirs addObject:sys32Dir];
+                        for (NSString *dir in dirs) {
+                            NSString *dst = [dir stringByAppendingPathComponent:@"ntdll.dll"];
+                            [fm removeItemAtPath:dst error:nil];
+                            [fm createSymbolicLinkAtPath:dst withDestinationPath:fastDll error:nil];
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] x64 fast paths: ntdll.dll -> ntdll-x64fast.dll (%s)\n",
+                                use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                    } else if (fastOn) {
+                        dprintf(STDERR_FILENO, "[WineProc] an x64 fast-path switch is 1 but this build has no ntdll-x64fast.dll -- the shipped ntdll.dll stays\n");
+                    }
                 }
             }
 

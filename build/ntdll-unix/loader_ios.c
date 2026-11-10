@@ -2469,6 +2469,8 @@ static void redirect_ntdll_functions( HMODULE module )
  * at ptr[-2]) and its LFH group retention (only with MADEIRA_HEAP_LFH_KEEP=1).
  *   env.MADEIRA_NTDLL_PROTON 1           ntdll-proton.dll (when the bundle has it)
  *                            unset or 0  ntdll.dll, the shipped binary
+ *   env.MADEIRA_X64_CS_FASTPATH / env.MADEIRA_X64_QPC_FASTPATH 1 (PROTON not 1)
+ *                                        ntdll-x64fast.dll (when the bundle has it)
  * app/Madeira/WineProcessBridge.m links system32\ntdll.dll to the same file. */
 static char *ios_ec_ntdll_name( const char *dir, const char *pe_dir )
 {
@@ -2487,6 +2489,24 @@ static char *ios_ec_ntdll_name( const char *dir, const char *pe_dir )
         if (!said++) dprintf( 2, "[ntdll-proton] MADEIRA_NTDLL_PROTON=1 but this build has no ntdll-proton.dll -- the shipped ntdll.dll is mapped\n" );
         free( name );
         name = NULL;
+    }
+    else if (!strcmp( pe_dir, "/arm64ec-windows" ))
+    {   /* madeira-doge: ntdll-x64fast.dll (tools/patch-wine-ntdll-x64fast.py, Playport's x64
+         * critical-section and QueryPerformanceCounter stubs) when either switch is 1 and
+         * MADEIRA_NTDLL_PROTON is not; the stubs themselves still check their own switch. */
+        const char *cs = getenv( "MADEIRA_X64_CS_FASTPATH" ), *qpc = getenv( "MADEIRA_X64_QPC_FASTPATH" );
+        if ((cs && cs[0] == '1' && !cs[1]) || (qpc && qpc[0] == '1' && !qpc[1]))
+        {
+            if (asprintf( &name, "%s%s/ntdll-x64fast.dll", dir, pe_dir ) < 0) name = NULL;
+            if (name && !access( name, R_OK ))
+            {
+                if (!said++) dprintf( 2, "[ntdll-x64fast] %s (cs=%s qpc=%s; opt-in)\n", name, cs ? cs : "-", qpc ? qpc : "-" );
+                return name;
+            }
+            if (!said++) dprintf( 2, "[ntdll-x64fast] an x64 fast-path switch is 1 but this build has no ntdll-x64fast.dll -- the shipped ntdll.dll is mapped\n" );
+            free( name );
+            name = NULL;
+        }
     }
     if (asprintf( &name, "%s%s/ntdll.dll", dir, pe_dir ) < 0) name = NULL;
     return name;

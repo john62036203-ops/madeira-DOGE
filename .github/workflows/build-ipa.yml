@@ -456,6 +456,15 @@ jobs:
       - name: Check per-thread trampoline capacity
         run: python3 tests/host/check-teb-trampoline-capacity.py
 
+      # madeira-doge: opt-in FEX split lock (BCD PR #46) and ntdll-x64fast.dll (Playport x64 stubs)
+      - name: Check FEX split lock and the x64 ntdll fast paths
+        continue-on-error: true
+        run: |
+          rc=0
+          python3 tests/host/check-fex-split-lock.py > check-fex-split-lock.out 2>&1 || { rc=1; echo "::error title=check-fex-split-lock::$(grep -E 'FAIL' check-fex-split-lock.out | head -5 | tr '\n' ' ' | tr -d '%' | cut -c1-900)"; }
+          python3 tests/host/check-ntdll-x64fast.py > check-ntdll-x64fast.out 2>&1 || { rc=1; echo "::error title=check-ntdll-x64fast::$(grep -E 'FAIL' check-ntdll-x64fast.out | head -5 | tr '\n' ' ' | tr -d '%' | cut -c1-900)"; }
+          exit $rc
+
       - name: Check read-only image patch diagnostics
         run: |
           python3 tests/host/check-image-patch-trace.py

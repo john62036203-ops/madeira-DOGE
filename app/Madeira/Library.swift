@@ -3408,6 +3408,30 @@ struct LibraryDetail: View {
                         Text("FEX watches for game code that rewrites itself on the iPhone's 16 KB memory pages instead of 4 KB pieces, so a rewrite next to other code is no longer missed (from upstream Madeira; JIT and anti-cheat code such as Age of Empires IV's or an emulator inside Madeira). May let \"Check every instruction\" style settings (FEX_SMCCHECKS = full) be removed. Turn it off if the game gets slower or crashes.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD PR #46 (76e4fab): opt-in here (tools/patch-fex-ios-split-lock.py)
+                    Toggle("Do misaligned atomic operations inline (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_SPLIT_LOCK") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_SPLIT_LOCK", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_SPLIT_LOCK") == "1" {
+                        Text("An x86 atomic operation that straddles a 16-byte boundary faults on Apple's processors and was redone by Madeira's exception handler, 25-30 microseconds each ([mach_exc] UNALIGNED-LSE in the log). FEX now checks first and does it inline under a lock, with the same result (from BCD; Far Cry 4 started much faster). Only helps games whose log shows many UNALIGNED-LSE lines. Turn it off if the game hangs or crashes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge Playport fex 0083: opt-in (tools/patch-fex-ios-pause.py)
+                    Toggle("Let spin-wait loops rest the CPU core (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_PAUSE") == "wfe" }, set: { setBCDKey("env.MADEIRA_FEX_PAUSE", $0 ? "wfe" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_PAUSE") == "wfe" {
+                        Text("x86 PAUSE, which game threads run while they wait for each other, becomes ARM's WFE: the core waits for an event instead of spinning at full speed, leaving power and heat budget to the threads doing work (from Playport; The Witcher 3 went from 22.4 to 24.4 fps). 64-bit games. Turn it off if the game stutters or gets slower.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge Playport wine-pe 0050: opt-in (tools/patch-wine-ntdll-x64fast.py, ntdll-x64fast.dll)
+                    Toggle("Critical sections without leaving the emulator (64-bit, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_X64_CS_FASTPATH") == "1" }, set: { setBCDKey("env.MADEIRA_X64_CS_FASTPATH", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_X64_CS_FASTPATH") == "1" {
+                        Text("A free lock the game takes or releases through EnterCriticalSection / LeaveCriticalSection is handled inside the emulator instead of a round trip into ARM64 Windows code; a busy lock still goes to Windows as before (from Playport; Red Dead Redemption 2 gained 2-6% fps and used 5-11% less CPU power together with other changes). Uses ntdll-x64fast.dll (not together with env.MADEIRA_NTDLL_PROTON = 1). Turn it off if the game freezes or crashes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge Playport wine-pe 0052 + fex 0061: opt-in (ntdll-x64fast.dll, tools/patch-fex-ios-rdtsc-selfsync.py)
+                    Toggle("Timer reads without leaving the emulator (64-bit, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_X64_QPC_FASTPATH") == "1" }, set: { setBCDKey("env.MADEIRA_X64_QPC_FASTPATH", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_X64_QPC_FASTPATH") == "1" {
+                        Text("QueryPerformanceCounter, which game engines call thousands of times a second, is answered inside the emulator from the CPU timer with the same value Windows code would give (from Playport). Uses ntdll-x64fast.dll (not together with env.MADEIRA_NTDLL_PROTON = 1). Turn it off if the game runs too fast or too slow, its timing jitters, or it freezes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge pso-async (from BCD 0.1.634): opt-in, madeira-d3d12 only
                     Toggle("Build new shaders in the background (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("pso-async") == "1" }, set: { setBCDKey("pso-async", $0 ? "1" : "") }))
                     if bcd.value("pso-async") == "1" {
