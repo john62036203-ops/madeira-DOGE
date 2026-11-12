@@ -1966,6 +1966,34 @@ static void *wine_process_thread(void *arg) {
                 }
             }
 
+            /* madeira-doge (BCD 0.1.653): env.MADEIRA_COMBASE_MTA = 1 (the game's own
+             * file) runs combase-optin.dll (tools/build-wine-extra-dlls.sh): the
+             * shipped combase.dll's source with an implicit MTA for a thread that
+             * never started COM (Unreal Engine 5's loading thread creates the audio
+             * device enumerator on one and crashed on the NULL it got). Off by
+             * default, linked like d3d11-src.dll above (relinked every session). */
+            {
+                const char *cmbMta = getenv("MADEIRA_COMBASE_MTA");
+                if (cmbMta && cmbMta[0] == '1') {
+                    NSString *ecDir = [bundlePath stringByAppendingPathComponent:@"arm64ec-windows"];
+                    NSString *optDll = madeira_pe_source(ecDir, "arm64ec-windows", @"combase-optin.dll");
+                    if ([fm fileExistsAtPath:optDll]) {
+                        NSMutableArray *dirs = [NSMutableArray arrayWithObject:
+                            [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];
+                        if (use_arm64ec) [dirs addObject:sys32Dir];
+                        for (NSString *dir in dirs) {
+                            NSString *dst = [dir stringByAppendingPathComponent:@"combase.dll"];
+                            [fm removeItemAtPath:dst error:nil];
+                            [fm createSymbolicLinkAtPath:dst withDestinationPath:optDll error:nil];
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_COMBASE_MTA=1: combase.dll -> combase-optin.dll (implicit MTA, BCD 0.1.653; %s)\n",
+                                use_arm64ec ? "system32 + sysx64" : "sysx64 only");
+                    } else {
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_COMBASE_MTA=1 but this build has no combase-optin.dll -- the shipped combase.dll stays\n");
+                    }
+                }
+            }
+
             /* madeira-doge: env.MADEIRA_NTDLL_PROTON = 1 maps ntdll-proton.dll
              * (tools/patch-wine-ntdll-proton.py, built by tools/build-wine-extra-dlls.sh
              * next to the shipped ntdll.dll; Proton 11's TLS layout and, with

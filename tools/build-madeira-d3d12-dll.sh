@@ -65,8 +65,11 @@ PACKDEF=()
 # skips the draws that need them, as before.
 echo "=== helper kernels (metallib) ==="
 KDEF=""
+# madeira-doge: the typed-view-align = 4 probe kernel (BCD 0.1.653) is left out if it does not compile.
 if command -v xcrun > /dev/null 2>&1 &&
-   xcrun -sdk iphoneos metal -std=metal3.0 -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err"; then
+   { xcrun -sdk iphoneos metal -std=metal3.0 -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err" ||
+     { echo "::warning::helper kernels: retrying without mad_texbuf_probe :: $(head -c 600 "$OUT/mad_kernels.err" | tr '\n' ' ')";
+       xcrun -sdk iphoneos metal -std=metal3.0 -DMAD_NO_TEXBUF_PROBE -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err"; }; }; then
     (cd "$OUT" && xxd -i mad_kernels.metallib > mad_kernels_metallib.h)
     KDEF="-DMAD_HAVE_KERNELS"
     echo "  $(wc -c < "$OUT/mad_kernels.metallib" | tr -d ' ') bytes"

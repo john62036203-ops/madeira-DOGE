@@ -79,6 +79,39 @@ OVERLAY = {
                 "note": "Default off. 1: a fixed view past the device's 512 GB address map fails instead of "
                         "being reported as mapped, and each refused 2^n guest-memory candidate of a "
                         "Xenia-derived program (e.g. Ninja's Dawn) is logged with what occupies it."},
+    "typed-view-shadow": {"category": "Direct3D 12", "title": "Aligned copies of offset typed views",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (BCD 0.1.653, opt-in there too; BCD recommends it for DRAGON BALL: Sparking! ZERO). 1: a typed "
+                        "shader-resource view of UPLOAD memory whose first element is not on a 16-byte boundary reads a 16-byte-aligned "
+                        "copy of its bytes, made when the view is made and refreshed at every ExecuteCommandLists (the GPU rounds a texture "
+                        "buffer's start down to 16 bytes and the shader converter ignores the element offset). Read once per game start."},
+    "typed-view-align": {"category": "Direct3D 12", "title": "Typed buffer view alignment",
+                "kind": "choice", "default": "", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c", "madeira-d3d12/src/pe/mad_kernels.metal"],
+                "choices": [("", "64 bytes (default)"), ("4", "Exact start (probed)"), ("16", "16 bytes"), ("256", "256 bytes")],
+                "note": "madeira-doge (BCD 0.1.653; BCD recommends 4 for DRAGON BALL: Sparking! ZERO). Unset: a typed buffer view's texture "
+                        "starts at a 64-byte boundary, as before. 16 or 256: at that boundary. 4: at its first element where a GPU probe at the "
+                        "first view shows Metal reads such textures right (logged as [typed-view] probe), else at 16. A view Metal refuses there "
+                        "is made at 16, then 64. Read once per game start."},
+    "env.MADEIRA_FEX_BCD_FIXES": {"category": "x86 emulation (FEX)", "title": "BCD 0.1.653 emulator crash fixes",
+                "kind": "bool", "default": "0",
+                "sources": ["tools/patch-fex-ios-bcd653-optin.py", "tools/patch-fex-ios-notify-nocpuarea.py",
+                            "tools/patch-fex-ios-process-term.py", "tools/patch-fex-ios-threadterm-clear-area.py"],
+                "note": "madeira-doge (BCD 0.1.653, on there; opt-in here). 1: in 64-bit sessions FEX's memory hooks skip a native ARM64 "
+                        "thread with no CPU area (services.exe, cmd.exe ... died at their first memory call), stop using the emulator's "
+                        "tracker once NtTerminateProcess(0) starts the process's end (about 3 % of exits faulted), and ThreadTerm clears the "
+                        "CPU area's thread-state slots after destroying the state. Read when each program starts; [fex-bcd-fixes] says it is on."},
+    "env.MADEIRA_DXMT_BCD_FIXES": {"category": "Direct3D 9/10/11 (DXMT)", "title": "BCD 0.1.653 Direct3D 11 crash fixes",
+                "kind": "bool", "default": "0", "sources": ["tools/bcd653/patch-dxmt-bcd653-optin.py", "tools/build-d3d11-dll.sh"],
+                "note": "madeira-doge (BCD 0.1.653). 1, with env.MADEIRA_D3D11_SRC = 1 (the Game details toggle sets both): d3d11-src.dll "
+                        "refuses textures over Direct3D 11's limits with E_INVALIDARG instead of letting Metal abort, drops "
+                        "UpdateSubresource on a STAGING buffer instead of crashing the encode thread, and answers IDXGISwapChain1::"
+                        "SetRotation/GetRotation with the identity rotation instead of ending the process. Unset: as before."},
+    "env.MADEIRA_COMBASE_MTA": {"category": "Wine core (ntdll)", "title": "Implicit MTA for threads without COM (combase-optin.dll)",
+                "kind": "bool", "default": "0", "sources": ["tools/bcd653/patch-wine-combase-implicit-mta.py", "tools/build-wine-extra-dlls.sh",
+                                                            "app/Madeira/WineProcessBridge.m"],
+                "note": "madeira-doge (BCD 0.1.653). 1 in a game's file: combase.dll is linked to combase-optin.dll for that session, in "
+                        "which a thread that never called CoInitialize joins a process MTA made on first need, as on Windows, instead of "
+                        "getting CO_E_NOTINITIALIZED (Unreal Engine 5's loading thread then called through NULL). Read at session start."},
     "env.MADEIRA_FEX_SPLIT_LOCK": {"category": "x86 emulation (FEX)", "title": "Atomics across a 16-byte boundary done inline",
                 "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-split-lock.py"],
                 "note": "madeira-doge (BCD PR #46, opt-in here; BCD: on by default). 1 in a game's file (Game details toggle) or "

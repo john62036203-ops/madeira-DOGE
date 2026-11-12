@@ -3414,6 +3414,12 @@ struct LibraryDetail: View {
                         Text("An x86 atomic operation that straddles a 16-byte boundary faults on Apple's processors and was redone by Madeira's exception handler, 25-30 microseconds each ([mach_exc] UNALIGNED-LSE in the log). FEX now checks first and does it inline under a lock, with the same result (from BCD; Far Cry 4 started much faster). Only helps games whose log shows many UNALIGNED-LSE lines. Turn it off if the game hangs or crashes.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD 0.1.653: opt-in here (tools/patch-fex-ios-bcd653-optin.py)
+                    Toggle("Emulator crash fixes from BCD 0.1.653 (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_BCD_FIXES") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_BCD_FIXES", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_BCD_FIXES") == "1" {
+                        Text("Three fixes from BCD for 64-bit games: helper programs a game starts (services.exe, cmd.exe and the like) no longer crash at once in the emulator; quitting a game no longer crashes in the emulator now and then (about 3 in 100 exits in BCD's logs); a thread that ends no longer leaves a stale pointer behind that a later error could crash on. A [fex-bcd-fixes] line in the log says it is on. Turn it off if the game hangs at start or on exit.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge Playport fex 0083: opt-in (tools/patch-fex-ios-pause.py)
                     Toggle("Let spin-wait loops rest the CPU core (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_PAUSE") == "wfe" }, set: { setBCDKey("env.MADEIRA_FEX_PAUSE", $0 ? "wfe" : "") }))
                     if bcd.value("env.MADEIRA_FEX_PAUSE") == "wfe" {
@@ -3430,6 +3436,29 @@ struct LibraryDetail: View {
                     Toggle("Timer reads without leaving the emulator (64-bit, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_X64_QPC_FASTPATH") == "1" }, set: { setBCDKey("env.MADEIRA_X64_QPC_FASTPATH", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_X64_QPC_FASTPATH") == "1" {
                         Text("QueryPerformanceCounter, which game engines call thousands of times a second, is answered inside the emulator from the CPU timer with the same value Windows code would give (from Playport). Uses ntdll-x64fast.dll (not together with env.MADEIRA_NTDLL_PROTON = 1). Turn it off if the game runs too fast or too slow, its timing jitters, or it freezes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge typed-view-shadow / typed-view-align (from BCD 0.1.653): opt-in, madeira-d3d12 only
+                    Toggle("Fix misaligned typed buffers with aligned copies (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("typed-view-shadow") == "1" }, set: { setBCDKey("typed-view-shadow", $0 ? "1" : "") }))
+                    if bcd.value("typed-view-shadow") == "1" {
+                        Text("Small data arrays the game writes every frame and the GPU reads as typed buffers are copied to a 16-byte-aligned place first, because the GPU would otherwise read them a few bytes early (from BCD; with the next switch it fixed DRAGON BALL: Sparking! ZERO's green-washed menus, black floors and block noise in cutscenes). The first start after turning it on may look washed out while shaders are rebuilt; start the game again. Costs a little CPU. Turn it off if the game gets slower or new glitches appear.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Start typed buffers at their first element (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("typed-view-align") == "4" }, set: { setBCDKey("typed-view-align", $0 ? "4" : "") }))
+                    if bcd.value("typed-view-align") == "4" {
+                        Text("A typed buffer view's texture starts exactly at its first element instead of 64 bytes before it, where a quick GPU test at the first view shows this device reads such textures right (typed-view-align = 4, from BCD; recommended there for DRAGON BALL: Sparking! ZERO together with the switch above). Turn it off if textures or lighting flicker or turn black.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge BCD 0.1.653 DXMT fixes: opt-in, in d3d11-src.dll (tools/bcd653/patch-dxmt-bcd653-optin.py)
+                    Toggle("Direct3D 11 crash fixes from BCD 0.1.653 (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_DXMT_BCD_FIXES") == "1" }, set: { setBCDKey("env.MADEIRA_DXMT_BCD_FIXES", $0 ? "1" : ""); setBCDKey("env.MADEIRA_D3D11_SRC", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_DXMT_BCD_FIXES") == "1" {
+                        Text("A texture larger than Direct3D 11 allows is refused the way Windows refuses it instead of crashing the game (The Witness, Tomb Raider), an update of a CPU-only buffer is skipped instead of crashing (FIFA 23), and a swap chain rotation request is answered instead of ending the game (SDL2 games). From BCD. These live in the d3d11.dll built from DXMT's source, so this switch also turns on env.MADEIRA_D3D11_SRC (and turning it off turns both off). Turn it off if the game behaves differently.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge BCD 0.1.653 combase implicit MTA: opt-in (combase-optin.dll)
+                    Toggle("COM fix for Unreal Engine 5 loading threads (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_COMBASE_MTA") == "1" }, set: { setBCDKey("env.MADEIRA_COMBASE_MTA", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_COMBASE_MTA") == "1" {
+                        Text("A game thread that never set up COM can still create COM objects, as on Windows, instead of getting an error. Unreal Engine 5 games create their audio device on such a loading thread and crashed on the error (from BCD: Meccha Chameleon, Hubert). Uses combase-optin.dll for this game only. Turn it off if the game hangs or loses sound.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     // madeira-doge pso-async (from BCD 0.1.634): opt-in, madeira-d3d12 only

@@ -413,4 +413,44 @@ PY
     git -C "$R/wine" checkout -- dlls/mmdevapi/spatialaudio.c
     rm -f "$md" "$B"/dlls/mmdevapi/arm64ec-windows/*.o "$B/mmdevapi-stock.dll"
 fi
+# madeira-doge (BCD 0.1.653): combase-optin.dll, the shipped combase.dll's source with
+# tools/bcd653/patch-wine-combase-implicit-mta.py: a thread that never started COM joins a
+# process MTA made on first need (Unreal Engine 5's FAsyncLoadingThread creates the audio
+# device enumerator on such a thread, got CO_E_NOTINITIALIZED, did not check it and called
+# through NULL: Meccha Chameleon, Hubert). Shipped NEXT TO combase.dll, which stays; only a
+# game with env.MADEIRA_COMBASE_MTA = 1 gets it (WineProcessBridge.m links it as combase.dll
+# for that session). Verified (marker, machine, exports) before it ships; the tree and the
+# objects are restored afterwards. MADEIRA_COMBASE_BUILD=0 skips it.
+if [ "${MADEIRA_COMBASE_BUILD:-1}" != 0 ] && [ -f "$R/wine/dlls/combase/apartment.c" ] && [ -f "$SHIP/combase.dll" ]; then
+    cb="$B/dlls/combase/arm64ec-windows/combase.dll"
+    cb_tmp="$SHIP/combase-optin.dll.tmp"
+    if python3 "$R/tools/bcd653/patch-wine-combase-implicit-mta.py" "$R/wine"; then
+        rm -f "$cb" "$B"/dlls/combase/arm64ec-windows/*.o
+        make -C "$B" -j"$JOBS" dlls/combase/arm64ec-windows/combase.dll > "$B.combase.log" 2>&1
+        if [ -f "$cb" ] && cp "$cb" "$cb_tmp" && "$MINGW/arm64ec-w64-mingw32-strip" --strip-debug "$cb_tmp"; then
+            python3 - "$cb_tmp" <<'PY'
+import struct, sys
+p = sys.argv[1]; d = open(p, 'rb').read()
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+target = struct.unpack_from('<I', d, pe + 24 + 56)[0] + 0x10000
+if len(d) < target:
+    open(p, 'ab').write(b'\0' * (target - len(d)))
+PY
+            if python3 "$R/tools/bcd653/patch-wine-combase-implicit-mta.py" --verify "$cb_tmp" "$SHIP/combase.dll"; then
+                mv "$cb_tmp" "$SHIP/combase-optin.dll"
+                echo "::notice::combase-optin.dll (implicit MTA for a thread that never started COM, BCD 0.1.653): built next to the shipped combase.dll, linked only with env.MADEIRA_COMBASE_MTA = 1"
+            else
+                rm -f "$cb_tmp"
+                echo "::warning::combase-optin.dll failed its check; not shipped (env.MADEIRA_COMBASE_MTA does nothing)"
+            fi
+        else
+            rm -f "$cb_tmp"
+            echo "::warning::combase-optin.dll did not build; env.MADEIRA_COMBASE_MTA does nothing :: $(grep -m 6 'error' "$B.combase.log" | tr '\n' ' ' | cut -c1-900)"
+        fi
+    else
+        echo "::warning::the combase implicit-MTA patch did not apply; combase-optin.dll not shipped"
+    fi
+    git -C "$R/wine" checkout -- dlls/combase/apartment.c
+    rm -f "$cb" "$B"/dlls/combase/arm64ec-windows/*.o
+fi
 exit 0

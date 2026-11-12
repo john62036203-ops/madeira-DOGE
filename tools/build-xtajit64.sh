@@ -210,12 +210,17 @@ done
 python3 "$R/tools/patch-fex-ios-split-lock.py" "$R/FEX" || echo "::warning::the split-lock fast path was not applied (FEX anchor changed); xtajit64.dll is built without it"
 python3 "$R/tools/patch-fex-ios-pause.py" "$R/FEX" || echo "::warning::the PAUSE mode opt-in was not applied (FEX anchor changed); xtajit64.dll is built without it"
 python3 "$R/tools/patch-fex-ios-rdtsc-selfsync.py" "$R/FEX" || echo "::warning::the RDTSC self-sync opt-in was not applied (FEX anchor changed); xtajit64.dll is built without it"
+#  - patch-fex-ios-bcd653-optin.py (BCD 0.1.653: notify-nocpuarea, process-term, threadterm-clear-area): MADEIRA_FEX_BCD_FIXES=1.
+#    Module.cpp is saved first so a build error from it restores the file with every earlier patch in it.
+cp "$R/FEX/Source/Windows/ARM64EC/Module.cpp" "$B.Module.cpp.pre-bcd653"
+python3 "$R/tools/patch-fex-ios-bcd653-optin.py" "$R/FEX" || { echo "::warning::the BCD 0.1.653 FEX fixes were not applied (FEX anchor changed); xtajit64.dll is built without them"; cp "$B.Module.cpp.pre-bcd653" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"; }
 # A build error from these three opt-ins must not cost the module every other fix: the final build
 # retries without them.
 build() {
     if ! cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1; then
-        echo "::warning::xtajit64.dll did not build with the madeira-doge FEX opt-ins (split lock, PAUSE, RDTSC self-sync); rebuilding without them :: $(grep -m 4 'error' "$B.build.log" | tr '\n' ' ' | cut -c1-900)"
+        echo "::warning::xtajit64.dll did not build with the madeira-doge FEX opt-ins (split lock, PAUSE, RDTSC self-sync, BCD 0.1.653 fixes); rebuilding without them :: $(grep -m 4 'error' "$B.build.log" | tr '\n' ' ' | cut -c1-900)"
         git -C "$R/FEX" checkout -- FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+        [ -f "$B.Module.cpp.pre-bcd653" ] && cp "$B.Module.cpp.pre-bcd653" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"   # madeira-doge: without the BCD 0.1.653 opt-in too
         cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1 \
             || { grep -m 20 "error" "$B.build.log"; exit 1; }
     fi

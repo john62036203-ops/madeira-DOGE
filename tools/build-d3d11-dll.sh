@@ -173,6 +173,10 @@ python3 "$R/tools/patch-dxmt-video-device.py" "$OUT/tree/src/d3d11" || fail "too
 python3 "$R/tools/patch-dxmt-share-trace.py" "$OUT/tree/src/d3d11" || fail "tools/patch-dxmt-share-trace.py did not apply"
 # madeira-doge (steamac 0007): env.MADEIRA_NULL_PSO_SKIP = 1 encodes a failed pipeline as a null SetPSO (winemetal drops its draws).
 python3 "$R/tools/patch-d3d11src-null-pso.py" "$OUT/tree/src/d3d11" || fail "tools/patch-d3d11src-null-pso.py did not apply"
+# madeira-doge (BCD 0.1.653): texture limit, UpdateSubresource on a staging buffer, swap chain rotation, all behind
+# env.MADEIRA_DXMT_BCD_FIXES = 1; all or nothing, and a failure only leaves them out.
+python3 "$R/tools/bcd653/patch-dxmt-bcd653-optin.py" "$OUT/tree/src/d3d11" \
+    || echo "::warning::tools/bcd653/patch-dxmt-bcd653-optin.py did not apply; d3d11-src.dll is built without BCD 0.1.653's fixes"
 # madeira-doge: DXMT_DYN_TRIM switch, on a copy of the one dxmt source it touches;
 # the object is linked into the shipped DLL ahead of libdxmt.a (the plain link
 # and the archive keep the pristine file).
