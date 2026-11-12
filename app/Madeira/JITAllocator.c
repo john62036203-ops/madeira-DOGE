@@ -1015,3 +1015,87 @@ __attribute__((constructor(102), used)) static void madeira_metal_validation_opt
     setenv("MTL_DEBUG_LAYER_WARNING_MODE", "nslog", 1);
     setenv("CFLOG_FORCE_STDERR", "1", 1);
 }
+
+
+/* madeira-doge nofootprint-probe (env.MADEIRA_NOFOOTPRINT_PROBE = 1; opt-in, diagnostic only).
+ *
+ * ammaarreshi/WindowsiOS (devices/winvirt.c, hv_alloc_no_footprint) keeps 4.5 GB of guest RAM out of
+ * the jetsam footprint on iOS 26/27: mach_make_memory_entry_64(MAP_MEM_NAMED_CREATE |
+ * MAP_MEM_LEDGER_TAGGED | RW) per 128 MB, mach_memory_entry_ownership(entry, TASK_NULL,
+ * VM_LEDGER_TAG_DEFAULT = 1, VM_LEDGER_FLAG_NO_FOOTPRINT = 1), vm_map OVERWRITE over a vm_allocate
+ * reservation, done while the debugger is attached (CS_DEBUGGED). This tree's JIT code uses tag 0
+ * (XNU's VM_LEDGER_TAG_NONE) and no MAP_MEM_LEDGER_TAGGED. The probe measures each variant: allocate
+ * `mb` MB, write one word per 16 KB page, read phys_footprint before and after, free it. A delta near
+ * 0 means the memory is not charged; near `mb` means it is. Nothing is kept. */
+static uint64_t nofp_footprint(void) {
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt) != KERN_SUCCESS) return 0;
+    return vmi.phys_footprint;
+}
+
+static void nofp_variant(const char *name, size_t bytes, int named, unsigned int extra_flags, int tag, int flags) {
+    enum { CHUNK = 128u << 20 };
+    vm_address_t base = 0;
+    kern_return_t kr = vm_allocate(mach_task_self(), &base, bytes, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        jit_log("[nofp-probe] %s: vm_allocate %zu MB failed kr=%d (%s)", name, bytes >> 20, kr, mach_error_string(kr));
+        return;
+    }
+    if (named) {
+        for (size_t off = 0; off < bytes; off += CHUNK) {
+            size_t len = bytes - off < CHUNK ? bytes - off : CHUNK;
+            memory_object_size_t got = len;
+            mach_port_t entry = MACH_PORT_NULL;
+            kr = mach_make_memory_entry_64(mach_task_self(), &got, 0,
+                                           MAP_MEM_NAMED_CREATE | extra_flags | VM_PROT_READ | VM_PROT_WRITE,
+                                           &entry, MACH_PORT_NULL);
+            if (kr != KERN_SUCCESS) {
+                jit_log("[nofp-probe] %s: make_memory_entry failed kr=%d (%s)", name, kr, mach_error_string(kr));
+                vm_deallocate(mach_task_self(), base, bytes);
+                return;
+            }
+            kr = mach_memory_entry_ownership(entry, TASK_NULL, tag, flags);
+            if (kr != KERN_SUCCESS) {
+                jit_log("[nofp-probe] %s: ownership(tag=%d, flags=%d) REFUSED kr=%d (%s)", name, tag, flags, kr, mach_error_string(kr));
+                mach_port_deallocate(mach_task_self(), entry);
+                vm_deallocate(mach_task_self(), base, bytes);
+                return;
+            }
+            vm_address_t to = base + off;
+            kr = vm_map(mach_task_self(), &to, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry, 0, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+            mach_port_deallocate(mach_task_self(), entry);
+            if (kr != KERN_SUCCESS) {
+                jit_log("[nofp-probe] %s: vm_map failed kr=%d (%s)", name, kr, mach_error_string(kr));
+                vm_deallocate(mach_task_self(), base, bytes);
+                return;
+            }
+        }
+    }
+    uint64_t before = nofp_footprint();
+    for (size_t off = 0; off < bytes; off += 0x4000) *(volatile uint64_t *)(base + off) = off | 1;
+    uint64_t after = nofp_footprint();
+    int ok = 1;
+    for (size_t off = 0; off < bytes; off += 0x4000) if (*(volatile uint64_t *)(base + off) != (off | 1)) { ok = 0; break; }
+    long long delta_mb = ((long long)after - (long long)before) / (1 << 20);
+    jit_log("[nofp-probe] %s: %zu MB written, phys_footprint %llu -> %llu MB (delta %lld MB: %s), data %s",
+            name, bytes >> 20, (unsigned long long)(before >> 20), (unsigned long long)(after >> 20), delta_mb,
+            delta_mb * 4 < (long long)(bytes >> 20) ? "NOT charged -- exempt" : "charged",
+            ok ? "read back right" : "WRONG");
+    vm_deallocate(mach_task_self(), base, bytes);
+}
+
+void jit_nofootprint_probe(size_t mb) {
+    uint32_t csflags = 0;
+    if (mb < 16) mb = 16;
+    if (mb > 1024) mb = 1024;
+    csops(getpid(), CS_OPS_STATUS, &csflags, sizeof csflags);
+    jit_log("[nofp-probe] start: %zu MB per variant, CS_DEBUGGED=%d, phys_footprint %llu MB",
+            mb, (csflags & CS_DEBUGGED) != 0, (unsigned long long)(nofp_footprint() >> 20));
+    nofp_variant("control (plain vm_allocate)", mb << 20, 0, 0, 0, 0);
+    nofp_variant("windowsios (LEDGER_TAGGED, tag 1, NO_FOOTPRINT)", mb << 20, 1, 0x002000 /* MAP_MEM_LEDGER_TAGGED */, 1, 1);
+    nofp_variant("this tree's constants (tag 0, NO_FOOTPRINT)", mb << 20, 1, 0, 0, 1);
+    nofp_variant("tag 1 without LEDGER_TAGGED", mb << 20, 1, 0, 1, 1);
+    jit_log("[nofp-probe] done: phys_footprint %llu MB", (unsigned long long)(nofp_footprint() >> 20));
+}

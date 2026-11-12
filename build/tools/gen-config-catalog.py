@@ -92,6 +92,12 @@ OVERLAY = {
                         "starts at a 64-byte boundary, as before. 16 or 256: at that boundary. 4: at its first element where a GPU probe at the "
                         "first view shows Metal reads such textures right (logged as [typed-view] probe), else at 16. A view Metal refuses there "
                         "is made at 16, then 64. Read once per game start."},
+    "env.MADEIRA_NOFOOTPRINT_PROBE": {"category": "Debugging / logs", "title": "Probe: memory outside the jetsam footprint",
+                "kind": "bool", "default": "0", "sources": ["app/Madeira/JITAllocator.c", "app/Madeira/StikJITHelper.swift"],
+                "note": "madeira-doge (diagnostic, after ammaarreshi/WindowsiOS's hv_alloc_no_footprint). 1: at the JIT pool request, "
+                        "with the debugger attached, 256 MB is allocated four ways (plain; named entry + MAP_MEM_LEDGER_TAGGED with "
+                        "ledger tag 1 and NO_FOOTPRINT; tag 0 as this tree's JIT code uses; tag 1 without LEDGER_TAGGED), written, "
+                        "checked and freed, with phys_footprint before and after in [nofp-probe] lines. Keeps nothing."},
     "env.MADEIRA_FEX_BCD_FIXES": {"category": "x86 emulation (FEX)", "title": "BCD 0.1.653 emulator crash fixes",
                 "kind": "bool", "default": "0",
                 "sources": ["tools/patch-fex-ios-bcd653-optin.py", "tools/patch-fex-ios-notify-nocpuarea.py",

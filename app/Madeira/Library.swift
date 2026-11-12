@@ -3414,6 +3414,12 @@ struct LibraryDetail: View {
                         Text("An x86 atomic operation that straddles a 16-byte boundary faults on Apple's processors and was redone by Madeira's exception handler, 25-30 microseconds each ([mach_exc] UNALIGNED-LSE in the log). FEX now checks first and does it inline under a lock, with the same result (from BCD; Far Cry 4 started much faster). Only helps games whose log shows many UNALIGNED-LSE lines. Turn it off if the game hangs or crashes.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge nofootprint-probe (WindowsiOS's ledger-exempt memory): opt-in, diagnostic only
+                    Toggle("Test memory that does not count toward the limit (diagnostic)", isOn: Binding(get: { bcd.value("env.MADEIRA_NOFOOTPRINT_PROBE") == "1" }, set: { setBCDKey("env.MADEIRA_NOFOOTPRINT_PROBE", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_NOFOOTPRINT_PROBE") == "1" {
+                        Text("At game start, while the debugger is attached, Madeira briefly takes 256 MB four different ways, writes to it and frees it, and logs ([nofp-probe]) whether iOS counted it toward the app's memory limit. Nothing else changes; start takes about a second longer. Send the log, then turn it off.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge BCD 0.1.653: opt-in here (tools/patch-fex-ios-bcd653-optin.py)
                     Toggle("Emulator crash fixes from BCD 0.1.653 (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_BCD_FIXES") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_BCD_FIXES", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_FEX_BCD_FIXES") == "1" {

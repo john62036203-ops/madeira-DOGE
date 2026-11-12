@@ -239,6 +239,13 @@ enum StikJITHelper {
 
         let debuggerAttached = isDebuggerAttached()
         LogStore.shared.log("[jit-debugger] attached=\(debuggerAttached ? 1 : 0) at the pool request")
+        // madeira-doge nofootprint-probe (env.MADEIRA_NOFOOTPRINT_PROBE = 1, opt-in, diagnostic): while the
+        // debugger is still attached, measure whether memory can be kept out of the jetsam footprint
+        // (WindowsiOS's recipe vs this tree's constants). Allocates, touches and frees; keeps nothing.
+        if ["1", "on", "true", "yes"].contains((MadeiraConfig.gameValue("env.MADEIRA_NOFOOTPRINT_PROBE")
+                                                 ?? MadeiraConfig.get("env.MADEIRA_NOFOOTPRINT_PROBE") ?? "").lowercased()) {
+            jit_nofootprint_probe(256)
+        }
         // With no debugger attached, a JIT request fails the launch with a message; 0 lets it crash the app as before.
         // CS_DEBUGGED stays set after a debugger detaches (JIT enabled by a tool
         // that attaches and leaves, or without Madeira's script), and the pool

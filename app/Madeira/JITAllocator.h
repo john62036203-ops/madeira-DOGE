@@ -28,6 +28,13 @@ void jit_region_destroy(JITRegion *region);
 /// changes nothing if the private ownership API refuses.
 bool jit_make_region_no_footprint(void *addr, size_t size, const char *label);
 
+/// madeira-doge nofootprint-probe (env.MADEIRA_NOFOOTPRINT_PROBE = 1, opt-in): one-off
+/// measurement of whether the kernel lets this process create guest memory that is not
+/// charged to phys_footprint (the jetsam number), with WindowsiOS's recipe and with the
+/// constants this tree uses. Allocates, touches and frees `mb` MB per variant and logs
+/// [nofp-probe] lines. Changes nothing else.
+void jit_nofootprint_probe(size_t mb);
+
 // Get the RW (writable) pointer. Write generated code here.
 void *jit_region_rw_ptr(JITRegion *region);
 
