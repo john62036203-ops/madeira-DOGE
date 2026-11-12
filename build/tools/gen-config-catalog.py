@@ -118,6 +118,19 @@ OVERLAY = {
                 "note": "madeira-doge (BCD 0.1.653). 1 in a game's file: combase.dll is linked to combase-optin.dll for that session, in "
                         "which a thread that never called CoInitialize joins a process MTA made on first need, as on Windows, instead of "
                         "getting CO_E_NOTINITIALIZED (Unreal Engine 5's loading thread then called through NULL). Read at session start."},
+    "env.MADEIRA_DEP_CALLER": {"category": "Memory & JIT pool", "title": "Only 32-bit programs change DEP",
+                "kind": "bool", "default": "0", "sources": ["build/ntdll-unix/process_ios.c"],
+                "note": "madeira-doge (upstream Madeira PR #615, 6cfcc82; opt-in here). 1: NtSetInformationProcess(ProcessExecuteFlags) "
+                        "is refused for a 64-bit caller even while a 32-bit process runs in the session (the calling thread's own TEB "
+                        "decides, as on Windows). Before, a 64-bit game loading a module without NX_COMPAT beside a 32-bit launcher "
+                        "turned DEP off session-wide and every 32-bit image was copied into the JIT pool (about 50 MB for Ubisoft "
+                        "Connect). [dep-caller] logs the first refusal. Read once per session."},
+    "env.MADEIRA_PROC_SLOT_REUSE": {"category": "Wine core (ntdll)", "title": "Reuse exited children's master-socket slots",
+                "kind": "bool", "default": "0", "sources": ["build/ntdll-unix/server_ios.c"],
+                "note": "madeira-doge (upstream Madeira PR #609; opt-in here). 1: a child process takes the first master-socket "
+                        "slot freed by an exited child instead of a new one, so a session that has started more than 64 child "
+                        "processes in all (launchers, crash handlers, helpers) can still start more. Unset: a new slot per child, "
+                        "as before ([Wine child] proc-socket table FULL after the 64th). Read once per session."},
     "env.MADEIRA_FEX_SPLIT_LOCK": {"category": "x86 emulation (FEX)", "title": "Atomics across a 16-byte boundary done inline",
                 "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-split-lock.py"],
                 "note": "madeira-doge (BCD PR #46, opt-in here; BCD: on by default). 1 in a game's file (Game details toggle) or "

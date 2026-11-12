@@ -4752,6 +4752,25 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
         break;
 
     case ProcessExecuteFlags:
+        /* madeira-doge (upstream Madeira PR #615, 6cfcc82; opt-in): is_wow64() answers for the session once any 32-bit
+         * pseudo-process has booted, so a 64-bit caller got through and virtual_set_force_exec, finding no guest window
+         * for it, turned DEP off session-wide and copied every 32-bit image into the JIT pool. env.MADEIRA_DEP_CALLER = 1:
+         * the calling thread's own TEB decides (WowTebOffset), as on Windows. Unset: as before. */
+        {
+            static int dep_caller = -1;
+            if (dep_caller < 0)
+            {
+                const char *e = getenv( "MADEIRA_DEP_CALLER" );
+                dep_caller = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (dep_caller > 0 && is_win64 && !NtCurrentTeb()->WowTebOffset && size == sizeof(ULONG))
+            {
+                static int said;
+                if (is_wow64() && !__sync_lock_test_and_set( &said, 1 ))
+                    fprintf( stderr, "[dep-caller] a 64-bit process asked to change DEP while a 32-bit one runs; refused (MADEIRA_DEP_CALLER)\n" );
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
         if ((is_win64 && !is_wow64()) || size != sizeof(ULONG)) return STATUS_INVALID_PARAMETER;
         {
             /* ml1354: DEP is per process. The flags were one session-wide value, so a

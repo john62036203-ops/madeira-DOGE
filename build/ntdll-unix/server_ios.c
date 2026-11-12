@@ -325,18 +325,50 @@ static void ios_fdt_autopsy( const char *what, int fd, int ret, int err )
                    e ? e->gen : 0, e ? ios_fdt_names[e->prev_kind] : "oob");
 }
 
+/* madeira-doge (upstream Madeira PR #609, opt-in): env.MADEIRA_PROC_SLOT_REUSE = 1 takes the first free slot (PEB NULL,
+ * cleared when a child exits) instead of a new index for every child, so the 65th child a session ever started still gets a
+ * master socket. A slot is claimed with IOS_PROC_SLOT_CLAIMED, never a PEB; ios_proc_socket_count stays the high-water mark
+ * the lock-free readers scan up to. Unset: a new index per child, as before. Read once. */
 static void ios_register_proc_socket(void *peb_id, int fd)
 {
-    int idx = __sync_fetch_and_add(&ios_proc_socket_count, 1);
-    if (idx >= IOS_MAX_PROC_SOCKETS)
+#define IOS_PROC_SLOT_CLAIMED ((void *)1)
+    static int ios_proc_slot_reuse = -1;
+    extern char *getenv( const char * );
+    int idx, n, reuse = ios_proc_slot_reuse;
+    if (reuse < 0)
     {
-        wine_log_write("[Wine child] proc-socket table FULL (%d)!", idx);
-        return;
+        const char *e = getenv( "MADEIRA_PROC_SLOT_REUSE" );
+        reuse = (e && e[0] == '1') ? 1 : 0;
+        ios_proc_slot_reuse = reuse;
+        if (reuse) wine_log_write("[proc-slot-reuse] on: a child's master-socket slot is reused once it has exited (MADEIRA_PROC_SLOT_REUSE)");
+    }
+    if (reuse)
+    {
+        for (idx = 0; idx < IOS_MAX_PROC_SOCKETS; idx++)
+            if (ios_proc_sockets[idx].peb == NULL &&
+                __sync_bool_compare_and_swap( &ios_proc_sockets[idx].peb, NULL, IOS_PROC_SLOT_CLAIMED )) break;
+        if (idx >= IOS_MAX_PROC_SOCKETS)
+        {
+            wine_log_write("[Wine child] proc-socket table FULL: %d live child processes!", IOS_MAX_PROC_SOCKETS);
+            return;
+        }
+    }
+    else
+    {
+        idx = __sync_fetch_and_add(&ios_proc_socket_count, 1);
+        if (idx >= IOS_MAX_PROC_SOCKETS)
+        {
+            wine_log_write("[Wine child] proc-socket table FULL (%d)!", idx);
+            return;
+        }
     }
     ios_fdt_reg( fd, FDT_MASTER, peb_id );
     ios_proc_sockets[idx].fd = fd;
     ios_proc_sockets[idx].exiting = FALSE;
     { int d; for (d = 0; d < IOS_DEAD_PEB_MAX; d++) if (ios_dead_pebs[d] == peb_id) ios_dead_pebs[d] = NULL; }
+    if (reuse)
+        while ((n = ios_proc_socket_count) < idx + 1)
+            if (__sync_bool_compare_and_swap( &ios_proc_socket_count, n, idx + 1 )) break;
     __sync_synchronize();
     ios_proc_sockets[idx].peb = peb_id;
 }

@@ -3414,6 +3414,18 @@ struct LibraryDetail: View {
                         Text("An x86 atomic operation that straddles a 16-byte boundary faults on Apple's processors and was redone by Madeira's exception handler, 25-30 microseconds each ([mach_exc] UNALIGNED-LSE in the log). FEX now checks first and does it inline under a lock, with the same result (from BCD; Far Cry 4 started much faster). Only helps games whose log shows many UNALIGNED-LSE lines. Turn it off if the game hangs or crashes.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge upstream Madeira PR #615 (6cfcc82): opt-in (build/ntdll-unix/process_ios.c)
+                    Toggle("Keep 64-bit games from turning off DEP (JIT pool, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_DEP_CALLER") == "1" }, set: { setBCDKey("env.MADEIRA_DEP_CALLER", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_DEP_CALLER") == "1" {
+                        Text("Only a 32-bit program may change its DEP setting, as on Windows. Before, a 64-bit game that loaded a DLL without DEP support while any 32-bit program (a launcher or helper) was running turned DEP off for the whole session, and every 32-bit program's DLLs were then copied into the JIT pool, taking room the game's own code needs (from upstream Madeira: about 50 MB with Ubisoft Connect, and a lower frame rate). A [dep-caller] line in the log shows it stepped in. Turn it off if a game fails to start.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge upstream Madeira PR #609: opt-in (build/ntdll-unix/server_ios.c)
+                    Toggle("Reuse slots of child programs that have ended (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_PROC_SLOT_REUSE") == "1" }, set: { setBCDKey("env.MADEIRA_PROC_SLOT_REUSE", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_PROC_SLOT_REUSE") == "1" {
+                        Text("Madeira had room for 64 child programs per session in total, even after earlier ones ended, so a launcher that starts a helper now and then could no longer start the game or a crash handler after a while ([Wine child] proc-socket table FULL in the log). With this on, a slot is reused once its program has ended (from upstream Madeira). Turn it off if programs fail to start or the session freezes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge nofootprint-probe (WindowsiOS's ledger-exempt memory): opt-in, diagnostic only
                     Toggle("Test memory that does not count toward the limit (diagnostic)", isOn: Binding(get: { bcd.value("env.MADEIRA_NOFOOTPRINT_PROBE") == "1" }, set: { setBCDKey("env.MADEIRA_NOFOOTPRINT_PROBE", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_NOFOOTPRINT_PROBE") == "1" {
