@@ -18,6 +18,11 @@ env.MADEIRA_GPU_HANG_INFO = 1 (per game, off by default):
     first 8 hex digits of the DXBC SHA-1), so a FAULTED line names the shader.
     Pipeline names are recorded through the gpu-trace pipeline table, which
     this switch now fills too.
+env.MADEIRA_SKIP_CS_ENC = shader_<sha8>[,shader_<sha8>...] (experiment, off by
+default; also turns the [gpu-hang] lines on): in every compute encoder that
+sets one of these pipelines, the dispatches are dropped (fence updates kept,
+so later encoders are not left waiting). env.MADEIRA_SKIP_CS_WAIT = 1 also
+drops that encoder's fence waits. The game loses that encoder's work.
 Native path only. Run after tools/patch-winemetal-gpu-trace.py. Idempotent;
 fails by name if an anchor moves. Run from the repository root.
 """
@@ -34,7 +39,8 @@ static int mad_ghi_on(void) {
   static int v = -1;
   if (v < 0) {
     const char *e = getenv("MADEIRA_GPU_HANG_INFO");
-    v = (e && *e && *e != '0') ? 1 : 0;
+    const char *k = getenv("MADEIRA_SKIP_CS_ENC");
+    v = ((e && *e && *e != '0') || (k && *k)) ? 1 : 0;
     if (v) fprintf(stderr, "[gpu-hang] MADEIRA_GPU_HANG_INFO on: encoder execution status + shader-named encoders\n");
   }
   return v;
@@ -111,6 +117,34 @@ static void mad_ghi_label(int compute, obj_handle_t encoder, const struct wmtcmd
     [(id<MTLCommandEncoder>)encoder setLabel:[NSString stringWithUTF8String:label]];
   }
 }
+/* MADEIRA_SKIP_CS_ENC: 0 = encode normally, 1 = drop dispatches, 2 = also drop fence waits. */
+static int mad_ghi_skip_mode(const struct wmtcmd_base *c) {
+  static int init;
+  static char list[512];
+  static int wait_too;
+  if (!init) {
+    const char *k = getenv("MADEIRA_SKIP_CS_ENC");
+    const char *w = getenv("MADEIRA_SKIP_CS_WAIT");
+    if (k) snprintf(list, sizeof list, ",%s,", k);
+    wait_too = (w && *w == '1');
+    init = 1;
+    if (list[0]) fprintf(stderr, "[gpu-hang] MADEIRA_SKIP_CS_ENC=%s wait=%d\n", k, wait_too);
+  }
+  if (!list[0]) return 0;
+  for (; c; c = c->next.ptr) {
+    if (c->type != WMTComputeCommandSetPSO) continue;
+    obj_handle_t pso = ((const struct wmtcmd_compute_setpso *)c)->pso;
+    if (!pso) continue;
+    char key[32];
+    snprintf(key, sizeof key, ",%s,", madeira_gt_pso_name(pso));
+    if (strstr(list, key)) {
+      static unsigned told;
+      if (told++ < 8) fprintf(stderr, "[gpu-hang] skipping a compute encoder that sets %s (#%u)\n", key, told);
+      return wait_too ? 2 : 1;
+    }
+  }
+  return 0;
+}
 
 '''
 
@@ -130,6 +164,18 @@ PAIRS = [
      "  if (mad_ghi_on()) mad_ghi_label(0, params->encoder, next);   /* madeira-doge: gpu hang info */\n", 1),
 ]
 
+POST = [
+    ("  if (mad_ghi_on()) mad_ghi_label(1, params->encoder, next);   /* madeira-doge: gpu hang info */\n",
+     "  if (mad_ghi_on()) mad_ghi_label(1, params->encoder, next);   /* madeira-doge: gpu hang info */\n"
+     "  const int mad_skip = mad_ghi_on() ? mad_ghi_skip_mode(next) : 0;   /* madeira-doge: MADEIRA_SKIP_CS_ENC */\n", 1, "post"),
+    ("      if (threadgroup_size.width == 0 && madeira_null_pso_skip()) break;   /* madeira-doge: steamac null-pso (0006) */\n",
+     "      if (threadgroup_size.width == 0 && madeira_null_pso_skip()) break;   /* madeira-doge: steamac null-pso (0006) */\n"
+     "      if (mad_skip) break;   /* madeira-doge: MADEIRA_SKIP_CS_ENC */\n", 3, "all"),
+    ("    case WMTComputeCommandWaitForFence: {\n      struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;\n",
+     "    case WMTComputeCommandWaitForFence: {\n      struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;\n"
+     "      if (mad_skip == 2) break;   /* madeira-doge: MADEIRA_SKIP_CS_WAIT */\n", 1, "all"),
+]
+
 
 def main():
     s = PATH.read_text()
@@ -143,6 +189,11 @@ def main():
         if n != want:
             sys.exit(f"{NAME}: anchor found {n} times (want {want}) in {PATH}:\n{old}")
         s = s.replace(old, new, 1)
+    for old, new, want, mode in POST:
+        n = s.count(old)
+        if n != want:
+            sys.exit(f"{NAME}: anchor found {n} times (want {want}) in {PATH}:\n{old}")
+        s = s.replace(old, new) if mode == "all" else s.replace(old, new, 1)
     PATH.write_text(s)
     print("winemetal_unix.c: patched (MADEIRA_GPU_HANG_INFO)")
     return 0
