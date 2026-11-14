@@ -169,6 +169,7 @@ enum mav_codec_kind
     MAV_CODEC_HEVC = 5,
     MAV_CODEC_VP9 = 6,          /* madeira-doge: libavcodec (software) */
     MAV_CODEC_VP8 = 7,
+    MAV_CODEC_WMV = 8,          /* madeira-doge: WMV1/2/3, VC-1 in ASF (libavcodec, opt-in MADEIRA_WG_WMV) */
 };
 
 struct mav_output
@@ -308,7 +309,32 @@ static void mav_configure( int video_allowed, const struct mav_video_backend *vi
  * planar 4:2:0 output is handed to the core as NV12 (Y as decoded, CbCr
  * interleaved into a buffer of the frame's own); 10-bit pictures are reduced
  * to 8 bits. */
-enum { MAV_LAVC_VP9 = 0x100, MAV_LAVC_VP8 = 0x101 };
+enum { MAV_LAVC_VP9 = 0x100, MAV_LAVC_VP8 = 0x101,
+       MAV_LAVC_WMV1 = 0x102, MAV_LAVC_WMV2 = 0x103, MAV_LAVC_WMV3 = 0x104, MAV_LAVC_VC1 = 0x105 };
+
+/* madeira-doge: the libavcodec decoder behind each MAV_LAVC_* value. */
+static enum AVCodecID mav_lavc_codec_id( int codec )
+{
+    switch (codec)
+    {
+    case MAV_LAVC_VP9: return AV_CODEC_ID_VP9;
+    case MAV_LAVC_VP8: return AV_CODEC_ID_VP8;
+    case MAV_LAVC_WMV1: return AV_CODEC_ID_WMV1;
+    case MAV_LAVC_WMV2: return AV_CODEC_ID_WMV2;
+    case MAV_LAVC_WMV3: return AV_CODEC_ID_WMV3;
+    case MAV_LAVC_VC1: return AV_CODEC_ID_VC1;
+    default: return AV_CODEC_ID_NONE;
+    }
+}
+
+/* madeira-doge: env.MADEIRA_WG_WMV = 1 opens ASF files (Windows Media: WMV
+ * video, WMA audio) -- Devil May Cry 5's movies. Off by default. */
+static int mav_wmv_allowed( void )
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv( "MADEIRA_WG_WMV" ); v = (e && e[0] == '1') ? 1 : 0; }
+    return v;
+}
 
 struct mav_lavc_vdec
 {
@@ -329,18 +355,18 @@ static void mav_log( const char *fmt, ... ) __attribute__((format(printf, 1, 2))
 
 static int mav_lavc_supports( int codec )
 {
-    return (codec == MAV_LAVC_VP9 && avcodec_find_decoder( AV_CODEC_ID_VP9 ))
-        || (codec == MAV_LAVC_VP8 && avcodec_find_decoder( AV_CODEC_ID_VP8 ));
+    enum AVCodecID id = mav_lavc_codec_id( codec );
+    return id != AV_CODEC_ID_NONE && avcodec_find_decoder( id ) != NULL;
 }
 
 static void *mav_lavc_open( int codec, const uint8_t *extradata, uint32_t extradata_size,
                             uint32_t width, uint32_t height, char *why, size_t why_size )
 {
-    const AVCodec *c = avcodec_find_decoder( codec == MAV_LAVC_VP9 ? AV_CODEC_ID_VP9 : AV_CODEC_ID_VP8 );
+    enum AVCodecID id = mav_lavc_codec_id( codec );
+    const AVCodec *c = id != AV_CODEC_ID_NONE ? avcodec_find_decoder( id ) : NULL;
     struct mav_lavc_vdec *d;
     long cpus = sysconf( _SC_NPROCESSORS_ONLN );
 
-    (void)extradata; (void)extradata_size; (void)width; (void)height;
     if (!c)
     {
         snprintf( why, why_size, "libavcodec has no decoder for it in this build" );
@@ -349,6 +375,19 @@ static void *mav_lavc_open( int codec, const uint8_t *extradata, uint32_t extrad
     if (!(d = calloc( 1, sizeof(*d) ))) return NULL;
     if (!(d->ctx = avcodec_alloc_context3( c )) || !(d->pkt = av_packet_alloc()) || !(d->frame = av_frame_alloc()))
         goto fail;
+    /* madeira-doge: WMV3/VC-1 need the ASF sequence header (extradata) and the
+     * picture size up front; VP8/VP9 read both from the stream. */
+    if (codec != MAV_LAVC_VP9 && codec != MAV_LAVC_VP8)
+    {
+        if (extradata && extradata_size)
+        {
+            if (!(d->ctx->extradata = av_mallocz( extradata_size + AV_INPUT_BUFFER_PADDING_SIZE ))) goto fail;
+            memcpy( d->ctx->extradata, extradata, extradata_size );
+            d->ctx->extradata_size = extradata_size;
+        }
+        d->ctx->width = d->ctx->coded_width = width;
+        d->ctx->height = d->ctx->coded_height = height;
+    }
     d->ctx->thread_count = cpus > 1 ? (int)(cpus > 6 ? 6 : cpus) : 1;
     d->ctx->thread_type = FF_THREAD_SLICE;    /* no frame delay */
     if (avcodec_open2( d->ctx, c, NULL ) < 0)
@@ -1044,6 +1083,13 @@ static int mav_classify_audio( enum AVCodecID id, enum mav_codec_kind *kind, uin
         /* madeira-doge: WebM audio, libavcodec, converted to float */
         *native = MAV_FMT_F32;
         return 1;
+    case AV_CODEC_ID_WMAV1:
+    case AV_CODEC_ID_WMAV2:
+    case AV_CODEC_ID_WMAPRO:
+        /* madeira-doge: ASF movie audio (MADEIRA_WG_WMV), libavcodec, to float */
+        if (!mav_wmv_allowed()) return 0;
+        *native = MAV_FMT_F32;
+        return 1;
     case AV_CODEC_ID_AAC:
         /* decoded by the platform backend, to float */
         *kind = MAV_CODEC_AAC;
@@ -1234,6 +1280,10 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
     case AV_CODEC_ID_HEVC: codec = MAV_BACKEND_HEVC; s->info.kind = MAV_CODEC_HEVC; break;
     case AV_CODEC_ID_VP9: codec = MAV_LAVC_VP9; s->info.kind = MAV_CODEC_VP9; break;
     case AV_CODEC_ID_VP8: codec = MAV_LAVC_VP8; s->info.kind = MAV_CODEC_VP8; break;
+    case AV_CODEC_ID_WMV1: codec = MAV_LAVC_WMV1; s->info.kind = MAV_CODEC_WMV; break;
+    case AV_CODEC_ID_WMV2: codec = MAV_LAVC_WMV2; s->info.kind = MAV_CODEC_WMV; break;
+    case AV_CODEC_ID_WMV3: codec = MAV_LAVC_WMV3; s->info.kind = MAV_CODEC_WMV; break;
+    case AV_CODEC_ID_VC1: codec = MAV_LAVC_VC1; s->info.kind = MAV_CODEC_WMV; break;
     default:
         snprintf( why, why_size, "no decoder for it in this port" );
         return MAV_E_UNSUPPORTED;
@@ -1241,7 +1291,7 @@ static int mav_open_video( struct mav_parser *p, struct mav_stream *s, AVStream 
     snprintf( s->info.codec, sizeof(s->info.codec), "%s", avcodec_get_name( par->codec_id ) );
     /* madeira-doge: VP8/VP9 (DYNASTY WARRIORS: ORIGINS' movies, WebM) are decoded in
      * software by libavcodec; H.264/HEVC stay on the platform backend. */
-    s->vb = codec == MAV_LAVC_VP9 || codec == MAV_LAVC_VP8 ? &mav_lavc_video_backend : mav_vbackend;
+    s->vb = codec >= MAV_LAVC_VP9 ? &mav_lavc_video_backend : mav_vbackend;
     if (!s->vb || !s->vb->supports( codec ))
     {
         snprintf( why, why_size, "no video decoder backend for it" );
@@ -1328,7 +1378,8 @@ static int mav_connect_locked( struct mav_parser *p )
     name = p->fmt->iformat->name;
     is_mp3 = !strcmp( name, "mp3" );
     p->is_mov = !strcmp( name, MAV_MOV_NAME );
-    p->is_mkv = !strcmp( name, MAV_MKV_NAME ) || !strcmp( name, "ivf" );
+    p->is_mkv = !strcmp( name, MAV_MKV_NAME ) || !strcmp( name, "ivf" )
+             || (!strcmp( name, "asf" ) && mav_wmv_allowed());   /* madeira-doge: MADEIRA_WG_WMV */
     if (!is_mp3 && strcmp( name, "wav" ) && !((p->is_mov || p->is_mkv) && mav_video_allowed))
         return mav_refuse( p, MAV_E_UNSUPPORTED, p->is_mov || p->is_mkv ? "container disabled by MADEIRA_WG_VIDEO=0"
                                                                          : "container not in the allowlist" );

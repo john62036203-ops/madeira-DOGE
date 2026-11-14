@@ -119,6 +119,10 @@ CONFIG_ARGS=(
     # audio, all decoded by libavcodec (LGPL); DYNASTY WARRIORS: ORIGINS' movies.
     --enable-demuxer=matroska,ivf
     --enable-decoder=vp8,vp9,opus,vorbis
+    # madeira-doge: ASF (Windows Media) with WMV1/2/3 or VC-1 video, decoded by
+    # libavcodec (LGPL); Devil May Cry 5's movies. Used only with env.MADEIRA_WG_WMV = 1.
+    --enable-demuxer=asf
+    --enable-decoder=wmv1,wmv2,wmv3,vc1
     --enable-parser=mpegaudio
     --disable-programs
     --disable-doc
