@@ -23,6 +23,9 @@ default; also turns the [gpu-hang] lines on): in every compute encoder that
 sets one of these pipelines, the dispatches are dropped (fence updates kept,
 so later encoders are not left waiting). env.MADEIRA_SKIP_CS_WAIT = 1 also
 drops that encoder's fence waits. The game loses that encoder's work.
+env.MADEIRA_SKIP_MESH_DRAWS = 1 (experiment, off by default; also turns the
+[gpu-hang] lines on): DXMT's geometry-shader and tessellation draws (Metal
+mesh draws) are dropped. Render encoder labels count them (mesh=N).
 Native path only. Run after tools/patch-winemetal-gpu-trace.py. Idempotent;
 fails by name if an anchor moves. Run from the repository root.
 """
@@ -40,7 +43,8 @@ static int mad_ghi_on(void) {
   if (v < 0) {
     const char *e = getenv("MADEIRA_GPU_HANG_INFO");
     const char *k = getenv("MADEIRA_SKIP_CS_ENC");
-    v = ((e && *e && *e != '0') || (k && *k)) ? 1 : 0;
+    const char *m = getenv("MADEIRA_SKIP_MESH_DRAWS");
+    v = ((e && *e && *e != '0') || (k && *k) || (m && *m == '1')) ? 1 : 0;
     if (v) fprintf(stderr, "[gpu-hang] MADEIRA_GPU_HANG_INFO on: encoder execution status + shader-named encoders\n");
   }
   return v;
@@ -77,7 +81,7 @@ static id<MTLCommandBuffer> mad_ghi_command_buffer(id<MTLCommandQueue> queue) {
       NSUInteger idx = 0;
       for (id<MTLCommandBufferEncoderInfo> info in infos) {
         if (info.errorState == MTLCommandEncoderErrorStateCompleted) { completed++; idx++; continue; }
-        if (shown < 24 || info.errorState == MTLCommandEncoderErrorStateFaulted) {
+        if (shown < 64 || info.errorState == MTLCommandEncoderErrorStateFaulted) {
           NSString *sp = info.debugSignposts.count ? [info.debugSignposts componentsJoinedByString:@","] : nil;
           fprintf(stderr, "[gpu-hang]   enc #%lu %s '%.200s'%s%.200s\n", (unsigned long)idx, mad_ghi_state(info.errorState),
                   info.label.UTF8String ? info.label.UTF8String : "", sp ? " signposts=" : "", sp ? sp.UTF8String : "");
@@ -90,13 +94,30 @@ static id<MTLCommandBuffer> mad_ghi_command_buffer(id<MTLCommandQueue> queue) {
   }];
   return cb;
 }
+static int mad_ghi_is_mesh_draw(unsigned t) {
+  switch (t) {
+  case WMTRenderCommandDrawMeshThreadgroups: case WMTRenderCommandDrawMeshThreadgroupsIndirect:
+  case WMTRenderCommandDXMTGeometryDraw: case WMTRenderCommandDXMTGeometryDrawIndexed:
+  case WMTRenderCommandDXMTGeometryDrawIndirect: case WMTRenderCommandDXMTGeometryDrawIndexedIndirect:
+  case WMTRenderCommandDXMTTessellationMeshDraw: case WMTRenderCommandDXMTTessellationMeshDrawIndexed:
+  case WMTRenderCommandDXMTTessellationMeshDrawIndirect: case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect:
+    return 1;
+  default: return 0;
+  }
+}
+static int mad_ghi_skip_mesh(void) {
+  static int v = -1;
+  if (v < 0) { const char *m = getenv("MADEIRA_SKIP_MESH_DRAWS"); v = (m && *m == '1') ? 1 : 0; }
+  return v;
+}
 /* Label an encoder with the Metal functions of the pipelines its commands set. */
 static void mad_ghi_label(int compute, obj_handle_t encoder, const struct wmtcmd_base *c) {
   char names[6][24];
-  unsigned n = 0, extra = 0, cmds = 0;
+  unsigned n = 0, extra = 0, cmds = 0, mesh = 0;
   for (; c; c = c->next.ptr) {
     obj_handle_t pso = 0;
     cmds++;
+    if (!compute && mad_ghi_is_mesh_draw(c->type)) mesh++;
     if (compute && c->type == WMTComputeCommandSetPSO) pso = ((const struct wmtcmd_compute_setpso *)c)->pso;
     else if (!compute && c->type == WMTRenderCommandSetPSO) pso = ((const struct wmtcmd_render_setpso *)c)->pso;
     if (!pso) continue;
@@ -107,9 +128,10 @@ static void mad_ghi_label(int compute, obj_handle_t encoder, const struct wmtcmd
     if (n < 6) snprintf(names[n++], sizeof names[0], "%s", nm);
     else extra++;
   }
-  if (!n) return;
+  if (!n && !mesh) return;
   char label[200];
-  int w = snprintf(label, sizeof label, "%s %u cmds:", compute ? "C" : "R", cmds);
+  int w = mesh ? snprintf(label, sizeof label, "%s %u cmds mesh=%u:", compute ? "C" : "R", cmds, mesh)
+               : snprintf(label, sizeof label, "%s %u cmds:", compute ? "C" : "R", cmds);
   for (unsigned i = 0; i < n && w > 0 && (size_t)w < sizeof label; i++)
     w += snprintf(label + w, sizeof label - w, " %s", names[i]);
   if (extra && w > 0 && (size_t)w < sizeof label) snprintf(label + w, sizeof label - w, " +%u", extra);
@@ -171,6 +193,9 @@ POST = [
     ("      if (threadgroup_size.width == 0 && madeira_null_pso_skip()) break;   /* madeira-doge: steamac null-pso (0006) */\n",
      "      if (threadgroup_size.width == 0 && madeira_null_pso_skip()) break;   /* madeira-doge: steamac null-pso (0006) */\n"
      "      if (mad_skip) break;   /* madeira-doge: MADEIRA_SKIP_CS_ENC */\n", 3, "all"),
+    ("    switch ((enum WMTRenderCommandType)next->type) {\n",
+     "    if (mad_ghi_on() && mad_ghi_skip_mesh() && mad_ghi_is_mesh_draw(next->type)) { next = next->next.ptr; continue; }   /* madeira-doge: MADEIRA_SKIP_MESH_DRAWS */\n"
+     "    switch ((enum WMTRenderCommandType)next->type) {\n", 1, "all"),
     ("    case WMTComputeCommandWaitForFence: {\n      struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;\n",
      "    case WMTComputeCommandWaitForFence: {\n      struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;\n"
      "      if (mad_skip == 2) break;   /* madeira-doge: MADEIRA_SKIP_CS_WAIT */\n", 1, "all"),
