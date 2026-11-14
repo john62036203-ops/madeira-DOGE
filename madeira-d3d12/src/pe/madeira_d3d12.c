@@ -770,6 +770,16 @@ static UINT64 mad_tick_freq(void) {
     }
     return g_es_freq;
 }
+/* madeira-doge tick-ms (from BCD 0.1.659, opt-in; tick-ms = 1). GetTickCount() reads the shared user page at 0x7ffe0320, which iOS
+ * cannot map: every call is an exception Wine's exception thread serves. Pipeline creation (born_tick), the pipeline archive's
+ * age check and present-min-ms called it; with the switch they read the CPU's counter instead (one mrs). Only differences of two
+ * values are used, so the count's start does not matter. 0 (default): GetTickCount, as before. */
+static DWORD mad_ms_now(void) {
+    static int on = -1;
+    if (on < 0) on = mad_cfg_int_pe("tick-ms", 0) ? 1 : 0;
+    if (on) return (DWORD)(mad_tick() * 1000 / mad_tick_freq());
+    return GetTickCount();
+}
 static void mad_es_rce(obj_handle_t e, const struct wmtcmd_base *c) {
     UINT64 t = mad_tick(); (MTLRenderCommandEncoder_encodeCommands)(e, c);
     InterlockedExchangeAdd64(&g_es_enc_t, (LONG64)(mad_tick() - t)); InterlockedIncrement(&g_es_enc_n);
@@ -9096,11 +9106,11 @@ static void mad_pso_first(struct mad_pso *p) {
     if (p->is_compute)
         d3d12_log("[pso-first] present #%lld: compute %s/%016llx first bound (created at present #%lld, %lu ms ago)%s\n",
                   (long long)g_presents_now, p->vs_name, (unsigned long long)p->cs_hash, (long long)p->born_present,
-                  (unsigned long)(GetTickCount() - p->born_tick), n == 30000 ? " -- limit of 30000 lines reached" : "");
+                  (unsigned long)(mad_ms_now() - p->born_tick), n == 30000 ? " -- limit of 30000 lines reached" : "");
     else
         d3d12_log("[pso-first] present #%lld: graphics vs '%s' ps '%s' first bound (created at present #%lld, %lu ms ago)%s\n",
                   (long long)g_presents_now, p->vs_name, p->ps_name, (long long)p->born_present,
-                  (unsigned long)(GetTickCount() - p->born_tick), n == 30000 ? " -- limit of 30000 lines reached" : "");
+                  (unsigned long)(mad_ms_now() - p->born_tick), n == 30000 ? " -- limit of 30000 lines reached" : "");
 }
 static int exec_tess_indirect_prep(struct mad_exec *e, const struct mad_cmd *c, UINT64 *out_off) {
     struct mad_device *d = e->q->device;
@@ -12454,6 +12464,41 @@ static void mad_tvs_report(void) {
               fq.QuadPart ? tk * 1000.0 / (double)fq.QuadPart : 0.0, (long)g_tvs_copies, (long long)g_tvs_late,
               g_tv_align, (long)g_tv_exact_views, (long)g_tv_fallback);
 }
+/* madeira-doge typed-view-unlocked (from BCD 0.1.659, opt-in; typed-view-unlocked = 1). Every typed buffer view's Metal texture
+ * is made while the device's one view lock is held, so threads that create views make them one at a time (BCD: The Last of Us
+ * Part I made 20,000-58,000 views a second from six job threads and waited ~1 s per second on this lock). With the switch a
+ * plain view (default 64-byte alignment, not a whole-buffer view, no shadow copy, no ShaderAtomic) has its texture made with
+ * the lock released; the lock is taken again, the view looked up once more, and a view another thread made meanwhile wins
+ * (ours is released). 0 (default): every view is made under the lock, as before. */
+static volatile LONG g_tv_unl_made, g_tv_unl_lost;
+static int mad_tv_unlocked(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = mad_cfg_int_pe("typed-view-unlocked", 0) ? 1 : 0;
+        if (on) d3d12_log("[madeira-d3d12] typed-view-unlocked = 1: typed buffer views are made outside the device's view lock\n");
+    }
+    return on;
+}
+/* tv-unlocked-test:begin */
+/* The texture mad_typed_buffer_view makes for a plain view (64-byte alignment), by the same arithmetic. 0: none to make here. */
+static int mad_tv_plain_shape(UINT64 res_size, int shared, UINT pf, UINT bytes, UINT64 byte_off, UINT64 num, int uav,
+                              struct WMTTextureInfo *ti, UINT64 *aligned_out, UINT64 *elem_out, UINT64 *width_out, UINT64 *bpr_out) {
+    UINT64 aligned = byte_off & ~(UINT64)63;
+    UINT64 elem = (byte_off - aligned) / bytes;
+    UINT64 width = num + elem;
+    if (aligned >= res_size) return 0;
+    if (aligned + width * bytes > res_size) width = (res_size - aligned) / bytes;
+    if (!width) return 0;
+    if (width > (1u << 28)) width = (1u << 28);
+    memset(ti, 0, sizeof *ti);
+    ti->pixel_format = (enum WMTPixelFormat)pf; ti->width = (uint32_t)width; ti->height = 1; ti->depth = 1; ti->array_length = 1;
+    ti->type = WMTTextureTypeTextureBuffer; ti->mipmap_level_count = 1; ti->sample_count = 1;
+    ti->usage = uav ? (WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite) : WMTTextureUsageShaderRead;
+    ti->options = shared ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;
+    *aligned_out = aligned; *elem_out = elem; *width_out = width; *bpr_out = width * bytes;
+    return 1;
+}
+/* tv-unlocked-test:end */
 static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,
                                  UINT64 first, UINT64 num, int uav, struct mad_descriptor *e) {
     enum WMTPixelFormat pf; int is_depth = 0; UINT bytes, block; unsigned k;
@@ -12489,6 +12534,33 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
     k = mad_tvh_find(r, (UINT)fmt, whole ? 0 : byte_off, whole ? wwidth : num, (UINT)uav);   /* madeira-bcd tv-hash */
     if (k == r->ntview) {
         UINT al = whole ? 64 : mad_tv_align(d, pf, bytes);   /* madeira-doge typed-view-align (BCD): 64 unless the switch says otherwise */
+        /* madeira-doge typed-view-unlocked: a plain view's texture is made with the lock released; the view is then looked up
+         * again, and either another thread's stays (have) or this one is published by the code below (made). */
+        if (!whole && al == 64 && mad_tv_unlocked() &&
+            !(((byte_off & 63) / bytes) && mad_tvs_on()) &&
+            !(uav && (pf == WMTPixelFormatR32Uint || pf == WMTPixelFormatR32Sint) && mad_typed_uav_atomic())) {
+            struct WMTTextureInfo pti; UINT64 p_al = 0, p_el = 0, p_w = 0, p_bpr = 0;
+            if (mad_tv_plain_shape(r->size, r->cpu || r->own_mem, (UINT)pf, bytes, byte_off, num, uav, &pti, &p_al, &p_el, &p_w, &p_bpr)) {
+                obj_handle_t pre; LONG m;
+                LeaveCriticalSection(&d->view_lock);
+                pre = MTLBuffer_newTexture(r->buffer, &pti, p_al, p_bpr);
+                EnterCriticalSection(&d->view_lock);
+                if (pre && !pti.gpu_resource_id) { NSObject_release(pre); pre = 0; }   /* refused: the code below tries and reports as before */
+                k = mad_tvh_find(r, (UINT)fmt, byte_off, num, (UINT)uav);
+                if (k != r->ntview) {   /* another thread made this very view meanwhile: it stays, ours goes */
+                    if (pre) { NSObject_release(pre); InterlockedIncrement(&g_tv_unl_lost); }
+                    goto have;
+                }
+                if (pre) {
+                    aligned = p_al; elem_off = p_el; width = p_w; bpr = p_bpr;
+                    ti = pti; sh_gpu = 0; sh = NULL; tex = pre;
+                    if ((m = InterlockedIncrement(&g_tv_unl_made)) == 1 || !(m % 500000))
+                        d3d12_log("[typed-view] typed-view-unlocked: %ld views made outside the view lock, %ld more given up for the same "
+                                  "view made by another thread meanwhile\n", (long)m, (long)g_tv_unl_lost);
+                    goto made;
+                }
+            }
+        }
     again:
         aligned = whole ? 0 : (byte_off & ~(UINT64)(al - 1));     /* linear texture alignment on Apple GPUs is <= 64 */
         elem_off = (byte_off - aligned) / bytes;
@@ -12529,6 +12601,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
             ti.gpu_resource_id = 0;
             goto again;
         }
+    made:   /* madeira-doge typed-view-unlocked: also reached with a texture made while the lock was released */
         if (!tex || !ti.gpu_resource_id) {
             if (said_fail++ < 8)
                 d3d12_log("[madeira-d3d12] typed buffer view FAILED: fmt %u first %llu num %llu (buffer %llu bytes)\n",
@@ -12568,6 +12641,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
                       (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, uav ? " (UAV)" : "",
                       (unsigned)width, (unsigned long long)elem_off);
     }
+have:   /* madeira-doge typed-view-unlocked: also reached when another thread made the view while the lock was released */
     if (whole) { elem_off = byte_off / bytes; e->gpu_va = r->gpu_address + byte_off; }
     else {
         elem_off = r->tview[k].eoff;   /* as the view was made (typed-view-align may have moved its start; 0 for a shadow copy) */
@@ -17199,7 +17273,7 @@ static int mad_parch_init(obj_handle_t device) {
             else d3d12_log("[madeira-d3d12] pso-archive: %s %ls, %llu pipelines in it (iOS %llu.%llu.%llu)\n",
                            load ? "using" : "starting", g_parch.warch, (unsigned long long)nkeys,
                            (unsigned long long)a, (unsigned long long)b, (unsigned long long)c);
-            g_parch.last = GetTickCount();
+            g_parch.last = mad_ms_now();   /* madeira-doge tick-ms */
             if (on && (g_parch.wake = CreateEventW(NULL, FALSE, FALSE, NULL))) {
                 HANDLE t = CreateThread(NULL, 0, mad_parch_writer, NULL, 0, NULL);
                 if (t) CloseHandle(t); else { CloseHandle(g_parch.wake); g_parch.wake = NULL; }
@@ -17277,7 +17351,7 @@ static void mad_parch_write_once(void) {
     if (InterlockedIncrement(&g_parch.written) <= 12 || !ok)
         d3d12_log("[madeira-d3d12] pso-archive: %s, %lu pipelines (+%lu)\n", ok ? "written" : "write FAILED",
                   (unsigned long)n1, (unsigned long)n0);
-    g_parch.last = GetTickCount();
+    g_parch.last = mad_ms_now();   /* madeira-doge tick-ms */
     InterlockedExchange(&g_parch.writing, 0);
 }
 /* One writer thread for the session: build 190 started a new thread for every
@@ -17302,7 +17376,7 @@ static void mad_parch_done(UINT64 key, int add, int ok) {
     }
     ReleaseSRWLockShared(&g_parch.ser);   /* taken in mad_parch_prepare */
     if (np) {
-        DWORD age = GetTickCount() - g_parch.last;
+        DWORD age = mad_ms_now() - g_parch.last;   /* madeira-doge tick-ms */
         if (((np >= 16 && age >= 60000) || age >= 180000) && !InterlockedCompareExchange(&g_parch.writing, 1, 0)) {
             if (g_parch.wake) SetEvent(g_parch.wake);
             else InterlockedExchange(&g_parch.writing, 0);
@@ -18296,7 +18370,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     p = calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
     p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "PipelineState";
-    p->born_present = g_presents_now; p->born_tick = GetTickCount();   /* madeira-bcd: pso-first-use */
+    p->born_present = g_presents_now; p->born_tick = mad_ms_now();   /* madeira-bcd: pso-first-use (madeira-doge tick-ms) */
     if (desc->HS.pShaderBytecode || desc->DS.pShaderBytecode) { p->has_tess = 1; InterlockedIncrement(&g_tess_psos); }   /* ml1050 */
 
     {
@@ -18974,7 +19048,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
     p = calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
     p->vtbl = &g_pso_vtbl; p->refs = 1; p->iid = &IID_ID3D12PipelineState; p->name = "ComputePipelineState";
-    p->born_present = g_presents_now; p->born_tick = GetTickCount();   /* madeira-bcd: pso-first-use */
+    p->born_present = g_presents_now; p->born_tick = mad_ms_now();   /* madeira-bcd: pso-first-use (madeira-doge tick-ms) */
     p->is_compute = 1;
     {   /* madeira-bcd: identify the bytecode for GPU fault reports */
         const unsigned char *b = desc->CS.pShaderBytecode; UINT64 hh = 0xcbf29ce484222325ull; SIZE_T q;
@@ -19450,6 +19524,46 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
                   what, u.res->name ? u.res->name : "?", u.res->width, u.res->height, u.level, u.sl0,
                   u.nsl == ~0u ? -1 : (int)u.nsl, (unsigned)u.fmt, pat, bpp);
 }
+/* madeira-doge uav-typed-buf-clear (from BCD 0.1.659, opt-in; uav-typed-buf-clear = 1). Direct3D 12 clears a TYPED buffer view as
+ * it clears a texture: every element gets the four values, each in its own channel. Only raw and structured views take Values[0]
+ * for every 32 bits, which is what this layer wrote for every buffer view. BCD: The Last of Us Part I clears its indirect dispatch
+ * records to (0, 1, 1, 0) through an R32G32B32A32_UINT view; with Values[0] everywhere Y and Z were 0, the deferred lighting
+ * pass ran no thread groups (no light, trails). With the switch a typed view is cleared per element in its format when that
+ * differs from the plain result; 0 (default): as before. */
+/* uav-buf-clear-test:begin */
+static int mad_buf_clear_typed_period(const unsigned char *px, UINT bpp, UINT32 per[4]) {
+    unsigned char b[16]; unsigned i;
+    if (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8 && bpp != 16) return 0;
+    for (i = 0; i < 16; i++) b[i] = px[i % bpp];
+    memcpy(per, b, 16);
+    return 1;
+}
+/* uav-buf-clear-test:end */
+static int mad_record_typed_buf_clear(struct mad_list *l, struct mad_cmd *c, struct mad_resource *r, const struct mad_descriptor *e,
+                                      const UINT32 v[4], int is_float, const char *what) {
+    static int on = -1; static volatile LONG said;
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; unsigned k; unsigned char px[16]; UINT32 per[4], plain[4]; UINT bpp; obj_handle_t pat;
+    struct mad_device *d = l->device;
+    if (on < 0) on = mad_cfg_int_pe("uav-typed-buf-clear", 0) ? 1 : 0;
+    if (!on || !v || !d || !r || !e->texture_view_id || !(e->metadata >> 63)) return 0;
+    EnterCriticalSection(&d->view_lock);
+    for (k = 0; k < r->ntview; k++)
+        if (r->tview[k].id == e->texture_view_id && r->tview[k].uav) { fmt = (DXGI_FORMAT)r->tview[k].fmt; break; }
+    LeaveCriticalSection(&d->view_lock);
+    if (fmt == DXGI_FORMAT_UNKNOWN || (is_float && mad_format_is_integer(fmt))) return 0;
+    bpp = mad_pack_clear(fmt, v, is_float, px);
+    if (!mad_buf_clear_typed_period(px, bpp, per)) return 0;
+    plain[0] = plain[1] = plain[2] = plain[3] = v[0];
+    if (!memcmp(per, plain, 16)) return 0;   /* the plain path writes the same */
+    pat = mad_fill_pattern16(d, per);
+    if (!pat) return 0;   /* the pattern cache is full: as before */
+    c->u.fill.byte = (UINT8)(per[0] & 0xff); c->u.fill.pattern = pat;
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] uav-typed-buf-clear: %s through a typed buffer view (format %u, %u-byte elements): values %#x %#x %#x %#x -> "
+                  "%08x %08x %08x %08x, resource '%s' range +%llu len %llu\n", what, (unsigned)fmt, bpp, v[0], v[1], v[2], v[3],
+                  per[0], per[1], per[2], per[3], r->name ? r->name : "?", (unsigned long long)c->u.fill.off, (unsigned long long)c->u.fill.len);
+    return 1;
+}
 static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *res, const UINT32 v[4], int is_float, const char *what) {
     struct mad_list *l = (struct mad_list *)This;
     struct mad_descriptor *e = (struct mad_descriptor *)cpu.ptr;
@@ -19475,6 +19589,7 @@ static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESC
     c = mad_list_push(l, MC_FILL_BB);
     if (!c) return;
     c->u.fill.res = r; c->u.fill.off = off; c->u.fill.len = len;
+    if (mad_record_typed_buf_clear(l, c, r, e, v, is_float, what)) return;   /* madeira-doge uav-typed-buf-clear (opt-in) */
     {
         UINT32 x = v ? v[0] : 0; UINT8 b = (UINT8)(x & 0xff);
         int exact = v && v[0] == v[1] && v[1] == v[2] && v[2] == v[3] &&
@@ -21723,9 +21838,9 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         if (g_upload_guard) mad_ug_verify(s->queue->device, mad_gpu_completed(s->queue->device));
         if (g_ic_frames) mad_ic_collect(s->queue->device);   /* ind-count: sum what the GPU has finished */
         if (g_present_min_ms) {   /* present-min-ms: frames at least N ms apart */
-            static DWORD last; DWORD now = GetTickCount();
+            static DWORD last; DWORD now = mad_ms_now();   /* madeira-doge tick-ms */
             if (last && now - last < g_present_min_ms) { Sleep(g_present_min_ms - (now - last)); InterlockedIncrement(&g_sd_throttled); }
-            last = GetTickCount();
+            last = mad_ms_now();
         }
         if ((s->presents % 300) == 299) mad_sd_report(s->presents + 1);
     }
@@ -21736,9 +21851,9 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         static int omin = -1; static DWORD olast;
         if (omin < 0) omin = (int)mad_cfg_int_pe("swap-offscreen-min-ms", 0);
         if (omin > 0) {
-            DWORD now = GetTickCount();
+            DWORD now = mad_ms_now();   /* madeira-doge tick-ms */
             if (olast && now - olast < (DWORD)omin) Sleep((DWORD)omin - (now - olast));
-            olast = GetTickCount();
+            olast = mad_ms_now();
         }
         s->presents++;
         return;

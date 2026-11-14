@@ -92,6 +92,28 @@ OVERLAY = {
                         "starts at a 64-byte boundary, as before. 16 or 256: at that boundary. 4: at its first element where a GPU probe at the "
                         "first view shows Metal reads such textures right (logged as [typed-view] probe), else at 16. A view Metal refuses there "
                         "is made at 16, then 64. Read once per game start."},
+    "typed-view-unlocked": {"category": "Direct3D 12", "title": "Make typed buffer views outside the view lock",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (BCD 0.1.659, opt-in there too). 1: a plain typed buffer view (64-byte alignment, not "
+                        "tview-whole, no typed-view-shadow copy, no ShaderAtomic) has its Metal texture made with the device's view "
+                        "lock released; the view is looked up again and one another thread made meanwhile wins. 0: under the lock, as "
+                        "before. Logged as [typed-view] typed-view-unlocked. Read once per game start."},
+    "uav-typed-buf-clear": {"category": "Direct3D 12", "title": "Clear typed buffer UAVs per element",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (BCD 0.1.659, always on there). 1: ClearUnorderedAccessViewUint/Float through a typed buffer "
+                        "view writes every element in the view's format (four channels), as Direct3D 12 does, when that differs from "
+                        "Values[0] in every 32 bits (The Last of Us Part I: indirect dispatch records cleared to 0,1,1,0). 0: Values[0] "
+                        "everywhere, as before. Logged as [madeira-d3d12] uav-typed-buf-clear. Read once per game start."},
+    "tick-ms": {"category": "Direct3D 12", "title": "Layer timing from the CPU counter",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (BCD 0.1.659). 1: pipeline creation times, the pso-archive age check, present-min-ms and "
+                        "swap-offscreen-min-ms read the CPU counter instead of GetTickCount (an exception per call on iOS: the shared "
+                        "user page cannot be mapped). 0: GetTickCount, as before. Read once per game start."},
+    "env.MADEIRA_FEX_CALLRET_LEAN": {"category": "x86 emulation (FEX)", "title": "No suspend check at call return points",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-callret-lean.py"],
+                "note": "madeira-doge (BCD 0.1.659, from Porthole 0143; an A/B experiment). 1 exactly: the JIT entry point right "
+                        "after a guest CALL has no suspend doorbell test (the callee's entry point or ExitFunctionEC tested it): two "
+                        "instructions fewer per call return. Unset: every entry point as before. 64-bit (ARM64EC) module only."},
     "env.MADEIRA_NOFOOTPRINT_PROBE": {"category": "Debugging / logs", "title": "Probe: memory outside the jetsam footprint",
                 "kind": "bool", "default": "0", "sources": ["app/Madeira/JITAllocator.c", "app/Madeira/StikJITHelper.swift"],
                 "note": "madeira-doge (diagnostic, after ammaarreshi/WindowsiOS's hv_alloc_no_footprint). 1: at the JIT pool request, "

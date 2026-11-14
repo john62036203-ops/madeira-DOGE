@@ -214,19 +214,29 @@ python3 "$R/tools/patch-fex-ios-rdtsc-selfsync.py" "$R/FEX" || echo "::warning::
 #    Module.cpp is saved first so a build error from it restores the file with every earlier patch in it.
 cp "$R/FEX/Source/Windows/ARM64EC/Module.cpp" "$B.Module.cpp.pre-bcd653"
 python3 "$R/tools/patch-fex-ios-bcd653-optin.py" "$R/FEX" || { echo "::warning::the BCD 0.1.653 FEX fixes were not applied (FEX anchor changed); xtajit64.dll is built without them"; cp "$B.Module.cpp.pre-bcd653" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"; }
+#  - patch-fex-ios-callret-lean.py (BCD 0.1.659 / Porthole 0143): MADEIRA_FEX_CALLRET_LEAN=1 leaves the suspend check out of
+#    the entry point right after a guest CALL (two instructions fewer per call return). Last, so its anchors are the other
+#    overlays' output.
+#    JIT.cpp / JITClass.h are saved first so a build error from it restores them with every earlier patch in them.
+cp "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp" "$B.JIT.cpp.pre-lean"
+cp "$R/FEX/FEXCore/Source/Interface/Core/JIT/JITClass.h" "$B.JITClass.h.pre-lean"
+python3 "$R/tools/patch-fex-ios-callret-lean.py" "$R/FEX" || { echo "::warning::the lean call return was not applied (FEX anchor changed); xtajit64.dll is built without it"; cp "$B.JIT.cpp.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"; cp "$B.JITClass.h.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JITClass.h"; }
 # A build error from these three opt-ins must not cost the module every other fix: the final build
 # retries without them.
 build() {
     if ! cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1; then
-        echo "::warning::xtajit64.dll did not build with the madeira-doge FEX opt-ins (split lock, PAUSE, RDTSC self-sync, BCD 0.1.653 fixes); rebuilding without them :: $(grep -m 4 'error' "$B.build.log" | tr '\n' ' ' | cut -c1-900)"
+        echo "::warning::xtajit64.dll did not build with the madeira-doge FEX opt-ins (split lock, PAUSE, RDTSC self-sync, BCD 0.1.653 fixes, lean call return); rebuilding without them :: $(grep -m 4 'error' "$B.build.log" | tr '\n' ' ' | cut -c1-900)"
         git -C "$R/FEX" checkout -- FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+        # madeira-doge: without callret-lean too (JIT.cpp / JITClass.h as they were before it, every earlier patch kept)
+        [ -f "$B.JIT.cpp.pre-lean" ] && cp "$B.JIT.cpp.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
+        [ -f "$B.JITClass.h.pre-lean" ] && cp "$B.JITClass.h.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JITClass.h"
         [ -f "$B.Module.cpp.pre-bcd653" ] && cp "$B.Module.cpp.pre-bcd653" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"   # madeira-doge: without the BCD 0.1.653 opt-in too
         cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1 \
             || { grep -m 20 "error" "$B.build.log"; exit 1; }
     fi
 }
 build
-git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/ARM64EC/Module.S Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/CPUID.h FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/Source/Interface/Core/CPUBackend.cpp FEXCore/Source/Interface/Core/Core.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+git -C FEX checkout -- "$CPUF" FEXCore/include/FEXCore/Utils/ThreadPoolAllocator.h Source/Windows/ARM64EC/Module.cpp Source/Windows/ARM64EC/Module.S Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/Source/Interface/Core/Frontend.cpp FEXCore/Source/Interface/Core/CPUID.h FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/Source/Interface/Core/CPUBackend.cpp FEXCore/Source/Interface/Core/Core.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp FEXCore/Source/Interface/Core/JIT/JIT.cpp FEXCore/Source/Interface/Core/JIT/JITClass.h
 git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
 cp "$B/Bin/libarm64ecfex.dll" "$AVX"

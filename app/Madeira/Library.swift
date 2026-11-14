@@ -3467,6 +3467,28 @@ struct LibraryDetail: View {
                         Text("A typed buffer view's texture starts exactly at its first element instead of 64 bytes before it, where a quick GPU test at the first view shows this device reads such textures right (typed-view-align = 4, from BCD; recommended there for DRAGON BALL: Sparking! ZERO together with the switch above). Turn it off if textures or lighting flicker or turn black.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD 0.1.659 Direct3D 12 changes: opt-in, madeira-d3d12 only
+                    Toggle("Make typed buffer views outside the view lock (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("typed-view-unlocked") == "1" }, set: { setBCDKey("typed-view-unlocked", $0 ? "1" : "") }))
+                    if bcd.value("typed-view-unlocked") == "1" {
+                        Text("Game threads that create many typed buffer views at once no longer wait for each other while each view's GPU texture is made; a view two threads make at the same time is kept once (from BCD; The Last of Us Part I waited about 1 second per second on this lock). Not used for views made with the typed-buffer alignment or copy switches above. Turn it off if the game crashes or textures go wrong.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Clear typed buffers per element (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("uav-typed-buf-clear") == "1" }, set: { setBCDKey("uav-typed-buf-clear", $0 ? "1" : "") }))
+                    if bcd.value("uav-typed-buf-clear") == "1" {
+                        Text("A clear of a typed buffer writes the game's four values into each element in the buffer's format, as Direct3D 12 does, instead of the first value everywhere (from BCD; fixed The Last of Us Part I's missing lighting and trails). Turn it off if lighting or effects look wrong.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Read time without the slow shared-page trap (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("tick-ms") == "1" }, set: { setBCDKey("tick-ms", $0 ? "1" : "") }))
+                    if bcd.value("tick-ms") == "1" {
+                        Text("The Direct3D 12 layer times its own work (each new shader pipeline, the pipeline archive, frame pacing) from the CPU's timer instead of GetTickCount, which on iOS costs an exception each call (from BCD). Can shorten shader-compile stutters a little. Turn it off if frame pacing or the pipeline archive behaves differently.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge BCD 0.1.659 / Porthole 0143: opt-in (tools/patch-fex-ios-callret-lean.py)
+                    Toggle("Leaner returns from game function calls (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_CALLRET_LEAN") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_CALLRET_LEAN", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_CALLRET_LEAN") == "1" {
+                        Text("The emulator leaves out a redundant thread-suspend check at the point every x86 function call returns to: two instructions fewer per call, slightly less JIT code (from BCD and Porthole, an A/B experiment there). 64-bit games. Turn it off if the game hangs, freezes when pausing or quitting, or crashes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge BCD 0.1.653 DXMT fixes: opt-in, in d3d11-src.dll (tools/bcd653/patch-dxmt-bcd653-optin.py)
                     Toggle("Direct3D 11 crash fixes from BCD 0.1.653 (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_DXMT_BCD_FIXES") == "1" }, set: { setBCDKey("env.MADEIRA_DXMT_BCD_FIXES", $0 ? "1" : ""); setBCDKey("env.MADEIRA_D3D11_SRC", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_DXMT_BCD_FIXES") == "1" {
