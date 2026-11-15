@@ -24,6 +24,7 @@
 #pragma makedep unix
 #endif
 
+#include <stdlib.h>   /* madeira-doge: getenv (MADEIRA_STYLE_FRAME) */
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
 #include "wine/server.h"
@@ -2429,6 +2430,18 @@ static LRESULT handle_nc_mouse_leave( HWND hwnd )
 }
 
 
+/* madeira-doge: env.MADEIRA_STYLE_FRAME (see WM_STYLECHANGED below) */
+static int madeira_style_frame(void)
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char *e = getenv( "MADEIRA_STYLE_FRAME" );
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, BOOL ansi )
 {
     LRESULT result = 0;
@@ -2977,7 +2990,15 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
         break;
 
     case WM_STYLECHANGED:
-        if ((LONG)wparam == GWL_STYLE && (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED))
+        /* madeira-doge: env.MADEIRA_STYLE_FRAME = 1 (off by default) recomputes the
+         * frame of any top-level window whose caption/border style changes, not only
+         * layered ones. Devil May Cry 5 switches to Borderless Window by dropping
+         * WS_CAPTION without SWP_FRAMECHANGED (build 633 log 2026-11-15 23:59:
+         * style 14ca0000 -> 94000000), so the client rect, and the Metal layer
+         * placed on it, kept the old title bar. */
+        if ((LONG)wparam == GWL_STYLE &&
+            ((get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED) ||
+             (madeira_style_frame() && !(get_window_long( hwnd, GWL_STYLE ) & WS_CHILD))))
         {
             STYLESTRUCT *style = (STYLESTRUCT *)lparam;
             if ((style->styleOld ^ style->styleNew) & (WS_CAPTION|WS_THICKFRAME|WS_VSCROLL|WS_HSCROLL))
