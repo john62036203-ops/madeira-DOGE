@@ -3467,6 +3467,12 @@ struct LibraryDetail: View {
                         Text("A typed buffer view's texture starts exactly at its first element instead of 64 bytes before it, where a quick GPU test at the first view shows this device reads such textures right (typed-view-align = 4, from BCD; recommended there for DRAGON BALL: Sparking! ZERO together with the switch above). Turn it off if textures or lighting flicker or turn black.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD 0.1.665 Direct3D 12 change: opt-in, madeira-d3d12 only
+                    Toggle("Draw blends that need a missing second shader output (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("dual-source-drop") == "1" }, set: { setBCDKey("dual-source-drop", $0 ? "1" : "") }))
+                    if bcd.value("dual-source-drop") == "1" {
+                        Text("A pipeline whose blending reads a second pixel-shader output that the converted shader does not write is refused by Metal, and everything drawn with it was left out. With this on, such a pipeline is built again without that part of the blend, so the object is drawn (from BCD 0.1.665: Freddy's House, Poppy Playtime, ReSkate). Can bring back missing effects or objects; their blending may be slightly off. Turn it off if something looks worse.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge BCD 0.1.659 Direct3D 12 changes: opt-in, madeira-d3d12 only
                     Toggle("Make typed buffer views outside the view lock (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("typed-view-unlocked") == "1" }, set: { setBCDKey("typed-view-unlocked", $0 ? "1" : "") }))
                     if bcd.value("typed-view-unlocked") == "1" {
@@ -3493,6 +3499,17 @@ struct LibraryDetail: View {
                     Toggle("Direct3D 11 crash fixes from BCD 0.1.653 (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_DXMT_BCD_FIXES") == "1" }, set: { setBCDKey("env.MADEIRA_DXMT_BCD_FIXES", $0 ? "1" : ""); setBCDKey("env.MADEIRA_D3D11_SRC", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_DXMT_BCD_FIXES") == "1" {
                         Text("A texture larger than Direct3D 11 allows is refused the way Windows refuses it instead of crashing the game (The Witness, Tomb Raider), an update of a CPU-only buffer is skipped instead of crashing (FIFA 23), and a swap chain rotation request is answered instead of ending the game (SDL2 games). From BCD. These live in the d3d11.dll built from DXMT's source, so this switch also turns on env.MADEIRA_D3D11_SRC (and turning it off turns both off). Turn it off if the game behaves differently.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge BCD 0.1.665 DXMT opt-ins: in d3d11-src.dll (tools/bcd665/patch-dxmt-bcd665-optin.py)
+                    Toggle("Keep more recycled constant buffers (Direct3D 11, experimental)", isOn: Binding(get: { !bcd.value("env.DXMT_DYN_KEEP").isEmpty && bcd.value("env.DXMT_DYN_KEEP") != "0" }, set: { setBCDKey("env.DXMT_DYN_KEEP", $0 ? "1024" : ""); setBCDKey("env.MADEIRA_D3D11_SRC", $0 ? "1" : "") }))
+                    if !bcd.value("env.DXMT_DYN_KEEP").isEmpty && bcd.value("env.DXMT_DYN_KEEP") != "0" {
+                        Text("A small buffer the game refills on every draw keeps up to 1024 used copies for reuse instead of 64, so the game stops making and freeing thousands of GPU buffers a second (from BCD and upstream DXMT; Dark Souls III made 15-30 thousand a second, FromSoftware games such as Sekiro work the same way). Uses up to 4 MB more memory per such buffer. Lives in the d3d11.dll built from DXMT's source, so this switch also turns on env.MADEIRA_D3D11_SRC (and turning it off turns both off). Turn it off if memory runs out or the game behaves differently.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Direct3D 11 sampler and compute fixes from upstream DXMT (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_DXMT_UPSTREAM_FIXES") == "1" }, set: { setBCDKey("env.MADEIRA_DXMT_UPSTREAM_FIXES", $0 ? "1" : ""); setBCDKey("env.MADEIRA_D3D11_SRC", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_DXMT_UPSTREAM_FIXES") == "1" {
+                        Text("A texture sampler asking for more than 16x anisotropic filtering gets 16x instead of an out-of-range value, and after a deferred context or context-state switch the compute shaders get their own UAVs back instead of the pixel stage's (two fixes from DXMT's author, taken by BCD 0.1.665). Lives in the d3d11.dll built from DXMT's source, so this switch also turns on env.MADEIRA_D3D11_SRC (and turning it off turns both off). Turn it off if the game looks or behaves differently.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     // madeira-doge BCD 0.1.653 combase implicit MTA: opt-in (combase-optin.dll)

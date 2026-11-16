@@ -859,6 +859,56 @@ static void mad_skip_report(void) {
 }
 
 static void mad_log_nserror(const char *what, obj_handle_t err);
+
+/* madeira-doge (BCD 0.1.665, round 660 M010): dual-source-drop (madeira.cfg or the game's file, default 0). A pipeline whose blend
+ * factors read the pixel shader's second output (SRC1_* / INV_SRC1_*) while the converted pixel shader writes none is refused by
+ * Metal ("... index(1) that is required for blending") and every draw with it was skipped (BCD: Freddy's House, Poppy Playtime,
+ * ReSkate). With the key on, such a refusal is retried once with those factors dropped (SRC1 -> ZERO, INV_SRC1 -> ONE), so the
+ * object is drawn as if the second output were zero. Any other refusal, and every pipeline Metal accepts, is untouched.
+ * 0 (default): the refusal stands and the draws are skipped, as before. */
+static int mad_err_wants_dual_source(obj_handle_t err) {
+    char text[600] = "";
+    obj_handle_t desc;
+    if (!err) return 0;
+    desc = NSObject_description(err);
+    if (desc) NSString_getCString(desc, text, sizeof text, WMTUTF8StringEncoding);
+    return strstr(text, "index(1) that is required for blending") != NULL;
+}
+static int mad_rp_drop_dual_source(struct WMTRenderPipelineInfo *rp) {
+    int changed = 0;
+    unsigned i, k;
+    for (i = 0; i < 8; i++) {
+        enum WMTBlendFactor *f[4] = { &rp->colors[i].src_rgb_blend_factor, &rp->colors[i].dst_rgb_blend_factor,
+                                      &rp->colors[i].src_alpha_blend_factor, &rp->colors[i].dst_alpha_blend_factor };
+        for (k = 0; k < 4; k++) {
+            if (*f[k] == WMTBlendFactorSource1Color || *f[k] == WMTBlendFactorSource1Alpha) { *f[k] = WMTBlendFactorZero; changed = 1; }
+            else if (*f[k] == WMTBlendFactorOneMinusSource1Color || *f[k] == WMTBlendFactorOneMinusSource1Alpha) { *f[k] = WMTBlendFactorOne; changed = 1; }
+        }
+    }
+    return changed;
+}
+/* The pipeline as Metal builds it; with dual-source-drop = 1 one second try without the dual-source factors after that one
+ * refusal. The first refusal is logged here; err holds the second one's, or nothing when it worked. */
+static obj_handle_t mad_new_render_pipeline(obj_handle_t dev, struct WMTRenderPipelineInfo *rp, const struct WMTVertexDescriptorInfo *vd,
+                                            obj_handle_t *err, const char *what) {
+    static volatile LONG on = -1;
+    obj_handle_t rps = vd ? MTLDevice_newRenderPipelineStateVD(dev, rp, vd, err) : MTLDevice_newRenderPipelineState(dev, rp, err);
+    if (rps || !*err) return rps;
+    if (on < 0) {
+        LONG cfg = mad_cfg_int_pe("dual-source-drop", 0) ? 1 : 0;   /* 1 = a pipeline Metal refuses for a missing second pixel output is rebuilt without the SRC1 blend factors; 0 = draws skipped, as before (default) */
+        InterlockedCompareExchange(&on, cfg, -1);
+    }
+    if (on > 0 && mad_err_wants_dual_source(*err) && mad_rp_drop_dual_source(rp)) {
+        static LONG said;
+        mad_log_nserror(what, *err);
+        *err = 0;
+        rps = vd ? MTLDevice_newRenderPipelineStateVD(dev, rp, vd, err) : MTLDevice_newRenderPipelineState(dev, rp, err);
+        if (InterlockedIncrement(&said) <= 8)
+            d3d12_log("[madeira-d3d12] dual-source blend dropped for pipeline (vs '%s'): its pixel shader writes no second output; %s\n",
+                      what ? what : "", rps ? "built without the SRC1 factors" : "still refused");
+    }
+    return rps;
+}
 static void mad_queue_revive(struct mad_device *d);
 struct mad_list; struct mad_queue;
 static void mad_list_rings_rewind(struct mad_list *l);
@@ -6196,8 +6246,7 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
         {   /* madeira-doge: pso-archive -- looked up in (and maybe added to) the persistent pipeline archive */
             struct WMTRenderPipelineInfo rpx = p->rp; UINT64 pk = 0; int padd = 0;
             int held = mad_parch_prepare(p, &rpx, &pk, &padd);
-            obj_handle_t built = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &rpx, &p->vd, &err)
-                                           : MTLDevice_newRenderPipelineState(p->device_handle, &rpx, &err);
+            obj_handle_t built = mad_new_render_pipeline(p->device_handle, &rpx, p->has_vd ? &p->vd : NULL, &err, p->vs_name);   /* dual-source-drop */
             if (built) { MemoryBarrier(); p->rps = built; }   /* pso-async: draws on other threads read rps without the lock */
             if (held) mad_parch_done(pk, padd, built != 0);
         }
@@ -18826,8 +18875,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             p->device_handle = d->mtl_device;
         } else {
             obj_handle_t err = 0;
-            p->rps = has_vd ? MTLDevice_newRenderPipelineStateVD(d->mtl_device, &rp, &vd, &err)
-                            : MTLDevice_newRenderPipelineState(d->mtl_device, &rp, &err);
+            p->rps = mad_new_render_pipeline(d->mtl_device, &rp, has_vd ? &vd : NULL, &err, p->vs_name);   /* dual-source-drop */
             if (err) mad_log_nserror(p->vs_name, err);
         }
     }

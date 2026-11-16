@@ -184,6 +184,10 @@ mkdir -p "$OUT/tree/src/dxmt"
 cp "$D/src/dxmt/dxmt_dynamic.cpp" "$OUT/tree/src/dxmt/"
 python3 "$R/tools/patch-dxmt-dyn-trim-switch.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-dyn-trim-switch.py did not apply"
 python3 "$R/tools/patch-dxmt-dyn-front-walk.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-dyn-front-walk.py did not apply"
+# madeira-doge (BCD 0.1.665): DXMT_DYN_KEEP, and env.MADEIRA_DXMT_UPSTREAM_FIXES = 1 (sampler anisotropy clamp, compute
+# UAV restore); each file is all or nothing, and a failure only leaves that part out.
+python3 "$R/tools/bcd665/patch-dxmt-bcd665-optin.py" "$OUT/tree/src/d3d11" "$OUT/tree/src/dxmt" \
+    || echo "::warning::tools/bcd665/patch-dxmt-bcd665-optin.py did not fully apply; d3d11-src.dll is built without part of BCD 0.1.665's DXMT opt-ins"
 grep -q "madeira-bcd: context state swap" "$OUT/tree/src/d3d11/d3d11_context_impl.cpp" || fail "the swap patch left d3d11_context_impl.cpp unchanged"
 
 # DXMT's meson.build: compiler_args, the project defines, buildtype=release

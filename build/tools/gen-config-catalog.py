@@ -92,6 +92,28 @@ OVERLAY = {
                         "starts at a 64-byte boundary, as before. 16 or 256: at that boundary. 4: at its first element where a GPU probe at the "
                         "first view shows Metal reads such textures right (logged as [typed-view] probe), else at 16. A view Metal refuses there "
                         "is made at 16, then 64. Read once per game start."},
+    "dual-source-drop": {"category": "Direct3D 12", "title": "Rebuild pipelines refused for a missing dual-source output",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (BCD 0.1.665, always on there). 1: a render pipeline Metal refuses because its blend factors read "
+                        "the pixel shader's second output (SRC1_* / INV_SRC1_*) that the converted shader does not write is built once "
+                        "more with those factors dropped (SRC1 -> ZERO, INV_SRC1 -> ONE), so its draws are no longer skipped. Any other "
+                        "refusal is untouched. 0: the refusal stands, as before. Logged as [madeira-d3d12] dual-source blend dropped. "
+                        "Read once per game start."},
+    "env.DXMT_DYN_KEEP": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Retired names kept per dynamic buffer",
+                "kind": "int", "default": "0", "sources": ["tools/bcd665/patch-dxmt-bcd665-optin.py"],
+                "note": "madeira-doge (BCD 0.1.665, from willfaust/dxmt 2c3bd5f). N (up to 65536): a dynamic buffer keeps up to "
+                        "max(64, min(N, env.DXMT_DYN_KEEP_KB * 1024 / its size)) retired Metal buffers for reuse, so a game that renames a "
+                        "constant buffer on every draw stops creating and releasing thousands a frame. Unset or 0: at most 64, as before. "
+                        "Only in d3d11-src.dll (env.MADEIRA_D3D11_SRC = 1). Logged as [dyn-keep]. Read once."},
+    "env.DXMT_DYN_KEEP_KB": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Memory bound of the kept retired names (KB per buffer)",
+                "kind": "int", "default": "4096", "sources": ["tools/bcd665/patch-dxmt-bcd665-optin.py"],
+                "note": "madeira-doge (BCD 0.1.665). Only with env.DXMT_DYN_KEEP: a dynamic buffer keeps retired names only up to this "
+                        "many kilobytes in total, so large buffers still keep 64. Read once."},
+    "env.MADEIRA_DXMT_UPSTREAM_FIXES": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Upstream DXMT sampler anisotropy and compute UAV restore fixes",
+                "kind": "bool", "default": "0", "sources": ["tools/bcd665/patch-dxmt-bcd665-optin.py"],
+                "note": "madeira-doge (BCD 0.1.665, from DXMT 7327fce and 1047544). 1: a sampler's MaxAnisotropy is clamped to 1..16, "
+                        "and restoring a context's state rebinds the compute stage's own UAVs instead of the output merger's. Unset or 0: "
+                        "as before. Only in d3d11-src.dll (env.MADEIRA_D3D11_SRC = 1). Read once."},
     "typed-view-unlocked": {"category": "Direct3D 12", "title": "Make typed buffer views outside the view lock",
                 "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
                 "note": "madeira-doge (BCD 0.1.659, opt-in there too). 1: a plain typed buffer view (64-byte alignment, not "
