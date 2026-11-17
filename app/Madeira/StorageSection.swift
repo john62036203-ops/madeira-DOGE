@@ -33,7 +33,20 @@ final class StorageModel: ObservableObject {
         }.filter { FileManager.default.fileExists(atPath: $0.path) }
     }
 
+    /// madeira-doge: hidden entries at the top of Documents, such as the Files app's
+    /// .Trash (files deleted from "On My iPhone > Madeira" can stay there, out of sight,
+    /// while still taking space). Madeira's own short-lived link temporaries are skipped.
+    static func hiddenDocuments() -> [URL] {
+        guard let docs = documents,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: docs.path) else { return [] }
+        return names.filter { $0.hasPrefix(".") && !$0.hasPrefix(".madeira-link-") }
+            .map { docs.appendingPathComponent($0) }
+    }
+
     static let items: [StorageItem] = [
+        StorageItem(id: "hidden", title: "Hidden files in Madeira's folder",
+                    detail: "Files deleted in the Files app that stay hidden here (.Trash) and other hidden items; games and saves are not touched", deletable: true,
+                    urls: { StorageModel.hiddenDocuments() }),
         StorageItem(id: "capture", title: "Frame captures",
                     detail: "Written by the overlay's CAP button", deletable: true,
                     urls: { [StorageModel.documents?.appendingPathComponent("capture", isDirectory: true)].compactMap { $0 } }),
