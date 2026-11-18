@@ -1324,6 +1324,12 @@ jobs:
       - name: Patch airconv God of War experiments
         run: python3 tools/patch-airconv-gow-experiments.py
 
+      # madeira-doge, OFF by default: MADEIRA_GOW_LUM_DEFAULT=1 makes the
+      # game's luminance compute shader skip the GI volume lookup (default
+      # ambient), to test whether that value drives the blackouts.
+      - name: Patch airconv God of War luminance default
+        run: python3 tools/patch-airconv-gow-lum-default.py
+
       # Same investigation, native winemetal, all OFF by default:
       # MADEIRA_GPU_TRACE=<s> (one frame's encoders + float-target values,
       # [gpu-trace] / [gpu-val] / [rb-src]), MADEIRA_RP_LOAD=1 (no DontCare
