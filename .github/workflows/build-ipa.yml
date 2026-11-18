@@ -1332,6 +1332,12 @@ jobs:
       - name: Patch winemetal GPU trace and render-pass experiment
         run: python3 tools/patch-winemetal-gpu-trace.py
 
+      # madeira-doge, same investigation, OFF by default: MADEIRA_GI_PROBE=1
+      # logs the GI volume constants the luminance compute shader reads
+      # ([gi-probe]) and writes its 3D textures to Documents/shader-dump.
+      - name: Patch winemetal GI probe
+        run: python3 tools/patch-winemetal-gi-probe.py
+
       # madeira-bcd fps-gov (opt-in, env.MADEIRA_FPS_CAP / MADEIRA_FPS_GOV_MW):
       # winemetal's presentDrawable calls server_ios.c's ios_fps_cap_dxmt_pace,
       # which returns at once while neither is set. Native only.
