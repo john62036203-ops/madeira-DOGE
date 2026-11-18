@@ -69,6 +69,11 @@ OVERLAY = {
                 "note": "Default off. If other image allocations fail, retired region-C code buffers up to 64 MB "
                         "may enter the image freelist after a 3-second grace, executable-page and thread-PC checks. "
                         "Requires pool-low; 64-bit processes only. Live buffers and the pool-low-margin stay unchanged."},
+    "mempool-no-window": {"category": "Memory & JIT pool", "title": "Memory pool without standing windows",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: the memory pool's 512 MB regions are not kept mapped as windows (they "
+                        "land in the guest band and can leave a game with large reservations no addresses); a "
+                        "freed range is mapped only while it is zeroed. Read when the pool starts."},
     "clear-rect-skip": {"category": "Direct3D 12", "title": "Skip partial render-target clears",
                 "kind": "bool", "default": "0",
                 "note": "Default off (a clear with rectangles clears the whole target). 1: a clear whose "

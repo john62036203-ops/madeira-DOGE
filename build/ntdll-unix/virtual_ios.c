@@ -21789,6 +21789,7 @@ static unsigned ios_pool_nfree;
 static int ios_pool_pressure;                /* 0 normal, 1 warning, 2 critical */
 static uint64_t ios_pool_margin = 1024ull << 20;
 static unsigned long long ios_pool_bytes, ios_pool_peak, ios_pool_takes, ios_pool_guarded, ios_pool_lost;
+static int ios_pool_no_window = -1;          /* madeira-doge: mempool-no-window = 1 */
 
 /* Called by the app (MemoryPool.m) before Wine starts, one region at a time. */
 int madeira_pool_add( unsigned int entry, unsigned long long size )
@@ -21797,14 +21798,23 @@ int madeira_pool_add( unsigned int entry, unsigned long long size )
     unsigned n = __atomic_load_n( &ios_pool_nreg, __ATOMIC_ACQUIRE );
     const char *margin = getenv( "MADEIRA_POOL_MARGIN_MB" );
     if (n >= IOS_POOL_MAX_REGIONS || !size || (ios_pool_region && size != ios_pool_region)) return -1;
-    if (mach_vm_map( mach_task_self(), &window, size, 0, VM_FLAGS_ANYWHERE, entry, 0, FALSE,
+    /* madeira-doge mempool-no-window (opt-in, madeira.cfg or the game's file): the
+     * kernel puts these whole-region windows in the guest band (God of War,
+     * 2026-11-18 07:51 log: 12 x 512 MB from 0x7049ff8000, free band 7751 -> 864 MB),
+     * the game's large reservations then fall into the low range, it fills up and a
+     * thread cannot be created. 1: no standing window; ios_pool_give maps just the
+     * freed range for its MADV_ZERO and unmaps it. */
+    if (ios_pool_no_window < 0) ios_pool_no_window = madeira_cfg_int( "mempool-no-window", 0 ) == 1;
+    if (!ios_pool_no_window &&
+        mach_vm_map( mach_task_self(), &window, size, 0, VM_FLAGS_ANYWHERE, entry, 0, FALSE,
                      VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE ) != KERN_SUCCESS) return -1;
     if (margin) ios_pool_margin = strtoull( margin, NULL, 10 ) << 20;
     ios_pool_region = size;
     ios_pool_reg[n].entry = entry; ios_pool_reg[n].window = (char *)window; ios_pool_reg[n].bump = 0;
     __atomic_store_n( &ios_pool_nreg, n + 1, __ATOMIC_RELEASE );
-    if (n == 0) dprintf( 2, "[swap] ml1150 pool: regions of %llu MB, guard margin %llu MB\n", size >> 20,
-                         (unsigned long long)(ios_pool_margin >> 20) );
+    if (n == 0) dprintf( 2, "[swap] ml1150 pool: regions of %llu MB, guard margin %llu MB%s\n", size >> 20,
+                         (unsigned long long)(ios_pool_margin >> 20),
+                         ios_pool_no_window ? " -- madeira-doge: no standing windows (mempool-no-window)" : "" );
     return 0;
 }
 int ios_mem_pressure_level( void ) { return __atomic_load_n( &ios_pool_pressure, __ATOMIC_RELAXED ); }
@@ -21899,7 +21909,24 @@ static int ios_pool_map( char *va, size_t len, int unix_prot, uint64_t off )
 static void ios_pool_give( uint64_t off, size_t len )
 {
     unsigned r = (unsigned)(off / ios_pool_region);
-    madvise( ios_pool_reg[r].window + off % ios_pool_region, len, MADV_ZERO );
+    if (ios_pool_reg[r].window)
+        madvise( ios_pool_reg[r].window + off % ios_pool_region, len, MADV_ZERO );
+    else
+    {
+        /* madeira-doge mempool-no-window: a window onto just this range, gone again
+         * at once. Without it the range cannot be zeroed, so it is never reused. */
+        mach_vm_address_t tmp = 0;
+        if (mach_vm_map( mach_task_self(), &tmp, len, 0, VM_FLAGS_ANYWHERE, ios_pool_reg[r].entry,
+                         off % ios_pool_region, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+                         VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE ) != KERN_SUCCESS)
+        {
+            ios_pool_bytes -= len;
+            ios_pool_lost += len;
+            return;
+        }
+        madvise( (void *)(uintptr_t)tmp, len, MADV_ZERO );
+        munmap( (void *)(uintptr_t)tmp, len );
+    }
     ios_pool_bytes -= len;
     if (ios_pool_nfree < 4096) { ios_pool_free[ios_pool_nfree].off = off; ios_pool_free[ios_pool_nfree].len = len; ios_pool_nfree++; }
     else ios_pool_lost += len;

@@ -3589,6 +3589,12 @@ struct LibraryDetail: View {
                         Text("The swap tier takes RAM-speed memory from the memory pool (Settings, mempool-mb) whenever the phone has spare memory, counting memory iOS can reclaim, instead of only when 1 GB is completely free (as Playport's donor memory does). Needs Swap and Memory pool set. Turn it off if the game or other apps get closed more often.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge mempool-no-window: per-game, in the game's own file
+                    Toggle("Keep the memory pool out of the game's address range (experimental)", isOn: Binding(get: { bcd.value("mempool-no-window") == "1" }, set: { setBCDKey("mempool-no-window", $0 ? "1" : "") }))
+                    if bcd.value("mempool-no-window") == "1" {
+                        Text("The memory pool normally keeps 512 MB windows mapped for every region, in the range where the game's memory goes; a game that reserves several GB at once (God of War) then runs out of addresses and crashes a few seconds in. On: no standing windows. Needs Swap and Memory pool set.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge present-dup-skip / perf-pass-split: per-game, in the game's own file
                     Toggle("Show only new frames (FPS = the game's own)", isOn: Binding(get: { bcd.value("present-dup-skip") == "1" }, set: { setBCDKey("present-dup-skip", $0 ? "1" : "") }))
                     if bcd.value("present-dup-skip") == "1" {
