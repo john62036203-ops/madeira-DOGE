@@ -2834,6 +2834,8 @@ struct LibraryView: View {
             if settingsShow("update", "updates", "new build", "app build", "SideStore", "version", "pack") { UpdatesSection() }
             if settingsShow("saves", "backup", "restore", "save games") { SavesSection() }
             if settingsShow("external", "drive", "USB", "SSD", "storage") { ExternalDrivesSection() }
+            // madeira-doge: what the runtime keeps on the phone, with the hidden items in Madeira's folder
+            if settingsShow("storage", "space", "hidden", "trash", "deleted", "logs", "shader cache", "capture") { StorageSection() }
             if settingsShow("appearance", "liquid metal", "metal", "glass") {
                 Section {
                     Toggle("Liquid metal", isOn: $liquidMetal.on)
