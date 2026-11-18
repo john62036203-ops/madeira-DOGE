@@ -4737,7 +4737,7 @@ struct LibraryHUD: View {
                     model.menu = false
                     // After the menu has gone, so the frame shows what the player saw.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                        madeira_capture_request(1)
+                        madeira_capture_request(1); madeiraGpuTraceMark()
                         LogStore.shared.log("[capture] madeira-doge: frame capture requested from the session menu")
                     }
                 } label: {
@@ -4829,7 +4829,7 @@ struct LibraryHUD: View {
                         model.menu = false
                         // After the menu has gone, so the frame shows what the player saw.
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                            madeira_capture_request(1)
+                            madeira_capture_request(1); madeiraGpuTraceMark()
                             LogStore.shared.log("[capture] frame capture requested from the in-game menu")
                         }
                     }
@@ -4989,7 +4989,7 @@ struct LibraryMetrics: View {
     var body: some View {
         HStack(spacing: 10) {
             Button {
-                madeira_capture_request(1)
+                madeira_capture_request(1); madeiraGpuTraceMark()
                 LogStore.shared.log("[capture] madeira-doge: frame capture requested from the metrics capsule")
                 captureFlash = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { captureFlash = false }

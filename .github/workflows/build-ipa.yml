@@ -1344,6 +1344,11 @@ jobs:
       - name: Patch winemetal GI probe
         run: python3 tools/patch-winemetal-gi-probe.py
 
+      # madeira-doge: with MADEIRA_GPU_TRACE set, the CAP button traces the
+      # next frame (the app creates Documents/gpu-trace-now).
+      - name: Patch winemetal GPU trace on CAP
+        run: python3 tools/patch-winemetal-gpu-trace-cap.py
+
       # madeira-bcd fps-gov (opt-in, env.MADEIRA_FPS_CAP / MADEIRA_FPS_GOV_MW):
       # winemetal's presentDrawable calls server_ios.c's ios_fps_cap_dxmt_pace,
       # which returns at once while neither is set. Native only.

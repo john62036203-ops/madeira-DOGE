@@ -394,7 +394,7 @@ struct FPSOverlay: View {
             .background(captureFlash ? Color.cyan : Color.clear)
             .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.cyan, lineWidth: 1))
             .onTapGesture {
-                madeira_capture_request(1)
+                madeira_capture_request(1); madeiraGpuTraceMark()
                 captureFlash = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { captureFlash = false }
             }
@@ -604,4 +604,12 @@ enum BatteryTemperature {
               let n = v as? NSNumber, n.intValue > 0 else { refused = true; return nil }
         return n.doubleValue / 100.0
     }
+}
+
+/// madeira-doge: CAP also asks the D3D11 GPU trace (env.MADEIRA_GPU_TRACE) for one full
+/// frame: winemetal looks for this file after each presented frame and removes it
+/// (tools/patch-winemetal-gpu-trace-cap.py). Harmless when the trace is off.
+func madeiraGpuTraceMark() {
+    guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+    FileManager.default.createFile(atPath: docs.appendingPathComponent("gpu-trace-now").path, contents: Data())
 }

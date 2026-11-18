@@ -208,7 +208,7 @@ struct SessionPanelView: View {
                         onClose()
                         // After the panel has gone, so the frame shows what the player saw.
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                            madeira_capture_request(1)
+                            madeira_capture_request(1); madeiraGpuTraceMark()
                             LogStore.shared.log("[capture] madeira-bcd: frame capture requested from the Session panel")
                         }
                     } label: {
