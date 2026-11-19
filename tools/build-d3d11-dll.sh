@@ -184,6 +184,10 @@ mkdir -p "$OUT/tree/src/dxmt"
 cp "$D/src/dxmt/dxmt_dynamic.cpp" "$OUT/tree/src/dxmt/"
 python3 "$R/tools/patch-dxmt-dyn-trim-switch.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-dyn-trim-switch.py did not apply"
 python3 "$R/tools/patch-dxmt-dyn-front-walk.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-dyn-front-walk.py did not apply"
+# madeira-doge: env.MADEIRA_NO_PASS_MERGE = 1 skips the encoder optimiser (God of War metering experiment); same
+# arrangement as dxmt_dynamic.cpp: a patched copy, linked ahead of libdxmt.a.
+cp "$D/src/dxmt/dxmt_context.cpp" "$OUT/tree/src/dxmt/"
+python3 "$R/tools/patch-dxmt-no-pass-merge.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-no-pass-merge.py did not apply"
 # madeira-doge (BCD 0.1.665): DXMT_DYN_KEEP, and env.MADEIRA_DXMT_UPSTREAM_FIXES = 1 (sampler anisotropy clamp, compute
 # UAV restore); each file is all or nothing, and a failure only leaves that part out.
 python3 "$R/tools/bcd665/patch-dxmt-bcd665-optin.py" "$OUT/tree/src/d3d11" "$OUT/tree/src/dxmt" \
@@ -295,6 +299,7 @@ for s in "${PARSER_SRC[@]}"; do
     o="$OUT/obj/parser_$s.o"; job "$D" "$P/$s.cpp" "$o" parser; PARSER_OBJ+=("$o")
 done
 job "$D" "$OUT/tree/src/dxmt/dxmt_dynamic.cpp" "$OUT/obj/dxmt_dynamic_mad.o" dxmt
+job "$D" "$OUT/tree/src/dxmt/dxmt_context.cpp" "$OUT/obj/dxmt_context_mad.o" dxmt
 for s in "${D3D11_SRC[@]}"; do
     o="$OUT/plain/obj/$(obj_name "$s").o"; job "$D" "$D/src/$s.cpp" "$o" d3d11; PLAIN_OBJ+=("$o")
     o="$OUT/obj/$(obj_name "$s").o"; job "$OUT/tree" "$OUT/tree/src/$s.cpp" "$o" d3d11; PATCHED_OBJ+=("$o")
@@ -321,7 +326,7 @@ link_dll() {  # link_dll <output> <objects...>
         2>> "$OUT/build.err" || { grep -m 20 "error" "$OUT/build.err"; fail "linking $(basename "$out") failed"; }
 }
 link_dll "$OUT/plain/d3d11.dll" "${PLAIN_OBJ[@]}"
-link_dll "$OUT/d3d11.dll" "${PATCHED_OBJ[@]}" "$OUT/obj/dxmt_dynamic_mad.o"
+link_dll "$OUT/d3d11.dll" "${PATCHED_OBJ[@]}" "$OUT/obj/dxmt_dynamic_mad.o" "$OUT/obj/dxmt_context_mad.o"
 LC_ALL=C grep -aqF "DXMT_DYN_TRIM" "$OUT/d3d11.dll" || fail "the DXMT_DYN_TRIM switch is not in the result"
 
 # The new DLL must export exactly what upstream's does, and import from the

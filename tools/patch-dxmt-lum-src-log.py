@@ -90,7 +90,10 @@ DISPATCH_NEW = DISPATCH_OLD + """    /* madeira-doge: luminance source log */
         uint32_t lum_f = madeira_lum_frame.fetch_add(1) + 1;
         if (madeira_lum_lines.fetch_add(1) < 40000)
           ERR("[lum-in] #", lum_f, " res ", madeira_lum_id(lum_in.res), " ", lum_in.w, "x", lum_in.h, " fmt ",
-              lum_in.fmt);
+              lum_in.fmt, " uav8 ",
+              madeira_lum_id(state_.ComputeStageUAV.UAVs.test_bound(8)
+                                 ? madeira_lum_ptr(state_.ComputeStageUAV.UAVs[8].View.ptr())
+                                 : nullptr));
       } else if (void *lum_want = madeira_lum_input.load()) {
         if (madeira_lum_budget.load() > 0) {
           for (const auto &[lum_slot, lum_entry] : state_.ComputeStageUAV.UAVs) {
@@ -132,8 +135,9 @@ DRAW_NEW = DRAW_OLD + """    /* madeira-doge: luminance source log */
             if (lum_ps.SRVs.test_bound(lum_i))
               lum_s[lum_i] = madeira_lum_res(lum_ps.SRVs[lum_i].SRV.ptr());
           if (madeira_lum_lines.fetch_add(1) < 40000)
-            ERR("[lum-src] draw rtv ", lum_r, " of ", state_.OutputMerger.NumRTVs, " ps ",
-                madeira_lum_id(lum_ps.Shader.ptr()), " srv0 ", madeira_lum_id(lum_s[0].res), " ", lum_s[0].w, "x",
+            ERR("[lum-src] draw rtv ", lum_r, " of ", state_.OutputMerger.NumRTVs, " vp ",
+                state_.Rasterizer.viewports[0].Width, "x", state_.Rasterizer.viewports[0].Height, " blend ",
+                madeira_lum_id(state_.OutputMerger.BlendState), " ps ", madeira_lum_id(lum_ps.Shader.ptr()), " srv0 ", madeira_lum_id(lum_s[0].res), " ", lum_s[0].w, "x",
                 lum_s[0].h, " f", lum_s[0].fmt, " srv1 ", madeira_lum_id(lum_s[1].res), " ", lum_s[1].w, "x",
                 lum_s[1].h, " f", lum_s[1].fmt, " srv2 ", madeira_lum_id(lum_s[2].res), " ", lum_s[2].w, "x",
                 lum_s[2].h, " f", lum_s[2].fmt, " srv3 ", madeira_lum_id(lum_s[3].res), " ", lum_s[3].w, "x",
