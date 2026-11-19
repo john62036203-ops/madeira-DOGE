@@ -194,6 +194,9 @@ python3 "$R/tools/patch-dxmt-rb-map-log.py" "$OUT/tree/src/d3d11" \
 # madeira-doge: env.MADEIRA_CS_CB_LOG = 1 logs the shared constants a compute dispatch is encoded with ([cs-cb]).
 python3 "$R/tools/patch-dxmt-cs-cb-log.py" "$OUT/tree/src/d3d11" \
     || echo "::warning::tools/patch-dxmt-cs-cb-log.py did not apply; d3d11-src.dll is built without the [cs-cb] log"
+# madeira-doge: env.MADEIRA_LUM_SRC_LOG = 1 logs the texture God of War's metering reads and what writes it ([lum-in], [lum-src]).
+python3 "$R/tools/patch-dxmt-lum-src-log.py" "$OUT/tree/src/d3d11" \
+    || echo "::warning::tools/patch-dxmt-lum-src-log.py did not apply; d3d11-src.dll is built without the [lum-src] log"
 grep -q "madeira-bcd: context state swap" "$OUT/tree/src/d3d11/d3d11_context_impl.cpp" || fail "the swap patch left d3d11_context_impl.cpp unchanged"
 
 # DXMT's meson.build: compiler_args, the project defines, buildtype=release
