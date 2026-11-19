@@ -11,7 +11,7 @@ float-target values after it), up to 24 times a session. Set
 `env.MADEIRA_GPU_TRACE = 99999` for CAP-only traces. `[gpu-trace] CAP ...`
 marks each.
 
-Needs tools/patch-winemetal-gpu-trace.py first. Native only; not in the i386
+Needs tools/patch-winemetal-gpu-trace.py and tools/patch-winemetal-gi-probe.py first. Native only; not in the i386
 farm key. Idempotent; fails by name if an anchor moves. Run from the
 repository root.
 """
@@ -40,6 +40,7 @@ static int madeira_gt_cap_requested(double now) {
   if (access(path, F_OK) != 0) return 0;
   unlink(path);
   left--;
+  madeira_gi_cap();   /* tools/patch-winemetal-gi-probe.py: write the colour LUTs again */
   fprintf(stderr, "[gpu-trace] CAP: tracing the next frame (%d more this session)\n", left);
   return 1;
 }
@@ -68,8 +69,9 @@ def main():
     if MARKER in s:
         print("winemetal_unix.c: already patched")
         return 0
-    if "madeira-bcd: gpu trace" not in s:
-        sys.exit(f"{NAME}: 'madeira-bcd: gpu trace' missing -- run tools/patch-winemetal-gpu-trace.py first")
+    for need in ("madeira-bcd: gpu trace", "madeira-doge: gi probe"):
+        if need not in s:
+            sys.exit(f"{NAME}: '{need}' missing -- run the gpu-trace and gi-probe patches first")
     for old, new, want in PAIRS:
         n = s.count(old)
         if n != want:

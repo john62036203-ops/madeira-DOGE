@@ -26,6 +26,11 @@ This probe records the inputs so the lookup can be redone on a PC:
                            more after it was first seen so its upload is done;
                            64 MB a texture, 300 MB in all.
 
+After each CAP (tools/patch-winemetal-gpu-trace-cap.py) the small 3D textures
+(up to 4 MB: the colour-grading LUTs, 32x32x32 RGBA8 inputs and the 64x64x64
+RGB10A2 output) are written again as gi-tex-...-c<n>.bin, and the LUT blend
+pass's constants are logged once: `[gi-probe] lbp c<n> ...` (28 hex words).
+
 Costs: one blocking GPU readback per dumped texture. Needs
 tools/patch-winemetal-gpu-trace.py first. Native only; not in the i386 farm
 key. Idempotent; fails by name if an anchor moves. Run from the repository
@@ -55,18 +60,21 @@ static int madeira_gi_on(void) {
   return madeira_gi_mode;
 }
 
-struct madeira_gi_tex { uintptr_t ptr; unsigned w, h, d, fmt; double first; int dumped; };
+struct madeira_gi_tex { uintptr_t ptr; unsigned w, h, d, fmt; double first; int dumped; unsigned gen; };
 static struct madeira_gi_tex madeira_gi_texs[64];
 static unsigned madeira_gi_ntex;
 static unsigned long long madeira_gi_dump_bytes;
 static id<MTLCommandQueue> madeira_gi_queue;
 static id<MTLBuffer> madeira_gi_cb1;        /* latest 672-byte buffer, retained */
+static unsigned madeira_gi_cap_gen;         /* bumped by each CAP (tools/patch-winemetal-gpu-trace-cap.py) */
+static void madeira_gi_cap(void) { madeira_gi_cap_gen++; }
 
 static unsigned madeira_gi_bpp(unsigned fmt) {
   switch ((MTLPixelFormat)fmt) {
   case MTLPixelFormatR8Unorm: return 1;
   case MTLPixelFormatRG16Float: return 4;
   case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm: return 4;
+  case MTLPixelFormatRGB10A2Unorm: return 4;   /* the colour-grading LUT the game blends (64x64x64) */
   case MTLPixelFormatRGBA16Float: return 8;
   case MTLPixelFormatRGBA32Float: return 16;
   default: return 0;
@@ -78,6 +86,7 @@ static void madeira_gi_dump_tex(id<MTLTexture> t, struct madeira_gi_tex *e) {
   unsigned long long bytes = (unsigned long long)e->w * e->h * e->d * bpp;
   unsigned long tid = madeira_gt_id(t);
   e->dumped = 1;
+  e->gen = madeira_gi_cap_gen;
   if (!bpp || !bytes || bytes > (64ull << 20) || madeira_gi_dump_bytes + bytes > (300ull << 20)) {
     fprintf(stderr, "[gi-probe] not dumped t%05lx fmt %u %ux%ux%u (%llu bytes; format not handled or over the cap)\n",
             tid, e->fmt, e->w, e->h, e->d, bytes);
@@ -90,7 +99,10 @@ static void madeira_gi_dump_tex(id<MTLTexture> t, struct madeira_gi_tex *e) {
   else if (home && *home) snprintf(dir, sizeof dir, "%s/Documents/shader-dump", home);
   else return;
   mkdir(dir, 0755);
-  snprintf(path, sizeof path, "%s/gi-tex-%05lx-%ux%ux%u-f%u.bin", dir, tid, e->w, e->h, e->d, e->fmt);
+  if (madeira_gi_cap_gen)
+    snprintf(path, sizeof path, "%s/gi-tex-%05lx-%ux%ux%u-f%u-c%u.bin", dir, tid, e->w, e->h, e->d, e->fmt, madeira_gi_cap_gen);
+  else
+    snprintf(path, sizeof path, "%s/gi-tex-%05lx-%ux%ux%u-f%u.bin", dir, tid, e->w, e->h, e->d, e->fmt);
   @autoreleasepool {
     id<MTLDevice> dev = t.device;
     if (!madeira_gi_queue) madeira_gi_queue = [dev newCommandQueue];
@@ -158,6 +170,10 @@ static void madeira_gi_note_tex(id<MTLTexture> t, unsigned long *seen, unsigned 
     return;
   }
   if (!e->dumped && now - e->first > 1.0) madeira_gi_dump_tex(t, e);
+  /* after a CAP: small 3D textures (the colour LUTs) are written again, as they stand now */
+  else if (e->dumped && e->gen != madeira_gi_cap_gen &&
+           (unsigned long long)w * h * d * madeira_gi_bpp(fmt) <= (4ull << 20))
+    madeira_gi_dump_tex(t, e);
 }
 
 static void madeira_gi_note_buffer(id<MTLBuffer> b) {
@@ -214,6 +230,9 @@ static void madeira_gi_walk(int kind, obj_handle_t enc, const struct wmtcmd_base
   static unsigned nseen;
   static char lens[200];
   static int leno;
+  static id<MTLBuffer> b256;                /* latest 256-byte buffer used since the last dispatch, retained */
+  static int lut_out;                       /* a writable RGB10A2 3D texture was used since the last dispatch */
+  static unsigned lbp_gen;
   if (kind == 0) {
     for (; c; c = c->next.ptr) {
       if ((enum WMTRenderCommandType)c->type != WMTRenderCommandUseResource) continue;
@@ -226,6 +245,9 @@ static void madeira_gi_walk(int kind, obj_handle_t enc, const struct wmtcmd_base
     cenc = enc;
     [cb2 release];
     cb2 = nil;
+    [b256 release];
+    b256 = nil;
+    lut_out = 0;
     nseen = 0;
     leno = 0;
     lens[0] = 0;
@@ -237,7 +259,12 @@ static void madeira_gi_walk(int kind, obj_handle_t enc, const struct wmtcmd_base
       if (!r) break;
       if ([r conformsToProtocol:@protocol(MTLTexture)]) {
         id<MTLTexture> t = (id<MTLTexture>)r;
-        if (t.textureType == MTLTextureType3D) madeira_gi_note_tex(t, seen, &nseen);
+        if (t.textureType == MTLTextureType3D) {
+          madeira_gi_note_tex(t, seen, &nseen);
+          if (t.pixelFormat == MTLPixelFormatRGB10A2Unorm &&
+              (((const struct wmtcmd_compute_useresource *)c)->usage & 2))
+            lut_out = 1;
+        }
       } else {
         id<MTLBuffer> b = (id<MTLBuffer>)r;
         unsigned long len = (unsigned long)[b length];
@@ -245,6 +272,10 @@ static void madeira_gi_walk(int kind, obj_handle_t enc, const struct wmtcmd_base
         if (len == 2192 && b != cb2) {
           [cb2 release];
           cb2 = [b retain];
+        }
+        if (len == 256 && b != b256) {
+          [b256 release];
+          b256 = [b retain];
         }
         if (leno < (int)sizeof lens - 12) leno += snprintf(lens + leno, sizeof lens - leno, " %lu", len);
       }
@@ -256,6 +287,21 @@ static void madeira_gi_walk(int kind, obj_handle_t enc, const struct wmtcmd_base
         [cb2 release];
         cb2 = nil;
       }
+      if (lut_out && b256 && lbp_gen != madeira_gi_cap_gen) {
+        /* the LUT blend pass (ConstBuf__lbp, 112 bytes): weights and count, once per CAP */
+        const uint32_t *q = (const uint32_t *)[b256 contents];
+        lbp_gen = madeira_gi_cap_gen;
+        if (q) {
+          char ln[300];
+          int o = 0;
+          for (unsigned i = 0; i < 28; i++) o += snprintf(ln + o, sizeof ln - o, " %08x", q[i]);
+          fprintf(stderr, "[gi-probe] lbp c%u b%05lx:%s\n", madeira_gi_cap_gen, madeira_gt_id(b256), ln);
+        } else
+          fprintf(stderr, "[gi-probe] lbp c%u: constants not CPU-visible\n", madeira_gi_cap_gen);
+      }
+      [b256 release];
+      b256 = nil;
+      lut_out = 0;
       leno = 0;
       lens[0] = 0;
       break;
