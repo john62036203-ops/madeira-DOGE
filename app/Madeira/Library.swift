@@ -3520,6 +3520,22 @@ struct LibraryDetail: View {
                         Text("A texture sampler asking for more than 16x anisotropic filtering gets 16x instead of an out-of-range value, and after a deferred context or context-state switch the compute shaders get their own UAVs back instead of the pixel stage's (two fixes from DXMT's author, taken by BCD 0.1.665). Lives in the d3d11.dll built from DXMT's source, so this switch also turns on env.MADEIRA_D3D11_SRC (and turning it off turns both off). Turn it off if the game looks or behaves differently.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge 2026-11-20: opt-ins in d3d11-src.dll (tools/d3d11-native-mem.c, tools/patch-dxmt-depth-equal-remap.py, tools/patch-dxmt-gow-exposure-filter.py)
+                    Toggle("Copy and clear memory natively in Direct3D 11 (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_D3D11_NATIVE_MEM") == "1" }, set: { setBCDKey("env.MADEIRA_D3D11_NATIVE_MEM", $0 ? "1" : ""); if $0 { setBCDKey("env.MADEIRA_D3D11_SRC", "1") } }))
+                    if bcd.value("env.MADEIRA_D3D11_NATIVE_MEM") == "1" {
+                        Text("The Direct3D 11 layer copies and clears memory with its own ARM64 code instead of the Windows C library's x86-64 routines, which run through the emulator (God of War: about 13 to 17 fps in its heaviest scenes). Lives in the d3d11.dll built from DXMT's source, so turning it on also turns on env.MADEIRA_D3D11_SRC. Turn it off if the game crashes or the picture breaks.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Tolerant depth-equal test (Direct3D 11, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_DEPTH_EQUAL_FUNC") == "7" }, set: { setBCDKey("env.MADEIRA_DEPTH_EQUAL_FUNC", $0 ? "7" : ""); setBCDKey("env.MADEIRA_DEPTH_EQUAL_BIAS", $0 ? "16" : ""); if $0 { setBCDKey("env.MADEIRA_D3D11_SRC", "1") } }))
+                    if bcd.value("env.MADEIRA_DEPTH_EQUAL_FUNC") == "7" {
+                        Text("A game that draws depth first and then colours only the pixels whose depth is exactly equal can lose scattered pixels here, because the two passes differ in the last bits (God of War: white and blue dots on characters). Such draws pass when the depth is equal or nearer and get a small depth bias. Assumes reversed depth, as God of War uses. Lives in the d3d11.dll built from DXMT's source, so turning it on also turns on env.MADEIRA_D3D11_SRC. Turn it off if surfaces show through each other.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("God of War: ignore bad exposure readings (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_GOW_EXPOSURE_FILTER") == "1" }, set: { setBCDKey("env.MADEIRA_GOW_EXPOSURE_FILTER", $0 ? "1" : ""); if $0 { setBCDKey("env.MADEIRA_D3D11_SRC", "1") } }))
+                    if bcd.value("env.MADEIRA_GOW_EXPOSURE_FILTER") == "1" {
+                        Text("God of War (2018) measures the picture's brightness on the GPU and reads the result back; here some readings come back wrong and the picture goes dark, then bright. A wrong reading is replaced by the last good one. A workaround: the cause of the wrong readings is not known. For this game only. Lives in the d3d11.dll built from DXMT's source, so turning it on also turns on env.MADEIRA_D3D11_SRC.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge BCD 0.1.653 combase implicit MTA: opt-in (combase-optin.dll)
                     Toggle("COM fix for Unreal Engine 5 loading threads (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_COMBASE_MTA") == "1" }, set: { setBCDKey("env.MADEIRA_COMBASE_MTA", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_COMBASE_MTA") == "1" {
