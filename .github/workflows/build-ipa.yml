@@ -1330,6 +1330,12 @@ jobs:
       - name: Patch airconv God of War luminance default
         run: python3 tools/patch-airconv-gow-lum-default.py
 
+      # madeira-doge, OFF by default: MADEIRA_GOW_NO_SPARKLE=1 zeroes the
+      # material sparkle term of God of War's layered pixel shaders (the white
+      # and blue dots that stick to the characters).
+      - name: Patch airconv God of War no sparkle
+        run: python3 tools/patch-airconv-gow-no-sparkle.py
+
       # Same investigation, native winemetal, all OFF by default:
       # MADEIRA_GPU_TRACE=<s> (one frame's encoders + float-target values,
       # [gpu-trace] / [gpu-val] / [rb-src]), MADEIRA_RP_LOAD=1 (no DontCare
