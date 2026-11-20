@@ -188,6 +188,10 @@ python3 "$R/tools/patch-dxmt-dyn-front-walk.py" "$OUT/tree/src/dxmt" || fail "to
 # arrangement as dxmt_dynamic.cpp: a patched copy, linked ahead of libdxmt.a.
 cp "$D/src/dxmt/dxmt_context.cpp" "$OUT/tree/src/dxmt/"
 python3 "$R/tools/patch-dxmt-no-pass-merge.py" "$OUT/tree/src/dxmt" || fail "tools/patch-dxmt-no-pass-merge.py did not apply"
+# madeira-doge: MADEIRA_RT_CLAMP=1, render passes on a large target cover only
+# what their viewports reach (God of War's 8192x4096 shadow atlas).
+python3 "$R/tools/patch-dxmt-rt-clamp.py" "$OUT/tree/src/dxmt" \
+    || echo "::warning::tools/patch-dxmt-rt-clamp.py did not apply; d3d11-src.dll is built without MADEIRA_RT_CLAMP"
 # madeira-doge (BCD 0.1.665): DXMT_DYN_KEEP, and env.MADEIRA_DXMT_UPSTREAM_FIXES = 1 (sampler anisotropy clamp, compute
 # UAV restore); each file is all or nothing, and a failure only leaves that part out.
 python3 "$R/tools/bcd665/patch-dxmt-bcd665-optin.py" "$OUT/tree/src/d3d11" "$OUT/tree/src/dxmt" \
