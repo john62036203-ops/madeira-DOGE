@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FEX: what x86 PAUSE compiles to on iOS (MADEIRA_FEX_PAUSE=wfe or isb; opt-in).
+"""FEX: what x86 PAUSE compiles to on iOS (MADEIRA_FEX_PAUSE=wfe, isb, yield-os[:K] or wait-os[:K[:U]]; opt-in).
 
 madeira-doge, from Playport (playportdev/playport patches/fex 0083, PLA-455). FEX
 compiles PAUSE (REP NOP) to YIELD, which Apple's cores treat as a NOP, so a guest
@@ -16,6 +16,12 @@ variable once, the first time the process's JIT emits a PAUSE (every block is
 compiled after the environment is set). FEX's code cache stays off, so no block
 compiled under one mode runs under another.
 
+yield-os and wait-os (Playport fex 0084 and 0086): WFE still holds the core, so under the power clamp, with the
+efficiency cores full and threads queued, a spinning thread keeps a runnable one waiting. yield-os[:K] keeps YIELD and
+makes every K-th PAUSE (default 128) a swtch_pri Mach trap (the core goes to a waiting thread, if any); wait-os[:K[:U]]
+makes it a thread_switch that blocks the thread U microseconds (default 50). Playport counts PAUSEs per guest thread in
+the CPU state frame; this port counts them in one process-wide word instead, so the frame layout is untouched.
+
 Applied by tools/build-xtajit64.sh (restores MiscOps.cpp after its build);
 idempotent; a moved anchor refuses the patch and the build goes on without it.
 Usage: patch-fex-ios-pause.py FEX-ROOT
@@ -30,26 +36,127 @@ INCLUDE_ANCHOR = '#include "Interface/Core/JIT/JITClass.h"\n'
 INCLUDE = "#include <cstdlib>\n#include <cstring>\n"
 
 OLD = "DEF_OP(Yield) {\n  yield();\n}\n"
-NEW = '''DEF_OP(Yield) {
+NEW = '''/* madeira-doge pause-mode: the count of PAUSEs since the last trap, shared by every guest thread (racy on purpose:
+ * it only decides which PAUSE traps). */
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+static uint64_t MadeiraPauseCount;
+#endif
+
+DEF_OP(Yield) {
 #ifdef FEX_IOS_HOST
-  /* madeira-doge pause-mode (Playport fex 0083): MADEIRA_FEX_PAUSE=wfe or isb, what x86 PAUSE compiles to; unset or
-   * anything else keeps YIELD, which Apple's cores treat as a NOP. Read once per process. */
-  static const int PauseMode = [] {
+  /* madeira-doge pause-mode (Playport fex 0083, 0084, 0086): MADEIRA_FEX_PAUSE picks what x86 PAUSE compiles to.
+   * wfe, isb: that instruction. yield-os[:K]: YIELD, and every K-th one (default 128, 1-4095) a swtch_pri Mach trap,
+   * which runs another runnable thread on this core if one waits. wait-os[:K[:U]]: as yield-os, but the trap is
+   * thread_switch with SWITCH_OPTION_DISPATCH_CONTENTION, which blocks the thread for U microseconds (default 50,
+   * 1-5000) whatever else is runnable. Unset or anything else keeps YIELD, which Apple's cores treat as a NOP.
+   * Read once per process. */
+  struct PauseOption {
+    int Mode;
+    uint32_t After;
+    uint32_t Usec;
+  };
+  static const PauseOption Pause = [] {
+    PauseOption O {0, 128, 50};
     const char* Env = getenv("MADEIRA_FEX_PAUSE");
-    const int Mode = Env && !strcmp(Env, "wfe") ? 1 : Env && !strcmp(Env, "isb") ? 2 : 0;
-    if (Mode) {
-      LogMan::Msg::IFmt("[fex-pause] PAUSE compiles to {} (MADEIRA_FEX_PAUSE)", Mode == 1 ? "WFE" : "ISB");
+    if (!Env) {
+      return O;
     }
-    return Mode;
+    auto Number = [](const char*& P, uint32_t Max, uint32_t& Out) {
+      uint32_t V = 0;
+      const char* Start = P;
+      for (; *P && *P != ':'; ++P) {
+        if (*P < '0' || *P > '9') {
+          return false;
+        }
+        V = V * 10 + static_cast<uint32_t>(*P - '0');
+        if (V > Max) {
+          return false;
+        }
+      }
+      if (P == Start || !V) {
+        return false;
+      }
+      Out = V;
+      return true;
+    };
+    if (!strcmp(Env, "wfe")) {
+      O.Mode = 1;
+    } else if (!strcmp(Env, "isb")) {
+      O.Mode = 2;
+    } else if (!strncmp(Env, "yield-os", 8) || !strncmp(Env, "wait-os", 7)) {
+      const bool Wait = Env[0] == 'w';
+      const char* P = Env + (Wait ? 7 : 8);
+      bool Good = true;
+      if (*P == ':') {
+        ++P;
+        Good = Number(P, 4095, O.After);
+        if (Good && Wait && *P == ':') {
+          ++P;
+          Good = Number(P, 5000, O.Usec);
+        }
+      }
+      if (Good && !*P) {
+        O.Mode = Wait ? 4 : 3;
+      }
+    }
+    if (O.Mode == 1 || O.Mode == 2) {
+      LogMan::Msg::IFmt("[fex-pause] PAUSE compiles to {} (MADEIRA_FEX_PAUSE)", O.Mode == 1 ? "WFE" : "ISB");
+    } else if (O.Mode) {
+      LogMan::Msg::IFmt("[fex-pause] PAUSE is YIELD and every {}th one {} (MADEIRA_FEX_PAUSE={})", O.After,
+                        O.Mode == 3 ? "gives the core up (swtch_pri)" : "blocks the thread (thread_switch)", Env);
+    } else {
+      LogMan::Msg::IFmt("[fex-pause] MADEIRA_FEX_PAUSE={} not understood: PAUSE stays YIELD", Env);
+    }
+    return O;
   }();
-  if (PauseMode == 1) {
+  if (Pause.Mode == 1) {
     wfe();
     return;
   }
-  if (PauseMode == 2) {
+  if (Pause.Mode == 2) {
     isb();
     return;
   }
+#ifdef ARCHITECTURE_arm64ec
+  if (Pause.Mode == 3 || Pause.Mode == 4) {
+    /* Darwin's Mach traps keep every register but x0 and set no flags the guest holds; x0, x1, x2 and x16 are
+     * saved in TMP1-TMP4 (x10-x13 on ARM64EC) around the trap. SUB and CBZ, not CMP: NZCV is the guest's. */
+    ARMEmitter::ForwardLabel Trap;
+    ARMEmitter::ForwardLabel Done;
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, reinterpret_cast<uint64_t>(&MadeiraPauseCount));
+    ldr(TMP2, TMP1, 0);
+    add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+    sub(ARMEmitter::Size::i64Bit, TMP3, TMP2, Pause.After);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &Trap);
+    str(TMP2, TMP1, 0);
+    yield();
+    (void)b(&Done);
+
+    (void)Bind(&Trap);
+    str(ARMEmitter::XReg::zr, TMP1, 0);
+    mov(ARMEmitter::Size::i64Bit, TMP1, ARMEmitter::Reg::r0);
+    mov(ARMEmitter::Size::i64Bit, TMP2, ARMEmitter::Reg::r16);
+    if (Pause.Mode == 4) {
+      mov(ARMEmitter::Size::i64Bit, TMP3, ARMEmitter::Reg::r1);
+      mov(ARMEmitter::Size::i64Bit, TMP4, ARMEmitter::Reg::r2);
+      movz(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, 0);          /* MACH_PORT_NULL */
+      movz(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, 3);          /* SWITCH_OPTION_DISPATCH_CONTENTION */
+      movz(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, Pause.Usec); /* microseconds */
+      movn(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r16, 60);        /* thread_switch, trap -61 */
+    } else {
+      movn(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r16, 58);        /* swtch_pri, trap -59 */
+    }
+    svc(0x80);
+    mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, TMP1);
+    mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r16, TMP2);
+    if (Pause.Mode == 4) {
+      mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, TMP3);
+      mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, TMP4);
+    }
+    (void)Bind(&Done);
+    return;
+  }
+#endif
 #endif
   yield();
 }
@@ -79,4 +186,4 @@ if __name__ == "__main__":
         print("patch-fex-ios-pause: already in")
     else:
         path.write_text(result)
-        print("FEX: MADEIRA_FEX_PAUSE=wfe|isb picks what x86 PAUSE compiles to (opt-in; YIELD otherwise)")
+        print("FEX: MADEIRA_FEX_PAUSE=wfe|isb|yield-os[:K]|wait-os[:K[:U]] picks what x86 PAUSE compiles to (opt-in; YIELD otherwise)")

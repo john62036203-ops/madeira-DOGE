@@ -204,7 +204,7 @@ done
 # madeira-doge, opt-in (each off unless its switch is 1 when the program starts):
 #  - patch-fex-ios-split-lock.py (BCD PR #46, 76e4fab): MADEIRA_FEX_SPLIT_LOCK=1 does an atomic whose operand
 #    crosses a 16-byte boundary inline under a lock instead of trapping ([mach_exc] UNALIGNED-LSE, 25-30 us each).
-#  - patch-fex-ios-pause.py (Playport fex 0083): MADEIRA_FEX_PAUSE=wfe|isb, what x86 PAUSE compiles to.
+#  - patch-fex-ios-pause.py (Playport fex 0083, 0084, 0086): MADEIRA_FEX_PAUSE=wfe|isb|yield-os|wait-os, what x86 PAUSE compiles to.
 #  - patch-fex-ios-rdtsc-selfsync.py (Playport fex 0061): RDTSC self-synchronizing with MADEIRA_X64_QPC_FASTPATH=1
 #    (the x64 QueryPerformanceCounter stub in ntdll-x64fast.dll counts with RDTSC).
 python3 "$R/tools/patch-fex-ios-split-lock.py" "$R/FEX" || echo "::warning::the split-lock fast path was not applied (FEX anchor changed); xtajit64.dll is built without it"
