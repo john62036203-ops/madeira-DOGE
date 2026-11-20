@@ -332,7 +332,15 @@ link_dll() {  # link_dll <output> <objects...>
         2>> "$OUT/build.err" || { grep -m 20 "error" "$OUT/build.err"; fail "linking $(basename "$out") failed"; }
 }
 link_dll "$OUT/plain/d3d11.dll" "${PLAIN_OBJ[@]}"
-link_dll "$OUT/d3d11.dll" "${PATCHED_OBJ[@]}" "$OUT/obj/dxmt_dynamic_mad.o" "$OUT/obj/dxmt_context_mad.o"
+# madeira-doge: memcpy / memmove / memset as ARM64EC code behind
+# env.MADEIRA_D3D11_NATIVE_MEM (tools/d3d11-native-mem.c); an object on the
+# link line wins over the UCRT import library. The patched DLL only.
+"$CC" -O3 -DNDEBUG -fno-builtin -c "$R/tools/d3d11-native-mem.c" -o "$OUT/obj/native_mem.o" 2>> "$OUT/build.err" \
+    || { grep -m 20 "error" "$OUT/build.err"; fail "compiling tools/d3d11-native-mem.c failed"; }
+link_dll "$OUT/d3d11.dll" "${PATCHED_OBJ[@]}" "$OUT/obj/dxmt_dynamic_mad.o" "$OUT/obj/dxmt_context_mad.o" "$OUT/obj/native_mem.o"
+LC_ALL=C grep -aqF "MADEIRA_D3D11_NATIVE_MEM" "$OUT/d3d11.dll" || fail "the MADEIRA_D3D11_NATIVE_MEM switch is not in the result"
+"$READOBJ" --coff-imports "$OUT/d3d11.dll" | grep -qE "Symbol: mem(cpy|move|set) " \
+    && fail "d3d11-src.dll still imports memcpy/memmove/memset from the UCRT"
 LC_ALL=C grep -aqF "DXMT_DYN_TRIM" "$OUT/d3d11.dll" || fail "the DXMT_DYN_TRIM switch is not in the result"
 
 # The new DLL must export exactly what upstream's does, and import from the
