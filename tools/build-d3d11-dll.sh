@@ -192,6 +192,10 @@ python3 "$R/tools/patch-dxmt-no-pass-merge.py" "$OUT/tree/src/dxmt" || fail "too
 # what their viewports reach (God of War's 8192x4096 shadow atlas).
 python3 "$R/tools/patch-dxmt-rt-clamp.py" "$OUT/tree/src/dxmt" \
     || echo "::warning::tools/patch-dxmt-rt-clamp.py did not apply; d3d11-src.dll is built without MADEIRA_RT_CLAMP"
+# madeira-doge: MADEIRA_SKIP_BIG_DEPTH=1, measurement only: depth-only passes on a
+# large target (God of War's shadow atlas) encode none of their commands.
+python3 "$R/tools/patch-dxmt-skip-big-depth.py" "$OUT/tree/src/dxmt" \
+    || echo "::warning::tools/patch-dxmt-skip-big-depth.py did not apply; d3d11-src.dll is built without MADEIRA_SKIP_BIG_DEPTH"
 # madeira-doge (BCD 0.1.665): DXMT_DYN_KEEP, and env.MADEIRA_DXMT_UPSTREAM_FIXES = 1 (sampler anisotropy clamp, compute
 # UAV restore); each file is all or nothing, and a failure only leaves that part out.
 python3 "$R/tools/bcd665/patch-dxmt-bcd665-optin.py" "$OUT/tree/src/d3d11" "$OUT/tree/src/dxmt" \
