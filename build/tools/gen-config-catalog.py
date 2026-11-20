@@ -97,6 +97,13 @@ OVERLAY = {
                         "starts at a 64-byte boundary, as before. 16 or 256: at that boundary. 4: at its first element where a GPU probe at the "
                         "first view shows Metal reads such textures right (logged as [typed-view] probe), else at 16. A view Metal refuses there "
                         "is made at 16, then 64. Read once per game start."},
+    "tex-defer": {"category": "Direct3D 12", "title": "Release textures after the GPU is done",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (BCD 0.1.682 / build 666, on by default there). 1: a released resource's texture, its typed and "
+                        "extra views and its resolve stand-in go on the ml1148 heap list and are released once two more command buffers "
+                        "have completed (Metal's completion queue still touched them: skate. crashed while loading); the reclaim then "
+                        "takes every ready entry, textures first. 0: released at once and the reclaim takes at most 64 entries, as "
+                        "before. Logged as [madeira-d3d12] tex-defer. Read once per game start."},
     "dual-source-drop": {"category": "Direct3D 12", "title": "Rebuild pipelines refused for a missing dual-source output",
                 "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
                 "note": "madeira-doge (BCD 0.1.665, always on there). 1: a render pipeline Metal refuses because its blend factors read "

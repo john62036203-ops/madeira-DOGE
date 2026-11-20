@@ -3469,6 +3469,12 @@ struct LibraryDetail: View {
                         Text("A typed buffer view's texture starts exactly at its first element instead of 64 bytes before it, where a quick GPU test at the first view shows this device reads such textures right (typed-view-align = 4, from BCD; recommended there for DRAGON BALL: Sparking! ZERO together with the switch above). Turn it off if textures or lighting flicker or turn black.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD 0.1.682 Direct3D 12 change: opt-in, madeira-d3d12 only
+                    Toggle("Release textures after the GPU lets go (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("tex-defer") == "1" }, set: { setBCDKey("tex-defer", $0 ? "1" : "") }))
+                    if bcd.value("tex-defer") == "1" {
+                        Text("A texture the game releases is kept until two more GPU command buffers have finished instead of being freed at once, because Metal still touches it for a moment after the game's fence says the GPU is done (from BCD 0.1.682: fixed skate. crashing in about 2 of 10 launches while loading). Can stop rare crashes during loading screens. Uses a little more memory for a frame or two. Turn it off if memory climbs or the game behaves worse.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge BCD 0.1.665 Direct3D 12 change: opt-in, madeira-d3d12 only
                     Toggle("Draw blends that need a missing second shader output (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("dual-source-drop") == "1" }, set: { setBCDKey("dual-source-drop", $0 ? "1" : "") }))
                     if bcd.value("dual-source-drop") == "1" {
