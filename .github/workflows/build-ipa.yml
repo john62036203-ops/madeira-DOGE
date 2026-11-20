@@ -1342,6 +1342,12 @@ jobs:
       - name: Patch airconv defuse fma
         run: python3 tools/patch-airconv-defuse-fma.py
 
+      # madeira-doge, OFF by default: God of War GI volume lookup tests,
+      # MADEIRA_GOW_GI_DECODE=1 (tolerant brick decode) and
+      # MADEIRA_GOW_GI_OFF=1 (ambient pass without GI volumes).
+      - name: Patch airconv God of War GI test
+        run: python3 tools/patch-airconv-gow-gi-test.py
+
       # Same investigation, native winemetal, all OFF by default:
       # MADEIRA_GPU_TRACE=<s> (one frame's encoders + float-target values,
       # [gpu-trace] / [gpu-val] / [rb-src]), MADEIRA_RP_LOAD=1 (no DontCare
