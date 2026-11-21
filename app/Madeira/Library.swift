@@ -3475,6 +3475,18 @@ struct LibraryDetail: View {
                         Text("A texture the game releases is kept until two more GPU command buffers have finished instead of being freed at once, because Metal still touches it for a moment after the game's fence says the GPU is done (from BCD 0.1.682: fixed skate. crashing in about 2 of 10 launches while loading). Can stop rare crashes during loading screens. Uses a little more memory for a frame or two. Turn it off if memory climbs or the game behaves worse.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD rp-lean: opt-in (tools/patch-winemetal-rp-lean.py)
+                    Toggle("Leaner render pass setup (Direct3D 11 and 12, experimental)", isOn: Binding(get: { bcd.value("rp-lean") == "1" }, set: { setBCDKey("rp-lean", $0 ? "1" : "") }))
+                    if bcd.value("rp-lean") == "1" {
+                        Text("Every render pass set up all eight colour outputs in Metal (about 240 calls and eight allocations) though a pass uses one to five. With this on only the outputs in use are set up; Metal gets the same pass (BCD's default). Saves CPU time in games with hundreds of passes a frame. Turn it off if the picture changes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge BCD heap-untracked: opt-in (tools/patch-winemetal-heap-untracked.py)
+                    Toggle("Untracked texture heaps (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("heap-untracked") == "1" }, set: { setBCDKey("heap-untracked", $0 ? "1" : "") }))
+                    if bcd.value("heap-untracked") == "1" {
+                        Text("Metal tracked each Direct3D 12 heap as a whole: a write to one texture made work on every other texture of that heap wait. With this on the heaps are untracked and the Direct3D 12 layer's own ordering (fence-chain = 1, the default) is relied on (from BCD, recommended there for Red Dead Redemption 2). Turn it off if textures flicker or show garbage.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge BCD 0.1.665 Direct3D 12 change: opt-in, madeira-d3d12 only
                     Toggle("Draw blends that need a missing second shader output (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("dual-source-drop") == "1" }, set: { setBCDKey("dual-source-drop", $0 ? "1" : "") }))
                     if bcd.value("dual-source-drop") == "1" {
@@ -3501,6 +3513,24 @@ struct LibraryDetail: View {
                     Toggle("Leaner returns from game function calls (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_CALLRET_LEAN") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_CALLRET_LEAN", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_FEX_CALLRET_LEAN") == "1" {
                         Text("The emulator leaves out a redundant thread-suspend check at the point every x86 function call returns to: two instructions fewer per call, slightly less JIT code (from BCD and Porthole, an A/B experiment there). 64-bit games. Turn it off if the game hangs, freezes when pausing or quitting, or crashes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge Playport fex 0071 (alias item): opt-in (tools/patch-fex-ios-alias-granules.py)
+                    Toggle("Faster calls from the game into system DLLs (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_ALIAS_GRANULES") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_ALIAS_GRANULES", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_ALIAS_GRANULES") == "1" {
+                        Text("Every call from the game's x86 code into an ARM64EC DLL (Direct3D 11, DXGI, XAudio2, kernel32) has to find the DLL's runnable copy; the emulator searched a list of a few hundred images for it, and searched all of it for nothing when the address was already the copy. With this on it is one table lookup (from Playport; BCD measured the search at 42-52 % of Direct3D 11 render threads' CPU). 64-bit games. Turn it off if the game crashes or hangs while starting or loading.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge BCD 0.1.573 callret-elide: opt-in (tools/patch-fex-ios-callret-elide.py)
+                    Toggle("No call-return bookkeeping in translated code (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_CALLRET_ELIDE") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_CALLRET_ELIDE", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_CALLRET_ELIDE") == "1" {
+                        Text("The emulator keeps a shadow stack of return addresses that nothing reads on iOS: about nine instructions at every x86 call and nine more at every return. With this on it is not kept (BCD's default). 64-bit games. It replaces Trust the call-return prediction (env.MADEIRA_CALLRET_TRUST) and Pop call-return entries, which then do nothing. Turn it off if the game crashes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge Playport fex 0060: opt-in (tools/patch-fex-ios-ec-callret-pop.py)
+                    Toggle("Pop call-return entries when a system DLL returns (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_EC_CALLRET_POP") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_EC_CALLRET_POP", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_EC_CALLRET_POP") == "1" {
+                        Text("An indirect call from the game into an ARM64EC DLL left its entry on the emulator's return-address stack, so the returns above it were predicted wrong until the stack was reset. With this on the entry is popped when the DLL returns, as upstream FEX does (from Playport). Only matters together with Trust the call-return prediction (env.MADEIRA_CALLRET_TRUST = 1); does nothing with No call-return bookkeeping. 64-bit games. Turn it off if the game crashes while starting.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     // madeira-doge BCD 0.1.653 DXMT fixes: opt-in, in d3d11-src.dll (tools/bcd653/patch-dxmt-bcd653-optin.py)

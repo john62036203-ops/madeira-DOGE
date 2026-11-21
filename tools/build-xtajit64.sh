@@ -221,9 +221,35 @@ python3 "$R/tools/patch-fex-ios-bcd653-optin.py" "$R/FEX" || { echo "::warning::
 cp "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp" "$B.JIT.cpp.pre-lean"
 cp "$R/FEX/FEXCore/Source/Interface/Core/JIT/JITClass.h" "$B.JITClass.h.pre-lean"
 python3 "$R/tools/patch-fex-ios-callret-lean.py" "$R/FEX" || { echo "::warning::the lean call return was not applied (FEX anchor changed); xtajit64.dll is built without it"; cp "$B.JIT.cpp.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"; cp "$B.JITClass.h.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JITClass.h"; }
-# A build error from these three opt-ins must not cost the module every other fix: the final build
+#  - madeira-doge translation-cost opt-ins (2026-11-22), each off unless its switch is 1 when the program starts:
+#    patch-fex-ios-callret-elide.py (BCD 0.1.573): MADEIRA_FEX_CALLRET_ELIDE=1, no call-ret shadow stack upkeep at CALL/RET.
+#    patch-fex-ios-ec-callret-pop.py (Playport fex 0060): MADEIRA_FEX_EC_CALLRET_POP=1, EnterEC pops an indirect CALL's entry.
+#    patch-fex-ios-alias-granules.py (Playport fex 0071 "alias"): MADEIRA_FEX_ALIAS_GRANULES=1, x64->EC targets by one probe.
+#    Their files are saved first (with every earlier patch in them) so a patch that does not apply, or a build
+#    error, puts them back.
+XLATE_FILES="FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp FEXCore/Source/Interface/Core/JIT/BranchOps.cpp FEXCore/Source/Interface/Core/JIT/JIT.cpp Source/Windows/ARM64EC/Module.cpp Source/Windows/ARM64EC/Module.S Source/Windows/ARM64EC/IosJitAlias.cpp"
+xlate_save() { for f in $XLATE_FILES; do cp "$R/FEX/$f" "$B.xlate.$(echo "$f" | tr / _)"; done; }
+xlate_restore() { for f in $XLATE_FILES; do [ -f "$B.xlate.$(echo "$f" | tr / _)" ] && cp "$B.xlate.$(echo "$f" | tr / _)" "$R/FEX/$f"; done; return 0; }
+xlate_save
+XLATE_APPLIED=0
+for x in callret-elide ec-callret-pop alias-granules; do
+    xlate_save_one() { for f in $XLATE_FILES; do cp "$R/FEX/$f" "$B.xlate1.$(echo "$f" | tr / _)"; done; }
+    xlate_save_one
+    if python3 "$R/tools/patch-fex-ios-$x.py" "$R/FEX"; then
+        XLATE_APPLIED=1
+    else
+        echo "::warning::patch-fex-ios-$x.py did not apply (FEX anchor changed); xtajit64.dll is built without it"
+        for f in $XLATE_FILES; do cp "$B.xlate1.$(echo "$f" | tr / _)" "$R/FEX/$f"; done
+    fi
+done
+# A build error from these opt-ins must not cost the module every other fix: the final build
 # retries without them.
 build() {
+    # madeira-doge: first without the 2026-11-22 translation-cost opt-ins only, keeping the older ones.
+    if [ "$XLATE_APPLIED" = 1 ] && ! cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1; then
+        echo "::warning::xtajit64.dll did not build with callret-elide / ec-callret-pop / alias-granules; rebuilding without them :: $(grep -m 4 'error' "$B.build.log" | tr '\n' ' ' | cut -c1-900)"
+        xlate_restore
+    fi
     if ! cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1; then
         echo "::warning::xtajit64.dll did not build with the madeira-doge FEX opt-ins (split lock, PAUSE, RDTSC self-sync, BCD 0.1.653 fixes, lean call return); rebuilding without them :: $(grep -m 4 'error' "$B.build.log" | tr '\n' ' ' | cut -c1-900)"
         git -C "$R/FEX" checkout -- FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp FEXCore/Source/Interface/Core/JIT/MiscOps.cpp FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp

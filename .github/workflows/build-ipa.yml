@@ -1378,6 +1378,17 @@ jobs:
       - name: Patch winemetal GPU hang attribution
         run: python3 tools/patch-winemetal-gpu-hang-info.py
 
+      # madeira-doge (BCD), both opt-in and off by default: rp-lean = 1 sets up
+      # only the colour attachments a render pass uses; heap-untracked = 1 makes
+      # Direct3D 12 placement heaps untracked. A moved anchor only leaves the
+      # switch without effect.
+      - name: Patch winemetal lean render passes and untracked heaps
+        run: |
+          cp dxmt/src/winemetal/unix/winemetal_unix.c "$RUNNER_TEMP/winemetal_unix.pre-rp-lean.c"
+          python3 tools/patch-winemetal-rp-lean.py || { echo "::warning::rp-lean was not applied"; cp "$RUNNER_TEMP/winemetal_unix.pre-rp-lean.c" dxmt/src/winemetal/unix/winemetal_unix.c; }
+          cp dxmt/src/winemetal/unix/winemetal_unix.c "$RUNNER_TEMP/winemetal_unix.pre-heap.c"
+          python3 tools/patch-winemetal-heap-untracked.py || { echo "::warning::heap-untracked was not applied"; cp "$RUNNER_TEMP/winemetal_unix.pre-heap.c" dxmt/src/winemetal/unix/winemetal_unix.c; }
+
       # WoW64's 32-bit Windows farm (app/Madeira/i386-windows), which upstream
       # builds from the pinned wine and DXMT (build/wine-i386) and does not
       # commit. Cached per wine/DXMT revision; a failure only leaves 32-bit

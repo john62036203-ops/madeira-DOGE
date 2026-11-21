@@ -97,6 +97,16 @@ OVERLAY = {
                         "starts at a 64-byte boundary, as before. 16 or 256: at that boundary. 4: at its first element where a GPU probe at the "
                         "first view shows Metal reads such textures right (logged as [typed-view] probe), else at 16. A view Metal refuses there "
                         "is made at 16, then 64. Read once per game start."},
+    "rp-lean": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Render passes fill only the colour attachments they use",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-winemetal-rp-lean.py"],
+                "note": "madeira-doge (BCD, on by default there). 1: _MTLCommandBuffer_renderCommandEncoder sets up only the "
+                        "colour attachments with a texture or a resolve texture, one descriptor lookup each. 0: all eight slots, "
+                        "as before. Direct3D 9, 10, 11 and 12. Read once per game start."},
+    "heap-untracked": {"category": "Direct3D 12", "title": "Untracked Metal placement heaps",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-winemetal-heap-untracked.py"],
+                "note": "madeira-doge (BCD). 1: Direct3D 12 placement heaps are made with MTLHazardTrackingModeUntracked; the "
+                        "runtime's encoder fences (fence-chain = 1) order the work. 0: tracked, as before. Logged as "
+                        "[heap-untracked]. Read once per game start."},
     "tex-defer": {"category": "Direct3D 12", "title": "Release textures after the GPU is done",
                 "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
                 "note": "madeira-doge (BCD 0.1.682 / build 666, on by default there). 1: a released resource's texture, its typed and "
@@ -148,6 +158,25 @@ OVERLAY = {
                 "note": "madeira-doge (BCD 0.1.659, from Porthole 0143; an A/B experiment). 1 exactly: the JIT entry point right "
                         "after a guest CALL has no suspend doorbell test (the callee's entry point or ExitFunctionEC tested it): two "
                         "instructions fewer per call return. Unset: every entry point as before. 64-bit (ARM64EC) module only."},
+    "env.MADEIRA_FEX_ALIAS_GRANULES": {"category": "x86 emulation (FEX)", "title": "x64 to ARM64EC call targets by one table probe",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-alias-granules.py"],
+                "note": "madeira-doge (Playport fex 0071, the alias item of MADEIRA_FEX_BATCH2). 1 exactly: ExitFunctionEC and "
+                        "ExitFunctionECJit translate the target through a table of every listed image's 64 KB granules before the "
+                        "hint and walk; a target that is in no image (already a pool address) ends at an empty slot instead of "
+                        "walking the whole alias table. Logged as FEX: alias-granules. Unset: hint and walk as before. 64-bit "
+                        "(ARM64EC) module only."},
+    "env.MADEIRA_FEX_CALLRET_ELIDE": {"category": "x86 emulation (FEX)", "title": "Do not maintain the call-ret shadow stack",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-callret-elide.py"],
+                "note": "madeira-doge (BCD 0.1.573, on by default there). 1 exactly: guest CALL and RET no longer push, pop, "
+                        "reload or bounds-check the call-ret shadow stack (about nine instructions each), and a linked CALL is "
+                        "backpatched as bl. env.MADEIRA_CALLRET_TRUST and env.MADEIRA_FEX_EC_CALLRET_POP then have nothing to read. "
+                        "Logged as FEX: callret-elide-v1. Unset: the stack is kept, byte for byte. 64-bit (ARM64EC) module only."},
+    "env.MADEIRA_FEX_EC_CALLRET_POP": {"category": "x86 emulation (FEX)", "title": "EnterEC pops an indirect CALL's call-ret entry",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-ec-callret-pop.py"],
+                "note": "madeira-doge (Playport fex 0060). 1 exactly: when ARM64EC code returns to the address on top of the "
+                        "call-ret stack, EnterEC pops the entry and returns to its host label (upstream FEX's behaviour) instead of "
+                        "leaving it behind. Useful with env.MADEIRA_CALLRET_TRUST = 1. Logged as FEX: ec-callret-pop. Unset: as "
+                        "before. 64-bit (ARM64EC) module only."},
     "env.MADEIRA_NOFOOTPRINT_PROBE": {"category": "Debugging / logs", "title": "Probe: memory outside the jetsam footprint",
                 "kind": "bool", "default": "0", "sources": ["app/Madeira/JITAllocator.c", "app/Madeira/StikJITHelper.swift"],
                 "note": "madeira-doge (diagnostic, after ammaarreshi/WindowsiOS's hv_alloc_no_footprint). 1: at the JIT pool request, "
