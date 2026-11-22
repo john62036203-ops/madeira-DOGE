@@ -7,6 +7,7 @@ retired-code reuse, fail-closed thread scans, and concurrent image/code allocati
 Mach queries use synthetic pages and thread states;
 this is an allocator test, not a device rendering test.
 """
+import re
 from pathlib import Path
 import os
 import subprocess
@@ -41,6 +42,8 @@ helpers = ''.join(function(signature) for signature in (
 ))
 image_copy = source[source.index('size_t image_alloc = (image_size + page_size - 1)'):]
 image_copy = image_copy[:image_copy.index('/* Copy ENTIRE PE image')]
+# madeira-doge pool-trim (MADEIRA_POOL_TRIM) notes whether the primary range is virgin right after it
+image_copy = re.sub(r'\n                /\* virgin: above the bump mark.*?\n                }', '', image_copy, flags=re.S)
 assert image_copy.count('ios_pool_low_image_range( alloc_size )') == 1
 allocation = ('offset = ios_pool_alloc_range_tagged(alloc_size, jit_pool_size - ios_jit_tail_reserved,\n'
               '                                                     ios_pool_image_tag( image_base, image_size, alloc_size ));\n'
@@ -61,6 +64,9 @@ carve_table = source[carve_start:source.index('\n\n', carve_start)]
 
 fixture = r'''
 #include <stdint.h>
+#include <stddef.h>
+/* madeira-doge pool-trim: ios_pool_free_put clears the trimmed-page bitmap; none here */
+static void ios_pool_cold_clear( size_t off, size_t size ) { (void)off; (void)size; }
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

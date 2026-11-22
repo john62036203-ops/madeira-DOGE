@@ -170,6 +170,9 @@ harness = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stddef.h>
+/* madeira-doge pool-trim: ios_pool_free_put clears the trimmed-page bitmap; none here */
+static void ios_pool_cold_clear( size_t off, size_t size ) { (void)off; (void)size; }
 #include <string.h>
 #include <time.h>
 #define IOS_POOL_REUSE_GRACE_SEC 3

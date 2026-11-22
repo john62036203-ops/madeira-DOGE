@@ -506,6 +506,8 @@ static LONG g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts;   /* ml1
 static LONG g_srv_clamped; static float g_srv_clamp_max;   /* ml1089 */
 static LONG g_zero_inst;   /* ml1094 */
 static LONG g_fence_waits, g_fence_updates, g_barriers;   /* ml1091 */
+static int g_rcf = -1;   /* madeira-duo root-cbv-fast (mad_root_cbv_fast_on) */
+static volatile LONG g_rcf_hits, g_rcf_misses;
 static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins, g_f6_rclose;   /* ml1134 */
 /* ml1137: GPU census, counts only. Barrier entries by the states they move
  * between, and what a state-aware wait rule would have needed at each
@@ -1856,6 +1858,8 @@ struct mad_list {
      * resident at every draw because Metal cannot see them. */
     struct mad_resource **used;
     unsigned nused, ucap;
+    /* madeira-duo root-cbv-fast: the last root descriptor's buffer (mad_resolve_root) */
+    UINT64 rc_lo, rc_len; struct mad_resource *rc_r; LONG64 rc_ver; unsigned rc_hits, rc_misses;
     /* Argument buffers: one slot of root values per draw, carved from shared
      * chunks. A draw's root arguments must survive until the GPU reads them,
      * so a single buffer rewritten per draw would race the previous draw. */
@@ -1921,11 +1925,17 @@ static ULONG STDMETHODCALLTYPE list_Release(ID3D12GraphicsCommandList *This) {
     return (ULONG)r;
 }
 static void mad_list_wait_idle(struct mad_list *l);
+static int mad_reset_wait_event_on(void);   /* madeira-duo reset-wait-event */
+static void mad_list_idle_wake(void);
 static HRESULT STDMETHODCALLTYPE list_Close(ID3D12GraphicsCommandList *This) {
     struct mad_list *l = (struct mad_list *)This;
     if (l->closed) return E_FAIL;          /* double Close is a caller bug */
     l->closed = 1;
     l->recorded_generation = l->alloc ? l->alloc->generation : 0;
+    if (l->rc_hits | l->rc_misses) {   /* madeira-duo root-cbv-fast: one add per list, not per record */
+        InterlockedExchangeAdd(&g_rcf_hits, (LONG)l->rc_hits); InterlockedExchangeAdd(&g_rcf_misses, (LONG)l->rc_misses);
+        l->rc_hits = l->rc_misses = 0;
+    }
     if (l->alloc) InterlockedDecrement(&l->alloc->recording);
     return S_OK;
 }
@@ -2496,6 +2506,27 @@ static void f7_census_barrier(struct mad_exec *e, const struct mad_cmd *c) {
     }
     e->f7_reason |= 1;
 }
+/* madeira-duo FENCE-CHAIN-FRAG (madeira.cfg fence-chain-frag, opt-in, default 0).
+ * Mode 3 waits only after a barrier on a resource written since the last wait,
+ * but a render pass that waits always waits at its VERTEX stage, so its vertex
+ * and tiling work can't overlap the previous pass's fragment work. In PoE2
+ * fight dumps 52-66 render encoders a frame start exactly when everything before
+ * them ends (e.g. a 330 us vertex stage behind a 1092 us fragment stage). With
+ * the switch, mode 3 uses ml1118's rule: the wait moves to the FRAGMENT stage
+ * unless a compute or blit encoder ended since the last vertex-stage wait
+ * (skinning, culling, uploads, indirect arguments keep the vertex wait). Hazard
+ * it does not cover, as in mode 5: a vertex shader reading a texture or buffer
+ * the previous render pass wrote. 0 (the default): mode 3 as before. */
+static int g_fc3_frag = -1;
+static volatile LONG g_fc3_frag_waits;
+static int mad_fc3_frag_on(void) {
+    if (g_fc3_frag < 0) {
+        int on = mad_cfg_int_pe("fence-chain-frag", 0) > 0;   /* madeira-duo: 1 = with fence-chain 3, a render pass waits at its fragment stage unless a compute/blit encoder ended since the last vertex-stage wait (ml1118's rule); 0 = at its vertex stage (as before) */
+        if (on) d3d12_log("[madeira-d3d12] fence-chain-frag = 1: with fence-chain 3, render passes wait at the fragment stage unless a compute/blit encoder ran since the last vertex-stage wait\n");
+        g_fc3_frag = on;
+    }
+    return g_fc3_frag;
+}
 static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) {
     struct wmtcmd_render_fence_op f;
     obj_handle_t fence;
@@ -2518,9 +2549,10 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
      * vertex-stage wait (skinning, culling, indirect arguments). Hazard it does
      * not cover: a vertex shader reading a texture the previous render pass
      * just drew. */
-    if (!update && e->mode == 5) {
+    /* madeira-duo fence-chain-frag: the same rule in mode 3 (see mad_fc3_frag_on) */
+    if (!update && (e->mode == 5 || (e->mode == 3 && mad_fc3_frag_on()))) {
         if (InterlockedExchange(&e->q->device->f5_nonrender, 0)) f.stages = (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject);
-        else f.stages = WMTRenderStageFragment;
+        else { f.stages = WMTRenderStageFragment; if (e->mode == 3) InterlockedIncrement(&g_fc3_frag_waits); }
     }
     MTLRenderCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&f);
     InterlockedIncrement(update ? &g_fence_updates : &g_fence_waits);
@@ -4040,6 +4072,19 @@ static void mad_dsw_census(void) {
     if (k)
         d3d12_log("[madeira-d3d12] default-buffer-swap residency (QueryWorkingSetEx over mincore, 128 pages a buffer): %u%% of the sampled pages in memory;%s\n",
                   all ? all_res * 100 / all : 0, line);
+}
+/* madeira-doge (Porthole 1.4.0) upload-swap-min-kb (madeira.cfg; default 8192 = the 8 MB of before): the size from which a CPU-visible buffer gets storage of our own on the file tier (ml1154).
+ * A smaller limit moves more UPLOAD buffers off the jetsam footprint; each takes whole 64 KB steps of address space, and only touched pages cost memory. */
+static UINT64 mad_upload_swap_min(void) {
+    static UINT64 v;
+    if (!v) {
+        long long kb = mad_cfg_int_pe("upload-swap-min-kb", 8192);
+        if (kb < 4) kb = 4;
+        if (kb > 1048576) kb = 1048576;
+        v = (UINT64)kb << 10;
+        if (kb != 8192) d3d12_log("[madeira-d3d12] upload-swap-min-kb = %lld: CPU-visible buffers of %lld KB or more live on file-backed storage\n", kb, kb);
+    }
+    return v;
 }
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
     static int on = -1;
@@ -6363,8 +6408,15 @@ static int mad_pa_start(void) {
     LONG s = InterlockedCompareExchange(&state, 1, 0);
     if (s == 0) {
         unsigned t, n = 0;
+        /* madeira-duo pso-async-threads: a build mostly waits on Metal's compiler
+         * service, which compiles several at once. On a new PoE2 map ~550
+         * pipelines miss the archive at ~430 ms each, and with 2 builders enemies
+         * stayed invisible for seconds (text15: 11k draws skipped). */
+        unsigned want = (unsigned)mad_cfg_int_pe("pso-async-threads", 2);
+        if (want < 1) want = 1; if (want > 8) want = 8;
         g_pa_sem = CreateSemaphoreA(NULL, 0, MAD_PA_MAX, NULL);
-        for (t = 0; g_pa_sem && t < 2; t++) {
+        d3d12_log("[madeira-d3d12] pso-async: %u builder threads (madeira.cfg pso-async-threads)\n", want);
+        for (t = 0; g_pa_sem && t < want; t++) {
             HANDLE h = CreateThread(NULL, 256 << 10, mad_pa_worker, NULL, 0, NULL);
             if (h) { CloseHandle(h); n++; }
         }
@@ -10311,6 +10363,14 @@ static void mad_perf_present(void) {
                       g_perf_presents ? (double)(cw - lw) / g_perf_presents : 0.0, g_perf_presents ? (double)(cu - lu) / g_perf_presents : 0.0,
                       g_perf_presents ? (double)(cb - lb) / g_perf_presents : 0.0, g_fence_chain);
             lw = cw; lu = cu; lb = cb;
+            if (g_fc3_frag > 0 && g_perf_presents)   /* madeira-duo fence-chain-frag */
+                d3d12_log("[perf] fence-chain-frag per frame: %.1f render waits at the fragment stage (the rest of the waits above stay at the vertex stage)\n",
+                          (double)InterlockedExchange(&g_fc3_frag_waits, 0) / g_perf_presents);
+            if (g_rcf > 0 && g_perf_presents) {   /* madeira-duo root-cbv-fast */
+                LONG h = InterlockedExchange(&g_rcf_hits, 0), m = InterlockedExchange(&g_rcf_misses, 0);
+                d3d12_log("[perf] root-cbv-fast per frame: %.0f root descriptors took the previous one's buffer, %.0f were searched (%.0f%% hits)\n",
+                          h / (double)g_perf_presents, m / (double)g_perf_presents, h + m ? 100.0 * h / (h + m) : 0.0);
+            }
             if (g_f6_used && g_perf_presents) {   /* ml1134 */
                 double np = (double)g_perf_presents;
                 LONG b = InterlockedExchange(&g_f6_begins, 0), sy = InterlockedExchange(&g_f6_synced, 0), at = InterlockedExchange(&g_f6_att_sync, 0);
@@ -10789,7 +10849,7 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
             UINT i;
             mad_ecl_run((ID3D12CommandQueue *)q, j->count, (ID3D12CommandList *const *)j->lists);
             for (i = 0; i < j->count; i++) {
-                InterlockedDecrement(&j->lists[i]->inflight);
+                if (!InterlockedDecrement(&j->lists[i]->inflight) && mad_reset_wait_event_on()) mad_list_idle_wake();   /* madeira-duo reset-wait-event */
                 list_Release((ID3D12GraphicsCommandList *)j->lists[i]);
             }
             break;
@@ -10864,9 +10924,45 @@ static void mad_present_throttle(struct mad_queue *q) {
     InterlockedExchangeAdd64(&g_xp.t_thr, t1.QuadPart - t0.QuadPart);   /* ml1128 */
     InterlockedExchangeAdd64(&g_perf_drain_ticks, t1.QuadPart - t0.QuadPart);
 }
+/* madeira-duo RESET-WAIT-EVENT (madeira.cfg reset-wait-event, opt-in, default 0).
+ * A list Reset while the submission worker still replays it spun: 256 pauses,
+ * then up to 3,840 Sleep(0) yields, then Sleep(1) until the worker let go. In
+ * PoE2 that happens 0.1-0.2 times a frame but lasts 100-400 ms (the replay is
+ * compiling a pipeline), and the yields burn an E-core under the power cap
+ * while Sleep(1) adds its own wake-up lag. With the switch the Reset sleeps on
+ * a condition variable that the worker wakes when a list it released has no
+ * jobs left (only while someone waits: one interlocked read per list
+ * otherwise). The wait re-checks every 2 ms as a safety net. 0 (the default):
+ * the spin, as before. */
+static int g_rwe = -1;
+static volatile LONG g_rwe_waiters;
+static SRWLOCK g_rwe_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_rwe_cv = CONDITION_VARIABLE_INIT;
+static int mad_reset_wait_event_on(void) {
+    if (g_rwe < 0) {
+        int on = mad_cfg_int_pe("reset-wait-event", 0) > 0;   /* madeira-duo: 1 = a command list Reset that waits for the submission worker sleeps until the worker wakes it; 0 = it spins (pauses, Sleep(0), then Sleep(1)) as before */
+        if (on) d3d12_log("[madeira-d3d12] reset-wait-event = 1: a list Reset waiting for the submission worker sleeps on a condition variable\n");
+        g_rwe = on;
+    }
+    return g_rwe;
+}
+/* reset-wait-event: the worker dropped a list's last job (inflight just reached 0). */
+static void mad_list_idle_wake(void) {
+    if (!InterlockedCompareExchange(&g_rwe_waiters, 0, 0)) return;   /* after the decrement: a waiter that registered later sees inflight == 0 */
+    AcquireSRWLockExclusive(&g_rwe_lock);   /* a waiter between its check and its sleep holds the lock: no lost wake-up */
+    ReleaseSRWLockExclusive(&g_rwe_lock);
+    WakeAllConditionVariable(&g_rwe_cv);
+}
 static void mad_list_wait_idle(struct mad_list *l) {
     LARGE_INTEGER t0, t1; unsigned spins = 0;
     QueryPerformanceCounter(&t0);
+    if (mad_reset_wait_event_on()) {
+        InterlockedIncrement(&g_rwe_waiters);   /* before reading inflight (Dekker with mad_list_idle_wake) */
+        AcquireSRWLockExclusive(&g_rwe_lock);
+        while (InterlockedCompareExchange(&l->inflight, 0, 0)) SleepConditionVariableSRW(&g_rwe_cv, &g_rwe_lock, 2, 0);
+        ReleaseSRWLockExclusive(&g_rwe_lock);
+        InterlockedDecrement(&g_rwe_waiters);
+    }
     while (l->inflight) {
         if (++spins < 256) YieldProcessor();
         else if (spins < 4096) Sleep(0);
@@ -14798,7 +14894,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * 0.4-0.9 GB of UPLOAD buffers live (ph-valley08-13), and its load-time
          * peak is what kills the Lumen runs. Metal-allocated shared storage is
          * charged in full. madeira.cfg upload-swap = 0 turns it off. */
-        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on() &&
+        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= mad_upload_swap_min() && mad_upload_swap_on() &&
             (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {   /* madeira-bcd readback-swap */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
             void *mem = mad_gstore_alloc(len);   /* madeira-doge gpu-store-pool */
@@ -16231,17 +16327,32 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
  * Every MIN/MAX filter value is logged once with its mapping (default on: a
  * game using one renders wrongly here); sampler-census = 1 logs every
  * distinct filter value. */
-static int g_smp_red = -1, g_smp_census;
+/* madeira-duo SAMPLER ANISOTROPY CAP (madeira.cfg sampler-max-aniso, opt-in, default
+ * 0). A game's anisotropic samplers ask for up to 16 taps along the stretched
+ * axis of every texture read; on a phone GPU that is fragment time a low internal
+ * resolution does not need. Path of Exile 2 at "texture_filtering = 8" uses one
+ * anisotropic sampler (filter 0x55, 8x, wrap) for its material textures. N (1..16)
+ * caps maxAnisotropy of the Metal sampler at N; 1 is plain trilinear. Only the
+ * Metal sampler object changes: the root signature the converter and the shader
+ * cache see keeps the game's value, so no shader is converted again. 0: as asked. */
+static int g_smp_red = -1, g_smp_census, g_smp_aniso;
+static volatile LONG g_smp_aniso_capped, g_smp_aniso_kept;
 static volatile LONG g_smp_seen[16];   /* filter values 0..0x1ff already logged */
 static const char *const g_cmp_names[8] = { "Never", "Less", "Equal", "LessEqual", "Greater", "NotEqual", "GreaterEqual", "Always" };
 static void mad_sampler_red_load(void) {
-    long long v;
+    long long v, a;
     if (g_smp_red >= 0) return;
     v = mad_cfg_int_pe("sampler-reduction", 0);    /* MIN/MAX reduction samplers (GoT Hi-Z culling): 3 = Metal reductionMode (iOS 26, A19 / Apple10; the fix), 1 = point filtering and no comparison, 2 = no comparison only */
     g_smp_census = mad_cfg_int_pe("sampler-census", 0) ? 1 : 0;   /* diagnostic: log every distinct sampler filter value once with its Metal mapping */
+    a = mad_cfg_int_pe("sampler-max-aniso", 0);    /* madeira-duo: N (1..16) caps the anisotropy of every sampler at N (1 = trilinear; less fragment time); 0 = as the game asks */
+    g_smp_aniso = a >= 1 && a <= 16 ? (int)a : 0;
+    MemoryBarrier();
     g_smp_red = v >= 1 && v <= 3 ? (int)v : 0;
     if (g_smp_red || g_smp_census)
         d3d12_log("[sampler] madeira-bcd sampler-reduction=%d sampler-census=%d\n", g_smp_red, g_smp_census);
+    if (g_smp_aniso)
+        d3d12_log("[sampler] madeira-duo sampler-max-aniso = %d: anisotropic samplers are capped at %dx%s\n", g_smp_aniso, g_smp_aniso,
+                  g_smp_aniso == 1 ? " (trilinear)" : "");
 }
 static void mad_sampler_log(const struct WMTSamplerInfo *si, UINT filter, UINT cmp, const char *who) {
     static const char *const red[4] = { "standard", "comparison", "MINIMUM", "MAXIMUM" };
@@ -16280,6 +16391,17 @@ static void mad_sampler_info(struct WMTSamplerInfo *si, UINT filter, UINT au, UI
     si->compare_function = (filter & 0x80) ? mad_compare((D3D12_COMPARISON_FUNC)cmp) : WMTCompareFunctionNever;
     si->lod_min_clamp = minlod; si->lod_max_clamp = maxlod > 1000.0f ? 1000.0f : maxlod;
     si->max_anisotroy = (filter & 0x40) ? (aniso ? aniso : 16) : 1;
+    if ((filter & 0x40) && g_smp_aniso) {   /* madeira-duo sampler-max-aniso, see above; unset, nothing here runs */
+        unsigned asked = (unsigned)si->max_anisotroy;
+        if (asked > (unsigned)g_smp_aniso) {
+            si->max_anisotroy = g_smp_aniso;
+            if (InterlockedIncrement(&g_smp_aniso_capped) == 1)
+                d3d12_log("[sampler] madeira-duo sampler-max-aniso: first anisotropic sampler capped, %ux -> %dx (filter 0x%03x, from %s)\n",
+                          asked, g_smp_aniso, filter, who ? who : "?");
+        } else if (InterlockedIncrement(&g_smp_aniso_kept) == 1)
+            d3d12_log("[sampler] madeira-duo sampler-max-aniso: first anisotropic sampler within the cap, %ux (filter 0x%03x, from %s)\n",
+                      asked, filter, who ? who : "?");
+    }
     si->normalized_coords = true;
     si->support_argument_buffers = true;
     if (red >= 2 && g_smp_red) {   /* madeira-bcd: sampler-reduction, see above */
@@ -19387,6 +19509,48 @@ static void STDMETHODCALLTYPE list_SetComputeRootSignature(ID3D12GraphicsCommand
         l->rec_rs[1] = (struct mad_rootsig *)rs; memset(l->rec_tab[1], 0, sizeof l->rec_tab[1]); memset(l->lat_va[1], 0, sizeof l->lat_va[1]);
     }
 }
+/* madeira-duo ROOT-CBV-FAST (madeira.cfg root-cbv-fast, opt-in, default 0).
+ * Every root CBV/SRV/UAV the game records is resolved to its resource
+ * (binary search of the address index plus the alias walk) so the replay can
+ * declare it with useResource. PoE2 records ~13k root CBVs a frame in fights,
+ * and mad_resolve_address was ~1.1-1.7 % of each frame thread's CPU, with about
+ * one cache miss per search step. Nearly all of those addresses fall inside the
+ * same few constant buffers, one after another. With the switch each list keeps
+ * the buffer its last root descriptor fell in, and an address inside it takes
+ * that answer without a search. Only a buffer with its own Metal storage (not
+ * placed in a heap) is kept, so nothing else can alias its range and the search
+ * would return the same buffer; the entry holds only while the address index is
+ * unchanged (aidx_ver, no pending rebuild), so a resource created or released
+ * since sends the next address back to the search. The resource noted for
+ * useResource is exactly the one the search gives. 0 (the default): every root
+ * descriptor is searched, as before. */
+static int mad_root_cbv_fast_on(void) {
+    if (g_rcf < 0) {
+        int on = mad_cfg_int_pe("root-cbv-fast", 0) > 0;   /* madeira-duo: 1 = a root CBV/SRV/UAV address inside the buffer the list's previous one resolved to skips the address search (same answer; only committed buffers, only while the address index is unchanged); 0 = every one is searched (as before) */
+        if (on) d3d12_log("[madeira-d3d12] root-cbv-fast = 1: root descriptor addresses inside the previous one's buffer skip the address search\n");
+        g_rcf = on;
+    }
+    return g_rcf;
+}
+static struct mad_resource *mad_resolve_root(struct mad_list *l, UINT64 value) {
+    struct mad_device *d = l->device;
+    struct mad_resource *r;
+    UINT64 off = 0;
+    LONG64 v;
+    if (!mad_root_cbv_fast_on() || !d) return mad_resolve_address(d, value, &off);
+    v = __atomic_load_n(&d->aidx_ver, __ATOMIC_ACQUIRE);
+    if (l->rc_r && v == l->rc_ver && !(v & 1) && !__atomic_load_n(&d->aidx_dirty, __ATOMIC_RELAXED) && value - l->rc_lo < l->rc_len) {
+        l->rc_hits++;
+        return l->rc_r;
+    }
+    l->rc_misses++;
+    r = mad_resolve_address(d, value, &off);   /* the entry kept stays valid while the version holds */
+    if (r && !r->placed_heap && r->buffer && r->size && !(v & 1) && !__atomic_load_n(&d->aidx_dirty, __ATOMIC_RELAXED) &&
+        __atomic_load_n(&d->aidx_ver, __ATOMIC_ACQUIRE) == v) {   /* answered from the index this version describes */
+        l->rc_lo = r->gpu_address; l->rc_len = r->size; l->rc_r = r; l->rc_ver = v;
+    }
+    return r;
+}
 static void mad_record_croot(struct mad_list *l, UINT index, UINT64 value, int resolve) {
     struct mad_cmd *c;
     if (index >= MAD_ROOT_PARAM_MAX) return;
@@ -19394,7 +19558,7 @@ static void mad_record_croot(struct mad_list *l, UINT index, UINT64 value, int r
     if (!c) return;
     c->u.root.index = index; c->u.root.value = value;
     if (!resolve && g_scbv_on > 0) l->rec_tab[1][index] = value;   /* madeira-bcd static-cbv: a table */
-    if (resolve) { UINT64 off = 0; mad_list_note_used(l, mad_resolve_address(l->device, value, &off)); }
+    if (resolve) mad_list_note_used(l, mad_resolve_root(l, value));   /* madeira-duo root-cbv-fast */
 }
 static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(ID3D12GraphicsCommandList *This, UINT index, D3D12_GPU_VIRTUAL_ADDRESS a) { mad_record_croot((struct mad_list *)This, index, a, 1); }
 static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(ID3D12GraphicsCommandList *This, UINT index, D3D12_GPU_VIRTUAL_ADDRESS a) { mad_record_croot((struct mad_list *)This, index, a, 1); }
@@ -19755,10 +19919,7 @@ static void mad_record_root(struct mad_list *l, UINT index, UINT64 value, int re
     if (!c) return;
     c->u.root.index = index; c->u.root.value = value;
     if (!resolve && g_scbv_on > 0) l->rec_tab[0][index] = value;   /* madeira-bcd static-cbv: a table */
-    if (resolve) {
-        UINT64 off = 0;
-        mad_list_note_used(l, mad_resolve_address(l->device, value, &off));
-    }
+    if (resolve) mad_list_note_used(l, mad_resolve_root(l, value));   /* madeira-duo root-cbv-fast */
 }
 static void STDMETHODCALLTYPE list_SetGraphicsRootConstantBufferView(ID3D12GraphicsCommandList *This,
         UINT index, D3D12_GPU_VIRTUAL_ADDRESS addr) { mad_record_root((struct mad_list *)This, index, addr, 1); }

@@ -26,7 +26,7 @@ def block(start, end="\n}\n"):
 
 rbs = block("static int mad_readback_swap_on(void) {")
 check("on by default (as before)", 'mad_cfg_int_pe("readback-swap", 1)' in rbs)
-up = ('if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on() &&\n'
+up = ('if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= mad_upload_swap_min() && mad_upload_swap_on() &&\n'
       '            (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {')
 check("upload-swap's condition: only READBACK buffers ask readback-swap", up in src and src.count("mad_readback_swap_on()") == 1)
 check("upload-swap itself unchanged (default 1)", 'mad_cfg_int_pe("upload-swap", 1)' in block("static int mad_upload_swap_on(void) {"))

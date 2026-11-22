@@ -3469,6 +3469,42 @@ struct LibraryDetail: View {
                         Text("A typed buffer view's texture starts exactly at its first element instead of 64 bytes before it, where a quick GPU test at the first view shows this device reads such textures right (typed-view-align = 4, from BCD; recommended there for DRAGON BALL: Sparking! ZERO together with the switch above). Turn it off if textures or lighting flicker or turn black.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge 2026-11-22 upstream daily check: willfaust/Madeira PR #632 and Porthole 1.4.0 (opt-in)
+                    Toggle("Cap anisotropic filtering at 4x (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("sampler-max-aniso") == "4" }, set: { setBCDKey("sampler-max-aniso", $0 ? "4" : "") }))
+                    if bcd.value("sampler-max-aniso") == "4" {
+                        Text("Texture samplers that ask for 8x or 16x anisotropic filtering get 4x instead, which saves GPU time on every textured pixel (from Madeira PR #632: Path of Exile 2 was GPU-bound on it). Textures seen at a steep angle, like floors in the distance, can look a little blurrier. No shader is converted again. Turn it off if textures look worse than the fps gained.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Command-list reset sleeps instead of spinning (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("reset-wait-event") == "1" }, set: { setBCDKey("reset-wait-event", $0 ? "1" : "") }))
+                    if bcd.value("reset-wait-event") == "1" {
+                        Text("When the game resets a command list the GPU worker is still using, the thread sleeps until it is woken instead of spinning, which spends less CPU (less heat) during pipeline-compile stalls (from Madeira PR #632). Turn it off if the game freezes or stutters more.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Faster root descriptor lookup (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("root-cbv-fast") == "1" }, set: { setBCDKey("root-cbv-fast", $0 ? "1" : "") }))
+                    if bcd.value("root-cbv-fast") == "1" {
+                        Text("A root constant buffer inside the same buffer as the previous one reuses that lookup instead of searching all resources again, which takes CPU work off the game's render threads (from Madeira PR #632; the log shows [perf] root-cbv-fast hit rates). Turn it off if anything draws wrongly.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("More background pipeline builders (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("pso-async-threads") == "4" }, set: { setBCDKey("pso-async-threads", $0 ? "4" : "") }))
+                    if bcd.value("pso-async-threads") == "4" {
+                        Text("Four threads instead of two build new GPU pipelines in the background, so a burst of new effects (new area, first fight) shows up sooner with fewer hitches (from Madeira PR #632). Uses more CPU while compiling, so the phone can get warmer. Has an effect only when background pipeline building (pso-async) is on.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Fragment-stage waits with fence chain 3 (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("fence-chain-frag") == "1" }, set: { setBCDKey("fence-chain-frag", $0 ? "1" : ""); setBCDKey("fence-chain", $0 ? "3" : "") }))
+                    if bcd.value("fence-chain-frag") == "1" {
+                        Text("Sets fence-chain = 3 and lets a render pass start its vertex work while the previous pass is still shading pixels, which can raise GPU throughput (from Madeira PR #632). Not covered: a vertex shader that reads what the previous pass drew, which would then flicker or break. Turning it off also turns fence-chain back to the default.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Move more upload buffers off app memory (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("upload-swap-min-kb") == "1024" }, set: { setBCDKey("upload-swap-min-kb", $0 ? "1024" : "") }))
+                    if bcd.value("upload-swap-min-kb") == "1024" {
+                        Text("CPU-visible buffers of 1 MB or more (instead of 8 MB) are put on file-backed storage, which iOS does not count against the app's memory limit (from Porthole 1.4.0). Can lower the memory peak that kills games while loading. May cost a little speed. Needs upload-swap, which is on by default.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Skip empty pages of DLL copies in the JIT pool (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_POOL_TRIM") == "1" }, set: { setBCDKey("env.MADEIRA_POOL_TRIM", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_POOL_TRIM") == "1" {
+                        Text("DLLs copied into the JIT pool leave their all-zero gaps between sections untouched, so those pages cost no memory and are not kept warm (from Madeira PR #632: about 120 MB less in a Path of Exile 2 session at its stronger level; this switch uses the safer level 1). The log shows [pool-trim] lines. Turn it off if a game crashes at start.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge BCD 0.1.682 Direct3D 12 change: opt-in, madeira-d3d12 only
                     Toggle("Release textures after the GPU lets go (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("tex-defer") == "1" }, set: { setBCDKey("tex-defer", $0 ? "1" : "") }))
                     if bcd.value("tex-defer") == "1" {

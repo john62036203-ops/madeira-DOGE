@@ -84,7 +84,7 @@ assert 'jit_pool_offset = cand + alloc_size;' in bump
 assert 'ios_pool_freelist[ios_pool_free_count].off = jit_pool_offset;' in bump
 
 warmer = function(native, 'static void *ios_pool_warmer_thread(')
-assert warmer.count('if (IOS_POOL_IN_HOLE(o)) continue;') == 4, 'all four warmer loops skip the hole'
+assert warmer.count('if (IOS_POOL_IN_HOLE(o) || ios_pool_cold_test(o)) continue;') == 4, 'all four warmer loops skip the hole'
 
 tail = native[native.index('size_t reserve_offset, tail_added, tail_skipped = 0;'):][:14000]
 assert 'ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,' in tail

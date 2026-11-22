@@ -107,6 +107,35 @@ OVERLAY = {
                 "note": "madeira-doge (BCD). 1: Direct3D 12 placement heaps are made with MTLHazardTrackingModeUntracked; the "
                         "runtime's encoder fences (fence-chain = 1) order the work. 0: tracked, as before. Logged as "
                         "[heap-untracked]. Read once per game start."},
+    "sampler-max-aniso": {"category": "Direct3D 12", "title": "Cap anisotropic filtering",
+                "kind": "int", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (willfaust/Madeira PR #632, ee3fb0b). N (1..16) caps maxAnisotropy of every anisotropic Metal "
+                        "sampler at N; 1 is plain trilinear. Less GPU texture work at the cost of blurrier textures at grazing "
+                        "angles. The root signature the shader cache sees is unchanged, so no shader is converted again. 0: as the game asks."},
+    "reset-wait-event": {"category": "Direct3D 12", "title": "Command-list Reset sleeps instead of spinning",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (willfaust/Madeira PR #632, b3419e8). 1: a command list Reset that waits for the submission "
+                        "worker sleeps on a condition variable and is woken when the list is idle (re-checks every 2 ms). 0: pauses, "
+                        "Sleep(0) yields, then Sleep(1), as before."},
+    "root-cbv-fast": {"category": "Direct3D 12", "title": "Root descriptors reuse the previous buffer lookup",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (willfaust/Madeira PR #632, 9d8c017). 1: a root CBV/SRV/UAV address inside the committed buffer "
+                        "the list's previous root descriptor resolved to skips the address search (same answer, only while the address "
+                        "index is unchanged). Logged as [perf] root-cbv-fast per frame. 0: every one is searched."},
+    "fence-chain-frag": {"category": "Direct3D 12", "title": "Fence chain 3 waits at the fragment stage",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (willfaust/Madeira PR #632, 766bcb5). Only with fence-chain = 3. 1: a render pass waits at its "
+                        "fragment stage unless a compute or blit encoder ended since the last vertex-stage wait, so vertex work can "
+                        "overlap the previous pass. Not covered: a vertex shader reading what the previous render pass wrote. 0: vertex stage."},
+    "pso-async-threads": {"category": "Direct3D 12", "title": "Background pipeline builder threads",
+                "kind": "int", "default": "2", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (willfaust/Madeira PR #632, 26275eb). Number of pso-async builder threads (1..8). More threads "
+                        "finish a burst of new pipelines sooner (fewer invisible objects / hitches) but use more CPU and heat. 2: as before."},
+    "upload-swap-min-kb": {"category": "Direct3D 12", "title": "Smallest upload buffer on file-backed memory",
+                "kind": "int", "default": "8192", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (Porthole 1.4.0). With upload-swap on, CPU-visible buffers of N KB or more get file-backed storage "
+                        "that iOS does not charge to the app. A smaller N moves more buffers off the memory footprint (each takes whole "
+                        "64 KB steps; may cost speed). 8192: the 8 MB of before."},
     "tex-defer": {"category": "Direct3D 12", "title": "Release textures after the GPU is done",
                 "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
                 "note": "madeira-doge (BCD 0.1.682 / build 666, on by default there). 1: a released resource's texture, its typed and "
@@ -278,6 +307,11 @@ OVERLAY = {
                         "also selects the factory's patchable MakeWindowAssociation and swapchain-creation entries. "
                         "The x64 entries use the loader's PE addresses so code patches and nearby allocations agree. "
                         "Existing native implementations remain behind the entries. Restart the game session."},
+    "env.MADEIRA_POOL_TRIM": {"category": "Memory & JIT pool", "title": "Skip empty pages of DLL copies in the JIT pool",
+                "kind": "int", "default": "0",
+                "note": "madeira-doge (willfaust/Madeira PR #632, 2d587dd). 1: a DLL copied to a never-used JIT pool range leaves its "
+                        "all-zero gap pages untouched (no memory, not warmed); 2: also skips a read-only .rsrc section. Logged as "
+                        "[pool-trim] and the warmer's trimmed= field. Risk at 2: code reading resources through the pool copy sees zeros. 0: full copy."},
     "env.MADEIRA_POOL_LOW_IMAGES": {"category": "Memory & JIT pool", "title": "Small images in spare code-buffer space",
                 "kind": "bool", "default": "0",
                 "note": "Default off. If the normal JIT image allocation fails, copies up to 16 MB may use "

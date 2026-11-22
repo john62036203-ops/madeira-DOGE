@@ -47,7 +47,7 @@ assert 'const char *lower = getenv( "MADEIRA_POOL_BIG_SLOT_BELOW" );' in source
 assert 'int below = lower && !strcmp( lower, "1" );' in source
 assert 'if (!fits && below)' in source, 'an unavailable lower slot must try the existing upper placement'
 assert '#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off)' in source
-assert source.count('if (IOS_POOL_IN_HOLE(o)) continue;') == 4, 'the warmer skips only the native hole'
+assert source.count('if (IOS_POOL_IN_HOLE(o) || ios_pool_cold_test(o)) continue;') == 4, 'the warmer skips only the native hole'
 
 harness = r'''
 #include <stdint.h>
