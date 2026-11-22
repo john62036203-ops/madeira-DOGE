@@ -22275,8 +22275,8 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
          * past the broad band check. MH Wilds (build 258): ~770 MB of FEX heap, 94 % of it in
          * the compressor once a scene loads; regions of 1 MB and up are ~570 MB of it in a few
          * hundred commits (the <1 MB ones are ~9,500 regions, too many extents).
-         * MADEIRA_SWAP_FEX_MIN_KB overrides the 1 MB floor. */
-        static int fexsw = -1; static size_t fexmin;
+         * MADEIRA_SWAP_FEX_MIN_KB overrides the 1 MB floor, and then the tier's floor is not applied. */
+        static int fexsw = -1, fexown; static size_t fexmin;
         if (fexsw < 0)
         {
             const char *v = getenv( "MADEIRA_SWAP_FEX" ), *m = getenv( "MADEIRA_SWAP_FEX_MIN_KB" );
@@ -22284,6 +22284,10 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
             fexsw = v && v[0] == '1';
             if (kb < 64) kb = 64;
             fexmin = (size_t)kb << 10;
+            /* A MADEIRA_SWAP_FEX_MIN_KB line is the whole floor for the arena: without it
+             * the tier's own floor applies as well (broad: 4 MB), and God of War's FEX heap
+             * is mostly 1-4 MB commits (build 675: 359 backed at 4092 KB, 1137 at 1 MB). */
+            fexown = m && m[0];
         }
         if (fexsw && ios_fex_arena_base_unix && b >= ios_fex_arena_base_unix && b + size <= ios_fex_arena_end_unix &&
             ios_swap_proc_is_game())
@@ -22292,7 +22296,7 @@ static int ios_swap_why( const void *base, size_t size, unsigned int vprot, stru
             size_t ps = ios_jit_pool_size_global;
             if ((ps && rx && b < rx + ps && e > rx) || (ps && rw && b < rw + ps && e > rw) || ios_jit_low_overlaps( b, size ))
                 return IOS_SW_FEXJIT;
-            if (size < fexmin || size < ios_swap_min) return IOS_SW_SMALL;
+            if (size < fexmin || (!fexown && size < ios_swap_min)) return IOS_SW_SMALL;
             if (ios_swap_churny( size )) { ios_swap_churn_skips++; return IOS_SW_CHURN; }
             ios_swap_fex_backed++;
             return IOS_SW_BACKED;
