@@ -1140,6 +1140,11 @@ jobs:
       - name: Patch DXMT with frame generation
         run: python3 tools/patch-dxmt-framegen.py
 
+      # MADEIRA_FRAMEGEN_CAP=1 per game: the FPS limit stays on under frame
+      # generation (20 -> 40 on the panel).
+      - name: Patch DXMT frame generation under the FPS limit
+        run: python3 tools/patch-dxmt-framegen-cap.py
+
       # Which encoder a GPU hang or fault came from (madeira_ctl ops 8 and 9).
       - name: Patch DXMT with GPU fault attribution
         run: python3 tools/patch-dxmt-gpu-fault-info.py
