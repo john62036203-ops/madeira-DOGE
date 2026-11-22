@@ -3387,6 +3387,11 @@ struct LibraryDetail: View {
                             Text("The game is held to the FPS limit chosen above and the screen shows twice that, evenly spaced (20 becomes 40). Steadier than doubling a rate that moves around, when the game can hold the limit.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
+                        bcdPicker("Generate frames down to (experimental)", "env.MADEIRA_FRAMEGEN_MIN_FPS", [("", "15 FPS (default)"), ("12", "12 FPS"), ("10", "10 FPS"), ("8", "8 FPS")])
+                        if !bcd.value("env.MADEIRA_FRAMEGEN_MIN_FPS").isEmpty {
+                            Text("By default no frame is generated while the game itself runs under 15 FPS, because frames that far apart interpolate badly. A lower line keeps generating in slow scenes, with more smearing.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     // madeira-doge pass-area: per-game, stored in the game's own file
                     Toggle("Render only the drawn area (experimental)", isOn: Binding(get: { bcd.value("pass-area") == "1" }, set: { setBCDKey("pass-area", $0 ? "1" : "") }))
