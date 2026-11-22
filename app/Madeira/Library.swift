@@ -3380,6 +3380,14 @@ struct LibraryDetail: View {
                         Text("Shows a MetalFX-generated frame between every two rendered frames: twice the frames on screen, at the cost of GPU time, some latency and artifacts at edges and on the HUD. FPS limits do not apply while it is on.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge 2026-11-22: opt-in (tools/patch-dxmt-framegen-cap.py)
+                    if bcd.frameGen == "1" {
+                        Toggle("Keep the FPS limit with frame generation (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FRAMEGEN_CAP") == "1" }, set: { setBCDKey("env.MADEIRA_FRAMEGEN_CAP", $0 ? "1" : "") }))
+                        if bcd.value("env.MADEIRA_FRAMEGEN_CAP") == "1" {
+                            Text("The game is held to the FPS limit chosen above and the screen shows twice that, evenly spaced (20 becomes 40). Steadier than doubling a rate that moves around, when the game can hold the limit.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                     // madeira-doge pass-area: per-game, stored in the game's own file
                     Toggle("Render only the drawn area (experimental)", isOn: Binding(get: { bcd.value("pass-area") == "1" }, set: { setBCDKey("pass-area", $0 ? "1" : "") }))
                     if bcd.value("pass-area") == "1" {
@@ -3677,6 +3685,17 @@ struct LibraryDetail: View {
                     Toggle("Move small allocations to disk when memory runs short (experimental)", isOn: Binding(get: { !bcd.value("swap-low-room-mb").isEmpty }, set: { setBCDKey("swap-low-room-mb", $0 ? "512" : "") }))
                     if !bcd.value("swap-low-room-mb").isEmpty {
                         Text("While the game is within 512 MB of its memory limit or right after a sudden jump in its memory use (a loading screen), small allocations are file-backed as well, so a load burst is less likely to get the game closed. Needs Swap set. Loading may be a little slower while it is active.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge 2026-11-22: per-game, in the game's own file (virtual_ios.c ios_swap_why, ios_swap_heat_level)
+                    Toggle("Move the emulator's own memory to disk (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_SWAP_FEX") == "1" }, set: { setBCDKey("env.MADEIRA_SWAP_FEX", $0 ? "1" : ""); setBCDKey("env.MADEIRA_SWAP_FEX_MIN_KB", $0 ? "1024" : "") }))
+                    if bcd.value("env.MADEIRA_SWAP_FEX") == "1" {
+                        Text("The x86-64 emulator's working memory (blocks of 1 MB and up, never the translated code) is file-backed too. Needs Swap set. God of War: about 1.5 GB less memory in use, enough to stop it being closed at the limit, but with long pauses while loading unless the next toggle is on as well.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Keep often-read blocks in memory while there is room (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_SWAP_HEAT") == "2" }, set: { setBCDKey("env.MADEIRA_SWAP_HEAT", $0 ? "2" : ""); setBCDKey("env.MADEIRA_SWAP_HEAT_FP_MB", $0 ? "5200" : "") }))
+                    if bcd.value("env.MADEIRA_SWAP_HEAT") == "2" {
+                        Text("Block sizes that keep being read back from the swap file stay in memory instead, as long as the game uses less than 5,200 MB; above that everything is file-backed again. Needs Swap set. Fewer pauses for more memory in use (God of War with the toggle above: 34 pauses in 44 minutes instead of 21 in 5, peak 5,650 MB). The 5,200 MB line suits an 8 GB iPhone; env.MADEIRA_SWAP_HEAT_FP_MB in the game's file moves it.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     // madeira-doge pool-spare-guard: per-game, in the game's own file
