@@ -3561,6 +3561,12 @@ struct LibraryDetail: View {
                         Text("A game that draws depth first and then colours only the pixels whose depth is exactly equal can lose scattered pixels here, because the two passes differ in the last bits (God of War: white and blue dots on characters). Such draws pass when the depth is equal or nearer and get a small depth bias. Assumes reversed depth, as God of War uses. Lives in the d3d11.dll built from DXMT's source, so turning it on also turns on env.MADEIRA_D3D11_SRC. Turn it off if surfaces show through each other.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge: opt-in, in d3d11-src.dll (tools/patch-dxmt-max-latency.py)
+                    bcdPicker("Frames queued ahead of the screen (Direct3D 11, experimental)", "env.MADEIRA_D3D11_MAX_LATENCY", [("", "Default (up to 3)"), ("2", "2"), ("1", "1 (least delay)")])
+                    if !bcd.value("env.MADEIRA_D3D11_MAX_LATENCY").isEmpty {
+                        Text("The game may run up to three frames ahead of the GPU; when the GPU is the limit, the picture is then that many frames behind the game and its sound (about 0.15 s at 18 fps). With 1 or 2 the game waits sooner, so the picture follows the sound and the controls more closely. A GPU-limited game keeps its frame rate; a CPU-limited one may lose some. Needs the d3d11.dll built from DXMT's source (env.MADEIRA_D3D11_SRC = 1); [max-latency] in the log says it is on. Go back to Default if the frame rate drops.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Toggle("God of War: ignore bad exposure readings (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_GOW_EXPOSURE_FILTER") == "1" }, set: { setBCDKey("env.MADEIRA_GOW_EXPOSURE_FILTER", $0 ? "1" : ""); if $0 { setBCDKey("env.MADEIRA_D3D11_SRC", "1") } }))
                     if bcd.value("env.MADEIRA_GOW_EXPOSURE_FILTER") == "1" {
                         Text("God of War (2018) measures the picture's brightness on the GPU and reads the result back; here some readings come back wrong and the picture goes dark, then bright. A wrong reading is replaced by the last good one. A workaround: the cause of the wrong readings is not known. For this game only. Lives in the d3d11.dll built from DXMT's source, so turning it on also turns on env.MADEIRA_D3D11_SRC.")

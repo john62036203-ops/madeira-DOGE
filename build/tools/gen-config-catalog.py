@@ -158,6 +158,12 @@ OVERLAY = {
                 "note": "madeira-doge (BCD 0.1.659, from Porthole 0143; an A/B experiment). 1 exactly: the JIT entry point right "
                         "after a guest CALL has no suspend doorbell test (the callee's entry point or ExitFunctionEC tested it): two "
                         "instructions fewer per call return. Unset: every entry point as before. 64-bit (ARM64EC) module only."},
+    "env.MADEIRA_D3D11_MAX_LATENCY": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Frames the game may queue ahead of the GPU",
+                "kind": "choice", "default": "", "sources": ["tools/patch-dxmt-max-latency.py"],
+                "choices": [("", "Default (3, or what the game sets)"), ("2", "2"), ("1", "1")],
+                "note": "madeira-doge. 1 or 2: DXMT's command queue waits for frame N-1 (or N-2) after presenting frame N, "
+                        "instead of N-3, at every Present: less delay between the game (and its sound) and the picture when "
+                        "the GPU is the limit. Source-built d3d11 only (env.MADEIRA_D3D11_SRC = 1). Logged as [max-latency]."},
     "env.MADEIRA_FEX_ALIAS_GRANULES": {"category": "x86 emulation (FEX)", "title": "x64 to ARM64EC call targets by one table probe",
                 "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-alias-granules.py"],
                 "note": "madeira-doge (Playport fex 0071, the alias item of MADEIRA_FEX_BATCH2). 1 exactly: ExitFunctionEC and "

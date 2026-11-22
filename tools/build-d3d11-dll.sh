@@ -206,6 +206,9 @@ python3 "$R/tools/patch-dxmt-rb-map-log.py" "$OUT/tree/src/d3d11" \
 # madeira-doge: env.MADEIRA_GOW_EXPOSURE_FILTER = 1 (God of War workaround: last good metering result instead of the bad one).
 python3 "$R/tools/patch-dxmt-gow-exposure-filter.py" "$OUT/tree/src/d3d11" \
     || echo "::warning::tools/patch-dxmt-gow-exposure-filter.py did not apply; d3d11-src.dll is built without the exposure filter"
+# madeira-doge: env.MADEIRA_D3D11_MAX_LATENCY = 1 or 2, fewer frames queued ahead of the GPU (picture closer to the sound).
+python3 "$R/tools/patch-dxmt-max-latency.py" "$OUT/tree/src/d3d11" \
+    || echo "::warning::tools/patch-dxmt-max-latency.py did not apply; d3d11-src.dll is built without MADEIRA_D3D11_MAX_LATENCY"
 # madeira-doge: env.MADEIRA_CS_CB_LOG = 1 logs the shared constants a compute dispatch is encoded with ([cs-cb]).
 python3 "$R/tools/patch-dxmt-cs-cb-log.py" "$OUT/tree/src/d3d11" \
     || echo "::warning::tools/patch-dxmt-cs-cb-log.py did not apply; d3d11-src.dll is built without the [cs-cb] log"
