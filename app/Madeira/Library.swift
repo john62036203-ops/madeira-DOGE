@@ -3441,9 +3441,9 @@ struct LibraryDetail: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     // madeira-doge Playport fex 0083: opt-in (tools/patch-fex-ios-pause.py)
-                    Toggle("Let spin-wait loops rest the CPU core (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_PAUSE") == "wfe" }, set: { setBCDKey("env.MADEIRA_FEX_PAUSE", $0 ? "wfe" : "") }))
-                    if bcd.value("env.MADEIRA_FEX_PAUSE") == "wfe" {
-                        Text("x86 PAUSE, which game threads run while they wait for each other, becomes ARM's WFE: the core waits for an event instead of spinning at full speed, leaving power and heat budget to the threads doing work (from Playport; The Witcher 3 went from 22.4 to 24.4 fps). 64-bit games. Turn it off if the game stutters or gets slower.")
+                    bcdPicker("Spin-wait loops (x86 PAUSE; FEX, experimental)", "env.MADEIRA_FEX_PAUSE", [("", "Spin at full speed (default)"), ("wfe", "Rest the core (wfe)"), ("yield-os", "Give the core away (yield-os)"), ("wait-os", "Sleep briefly (wait-os)")])
+                    if !bcd.value("env.MADEIRA_FEX_PAUSE").isEmpty {
+                        Text("What x86 PAUSE, which game threads run while they wait for each other, becomes. Rest the core: ARM's WFE, the core waits for an event instead of spinning (from Playport; The Witcher 3 went from 22.4 to 24.4 fps). Give the core away: every 128th PAUSE hands the core to a waiting thread, if there is one. Sleep briefly: every 128th PAUSE takes the thread off its core for a moment, which leaves the most power and heat budget to the threads doing work. 64-bit games; read when the game starts ([fex-pause] in the log says which is on). Go back to the default if the game stutters or gets slower.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     // madeira-doge Playport wine-pe 0050: opt-in (tools/patch-wine-ntdll-x64fast.py, ntdll-x64fast.dll)

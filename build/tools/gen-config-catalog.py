@@ -225,7 +225,8 @@ OVERLAY = {
                         "inline under a lock, with the same result. Unset or 0: the trap, as before. Read when each program starts."},
     "env.MADEIRA_FEX_PAUSE": {"category": "x86 emulation (FEX)", "title": "What x86 PAUSE compiles to",
                 "kind": "choice", "default": "", "sources": ["tools/patch-fex-ios-pause.py"],
-                "choices": [("", "YIELD (default)"), ("wfe", "WFE"), ("isb", "ISB")],
+                "choices": [("", "YIELD (default)"), ("wfe", "WFE"), ("isb", "ISB"), ("yield-os", "YIELD, every 128th gives the core away"),
+                            ("wait-os", "YIELD, every 128th blocks the thread")],
                 "note": "madeira-doge (Playport fex 0083). Unset: PAUSE is YIELD, which Apple's cores treat as a NOP, so a game's "
                         "spin-wait loop runs flat out. wfe: the core waits for the next event (Playport: The Witcher 3 22.4 -> 24.4 fps, "
                         "the other cores got the power back). isb: a short pipeline flush. 64-bit programs; read when each program "
