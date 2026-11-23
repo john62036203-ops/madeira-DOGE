@@ -1394,6 +1394,13 @@ jobs:
           cp dxmt/src/winemetal/unix/winemetal_unix.c "$RUNNER_TEMP/winemetal_unix.pre-heap.c"
           python3 tools/patch-winemetal-heap-untracked.py || { echo "::warning::heap-untracked was not applied"; cp "$RUNNER_TEMP/winemetal_unix.pre-heap.c" dxmt/src/winemetal/unix/winemetal_unix.c; }
 
+      # madeira-doge, opt-in and off by default: env.MADEIRA_FRAME_WG = <fps>
+      # makes each presented frame an os_workgroup interval with a deadline
+      # (build/ntdll-unix/thread_ios.c); this adds the once-a-frame call. After
+      # the frame cap patch, whose anchor it would otherwise split.
+      - name: Patch winemetal frame workgroup tick
+        run: python3 tools/patch-winemetal-frame-wg.py
+
       # WoW64's 32-bit Windows farm (app/Madeira/i386-windows), which upstream
       # builds from the pinned wine and DXMT (build/wine-i386) and does not
       # commit. Cached per wine/DXMT revision; a failure only leaves 32-bit

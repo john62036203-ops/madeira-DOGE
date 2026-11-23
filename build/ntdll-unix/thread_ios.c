@@ -1250,6 +1250,10 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
             extern void ios_thread_qos_exit( unsigned tid );   /* MADEIRA_THREAD_QOS */
             ios_thread_qos_exit( (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread );
         }
+        {
+            extern void madeira_frame_wg_exit_self(void);   /* MADEIRA_FRAME_WG */
+            madeira_frame_wg_exit_self();
+        }
     }
     pthread_exit( UIntToPtr(status) );
 }
@@ -1477,9 +1481,166 @@ static int tq_store( unsigned tid, qos_class_t cls, const char *name )
     return changed;
 }
 
+/* frame-wg: env.MADEIRA_FRAME_WG = <fps> (10..240; opt-in, madeira-doge).
+ *
+ * iOS's performance controller picks core types and clock speeds from what it can
+ * see: how busy each thread is and, for work that declares one, a deadline. A game
+ * under Madeira declares none: its frames are produced by guest threads that iOS
+ * knows nothing about. God of War, 2026-11-23 (logs bc47634c, 6d446740, a33340a0;
+ * every PAUSE mode): in gameplay the two performance cores ran at their lowest
+ * clock (1.26 GHz) with about one of them in use, 2.5-3 efficiency cores did the
+ * work at 1.79 GHz and the guest threads spent 8-10 thread-seconds a second
+ * runnable but not running, at 12-19 fps; in the menus the same process had a
+ * performance core at 3.5 GHz.
+ *
+ * With the switch every guest thread joins one interval workgroup
+ * (os_workgroup_interval_create, the default type, which needs no entitlement and
+ * gets its own thread group), and every presented frame ends one interval and
+ * starts the next with the deadline 1/fps away (madeira_frame_wg_tick, called by
+ * winemetal's presentDrawable: tools/patch-winemetal-frame-wg.py). A frame that
+ * takes longer than that is a missed deadline the controller is told about.
+ * Whether it answers with faster cores is what the switch is there to find out.
+ *
+ * libdispatch aborts the process when a thread starts, finishes or leaves a
+ * workgroup it is not a member of, or exits while a member, so: a thread's join
+ * token lives under a pthread key whose destructor leaves the workgroup (dynamic
+ * keys are destroyed before libdispatch's own), the thread-exit path leaves first,
+ * and the tick only runs on a thread holding a token. The functions are looked up
+ * by name, so nothing is added to the app's link. Unset = nothing changes. */
+#include <dlfcn.h>
+#include <mach/mach_time.h>
+
+struct fw_token { uint32_t sig; char opaque[60]; };   /* os_workgroup_join_token_s: 4 + 36 bytes */
+static pthread_once_t fw_once = PTHREAD_ONCE_INIT;
+static void *fw_wg;                 /* os_workgroup_interval_t; NULL = off */
+static pthread_key_t fw_key;        /* this thread's join token while it is a member */
+static uint64_t fw_period;          /* 1/fps in mach ticks */
+static int  (*fw_join)( void *, void * );
+static void (*fw_leave)( void *, void * );
+static int  (*fw_start)( void *, uint64_t, uint64_t, void * );
+static int  (*fw_finish)( void *, void * );
+static int fw_members, fw_join_errs, fw_busy, fw_started;
+static unsigned fw_ticks, fw_late, fw_errs;
+static uint64_t fw_deadline;
+static __thread int fw_tried;
+
+static void fw_leave_token( void *tok )   /* the key's destructor */
+{
+    if (!tok) return;
+    fw_leave( fw_wg, tok );
+    __atomic_sub_fetch( &fw_members, 1, __ATOMIC_RELAXED );
+    free( tok );
+}
+
+static void fw_init(void)
+{
+    const char *e = getenv( "MADEIRA_FRAME_WG" );
+    int fps = e ? atoi( e ) : 0;
+    void *(*create)( const char *, uint32_t, void * );
+    mach_timebase_info_data_t tb;
+    void *wg;
+
+    if (!e || !*e || !strcmp( e, "0" )) return;
+    if (fps < 10 || fps > 240)
+    {
+        dprintf( 2, "[frame-wg] MADEIRA_FRAME_WG=%s ignored: a frame rate from 10 to 240\n", e );
+        return;
+    }
+    create    = dlsym( RTLD_DEFAULT, "os_workgroup_interval_create" );
+    fw_join   = dlsym( RTLD_DEFAULT, "os_workgroup_join" );
+    fw_leave  = dlsym( RTLD_DEFAULT, "os_workgroup_leave" );
+    fw_start  = dlsym( RTLD_DEFAULT, "os_workgroup_interval_start" );
+    fw_finish = dlsym( RTLD_DEFAULT, "os_workgroup_interval_finish" );
+    if (!create || !fw_join || !fw_leave || !fw_start || !fw_finish)
+    {
+        dprintf( 2, "[frame-wg] off: the workgroup functions are not in this iOS (create %p join %p leave %p start %p finish %p)\n",
+                 create, fw_join, fw_leave, fw_start, fw_finish );
+        return;
+    }
+    if (mach_timebase_info( &tb ) || !tb.numer || pthread_key_create( &fw_key, fw_leave_token )) return;
+    fw_period = 1000000000ull / fps * tb.denom / tb.numer;
+    errno = 0;
+    if (!(wg = create( "madeira.frame", 32 /* OS_CLOCK_MACH_ABSOLUTE_TIME */, NULL )))
+    {
+        dprintf( 2, "[frame-wg] off: os_workgroup_interval_create failed (%s)\n", strerror( errno ) );
+        return;
+    }
+    __atomic_store_n( &fw_wg, wg, __ATOMIC_RELEASE );
+    dprintf( 2, "[frame-wg] MADEIRA_FRAME_WG=%d: guest threads join workgroup %p, each presented frame is an interval with its deadline %.1f ms away\n",
+             fps, wg, 1000.0 / fps );
+}
+
+/* every guest thread, on itself (madeira_guest_qos_self) */
+static void fw_join_self(void)
+{
+    struct fw_token *tok;
+    int r;
+
+    pthread_once( &fw_once, fw_init );
+    if (!__atomic_load_n( &fw_wg, __ATOMIC_ACQUIRE ) || fw_tried) return;
+    fw_tried = 1;
+    if (pthread_getspecific( fw_key ) || !(tok = calloc( 1, sizeof(*tok) ))) return;
+    if ((r = fw_join( fw_wg, tok )))
+    {
+        free( tok );
+        if (__atomic_fetch_add( &fw_join_errs, 1, __ATOMIC_RELAXED ) < 4)
+            dprintf( 2, "[frame-wg] a thread could not join: %s\n", strerror( r ) );
+        return;
+    }
+    pthread_setspecific( fw_key, tok );
+    __atomic_add_fetch( &fw_members, 1, __ATOMIC_RELAXED );
+}
+
+/* thread exit, on the exiting thread */
+void madeira_frame_wg_exit_self(void)
+{
+    void *tok;
+    if (!__atomic_load_n( &fw_wg, __ATOMIC_ACQUIRE ) || !(tok = pthread_getspecific( fw_key ))) return;
+    pthread_setspecific( fw_key, NULL );
+    fw_leave_token( tok );
+}
+
+/* winemetal's presentDrawable: the frame boundary, on the thread that presents */
+void madeira_frame_wg_tick(void)
+{
+    uint64_t now;
+    int r;
+
+    if (!__atomic_load_n( &fw_wg, __ATOMIC_ACQUIRE )) return;
+    if (!pthread_getspecific( fw_key ))
+    {
+        fw_tried = 0;
+        fw_join_self();
+        if (!pthread_getspecific( fw_key )) return;
+    }
+    if (__atomic_exchange_n( &fw_busy, 1, __ATOMIC_ACQUIRE )) return;
+    now = mach_absolute_time();
+    if (fw_started)
+    {
+        if ((r = fw_finish( fw_wg, NULL )) && fw_errs++ < 4)
+            dprintf( 2, "[frame-wg] interval finish failed: %s\n", strerror( r ) );
+        if (now > fw_deadline) fw_late++;
+        fw_started = 0;
+    }
+    if (!(r = fw_start( fw_wg, now, now + fw_period, NULL )))
+    {
+        fw_started = 1;
+        fw_deadline = now + fw_period;
+    }
+    else if (fw_errs++ < 4) dprintf( 2, "[frame-wg] interval start failed: %s\n", strerror( r ) );
+    if (!(++fw_ticks % 512))
+    {
+        dprintf( 2, "[frame-wg] %u frames, %u of the last 512 past their deadline, %d threads in the workgroup, %u errors\n",
+                 fw_ticks, fw_late, __atomic_load_n( &fw_members, __ATOMIC_RELAXED ), fw_errs );
+        fw_late = 0;
+    }
+    __atomic_store_n( &fw_busy, 0, __ATOMIC_RELEASE );
+}
+
 /* sync.c's ios_eco_apply_self calls this in place of pthread_set_qos_class_self_np */
 int madeira_guest_qos_self( qos_class_t cls, int rel )
 {
+    fw_join_self();   /* MADEIRA_FRAME_WG */
     if (cls == QOS_CLASS_USER_INTERACTIVE && tq_self_tid && tq_enabled())
     {
         char name[48];
