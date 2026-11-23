@@ -1350,8 +1350,31 @@ static struct tq_thread tq_threads[TQ_MAX_THREADS];   /* tid 0 = free slot */
 static __thread unsigned tq_self_tid;                 /* set once the TEB is known */
 static __thread qos_class_t tq_self_applied;          /* class this thread set through the switch, 0 = none */
 
+/* madeira-doge: env.MADEIRA_THREAD_RT = "TaskManager*;DxRenderThread" (opt-in) gives the threads whose
+ * name matches a pattern Mach's time-constraint (real-time) policy instead of a QoS class: the policy
+ * audio threads use, which the scheduler runs ahead of every timeshare thread. Tried for God of War
+ * (2026-11-23), whose fights ran on the efficiency cores with the performance cores at their lowest
+ * clock whatever was tried. Its rules go ahead of MADEIRA_THREAD_QOS's. */
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#define TQ_CLASS_RT ((qos_class_t)0x99)
+
+static int tq_set_realtime(void)
+{
+    mach_timebase_info_data_t tb;
+    thread_time_constraint_policy_data_t pol;
+    if (mach_timebase_info( &tb ) || !tb.numer) return -1;
+    pol.period = 0;
+    pol.computation = (uint32_t)(4000000ull * tb.denom / tb.numer);    /* 4 ms */
+    pol.constraint  = (uint32_t)(8000000ull * tb.denom / tb.numer);    /* within 8 ms */
+    pol.preemptible = 1;
+    return thread_policy_set( pthread_mach_thread_np( pthread_self() ), THREAD_TIME_CONSTRAINT_POLICY,
+                              (thread_policy_t)&pol, THREAD_TIME_CONSTRAINT_POLICY_COUNT ) == KERN_SUCCESS ? 0 : -1;
+}
+
 static const char *tq_class_name( qos_class_t c )
 {
+    if (c == TQ_CLASS_RT) return "real-time";
     switch (c)
     {
     case QOS_CLASS_USER_INTERACTIVE: return "user-interactive";
@@ -1401,8 +1424,23 @@ static char *tq_trim( char *s, char *end )   /* [s, end) without surrounding bla
 
 static void tq_init_once(void)
 {
-    const char *e = getenv( "MADEIRA_THREAD_QOS" );
+    const char *e = getenv( "MADEIRA_THREAD_QOS" ), *rt = getenv( "MADEIRA_THREAD_RT" );
     char buf[1024], *p, *next;
+    if (rt && *rt)
+    {
+        snprintf( buf, sizeof(buf), "%s", rt );
+        for (p = buf; p && *p && tq_nrules < TQ_MAX_RULES; p = next)
+        {
+            char *semi = strchr( p, ';' ), *end = semi ? semi : p + strlen( p ), *pat;
+            next = semi ? semi + 1 : NULL;
+            pat = tq_trim( p, end );
+            if (!*pat || strlen( pat ) >= sizeof(tq_rules[0].pat)) continue;
+            strcpy( tq_rules[tq_nrules].pat, pat );
+            tq_rules[tq_nrules++].cls = TQ_CLASS_RT;
+        }
+        dprintf( 2, "[thread-qos] MADEIRA_THREAD_RT: %d real-time rule(s)\n", tq_nrules );
+    }
+    tq_on = tq_nrules > 0;
     if (!e || !*e) return;
     snprintf( buf, sizeof(buf), "%s", e );
     for (p = buf; p && *p && tq_nrules < TQ_MAX_RULES; p = next)
@@ -1647,7 +1685,9 @@ int madeira_guest_qos_self( qos_class_t cls, int rel )
         qos_class_t want = tq_lookup( tq_self_tid, name );
         if (want)
         {
-            int r = pthread_set_qos_class_self_np( want, 0 );
+            int r;
+            if (want == TQ_CLASS_RT && tq_self_applied == TQ_CLASS_RT) return 0;   /* set once; it is not a QoS class */
+            r = want == TQ_CLASS_RT ? tq_set_realtime() : pthread_set_qos_class_self_np( want, 0 );
             if (want != tq_self_applied)
             {
                 tq_self_applied = want;

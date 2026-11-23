@@ -3453,6 +3453,12 @@ struct LibraryDetail: View {
                         Text("Three fixes from BCD for 64-bit games: helper programs a game starts (services.exe, cmd.exe and the like) no longer crash at once in the emulator; quitting a game no longer crashes in the emulator now and then (about 3 in 100 exits in BCD's logs); a thread that ends no longer leaves a stale pointer behind that a later error could crash on. A [fex-bcd-fixes] line in the log says it is on. Turn it off if the game hangs at start or on exit.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge: opt-in (build/ntdll-unix/thread_ios.c MADEIRA_THREAD_RT), God of War's thread names
+                    Toggle("Run God of War's worker and render threads as real-time (experimental)", isOn: Binding(get: { !bcd.value("env.MADEIRA_THREAD_RT").isEmpty }, set: { setBCDKey("env.MADEIRA_THREAD_RT", $0 ? "TaskManager*;DxRenderThread*;dxmt-encode-thr*" : "") }))
+                    if !bcd.value("env.MADEIRA_THREAD_RT").isEmpty {
+                        Text("Gives the named threads the real-time scheduling audio threads get, ahead of everything else, to see whether iOS then runs them on the performance cores at full speed. Can stutter, break the sound or do nothing; turn it off if the game gets worse. Read when the game starts ([thread-qos] in the log).")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge: opt-in (build/ntdll-unix/thread_ios.c frame-wg, tools/patch-winemetal-frame-wg.py)
                     bcdPicker("Tell iOS each frame's deadline (experimental)", "env.MADEIRA_FRAME_WG", [("", "Off (default)"), ("30", "30 fps"), ("40", "40 fps"), ("60", "60 fps")])
                     if !bcd.value("env.MADEIRA_FRAME_WG").isEmpty {
