@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FEX: what x86 PAUSE compiles to on iOS (MADEIRA_FEX_PAUSE=wfe, isb, yield-os[:K] or wait-os[:K[:U]]; opt-in).
+"""FEX: what x86 PAUSE compiles to on iOS (MADEIRA_FEX_PAUSE=wfe, isb, yield-os[:K], yield-sw[:K] or wait-os[:K[:U]]; opt-in).
 
 madeira-doge, from Playport (playportdev/playport patches/fex 0083, PLA-455). FEX
 compiles PAUSE (REP NOP) to YIELD, which Apple's cores treat as a NOP, so a guest
@@ -19,8 +19,15 @@ compiled under one mode runs under another.
 yield-os and wait-os (Playport fex 0084 and 0086): WFE still holds the core, so under the power clamp, with the
 efficiency cores full and threads queued, a spinning thread keeps a runnable one waiting. yield-os[:K] keeps YIELD and
 makes every K-th PAUSE (default 128) a swtch_pri Mach trap (the core goes to a waiting thread, if any); wait-os[:K[:U]]
-makes it a thread_switch that blocks the thread U microseconds (default 50). Playport counts PAUSEs per guest thread in
-the CPU state frame; this port counts them in one process-wide word instead, so the frame layout is untouched.
+makes it a thread_switch that blocks the thread U microseconds (default 50). yield-sw[:K] (madeira-doge) makes it a
+swtch Mach trap: like swtch_pri it lets a thread waiting for this core run, but it does not depress the caller's
+priority, so the caller competes again at once (swtch_pri leaves it at the lowest priority until it next runs).
+
+PAUSEs are counted per guest thread, as Playport does, in a word of the CPU state frame the thread already has
+(IosLastCallbackLR, a diagnostic witness an ARM64EC thread writes only on a path it should never take), so the frame
+layout is untouched. Until build 685 one process-wide word was counted instead: every 128th PAUSE of the whole
+process trapped, whichever thread ran it, so a thread that spun twice for a lock could be the one taken off its core
+(God of War, 2026-11-23: unrelated threads sampled in swtch_pri).
 
 Applied by tools/build-xtajit64.sh (restores MiscOps.cpp after its build);
 idempotent; a moved anchor refuses the patch and the build goes on without it.
@@ -36,20 +43,15 @@ INCLUDE_ANCHOR = '#include "Interface/Core/JIT/JITClass.h"\n'
 INCLUDE = "#include <cstdlib>\n#include <cstring>\n"
 
 OLD = "DEF_OP(Yield) {\n  yield();\n}\n"
-NEW = '''/* madeira-doge pause-mode: the count of PAUSEs since the last trap, shared by every guest thread (racy on purpose:
- * it only decides which PAUSE traps). */
-#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
-static uint64_t MadeiraPauseCount;
-#endif
-
-DEF_OP(Yield) {
+NEW = '''DEF_OP(Yield) {
 #ifdef FEX_IOS_HOST
   /* madeira-doge pause-mode (Playport fex 0083, 0084, 0086): MADEIRA_FEX_PAUSE picks what x86 PAUSE compiles to.
-   * wfe, isb: that instruction. yield-os[:K]: YIELD, and every K-th one (default 128, 1-4095) a swtch_pri Mach trap,
-   * which runs another runnable thread on this core if one waits. wait-os[:K[:U]]: as yield-os, but the trap is
-   * thread_switch with SWITCH_OPTION_DISPATCH_CONTENTION, which blocks the thread for U microseconds (default 50,
-   * 1-5000) whatever else is runnable. Unset or anything else keeps YIELD, which Apple's cores treat as a NOP.
-   * Read once per process. */
+   * wfe, isb: that instruction. yield-os[:K]: YIELD, and every K-th PAUSE of a thread (default 128, 1-4095) a
+   * swtch_pri Mach trap, which runs another runnable thread on this core if one waits and leaves the caller at the
+   * lowest priority until it next runs. yield-sw[:K]: the same with the swtch trap, which does not depress the
+   * caller. wait-os[:K[:U]]: the trap is thread_switch with SWITCH_OPTION_DISPATCH_CONTENTION, which blocks the
+   * thread for U microseconds (default 50, 1-5000) whatever else is runnable. Unset or anything else keeps YIELD,
+   * which Apple's cores treat as a NOP. Read once per process. The count is the thread's own (a word of its frame). */
   struct PauseOption {
     int Mode;
     uint32_t After;
@@ -83,8 +85,9 @@ DEF_OP(Yield) {
       O.Mode = 1;
     } else if (!strcmp(Env, "isb")) {
       O.Mode = 2;
-    } else if (!strncmp(Env, "yield-os", 8) || !strncmp(Env, "wait-os", 7)) {
+    } else if (!strncmp(Env, "yield-os", 8) || !strncmp(Env, "yield-sw", 8) || !strncmp(Env, "wait-os", 7)) {
       const bool Wait = Env[0] == 'w';
+      const bool Sw = !Wait && Env[6] == 's';
       const char* P = Env + (Wait ? 7 : 8);
       bool Good = true;
       if (*P == ':') {
@@ -96,14 +99,16 @@ DEF_OP(Yield) {
         }
       }
       if (Good && !*P) {
-        O.Mode = Wait ? 4 : 3;
+        O.Mode = Wait ? 4 : Sw ? 5 : 3;
       }
     }
     if (O.Mode == 1 || O.Mode == 2) {
       LogMan::Msg::IFmt("[fex-pause] PAUSE compiles to {} (MADEIRA_FEX_PAUSE)", O.Mode == 1 ? "WFE" : "ISB");
     } else if (O.Mode) {
-      LogMan::Msg::IFmt("[fex-pause] PAUSE is YIELD and every {}th one {} (MADEIRA_FEX_PAUSE={})", O.After,
-                        O.Mode == 3 ? "gives the core up (swtch_pri)" : "blocks the thread (thread_switch)", Env);
+      LogMan::Msg::IFmt("[fex-pause] PAUSE is YIELD and every {}th one of a thread {} (MADEIRA_FEX_PAUSE={})", O.After,
+                        O.Mode == 3 ? "gives the core up (swtch_pri)" :
+                        O.Mode == 5 ? "lets a waiting thread in (swtch)" : "blocks the thread (thread_switch)",
+                        Env);
     } else {
       LogMan::Msg::IFmt("[fex-pause] MADEIRA_FEX_PAUSE={} not understood: PAUSE stays YIELD", Env);
     }
@@ -118,22 +123,26 @@ DEF_OP(Yield) {
     return;
   }
 #ifdef ARCHITECTURE_arm64ec
-  if (Pause.Mode == 3 || Pause.Mode == 4) {
+  if (Pause.Mode >= 3) {
     /* Darwin's Mach traps keep every register but x0 and set no flags the guest holds; x0, x1, x2 and x16 are
-     * saved in TMP1-TMP4 (x10-x13 on ARM64EC) around the trap. SUB and CBZ, not CMP: NZCV is the guest's. */
+     * saved in TMP1-TMP4 (x10-x13 on ARM64EC) around the trap. SUB and CBZ, not CMP: NZCV is the guest's.
+     * The count is this thread's: IosLastCallbackLR of its frame (see the patch's notes). */
+    static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosLastCallbackLR) % 8 == 0 &&
+                  offsetof(FEXCore::Core::CpuStateFrame, IosLastCallbackLR) <= 32760,
+                  "the PAUSE count is loaded with a scaled LDR");
     ARMEmitter::ForwardLabel Trap;
     ARMEmitter::ForwardLabel Done;
-    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, reinterpret_cast<uint64_t>(&MadeiraPauseCount));
-    ldr(TMP2, TMP1, 0);
+    ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, IosLastCallbackLR));
     add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
     sub(ARMEmitter::Size::i64Bit, TMP3, TMP2, Pause.After);
+    lsr(ARMEmitter::Size::i64Bit, TMP3, TMP3, 63); /* 0 once the count reached K (a stale witness value traps at once) */
     (void)cbz(ARMEmitter::Size::i64Bit, TMP3, &Trap);
-    str(TMP2, TMP1, 0);
+    str(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, IosLastCallbackLR));
     yield();
     (void)b(&Done);
 
     (void)Bind(&Trap);
-    str(ARMEmitter::XReg::zr, TMP1, 0);
+    str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, IosLastCallbackLR));
     mov(ARMEmitter::Size::i64Bit, TMP1, ARMEmitter::Reg::r0);
     mov(ARMEmitter::Size::i64Bit, TMP2, ARMEmitter::Reg::r16);
     if (Pause.Mode == 4) {
@@ -143,6 +152,8 @@ DEF_OP(Yield) {
       movz(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, 3);          /* SWITCH_OPTION_DISPATCH_CONTENTION */
       movz(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, Pause.Usec); /* microseconds */
       movn(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r16, 60);        /* thread_switch, trap -61 */
+    } else if (Pause.Mode == 5) {
+      movn(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r16, 59);        /* swtch, trap -60 */
     } else {
       movn(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r16, 58);        /* swtch_pri, trap -59 */
     }
@@ -186,4 +197,4 @@ if __name__ == "__main__":
         print("patch-fex-ios-pause: already in")
     else:
         path.write_text(result)
-        print("FEX: MADEIRA_FEX_PAUSE=wfe|isb|yield-os[:K]|wait-os[:K[:U]] picks what x86 PAUSE compiles to (opt-in; YIELD otherwise)")
+        print("FEX: MADEIRA_FEX_PAUSE=wfe|isb|yield-os[:K]|yield-sw[:K]|wait-os[:K[:U]] picks what x86 PAUSE compiles to (opt-in; YIELD otherwise)")
