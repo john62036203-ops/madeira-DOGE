@@ -3453,6 +3453,12 @@ struct LibraryDetail: View {
                         Text("Three fixes from BCD for 64-bit games: helper programs a game starts (services.exe, cmd.exe and the like) no longer crash at once in the emulator; quitting a game no longer crashes in the emulator now and then (about 3 in 100 exits in BCD's logs); a thread that ends no longer leaves a stale pointer behind that a later error could crash on. A [fex-bcd-fixes] line in the log says it is on. Turn it off if the game hangs at start or on exit.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge: opt-in (build/ntdll-unix/thread_ios.c frame-wg, tools/patch-winemetal-frame-wg.py)
+                    bcdPicker("Tell iOS each frame's deadline (experimental)", "env.MADEIRA_FRAME_WG", [("", "Off (default)"), ("30", "30 fps"), ("40", "40 fps"), ("60", "60 fps")])
+                    if !bcd.value("env.MADEIRA_FRAME_WG").isEmpty {
+                        Text("iOS picks which cores a thread gets and how fast they run from how busy the thread looks, and a game here looks idle to it: God of War ran its fights on the efficiency cores with the performance cores at their lowest speed. This puts the game's threads in one work group and marks every frame as work due in 1/fps, so iOS is told when frames come late. Whether iOS answers with faster cores is not known yet; it can also cost battery and heat. Read when the game starts ([frame-wg] in the log).")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge Playport fex 0083: opt-in (tools/patch-fex-ios-pause.py)
                     bcdPicker("Spin-wait loops (x86 PAUSE; FEX, experimental)", "env.MADEIRA_FEX_PAUSE", [("", "Spin at full speed (default)"), ("wfe", "Rest the core (wfe)"), ("yield-os", "Give the core away (yield-os)"), ("yield-os:16", "Give the core away sooner (yield-os:16)"), ("yield-sw", "Let a waiting thread in (yield-sw)"), ("wait-os", "Sleep briefly (wait-os)"), ("wait-os:16", "Sleep briefly, sooner (wait-os:16)")])
                     if !bcd.value("env.MADEIRA_FEX_PAUSE").isEmpty {
