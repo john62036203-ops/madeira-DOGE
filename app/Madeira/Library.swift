@@ -3530,6 +3530,12 @@ struct LibraryDetail: View {
                         Text("DLLs copied into the JIT pool leave their all-zero gaps between sections untouched, so those pages cost no memory and are not kept warm (from Madeira PR #632: about 120 MB less in a Path of Exile 2 session at its stronger level; this switch uses the safer level 1). The log shows [pool-trim] lines. Turn it off if a game crashes at start.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD 0.1.712 change: opt-in
+                    Toggle("Run a big x64 program from its file when the JIT pool is full (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_X64_IMAGE_NOCOPY_FIT") == "1" }, set: { setBCDKey("env.MADEIRA_X64_IMAGE_NOCOPY_FIT", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_X64_IMAGE_NOCOPY_FIT") == "1" {
+                        Text("An x64-only EXE or DLL whose JIT pool copy cannot fit right now (the pool is too full, or the file is bigger than the whole pool) runs from its loaded file instead of failing to load with [jit-pool] EXHAUSTED (from BCD 0.1.712). Files that fit keep their copy, so nothing changes for a game that starts today. The log shows [x64-image] ... MADEIRA_X64_IMAGE_NOCOPY_FIT lines.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge BCD 0.1.682 Direct3D 12 change: opt-in, madeira-d3d12 only
                     Toggle("Release textures after the GPU lets go (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("tex-defer") == "1" }, set: { setBCDKey("tex-defer", $0 ? "1" : "") }))
                     if bcd.value("tex-defer") == "1" {

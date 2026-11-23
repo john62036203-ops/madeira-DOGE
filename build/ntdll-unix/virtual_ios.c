@@ -16965,6 +16965,59 @@ static int ios_x64_image_nocopy_enabled(void)
     return cached;
 }
 
+/* madeira-doge (BCD 0.1.712 round 707 S1 S1, and round 625 S14-b; opt-in here): env.MADEIRA_X64_IMAGE_NOCOPY_FIT = 1.
+ * A pure-x64 image whose JIT-pool copy cannot fit (larger than the whole pool, or larger than any free place of
+ * the pool right now) was copied anyway and the copy was refused ("[jit-pool] EXHAUSTED ... FAILING the load"):
+ * the program never started. With the switch on, only such an image runs from its PE VA, as
+ * MADEIRA_X64_IMAGE_NOCOPY runs it; an image that may fit keeps its copy. Unset: nothing changes. */
+static int ios_x64_image_nocopy_fit_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *s = getenv( "MADEIRA_X64_IMAGE_NOCOPY_FIT" );
+        cached = (s && s[0] == '1' && !s[1]) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* 1 when the copy of total_size bytes cannot fit the pool (see above); the room found goes to *room. Called under
+ * virtual_mutex; takes ios_pool_lock as the pool's allocator does. Counted generously: the largest free run, the
+ * main pool's untouched part, the low pool's part for images, the big-image slot, whichever is largest. */
+static int ios_x64_image_copy_cannot_fit( size_t total_size, size_t *room )
+{
+    const size_t code_reserve = 4u * 1024 * 1024, slack = 0x10000;
+    size_t pool = ios_jit_pool_size_global, largest = 0, main_virgin = 0, c_virgin, c_image_virgin, hole, avail;
+    int i;
+
+    *room = 0;
+    if (!pool)
+    {
+        const char *sz = getenv( "WINE_IOS_JIT_SIZE" );
+        pool = sz ? (size_t)strtoull( sz, NULL, 16 ) : 0;
+        *room = pool;
+        return pool && total_size > pool;   /* the pool is not up yet: only an image larger than the whole pool */
+    }
+    if (total_size > pool) { *room = pool; return 1; }
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < (int)ios_pool_free_count; i++)
+        if (ios_pool_freelist[i].size > largest) largest = ios_pool_freelist[i].size;
+    hole = ios_pool_hole_between( pool, jit_pool_offset, ios_jit_tail_reserved, ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+    if (jit_pool_offset <= pool && ios_jit_tail_reserved <= pool - jit_pool_offset &&
+        hole <= pool - jit_pool_offset - ios_jit_tail_reserved)
+        main_virgin = pool - jit_pool_offset - ios_jit_tail_reserved - hole;
+    c_virgin = ios_jit_low_reserved < ios_jit_low_size_global ? ios_jit_low_size_global - ios_jit_low_reserved : 0;
+    c_image_virgin = c_virgin > code_reserve ? c_virgin - code_reserve : 0;
+    avail = largest;
+    if (main_virgin > avail) avail = main_virgin;
+    if (c_image_virgin > avail) avail = c_image_virgin;
+    if (ios_pool_big_size && total_size >= IOS_POOL_BIG_MIN && (!ios_pool_big_taken || ios_pool_big_freed_at) && ios_pool_big_size > avail)
+        avail = ios_pool_big_size;
+    pthread_mutex_unlock( &ios_pool_lock );
+    *room = avail;
+    return total_size + slack > avail;
+}
+
 /* The request is host-page rounded (16 KB) while SizeOfImage is only 4 KB
  * aligned, so a last section's request ends up to 12 KB past the view: GTA V
  * Enhanced build 423 (2026-10-07 09:18), GTA5_Enhanced.exe 0x72d4840000+
@@ -16992,7 +17045,7 @@ static int ios_x64_image_is_host_data( const void *base, size_t size )
 #ifdef WINE_IOS
     struct file_view *view;
 
-    if (!ios_x64_image_nocopy_enabled()) return 0;
+    if (!ios_x64_image_nocopy_enabled() && !ios_x64_image_nocopy_fit_enabled()) return 0;
     if (!(view = find_view( base, 0 ))) return 0;
     if (!(view->protect & VPROT_X64DATA)) return 0;
     return ios_x64_image_view_covers( (uintptr_t)view->base, view->size, (uintptr_t)base, size );
@@ -25150,6 +25203,24 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             dprintf( 2, "[x64-image] %s %p+0x%lx mapped without a pool copy (pure x64: the emulator runs "
                         "it at the PE VA; MADEIRA_X64_IMAGE_NOCOPY)\n",
                      debugstr_us(nt_name), ptr, (unsigned long)total_size );
+    }
+    else if (ios_x64_image_nocopy_fit_enabled() && !ios_map_resource_view && !ios_wow_base() &&
+             nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+             nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+             !(view->protect & VPROT_ARM64EC) && !image_info->is_hybrid && !image_info->wine_builtin)
+    {   /* madeira-doge MADEIRA_X64_IMAGE_NOCOPY_FIT: see ios_x64_image_copy_cannot_fit */
+        static int fit_images;
+        size_t room;
+        if (ios_x64_image_copy_cannot_fit( total_size, &room ))
+        {
+            view->protect |= VPROT_X64DATA;
+            ios_x64nc_note( ptr, total_size );
+            if (fit_images++ < 64)
+                dprintf( 2, "[x64-image] %s %p+0x%lx: the JIT pool has %lu MB for the %lu MB copy: running it from the "
+                            "loaded image (MADEIRA_X64_IMAGE_NOCOPY_FIT)\n",
+                         debugstr_us(nt_name), ptr, (unsigned long)total_size, (unsigned long)(room >> 20),
+                         (unsigned long)(total_size >> 20) );
+        }
     }
     ios_fft_arena_patch( ptr, nt, sec, total_size, nt_name );   /* ml1299 */
 #endif

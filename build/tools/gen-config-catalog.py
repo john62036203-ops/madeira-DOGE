@@ -287,6 +287,12 @@ OVERLAY = {
                         "madeira.cfg: when the session logs [jit-pool] EXHAUSTED, pool-split = 1 and "
                         "env.MADEIRA_X64_IMAGE_NOCOPY = 1 are added to the game's own config (a key it already sets stays), "
                         "and the alert after the session asks for Madeira to be reopened. Unset or 0: nothing is added."},
+    "env.MADEIRA_X64_IMAGE_NOCOPY_FIT": {"category": "Memory & JIT pool", "title": "Pure-x64 images without a copy when the JIT pool is full",
+                "kind": "bool", "default": "0",
+                "note": "madeira-doge (BCD 0.1.712, opt-in here): 1 in a game's file (Game details toggle): an x64-only image "
+                        "whose JIT-pool copy cannot fit (larger than the whole pool, or than any free place of the pool now) "
+                        "runs from its loaded image, as MADEIRA_X64_IMAGE_NOCOPY runs it, instead of failing the load "
+                        "([jit-pool] EXHAUSTED). Images that may fit keep their copy. Unset or 0: nothing changes."},
     "env.MADEIRA_X64_IMAGE_NOCOPY": {"category": "Memory & JIT pool", "title": "Pure-x64 images without a JIT-pool copy",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: an x64-only image (not ARM64EC hybrid, not a Wine builtin) in a 64-bit "
