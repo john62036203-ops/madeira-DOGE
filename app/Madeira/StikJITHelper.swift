@@ -1,5 +1,14 @@
 import UIKit
 
+/// madeira-doge: libproc's proc_regionfilename (the path of the file mapped at an address of this
+/// process; 0 when the region is not a file mapping), looked up at run time so a missing symbol
+/// only loses the name. Used for the pool placement log.
+private func madeiraProcRegionFilename(_ pid: Int32, _ address: UInt64, _ buffer: UnsafeMutablePointer<CChar>, _ buffersize: UInt32) -> Int32 {
+    typealias Fn = @convention(c) (Int32, UInt64, UnsafeMutableRawPointer?, UInt32) -> Int32
+    guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "proc_regionfilename") else { return 0 }
+    return unsafeBitCast(sym, to: Fn.self)(pid, address, UnsafeMutableRawPointer(buffer), buffersize)
+}
+
 /// Helper to enable JIT via StikDebug/StikJIT URL scheme.
 /// Opens StikDebug with Madeira's bundled script, polls for CS_DEBUGGED,
 /// then allocates JIT memory and detaches the debugger.
@@ -581,7 +590,12 @@ enum StikJITHelper {
                     }
                     if kr != KERN_SUCCESS || a >= vm_address_t(guestLo) { break }
                     if rsize >= 64 << 20 {
-                        lines.append(String(format: "0x%lx+%luMB tag%u prot%d share%d", Int(a), Int(rsize >> 20), ext.user_tag, Int(ext.protection), Int(ext.share_mode)))
+                        // madeira-doge: the mapped file's name when there is one (2026-11-23: a 71-132 MB
+                        // read-only region right above the window took the pool's first run, FF7 Remake).
+                        var name = [CChar](repeating: 0, count: 1024)
+                        let got = madeiraProcRegionFilename(getpid(), UInt64(a), &name, UInt32(name.count))
+                        let file = got > 0 ? " file=" + ((String(cString: name) as NSString).lastPathComponent) : ""
+                        lines.append(String(format: "0x%lx+%luMB tag%u prot%d share%d", Int(a), Int(rsize >> 20), ext.user_tag, Int(ext.protection), Int(ext.share_mode)) + file)
                         shown += 1
                     }
                     a += vm_address_t(rsize)

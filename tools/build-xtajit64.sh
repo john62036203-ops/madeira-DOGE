@@ -171,6 +171,10 @@ python3 "$R/tools/patch-fex-ios-inline-smc-split.py" "$R/FEX/FEXCore/Source/Inte
 python3 "$R/tools/patch-fex-ios-rwx-section-smc.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-codelock-reentry.py" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp"
 python3 "$R/tools/patch-fex-ios-codelock-why.py" "$R/FEX"
+# madeira-doge: a thread that owns the process heap defers its invalidation instead of parking on the
+# code-invalidation lock (FF7 Remake, build 695: heap owner <-> lock owner). MADEIRA_FEX_HEAP_INVAL_DEFER=0 = the old wait.
+python3 "$R/tools/patch-fex-ios-heap-holder-inval.py" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp" \
+    || echo "::warning::patch-fex-ios-heap-holder-inval.py did not apply (the heap-owner deadlock fix is not in this build)"
 python3 "$R/tools/patch-fex-ios-callret-trust.py" "$R/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp"
 python3 "$R/tools/patch-fex-ios-ssa-bytes.py" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
 python3 "$R/tools/patch-fex-ios-smc-read.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"

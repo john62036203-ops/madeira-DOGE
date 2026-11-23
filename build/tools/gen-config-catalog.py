@@ -258,6 +258,11 @@ OVERLAY = {
                         "boundary faults on Apple's processors and was done by the exception thread ([mach_exc] UNALIGNED-LSE, "
                         "25-30 microseconds each); with this the 64-bit emulator tests the operand first and does such an operation "
                         "inline under a lock, with the same result. Unset or 0: the trap, as before. Read when each program starts."},
+    "env.MADEIRA_FEX_HEAP_INVAL_DEFER": {"category": "x86 emulation (FEX)", "title": "Heap owner defers code invalidation",
+                "kind": "bool", "default": "1",
+                "note": "madeira-doge: on unless 0. A thread that owns the process heap's lock and is told that memory changed does "
+                        "not park on the emulator's code-invalidation lock: after about 20 ms the range is queued for the next "
+                        "holder (FINAL FANTASY VII REMAKE froze at start with the two locks held crosswise). 0: the old wait."},
     "env.MADEIRA_FEX_PAUSE": {"category": "x86 emulation (FEX)", "title": "What x86 PAUSE compiles to",
                 "kind": "choice", "default": "", "sources": ["tools/patch-fex-ios-pause.py"],
                 "choices": [("", "YIELD (default)"), ("wfe", "WFE"), ("isb", "ISB"), ("yield-os", "YIELD, every 128th gives the core away"),
