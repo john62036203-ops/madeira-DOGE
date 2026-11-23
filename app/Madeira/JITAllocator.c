@@ -971,7 +971,11 @@ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
         madeira_early_window_base = win; madeira_early_window_size = winsz;
     }
     /* Largest no-overwrite run starting at the window's end, 16MB granularity. */
-    for (sz = 1024ul << 20; sz >= (256ul << 20); sz -= (16ul << 20)) {
+    /* madeira-doge: down to 64MB (was 256MB). With a 576MB window (exe-window-mb) the run between the
+     * window and the main thread's stack is 100-180MB, so no placeholder was ever taken and a 71-132MB
+     * runtime mapping landed there on some launches: the pool shrank to 256-272MB and FINAL FANTASY VII
+     * REMAKE ran out of it while loading (logs 2026-11-23 22:50, 23:05, 23:52, 2026-11-24 06:30). */
+    for (sz = 1024ul << 20; sz >= (64ul << 20); sz -= (16ul << 20)) {
         a = win + winsz;
         if (vm_allocate(mach_task_self(), &a, sz, VM_FLAGS_FIXED) == KERN_SUCCESS && a == win + winsz) {
             vm_protect(mach_task_self(), a, sz, 0, VM_PROT_NONE);
