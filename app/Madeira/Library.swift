@@ -3813,6 +3813,15 @@ struct LibraryDetail: View {
                     Toggle("Report an NVIDIA GPU", isOn: Binding(get: { bcd.nvidia }, set: { on in
                         bcd.nvidia = on; LibraryPrefs.setNvidia(on, for: entry.windowsPath)
                     }))
+                    // madeira-doge 2026-11-23: opt-in (tools/build-dxmt-nvngx.sh, tools/patch-nvapi-dlss.py)
+                    Toggle("DLSS on MetalFX (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_DLSS") == "1" }, set: { on in
+                        if on { bcd.nvidia = true; LibraryPrefs.setNvidia(true, for: entry.windowsPath) }
+                        setBCDKey("env.MADEIRA_DLSS", on ? "1" : "")
+                    }))
+                    if bcd.value("env.MADEIRA_DLSS") == "1" {
+                        Text("A game with DLSS Super Resolution can choose it in its own settings; Apple's MetalFX temporal upscaler then builds the picture from a lower-resolution one, using the game's depth and motion. Turns on \"Report an NVIDIA GPU\" (the game has to see an NVIDIA card). Costs GPU time and memory, and not every game accepts it; turn it off if the game stops or the picture breaks.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Toggle("Older NVIDIA card (Direct3D 9)", isOn: Binding(get: { bcd.olderNvidia }, set: { on in
                         bcd.olderNvidia = on; LibraryPrefs.setOlderNvidia(on, for: entry.windowsPath)
                     }))
