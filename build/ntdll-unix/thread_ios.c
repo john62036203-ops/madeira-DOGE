@@ -1639,11 +1639,14 @@ void madeira_frame_wg_exit_self(void)
 }
 
 /* winemetal's presentDrawable: the frame boundary, on the thread that presents */
+volatile uint64_t madeira_last_present_ticks;   /* mach time of the last presented frame: the stall sampler (server_ios.c) */
+
 void madeira_frame_wg_tick(void)
 {
     uint64_t now;
     int r;
 
+    __atomic_store_n( &madeira_last_present_ticks, mach_absolute_time(), __ATOMIC_RELAXED );
     if (!__atomic_load_n( &fw_wg, __ATOMIC_ACQUIRE )) return;
     if (!pthread_getspecific( fw_key ))
     {

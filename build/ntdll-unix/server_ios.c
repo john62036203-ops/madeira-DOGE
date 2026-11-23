@@ -3038,6 +3038,28 @@ static void ios_thread_sampler_main(void)
         {
             usleep( 100000 );
             if (stuck_check) ios_stuck_store_check();
+            {   /* madeira-doge stall sampler: a game that was presenting frames and has shown none for 0.8 s
+                 * gets one thread pass and one guest profile now, and one more of each at 3 s (God of War,
+                 * 2026-11-24: stalls of 1-5 s with only the main thread running, which the 20 s bursts never
+                 * landed in). Nothing until the next frame after that. */
+                extern volatile uint64_t madeira_last_present_ticks;
+                static uint64_t stall_of; static int stall_shots; static mach_timebase_info_data_t stb;
+                uint64_t last = __atomic_load_n( &madeira_last_present_ticks, __ATOMIC_RELAXED ), ms;
+                if (!stb.denom) mach_timebase_info( &stb );
+                if (last && stb.denom)
+                {
+                    if (last != stall_of) { stall_of = last; stall_shots = 0; }
+                    ms = (mach_absolute_time() - last) * stb.numer / stb.denom / 1000000;
+                    if ((stall_shots == 0 && ms >= 800) || (stall_shots == 1 && ms >= 3000))
+                    {
+                        stall_shots++;
+                        wine_log_write( "[stall] no frame for %llu ms: thread pass and guest profile %d of 2", (unsigned long long)ms, stall_shots );
+                        ios_thread_sampler_pass( 0 );
+                        ++gen; ios_guest_rip_profile( gen );
+                        wine_log_write( "[stall] sample %d done", stall_shots );
+                    }
+                }
+            }
         }
         for (b = 0; b < 4; b++) { ios_thread_sampler_pass(b); usleep(250000); }
         wine_log_write("[thread-sample] ml876 burst done");
