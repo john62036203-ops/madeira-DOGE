@@ -1470,6 +1470,13 @@ jobs:
         continue-on-error: true
         run: bash tools/build-dxmt-nvapi.sh
 
+      # DXMT's NGX core (dxmt/src/nvngx): a game's DLSS Super Resolution on the
+      # MetalFX temporal scaler. Opt-in per game (env.MADEIRA_DLSS = 1 with
+      # "Report an NVIDIA GPU"); the files are inert otherwise.
+      - name: Build DXMT nvngx.dll
+        continue-on-error: true
+        run: bash tools/build-dxmt-nvngx.sh
+
       # Upstream ships no faultrep.dll; games that import it (Ghost of
       # Tsushima) fail in the loader with STATUS_DLL_NOT_FOUND.
       - name: Build faultrep.dll

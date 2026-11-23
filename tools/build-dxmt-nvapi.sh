@@ -43,6 +43,9 @@ python3 "$R/tools/patch-nvapi-gpu-info.py" "$OUT/nvapi.cpp"
 # The query trace and the adapter / display / driver answers in the session
 # log; the one display found by its adapter name (docs/got-gpu-check.md).
 python3 "$R/tools/patch-nvapi-trace.py" "$OUT/nvapi.cpp"
+# MADEIRA_DLSS=1: the registry value and the signature answer NVIDIA's NGX
+# client needs before it loads DXMT's NGX core (tools/build-dxmt-nvngx.sh).
+python3 "$R/tools/patch-nvapi-dlss.py" "$OUT/nvapi.cpp"
 
 "$MINGW/arm64ec-w64-mingw32-clang++" -std=c++20 -O2 -shared -o "$OUT/nvapi64.dll" \
     "$OUT/nvapi.cpp" "$D/src/nvapi/nvapi64.def" \
@@ -52,7 +55,7 @@ python3 "$R/tools/patch-nvapi-trace.py" "$OUT/nvapi.cpp"
     -I"$D/include" -I"$D/libs" -I"$U" -I"$D/src/winemetal" -I"$D/external/nvapi" -I"$D/src/nvapi" -I"$D/src/d3d11" -I"$D/src/dxgi" \
     -DNOMINMAX -D_WIN32_WINNT=0xa00 -DDXMT_IOS=1 -DDXMT_PAGE_SIZE=4096 -fblocks \
     -Wno-microsoft-exception-spec \
-    -L"$OUT" -lwinemetal -ldxgi -lntdll -static -Wl,--file-alignment=4096 -Wl,--section-alignment=16384 \
+    -L"$OUT" -lwinemetal -ldxgi -lntdll -ladvapi32 -static -Wl,--file-alignment=4096 -Wl,--section-alignment=16384 \
     2> "$OUT/nvapi.err" || { grep -m 20 "error" "$OUT/nvapi.err"; exit 1; }
 "$MINGW/llvm-strip" --strip-debug "$OUT/nvapi64.dll"
 
