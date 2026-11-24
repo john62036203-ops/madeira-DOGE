@@ -10,8 +10,12 @@ normal values, dark picture = wrong values. The cause upstream of the readback i
 path, groupshared sync and the encoder optimiser are ruled out).
 
 This is a workaround, not the fix: with env.MADEIRA_GOW_EXPOSURE_FILTER = 1, a READ map of a 16-byte staging resource
-whose values fall in the wrong result's window (first in -1.5..0.5 and third in 900..1800) gets the last values that
+whose values fall in the wrong result's window (first in -1.5..0.5 and third in 500..3000) gets the last values that
 were outside that window written over it before the game reads them. [exp-filter] logs the counts every 600 maps.
+The third value's bounds were 900..1800 until build 705. At 1280x720 with metalfx-upscale = 1.5 (2026-11-24, build 705,
+dark picture again) the wrong result came as first -0.52..-0.66, third 2037..2400 and passed as good; normal results in
+that run and the others still had the first value at 1.7 or more, so the first value decides and the third only keeps
+unrelated 16-byte readbacks out.
 
 Applied by tools/build-d3d11-dll.sh to its copy of the sources, AFTER tools/patch-dxmt-rb-map-log.py (argument: that d3d11
 directory). Source-built d3d11 only (env.MADEIRA_D3D11_SRC = 1). Idempotent; fails by name if the anchor moved.
@@ -34,7 +38,7 @@ NEW = OLD + """          /* madeira-doge: gow exposure filter (tools/patch-dxmt-
               float exp_v[4];
               std::memcpy(exp_v, staging->mappedImmediateMemory(), 16);
               const bool exp_bad =
-                  exp_v[0] > -1.5f && exp_v[0] < 0.5f && exp_v[2] > 900.0f && exp_v[2] < 1800.0f;
+                  exp_v[0] > -1.5f && exp_v[0] < 0.5f && exp_v[2] > 500.0f && exp_v[2] < 3000.0f;
               exp_maps++;
               if (exp_bad) {
                 if (exp_have) {
