@@ -22500,6 +22500,19 @@ static int ios_swap_churny( size_t size )
     int i;
     if (ios_swap_heat_skip( size )) return 1;   /* madeira-bcd swap-heat (opt-in) */
     if (!ios_swap_broad) return 0;
+    {
+        /* madeira-doge: env.MADEIRA_SWAP_CHURN = 0 turns the churn filter off (default: on, as before). FINAL FANTASY VII
+         * REMAKE, 2026-11-24 00:05: 0x200000 and 0x1000000 were marked churny within seconds and 5375 later blocks of the
+         * eight marked sizes stayed anonymous; the game was ended at its memory limit with 2.8 GB compressed. */
+        static int churn_off = -1;
+        if (churn_off < 0)
+        {
+            const char *e = getenv( "MADEIRA_SWAP_CHURN" );
+            churn_off = (e && e[0] == '0' && !e[1]) ? 1 : 0;
+            if (churn_off) dprintf( 2, "[swap] madeira-doge: churn filter off (MADEIRA_SWAP_CHURN=0): sizes whose blocks die young stay file-backed\n" );
+        }
+        if (churn_off) return 0;
+    }
     i = ios_swap_churn_find( size, 0 );
     return i >= 0 && ios_swap_churn_is( (unsigned)i );
 }
