@@ -3453,6 +3453,12 @@ struct LibraryDetail: View {
                         Text("Three fixes from BCD for 64-bit games: helper programs a game starts (services.exe, cmd.exe and the like) no longer crash at once in the emulator; quitting a game no longer crashes in the emulator now and then (about 3 in 100 exits in BCD's logs); a thread that ends no longer leaves a stale pointer behind that a later error could crash on. A [fex-bcd-fixes] line in the log says it is on. Turn it off if the game hangs at start or on exit.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge: opt-in (build/ntdll-unix/thread_ios.c cpu-spin)
+                    Toggle("Keep one core busy so iOS raises the CPU speed (experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_CPU_SPIN") == "1" }, set: { setBCDKey("env.MADEIRA_CPU_SPIN", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_CPU_SPIN") == "1" {
+                        Text("One extra thread does nothing but spin while the game shows frames. The cores of a group share one speed, so a thread that is always busy may make iOS run the game's threads next to it faster. It burns a core's worth of battery and heat, and may do nothing or make the game slower; turn it off then. Read when the game starts ([cpu-spin] in the log).")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge: opt-in (build/ntdll-unix/thread_ios.c MADEIRA_THREAD_RT), God of War's thread names
                     Toggle("Run God of War's worker and render threads as real-time (experimental)", isOn: Binding(get: { !bcd.value("env.MADEIRA_THREAD_RT").isEmpty }, set: { setBCDKey("env.MADEIRA_THREAD_RT", $0 ? "TaskManager*;DxRenderThread*;dxmt-encode-thr*" : "") }))
                     if !bcd.value("env.MADEIRA_THREAD_RT").isEmpty {

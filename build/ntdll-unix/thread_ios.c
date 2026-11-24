@@ -1678,10 +1678,60 @@ void madeira_frame_wg_tick(void)
     __atomic_store_n( &fw_busy, 0, __ATOMIC_RELEASE );
 }
 
+/* cpu-spin: env.MADEIRA_CPU_SPIN = N (1..2; opt-in, madeira-doge). N native threads at user-interactive
+ * that do nothing but spin while the game is presenting frames (a frame in the last second), and sleep
+ * otherwise. God of War, 2026-11-24: in gameplay no thread is busy all the time and the performance
+ * cores sit at 1.26 GHz; in a stall, where the main thread alone runs flat out, the same cores go to
+ * 3.3 GHz. The cores of a cluster share one clock, so a thread that is always busy may pull the clock
+ * up for the game's threads beside it ("waste makes haste", as done for the GPU in Apple developer
+ * forum thread 768160). It costs a core's worth of power and heat; whether iOS raises the clock for it
+ * while the GPU is busy is what the switch is there to find out. */
+static pthread_once_t cs_once = PTHREAD_ONCE_INIT;
+
+static void *cs_main( void *arg )
+{
+    mach_timebase_info_data_t tb;
+    uint64_t sec, spun = 0, last_log = 0;
+    volatile uint64_t sink = 0;
+
+    pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
+    pthread_setname_np( "madeira-cpu-spin" );
+    mach_timebase_info( &tb );
+    sec = 1000000000ull * tb.denom / tb.numer;
+    for (;;)
+    {
+        uint64_t now = mach_absolute_time(), last = __atomic_load_n( &madeira_last_present_ticks, __ATOMIC_RELAXED );
+        if (!last || now - last > sec) { usleep( 100000 ); continue; }
+        while (mach_absolute_time() - now < sec / 100) sink += now;   /* 10 ms flat out, then look again */
+        spun += 10;
+        if (spun - last_log >= 60000)
+        {
+            last_log = spun;
+            dprintf( 2, "[cpu-spin] thread %ld has spun %llu s so far\n", (long)(intptr_t)arg, (unsigned long long)(spun / 1000) );
+        }
+    }
+    return NULL;
+}
+
+static void cs_init(void)
+{
+    const char *e = getenv( "MADEIRA_CPU_SPIN" );
+    int i, n = e ? atoi( e ) : 0;
+    if (n < 1) return;
+    if (n > 2) n = 2;
+    for (i = 0; i < n; i++)
+    {
+        pthread_t t;
+        if (!pthread_create( &t, NULL, cs_main, (void *)(intptr_t)i )) pthread_detach( t );
+    }
+    dprintf( 2, "[cpu-spin] MADEIRA_CPU_SPIN=%d: %d thread(s) spin while frames are being presented\n", n, n );
+}
+
 /* sync.c's ios_eco_apply_self calls this in place of pthread_set_qos_class_self_np */
 int madeira_guest_qos_self( qos_class_t cls, int rel )
 {
     fw_join_self();   /* MADEIRA_FRAME_WG */
+    pthread_once( &cs_once, cs_init );   /* MADEIRA_CPU_SPIN */
     if (cls == QOS_CLASS_USER_INTERACTIVE && tq_self_tid && tq_enabled())
     {
         char name[48];
