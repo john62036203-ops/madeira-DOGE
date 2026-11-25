@@ -7509,6 +7509,38 @@ dispatch_guest_fault:
                                     dprintf( STDERR_FILENO, "[rsp-trunc]   guest stack: %llx %llx %llx %llx\n",
                                              (unsigned long long)stk[0], (unsigned long long)stk[1],
                                              (unsigned long long)stk[2], (unsigned long long)stk[3] );
+                                /* madeira-doge: text the stopped code left behind. God of War stops on
+                                 * its own int3 at GoW.exe+0x5a6238 right after a call that takes a
+                                 * message (builds 695 and 708); print the stack as text and any text
+                                 * the first four stack slots point to, so the log shows the message. */
+                                {
+                                    unsigned char tb[768];
+                                    char tx[768 + 1];
+                                    int ti, tk, run = 0;
+                                    mach_vm_size_t tg = 0;
+                                    if (rsp && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)rsp, sizeof(tb),
+                                            (mach_vm_address_t)tb, &tg ) == KERN_SUCCESS && tg == sizeof(tb))
+                                    {
+                                        for (ti = 0; ti < (int)sizeof(tb); ti++)
+                                        {
+                                            tx[ti] = (tb[ti] >= 0x20 && tb[ti] < 0x7f) ? (char)tb[ti] : '.';
+                                            if (tx[ti] != '.') run++;
+                                        }
+                                        tx[sizeof(tb)] = 0;
+                                        if (run >= 16) dprintf( STDERR_FILENO, "[rsp-trunc]   stack as text: %s\n", tx );
+                                    }
+                                    for (tk = 0; tk < 4; tk++)
+                                    {
+                                        if (stk[tk] < 0x10000 || (stk[tk] >> 47)) continue;
+                                        tg = 0;
+                                        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)stk[tk], 256,
+                                                (mach_vm_address_t)tb, &tg ) != KERN_SUCCESS || tg != 256) continue;
+                                        for (ti = 0; ti < 256 && tb[ti] >= 0x20 && tb[ti] < 0x7f; ti++) tx[ti] = (char)tb[ti];
+                                        tx[ti] = 0;
+                                        if (ti >= 4) dprintf( STDERR_FILENO, "[rsp-trunc]   text at stack[%d]=%llx: %s\n",
+                                                              tk, (unsigned long long)stk[tk], tx );
+                                    }
+                                }
                                 /* madeira-doge: the saved rip can be stale (it is the last block the
                                  * emulator entered through a return); the call that led here is the
                                  * one whose return address is on top of the stack (build 162: rip said
