@@ -258,6 +258,13 @@ OVERLAY = {
                         "boundary faults on Apple's processors and was done by the exception thread ([mach_exc] UNALIGNED-LSE, "
                         "25-30 microseconds each); with this the 64-bit emulator tests the operand first and does such an operation "
                         "inline under a lock, with the same result. Unset or 0: the trap, as before. Read when each program starts."},
+    "env.MADEIRA_FEX_EXEC_RECHECK": {"category": "x86 emulation (FEX)", "title": "Recheck executable mapped memory before failing",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-exec-recheck.py"],
+                "note": "madeira-doge (BCD PR #73, Turing Complete; opt-in here and in BCD). 1 in a game's file (Game details "
+                        "toggle) or madeira.cfg: when the 64-bit emulator finds no executable record for an address it is asked to "
+                        "run, it asks VirtualQuery first; a committed, executable, unguarded MEM_MAPPED view gets that one 4 KB page "
+                        "added ([tc-exec-recheck] restored ..., up to 32 lines). Private memory and data pages are never promoted. "
+                        "Unset or anything but 1: the miss faults as before. Read once per program."},
     "env.MADEIRA_FEX_HEAP_INVAL_DEFER": {"category": "x86 emulation (FEX)", "title": "Heap owner defers code invalidation",
                 "kind": "bool", "default": "1",
                 "note": "madeira-doge: on unless 0. A thread that owns the process heap's lock and is told that memory changed does "

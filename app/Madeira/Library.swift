@@ -3429,6 +3429,12 @@ struct LibraryDetail: View {
                         Text("An x86 atomic operation that straddles a 16-byte boundary faults on Apple's processors and was redone by Madeira's exception handler, 25-30 microseconds each ([mach_exc] UNALIGNED-LSE in the log). FEX now checks first and does it inline under a lock, with the same result (from BCD; Far Cry 4 started much faster). Only helps games whose log shows many UNALIGNED-LSE lines. Turn it off if the game hangs or crashes.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD PR #73 (ceae1eb): opt-in (tools/patch-fex-ios-exec-recheck.py)
+                    Toggle("Recheck executable mapped memory before failing (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_EXEC_RECHECK") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_EXEC_RECHECK", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_EXEC_RECHECK") == "1" {
+                        Text("When the 64-bit emulator is about to refuse code at an address it has no record of, it first asks Windows about that memory; if it is a committed, executable mapped view (not a guard page, not ordinary data), just that 4 KB page is accepted and the game goes on instead of crashing (from BCD; Turing Complete started with it). Only helps a game that crashes at launch or when code is generated at run time. The log shows [tc-exec-recheck] restored ... lines when it steps in. Turn it off if the game crashes or hangs.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge upstream Madeira PR #615 (6cfcc82): opt-in (build/ntdll-unix/process_ios.c)
                     Toggle("Keep 64-bit games from turning off DEP (JIT pool, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_DEP_CALLER") == "1" }, set: { setBCDKey("env.MADEIRA_DEP_CALLER", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_DEP_CALLER") == "1" {

@@ -225,6 +225,12 @@ python3 "$R/tools/patch-fex-ios-bcd653-optin.py" "$R/FEX" || { echo "::warning::
 cp "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp" "$B.JIT.cpp.pre-lean"
 cp "$R/FEX/FEXCore/Source/Interface/Core/JIT/JITClass.h" "$B.JITClass.h.pre-lean"
 python3 "$R/tools/patch-fex-ios-callret-lean.py" "$R/FEX" || { echo "::warning::the lean call return was not applied (FEX anchor changed); xtajit64.dll is built without it"; cp "$B.JIT.cpp.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"; cp "$B.JITClass.h.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JITClass.h"; }
+#  - madeira-doge BCD PR #73 (ceae1eb): patch-fex-ios-exec-recheck.py, MADEIRA_FEX_EXEC_RECHECK=1 rechecks an address
+#    FEX has no executable record for with VirtualQuery and accepts that one page of a committed executable mapped
+#    view (Turing Complete). InvalidationTracker.cpp is saved first; a patch that does not apply, or a build error,
+#    puts it back.
+cp "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp" "$B.InvalidationTracker.cpp.pre-recheck"
+python3 "$R/tools/patch-fex-ios-exec-recheck.py" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp" || { echo "::warning::the exec recheck opt-in was not applied (FEX anchor changed); xtajit64.dll is built without it"; cp "$B.InvalidationTracker.cpp.pre-recheck" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp"; }
 #  - madeira-doge translation-cost opt-ins (2026-11-22), each off unless its switch is 1 when the program starts:
 #    patch-fex-ios-callret-elide.py (BCD 0.1.573): MADEIRA_FEX_CALLRET_ELIDE=1, no call-ret shadow stack upkeep at CALL/RET.
 #    patch-fex-ios-ec-callret-pop.py (Playport fex 0060): MADEIRA_FEX_EC_CALLRET_POP=1, EnterEC pops an indirect CALL's entry.
@@ -261,6 +267,7 @@ build() {
         [ -f "$B.JIT.cpp.pre-lean" ] && cp "$B.JIT.cpp.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
         [ -f "$B.JITClass.h.pre-lean" ] && cp "$B.JITClass.h.pre-lean" "$R/FEX/FEXCore/Source/Interface/Core/JIT/JITClass.h"
         [ -f "$B.Module.cpp.pre-bcd653" ] && cp "$B.Module.cpp.pre-bcd653" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"   # madeira-doge: without the BCD 0.1.653 opt-in too
+        [ -f "$B.InvalidationTracker.cpp.pre-recheck" ] && cp "$B.InvalidationTracker.cpp.pre-recheck" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp"   # madeira-doge: without the exec recheck opt-in too
         cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1 \
             || { grep -m 20 "error" "$B.build.log"; exit 1; }
     fi
