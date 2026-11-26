@@ -3640,6 +3640,14 @@ struct LibraryDetail: View {
                         Text("A game that draws depth first and then colours only the pixels whose depth is exactly equal can lose scattered pixels here, because the two passes differ in the last bits (God of War: white and blue dots on characters). Such draws pass when the depth is equal or nearer and get a small depth bias. Assumes reversed depth, as God of War uses. Lives in the d3d11.dll built from DXMT's source, so turning it on also turns on env.MADEIRA_D3D11_SRC. Turn it off if surfaces show through each other.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge: opt-in, in d3d11-src.dll (tools/patch-dxmt-depth-equal-skinned.py)
+                    if bcd.value("env.MADEIRA_DEPTH_EQUAL_FUNC") == "7" {
+                        Toggle("Tolerant depth-equal test on skinned models only (Direct3D 11, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_DEPTH_EQUAL_SKINNED") == "1" }, set: { setBCDKey("env.MADEIRA_DEPTH_EQUAL_SKINNED", $0 ? "1" : "") }))
+                        if bcd.value("env.MADEIRA_DEPTH_EQUAL_SKINNED") == "1" {
+                            Text("The tolerant test above is used only for models that are animated with bones (characters); everything else gets the game's exact test back. For God of War, where the tolerant test puts blocks of wrong colour around trees against the sky. Untested: if the dots on characters come back, the game does not draw its characters that way and this should be turned off.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                     // madeira-doge: opt-in, in d3d11-src.dll (tools/patch-dxmt-max-latency.py)
                     bcdPicker("Frames queued ahead of the screen (Direct3D 11, experimental)", "env.MADEIRA_D3D11_MAX_LATENCY", [("", "Default (up to 3)"), ("2", "2"), ("1", "1 (least delay)")])
                     if !bcd.value("env.MADEIRA_D3D11_MAX_LATENCY").isEmpty {

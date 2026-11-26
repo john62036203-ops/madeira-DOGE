@@ -221,6 +221,9 @@ python3 "$R/tools/patch-dxmt-lum-src-log.py" "$OUT/tree/src/d3d11" \
 # madeira-doge: env.MADEIRA_DSS_LOG = 1 logs depth-stencil states; env.MADEIRA_DEPTH_EQUAL_FUNC = n remaps depth EQUAL (experiment).
 python3 "$R/tools/patch-dxmt-depth-equal-remap.py" "$OUT/tree/src/d3d11" \
     || echo "::warning::tools/patch-dxmt-depth-equal-remap.py did not apply; d3d11-src.dll is built without the depth EQUAL remap"
+# madeira-doge: env.MADEIRA_DEPTH_EQUAL_SKINNED = 1 keeps the remap above to skinned draws (after the remap patch).
+python3 "$R/tools/patch-dxmt-depth-equal-skinned.py" "$OUT/tree/src/d3d11" \
+    || echo "::warning::tools/patch-dxmt-depth-equal-skinned.py did not apply; d3d11-src.dll is built without MADEIRA_DEPTH_EQUAL_SKINNED"
 grep -q "madeira-bcd: context state swap" "$OUT/tree/src/d3d11/d3d11_context_impl.cpp" || fail "the swap patch left d3d11_context_impl.cpp unchanged"
 
 # DXMT's meson.build: compiler_args, the project defines, buildtype=release
