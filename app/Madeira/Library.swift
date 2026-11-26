@@ -3429,6 +3429,12 @@ struct LibraryDetail: View {
                         Text("An x86 atomic operation that straddles a 16-byte boundary faults on Apple's processors and was redone by Madeira's exception handler, 25-30 microseconds each ([mach_exc] UNALIGNED-LSE in the log). FEX now checks first and does it inline under a lock, with the same result (from BCD; Far Cry 4 started much faster). Only helps games whose log shows many UNALIGNED-LSE lines. Turn it off if the game hangs or crashes.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge BCD 0.1.721 (willfaust/FEX PR #40): opt-in (tools/patch-fex-ios-section-skip.py)
+                    Toggle("Skip code invalidation when data file views are unmapped (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_SECTION_SKIP") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_SECTION_SKIP", $0 ? "1" : "") }))
+                    if bcd.value("env.MADEIRA_FEX_SECTION_SKIP") == "1" {
+                        Text("Each time a game unmaps a file view, the 64-bit emulator takes its code-invalidation lock and walks every thread's code cache, even when that memory never held code. Games that stream assets through file views do this dozens of times a second. With this on, a view that never was executable is skipped (from BCD 0.1.721; RDR2, GTA V, Fallout 4 logs). May help stutter or hangs behind [fexlock] STUCK lines in 64-bit games; the log shows [iOS-xrem] via=section-data lines when it steps in. Turn it off if the game crashes or shows broken code behaviour.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     // madeira-doge BCD PR #73 (ceae1eb): opt-in (tools/patch-fex-ios-exec-recheck.py)
                     Toggle("Recheck executable mapped memory before failing (FEX, experimental)", isOn: Binding(get: { bcd.value("env.MADEIRA_FEX_EXEC_RECHECK") == "1" }, set: { setBCDKey("env.MADEIRA_FEX_EXEC_RECHECK", $0 ? "1" : "") }))
                     if bcd.value("env.MADEIRA_FEX_EXEC_RECHECK") == "1" {
@@ -3564,6 +3570,12 @@ struct LibraryDetail: View {
                     Toggle("Untracked texture heaps (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("heap-untracked") == "1" }, set: { setBCDKey("heap-untracked", $0 ? "1" : "") }))
                     if bcd.value("heap-untracked") == "1" {
                         Text("Metal tracked each Direct3D 12 heap as a whole: a write to one texture made work on every other texture of that heap wait. With this on the heaps are untracked and the Direct3D 12 layer's own ordering (fence-chain = 1, the default) is relied on (from BCD, recommended there for Red Dead Redemption 2). Turn it off if textures flicker or show garbage.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    // madeira-doge BCD 0.1.721 Direct3D 12 change: opt-in, madeira-d3d12 only
+                    Toggle("Neutralise second-output blends Metal would crash on (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("src1-neutralise") == "1" }, set: { setBCDKey("src1-neutralise", $0 ? "1" : "") }))
+                    if bcd.value("src1-neutralise") == "1" {
+                        Text("Metal ends the game (a validation assertion) when a blend reads the pixel shader's second output on any render target but the first, or beside a second target; Direct3D 12 games can leave such blend settings on targets that never use them. With this on, those blend factors are removed before the pipeline is built, so the game keeps running (from BCD 0.1.721: Cyberpunk 2077). Only helps a Direct3D 12 game that closes with no error at a certain scene; the log shows [madeira-d3d12] src1-neutralise when it steps in. Turn it off if blending looks wrong.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     // madeira-doge BCD 0.1.665 Direct3D 12 change: opt-in, madeira-d3d12 only

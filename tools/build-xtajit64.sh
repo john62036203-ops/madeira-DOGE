@@ -231,6 +231,10 @@ python3 "$R/tools/patch-fex-ios-callret-lean.py" "$R/FEX" || { echo "::warning::
 #    puts it back.
 cp "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp" "$B.InvalidationTracker.cpp.pre-recheck"
 python3 "$R/tools/patch-fex-ios-exec-recheck.py" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp" || { echo "::warning::the exec recheck opt-in was not applied (FEX anchor changed); xtajit64.dll is built without it"; cp "$B.InvalidationTracker.cpp.pre-recheck" "$R/FEX/Source/Windows/Common/InvalidationTracker.cpp"; }
+#  - madeira-doge BCD 0.1.721 (willfaust/FEX PR #40): patch-fex-ios-section-skip.py, MADEIRA_FEX_SECTION_SKIP=1 leaves out the code
+#    invalidation of an unmapped section view that was never executable (not for a sub-floor image's window). A patch that does
+#    not apply writes nothing; a build error puts back the file saved above (without this opt-in too).
+python3 "$R/tools/patch-fex-ios-section-skip.py" "$R/FEX" || echo "::warning::the section-unmap skip opt-in was not applied (FEX anchor changed); xtajit64.dll is built without it"
 #  - madeira-doge translation-cost opt-ins (2026-11-22), each off unless its switch is 1 when the program starts:
 #    patch-fex-ios-callret-elide.py (BCD 0.1.573): MADEIRA_FEX_CALLRET_ELIDE=1, no call-ret shadow stack upkeep at CALL/RET.
 #    patch-fex-ios-ec-callret-pop.py (Playport fex 0060): MADEIRA_FEX_EC_CALLRET_POP=1, EnterEC pops an indirect CALL's entry.

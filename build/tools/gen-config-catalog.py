@@ -143,6 +143,13 @@ OVERLAY = {
                         "have completed (Metal's completion queue still touched them: skate. crashed while loading); the reclaim then "
                         "takes every ready entry, textures first. 0: released at once and the reclaim takes at most 64 entries, as "
                         "before. Logged as [madeira-d3d12] tex-defer. Read once per game start."},
+    "src1-neutralise": {"category": "Direct3D 12", "title": "Neutralise SRC1 blends Metal asserts on",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (BCD 0.1.721, always on there; Cyberpunk 2077). 1: SRC1_* / INV_SRC1_* blend factors are kept only "
+                        "on render target 0 with blending on when it is the only valid target; on any other target (or with blending off) "
+                        "the target is written as no blending, and on target 0 beside a second valid target they become ZERO / ONE, "
+                        "because Metal's pipeline validation asserts (the process ends) for them. Logged as [madeira-d3d12] "
+                        "src1-neutralise (8 lines). 0: pipelines are built as before. Read once per game start."},
     "dual-source-drop": {"category": "Direct3D 12", "title": "Rebuild pipelines refused for a missing dual-source output",
                 "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
                 "note": "madeira-doge (BCD 0.1.665, always on there). 1: a render pipeline Metal refuses because its blend factors read "
@@ -258,6 +265,13 @@ OVERLAY = {
                         "boundary faults on Apple's processors and was done by the exception thread ([mach_exc] UNALIGNED-LSE, "
                         "25-30 microseconds each); with this the 64-bit emulator tests the operand first and does such an operation "
                         "inline under a lock, with the same result. Unset or 0: the trap, as before. Read when each program starts."},
+    "env.MADEIRA_FEX_SECTION_SKIP": {"category": "x86 emulation (FEX)", "title": "Skip invalidation for unmapped data views",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-section-skip.py"],
+                "note": "madeira-doge (BCD 0.1.721, willfaust/FEX PR #40; opt-in here and in BCD). 1 (exactly): when a section view "
+                        "is unmapped and its range never intersected the 64-bit emulator's executable intervals (nor a sub-floor "
+                        "image's window), the code invalidation and its lock are skipped and the [iOS-xrem] line is sampled "
+                        "(via=section-data, first 8 then every 1024th). Anything else: every unmap invalidates, as before. 64-bit "
+                        "programs only. Read once per program."},
     "env.MADEIRA_FEX_EXEC_RECHECK": {"category": "x86 emulation (FEX)", "title": "Recheck executable mapped memory before failing",
                 "kind": "bool", "default": "0", "sources": ["tools/patch-fex-ios-exec-recheck.py"],
                 "note": "madeira-doge (BCD PR #73, Turing Complete; opt-in here and in BCD). 1 in a game's file (Game details "
