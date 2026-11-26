@@ -400,7 +400,7 @@ expect(ig[0].choices.map(\.label) == ["944×656 · light", "1152×800 · default
        "iPad 11: labels name each level")
 expect(ig.map(\.title) == ["This screen's shape", "16:9 widescreen · bars above and below", "4:3 classic · bars at the sides"],
        "iPad 11: group titles say how the PC shapes fit")
-expect(sizes(ig[1]) == ["960x540", "1120x630", "1280x720", "1600x900", "1920x1080", "2560x1440"] && sizes(ig[2]) == ["640x480", "800x600", "1024x768", "1280x960"],
+expect(sizes(ig[1]) == ["960x540", "1024x576", "1120x630", "1280x720", "1600x900", "1920x1080", "2560x1440"] && sizes(ig[2]) == ["640x480", "800x600", "1024x768", "1280x960"],
        "iPad 11: the 16:9 and 4:3 sizes")
 expect(!RC.fills(1408, 648, screen: ipad) && RC.fills(1408, 648, screen: phone16), "1408x648 is a phone's shape, not an iPad's")
 expect(RC.defaultSize(for: phone16) == (1408, 648) && sizes(RC.groups(for: phone16)[0]) == ["1168x536", "1408x648", "2120x976", "2868x1320"],
