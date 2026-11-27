@@ -38,6 +38,7 @@ MARKER = "madeira-doge: depth equal skinned"
 HEADER = """#pragma once
 /* madeira-doge: depth equal skinned (tools/patch-dxmt-depth-equal-skinned.py) */
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -85,7 +86,8 @@ inline bool has_prefix(const char *s, const char *prefix) {
   return true;
 }
 
-constexpr uint32_t kMaxLayouts = 256;
+constexpr uint32_t kSlots = 8192; /* power of two; build 721 ran past a 256-entry table (God of War makes one layout per shader) */
+constexpr uint32_t kMaxLayouts = 6000;
 constexpr uint32_t kSkinned = 1; /* has BLENDINDICES / BLENDWEIGHT */
 constexpr uint32_t kStrict = 2;  /* has a semantic named in MADEIRA_DEPTH_EQUAL_STRICT */
 
@@ -93,41 +95,59 @@ struct Layout {
   std::atomic<const void *> ptr{nullptr};
   std::atomic<uint32_t> flags{0};
   std::atomic<uint32_t> binds{0};
-  char names[120];
+  uint32_t id = 0;
+  char names[76];
 };
 
-inline Layout g_layouts[kMaxLayouts];
+inline Layout g_layouts[kSlots];
 inline std::atomic<uint32_t> g_layout_count{0};
 inline std::mutex g_layout_mutex;
 inline std::atomic<uint32_t> g_binds_tolerant{0};
 inline std::atomic<uint32_t> g_binds_strict{0};
 
+inline uint32_t slot_of(const void *layout) {
+  uint64_t h = (uint64_t)(uintptr_t)layout;
+  h = (h >> 4) * 0x9E3779B97F4A7C15ull;
+  return (uint32_t)(h >> 40) & (kSlots - 1);
+}
+
 /* returns the layout's number (1-based), 0 when the table is full */
 inline uint32_t add_layout(const void *layout, uint32_t flags, const char *names) {
   std::lock_guard<std::mutex> lock(g_layout_mutex);
-  const uint32_t n = g_layout_count.load(std::memory_order_relaxed);
-  for (uint32_t i = 0; i < n; i++)
-    if (g_layouts[i].ptr.load(std::memory_order_relaxed) == layout) {
-      g_layouts[i].flags.fetch_or(flags, std::memory_order_relaxed);
-      return i + 1;
+  uint32_t s = slot_of(layout);
+  for (uint32_t probe = 0; probe < kSlots; probe++, s = (s + 1) & (kSlots - 1)) {
+    const void *p = g_layouts[s].ptr.load(std::memory_order_relaxed);
+    if (p == layout) {
+      g_layouts[s].flags.fetch_or(flags, std::memory_order_relaxed);
+      return g_layouts[s].id;
     }
-  if (n >= kMaxLayouts)
-    return 0;
-  std::strncpy(g_layouts[n].names, names, sizeof(g_layouts[n].names) - 1);
-  g_layouts[n].names[sizeof(g_layouts[n].names) - 1] = 0;
-  g_layouts[n].flags.store(flags, std::memory_order_relaxed);
-  g_layouts[n].ptr.store(layout, std::memory_order_relaxed);
-  g_layout_count.store(n + 1, std::memory_order_release);
-  return n + 1;
+    if (p == nullptr) {
+      const uint32_t n = g_layout_count.load(std::memory_order_relaxed);
+      if (n >= kMaxLayouts)
+        return 0;
+      std::strncpy(g_layouts[s].names, names, sizeof(g_layouts[s].names) - 1);
+      g_layouts[s].names[sizeof(g_layouts[s].names) - 1] = 0;
+      g_layouts[s].id = n + 1;
+      g_layouts[s].flags.store(flags, std::memory_order_relaxed);
+      g_layouts[s].ptr.store(layout, std::memory_order_release);
+      g_layout_count.store(n + 1, std::memory_order_release);
+      return n + 1;
+    }
+  }
+  return 0;
 }
 
 inline Layout *find_layout(const void *layout) {
   if (!layout)
     return nullptr;
-  const uint32_t n = g_layout_count.load(std::memory_order_acquire);
-  for (uint32_t i = 0; i < n; i++)
-    if (g_layouts[i].ptr.load(std::memory_order_relaxed) == layout)
-      return &g_layouts[i];
+  uint32_t s = slot_of(layout);
+  for (uint32_t probe = 0; probe < kSlots; probe++, s = (s + 1) & (kSlots - 1)) {
+    const void *p = g_layouts[s].ptr.load(std::memory_order_acquire);
+    if (p == layout)
+      return &g_layouts[s];
+    if (p == nullptr)
+      return nullptr;
+  }
   return nullptr;
 }
 
@@ -243,11 +263,11 @@ IMPL_DSS_NEW = """      /* madeira-doge: depth equal skinned */
           const uint32_t madeira_b = madeira_tol ? madeira_deq::g_binds_strict.load() : ++madeira_deq::g_binds_strict;
           if (((madeira_a + madeira_b) % 40000u) == 0) {
             ERR("[deq] equal-state binds: tolerant ", madeira_a, " strict ", madeira_b);
-            const uint32_t madeira_n = madeira_deq::g_layout_count.load(std::memory_order_acquire);
-            for (uint32_t madeira_i = 0; madeira_i < madeira_n; madeira_i++) {
+            ERR("[deq] layouts known: ", madeira_deq::g_layout_count.load(std::memory_order_acquire));
+            for (uint32_t madeira_i = 0; madeira_i < madeira_deq::kSlots; madeira_i++) {
               const uint32_t madeira_c = madeira_deq::g_layouts[madeira_i].binds.load(std::memory_order_relaxed);
               if (madeira_c >= (madeira_a + madeira_b) / 100u)
-                ERR("[deq]   layout #", madeira_i + 1, " flags ",
+                ERR("[deq]   layout #", madeira_deq::g_layouts[madeira_i].id, " flags ",
                     madeira_deq::g_layouts[madeira_i].flags.load(std::memory_order_relaxed), " binds ", madeira_c, ": ",
                     madeira_deq::g_layouts[madeira_i].names);
             }
@@ -297,13 +317,13 @@ DEV_NEW = """    /* madeira-doge: depth equal skinned (tools/patch-dxmt-depth-eq
         if (!madeira_deq::strict_list().empty() &&
             madeira_deq::strict_list().find(" " + madeira_one + " ") != std::string::npos)
           madeira_flags |= madeira_deq::kStrict;
-        if (madeira_names.size() < 110) {
+        if (madeira_names.size() < 66) {
           madeira_names += madeira_one;
           madeira_names += ' ';
         }
       }
       const uint32_t madeira_id = madeira_deq::add_layout(*ppInputLayout, madeira_flags, madeira_names.c_str());
-      if (++madeira_il_n <= 96)
+      if (++madeira_il_n <= 96 || madeira_id == 0)
         ERR("[deq] layout #", madeira_id, " flags ", madeira_flags, ": ", madeira_names);
     }
     return madeira_il_hr;
