@@ -3659,6 +3659,11 @@ struct LibraryDetail: View {
                             Text("The tolerant test above is used only for models that are animated with bones (characters); everything else gets the game's exact test back. For God of War, where the tolerant test puts blocks of wrong colour around trees against the sky. Untested: if the dots on characters come back, the game does not draw its characters that way and this should be turned off.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
+                        bcdPicker("Keep the exact depth test for models with (experimental)", "env.MADEIRA_DEPTH_EQUAL_STRICT", [("", "Off (default)"), ("TEXCOORD4", "TEXCOORD4"), ("TEXCOORD6", "TEXCOORD6"), ("TEXCOORD7", "TEXCOORD7"), ("TEXCOORD4,TEXCOORD6", "TEXCOORD4 or 6"), ("TEXCOORD4,TEXCOORD7", "TEXCOORD4 or 7"), ("TEXCOORD4,TEXCOORD6,TEXCOORD7", "TEXCOORD4, 6 or 7"), ("COLOR0", "COLOR0")])
+                        if !bcd.value("env.MADEIRA_DEPTH_EQUAL_STRICT").isEmpty {
+                            Text("The other way round: every model gets the tolerant test except those whose vertex data has the chosen element, which keep the game's exact test (wins over the skinned-only switch). For finding the element God of War's foliage uses, so that trees have no blocks and cloth has no dots; the [deq] lines in the log list the vertex formats the game draws with.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     // madeira-doge: opt-in, in d3d11-src.dll (tools/patch-dxmt-max-latency.py)
                     bcdPicker("Frames queued ahead of the screen (Direct3D 11, experimental)", "env.MADEIRA_D3D11_MAX_LATENCY", [("", "Default (up to 3)"), ("2", "2"), ("1", "1 (least delay)")])
