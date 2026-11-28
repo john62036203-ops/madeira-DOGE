@@ -508,6 +508,9 @@ static LONG g_zero_inst;   /* ml1094 */
 static LONG g_fence_waits, g_fence_updates, g_barriers;   /* ml1091 */
 static int g_rcf = -1;   /* madeira-duo root-cbv-fast (mad_root_cbv_fast_on) */
 static volatile LONG g_rcf_hits, g_rcf_misses;
+static int g_bbf = -1;   /* madeira-duo buf-bind-fast (mad_buf_bind_fast_on), from willfaust/Madeira PR #632 */
+static volatile LONG g_bbf_hits, g_bbf_misses;
+static int g_replay_pf = -1;   /* madeira-duo replay-prefetch (mad_replay_prefetch), from willfaust/Madeira PR #632 */
 static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins, g_f6_rclose;   /* ml1134 */
 /* ml1137: GPU census, counts only. Barrier entries by the states they move
  * between, and what a state-aware wait rule would have needed at each
@@ -1906,6 +1909,8 @@ struct mad_list {
     unsigned nused, ucap;
     /* madeira-duo root-cbv-fast: the last root descriptor's buffer (mad_resolve_root) */
     UINT64 rc_lo, rc_len; struct mad_resource *rc_r; LONG64 rc_ver; unsigned rc_hits, rc_misses;
+    /* madeira-duo buf-bind-fast: the buffers the last index and vertex buffer addresses fell in (mad_resolve_bind) */
+    struct { UINT64 lo, len; struct mad_resource *r; } bb_e[8]; LONG64 bb_ver; unsigned bb_next, bb_hits, bb_misses;
     /* Argument buffers: one slot of root values per draw, carved from shared
      * chunks. A draw's root arguments must survive until the GPU reads them,
      * so a single buffer rewritten per draw would race the previous draw. */
@@ -1981,6 +1986,10 @@ static HRESULT STDMETHODCALLTYPE list_Close(ID3D12GraphicsCommandList *This) {
     if (l->rc_hits | l->rc_misses) {   /* madeira-duo root-cbv-fast: one add per list, not per record */
         InterlockedExchangeAdd(&g_rcf_hits, (LONG)l->rc_hits); InterlockedExchangeAdd(&g_rcf_misses, (LONG)l->rc_misses);
         l->rc_hits = l->rc_misses = 0;
+    }
+    if (l->bb_hits | l->bb_misses) {   /* madeira-duo buf-bind-fast */
+        InterlockedExchangeAdd(&g_bbf_hits, (LONG)l->bb_hits); InterlockedExchangeAdd(&g_bbf_misses, (LONG)l->bb_misses);
+        l->bb_hits = l->bb_misses = 0;
     }
     if (l->alloc) InterlockedDecrement(&l->alloc->recording);
     return S_OK;
@@ -6540,17 +6549,34 @@ static void mad_prebuild_start(void) {
         if (h) { CloseHandle(h); g_pb_threads++; }
     }
 }
+/* madeira-duo REPLAY-PREFETCH (madeira.cfg replay-prefetch = N, opt-in, default 0;
+ * from willfaust/Madeira PR #632). The loops that walk a list's recorded
+ * commands (replay and pipeline pre-build) prefetch the command N ahead (1-64).
+ * A prefetch reads no data and cannot fault. 0: nothing changes. */
+static unsigned mad_replay_prefetch(void) {
+    if (g_replay_pf < 0) {
+        int n = mad_cfg_int_pe("replay-prefetch", 0);   /* madeira-duo: N = the replay asks for the recorded command N ahead (1-64) before it works on the current one; 0 = off */
+        if (n < 0) n = 0;
+        if (n > 64) n = 64;
+        if (n) d3d12_log("[madeira-d3d12] replay-prefetch = %d: list replay prefetches %d commands (%u bytes) ahead\n", n, n, (unsigned)(n * sizeof(struct mad_cmd)));
+        g_replay_pf = n;
+    }
+    return (unsigned)g_replay_pf;
+}
 static void mad_prebuild_lists(UINT count, ID3D12CommandList *const *lists) {
     static int on = -1;
     static volatile LONG g_prebuilt, g_prebuild_batches;
     struct mad_pso *v[256]; LONG n = 0; UINT i, k, j;
-    if (on < 0) on = mad_cfg_int_pe("pso-parallel", 1) ? 1 : 0;
+    const size_t pf = (size_t)mad_replay_prefetch() * sizeof(struct mad_cmd);   /* madeira-duo replay-prefetch */
+    if (on < 0) on = mad_cfg_int_pe("pso-parallel", 1) ? 1 : 0;   /* madeira.cfg pso-parallel (default 1): a batch's new pipelines built in parallel */
     if (!on) return;
     for (i = 0; i < count && n < 256; i++) {
         struct mad_list *l = (struct mad_list *)lists[i];
         if (!l || !l->closed || (l->alloc && l->recorded_generation != l->alloc->generation)) continue;   /* the replay rejects these */
         for (k = 0; k < l->ncmds && n < 256; k++) {
-            struct mad_pso *p = l->cmds[k].kind == MC_PSO ? l->cmds[k].u.pso : NULL;
+            struct mad_pso *p;
+            if (pf) __builtin_prefetch((const void *)((uintptr_t)&l->cmds[k] + pf));   /* madeira-duo replay-prefetch */
+            p = l->cmds[k].kind == MC_PSO ? l->cmds[k].u.pso : NULL;
             if (!p) continue;
             if (p->is_compute ? (p->cps || !p->lazy_cs) : (p->rps || !p->lazy)) continue;
             if (!p->is_compute && mad_pso_async_on() && mad_pso_async_queue(p)) continue;   /* pso-async: built in the background */
@@ -9920,6 +9946,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     {
     int hoist = mad_hoist_plan(l), pass;   /* madeira-doge list-hoist */
+    const size_t replay_pf = (size_t)mad_replay_prefetch() * sizeof(struct mad_cmd);   /* madeira-duo replay-prefetch */
     for (pass = 0; pass < (hoist ? 2 : 1); pass++) {
     e.hoist = hoist ? (UINT8)(pass + 1) : 0;
     if (pass == 1) {   /* the graphics pass begins behind everything the compute pass encoded */
@@ -9928,6 +9955,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     }
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
+        if (replay_pf) __builtin_prefetch((const void *)((uintptr_t)c + replay_pf));   /* madeira-duo replay-prefetch */
         if (e.hoist && !(mad_hoist_class(c) & e.hoist)) continue;
         e.cur = i;   /* ml1137 */
         if (g_capture_on) mad_capture_log_op(c);   /* madeira-bcd */
@@ -10415,6 +10443,11 @@ static void mad_perf_present(void) {
             if (g_rcf > 0 && g_perf_presents) {   /* madeira-duo root-cbv-fast */
                 LONG h = InterlockedExchange(&g_rcf_hits, 0), m = InterlockedExchange(&g_rcf_misses, 0);
                 d3d12_log("[perf] root-cbv-fast per frame: %.0f root descriptors took the previous one's buffer, %.0f were searched (%.0f%% hits)\n",
+                          h / (double)g_perf_presents, m / (double)g_perf_presents, h + m ? 100.0 * h / (h + m) : 0.0);
+            }
+            if (g_bbf > 0 && g_perf_presents) {   /* madeira-duo buf-bind-fast */
+                LONG h = InterlockedExchange(&g_bbf_hits, 0), m = InterlockedExchange(&g_bbf_misses, 0);
+                d3d12_log("[perf] buf-bind-fast per frame: %.0f index/vertex buffer addresses took a kept buffer, %.0f were searched (%.0f%% hits)\n",
                           h / (double)g_perf_presents, m / (double)g_perf_presents, h + m ? 100.0 * h / (h + m) : 0.0);
             }
             if (g_f6_used && g_perf_presents) {   /* ml1134 */
@@ -20040,13 +20073,50 @@ static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(ID3D12GraphicsCommandL
     if (t >= D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ && !said++)
         d3d12_log("[madeira-d3d12] topology %u (adjacency or patches) drawn as triangles\n", (unsigned)t);
 }
+/* madeira-duo BUF-BIND-FAST (madeira.cfg buf-bind-fast, opt-in, default 0;
+ * from willfaust/Madeira PR #632). Each list keeps the last eight buffers its
+ * index/vertex buffer addresses fell in; an address inside one skips the
+ * address search. Same rules as root-cbv-fast: only buffers with their own
+ * Metal storage, only while the address index version is unchanged. */
+static int mad_buf_bind_fast_on(void) {
+    if (g_bbf < 0) {
+        int on = mad_cfg_int_pe("buf-bind-fast", 0) > 0;   /* madeira-duo: 1 = an index/vertex buffer address inside one of the list's last eight resolved buffers skips the address search (same answer; only committed buffers, only while no resource was created or released) */
+        if (on) d3d12_log("[madeira-d3d12] buf-bind-fast = 1: index and vertex buffer addresses inside a buffer the list resolved before skip the address search\n");
+        g_bbf = on;
+    }
+    return g_bbf;
+}
+static struct mad_resource *mad_resolve_bind(struct mad_list *l, UINT64 addr, UINT64 *off) {
+    struct mad_device *d = l->device;
+    struct mad_resource *r;
+    LONG64 v;
+    unsigned k;
+    if (!mad_buf_bind_fast_on() || !d) return mad_resolve_address(d, addr, off);
+    v = __atomic_load_n(&d->aidx_ver, __ATOMIC_ACQUIRE);
+    if (v == l->bb_ver && !(v & 1) && !__atomic_load_n(&d->aidx_dirty, __ATOMIC_RELAXED)) {
+        for (k = 0; k < 8; k++) if (l->bb_e[k].r && addr - l->bb_e[k].lo < l->bb_e[k].len) {
+            l->bb_hits++;
+            *off = addr - l->bb_e[k].lo;
+            return l->bb_e[k].r;
+        }
+    }
+    l->bb_misses++;
+    r = mad_resolve_address(d, addr, off);
+    if (r && !r->placed_heap && r->buffer && r->size && !(v & 1) && !__atomic_load_n(&d->aidx_dirty, __ATOMIC_RELAXED) &&
+        __atomic_load_n(&d->aidx_ver, __ATOMIC_ACQUIRE) == v) {   /* answered from the index this version describes */
+        if (l->bb_ver != v) { memset(l->bb_e, 0, sizeof l->bb_e); l->bb_ver = v; l->bb_next = 0; }   /* entries of another version are dropped */
+        k = l->bb_next++ & 7;
+        l->bb_e[k].lo = r->gpu_address; l->bb_e[k].len = r->size; l->bb_e[k].r = r;
+    }
+    return r;
+}
 static void STDMETHODCALLTYPE list_IASetIndexBuffer(ID3D12GraphicsCommandList *This, const D3D12_INDEX_BUFFER_VIEW *view) {
     struct mad_list *l = (struct mad_list *)This;
     struct mad_cmd *c = mad_list_push(l, MC_IB);
     UINT64 off = 0;
     if (!c) return;
     if (!view) return;   /* an unbound index buffer */
-    c->u.ib.res = mad_resolve_address(l->device, view->BufferLocation, &off);
+    c->u.ib.res = mad_resolve_bind(l, view->BufferLocation, &off);   /* madeira-duo buf-bind-fast */
     c->u.ib.off = off;
     c->u.ib.type = view->Format == DXGI_FORMAT_R32_UINT ? WMTIndexTypeUInt32 : WMTIndexTypeUInt16;
     if (!c->u.ib.res) {
@@ -20065,7 +20135,7 @@ static void STDMETHODCALLTYPE list_IASetVertexBuffers(ID3D12GraphicsCommandList 
         if (!c) return;
         c->u.vb.slot = start + i;
         if (views && views[i].BufferLocation) {
-            c->u.vb.res = mad_resolve_address(l->device, views[i].BufferLocation, &off);
+            c->u.vb.res = mad_resolve_bind(l, views[i].BufferLocation, &off);   /* madeira-duo buf-bind-fast */
             c->u.vb.off = off;
             c->u.vb.stride = views[i].StrideInBytes;
             c->u.vb.size = views[i].SizeInBytes;

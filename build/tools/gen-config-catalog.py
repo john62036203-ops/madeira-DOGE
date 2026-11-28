@@ -122,6 +122,15 @@ OVERLAY = {
                 "note": "madeira-doge (willfaust/Madeira PR #632, 9d8c017). 1: a root CBV/SRV/UAV address inside the committed buffer "
                         "the list's previous root descriptor resolved to skips the address search (same answer, only while the address "
                         "index is unchanged). Logged as [perf] root-cbv-fast per frame. 0: every one is searched."},
+    "buf-bind-fast": {"category": "Direct3D 12", "title": "Index/vertex buffers reuse the list's recent buffer lookups",
+                "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (willfaust/Madeira PR #632, 92520a5). 1: an index or vertex buffer address inside one of the last "
+                        "eight committed buffers the list resolved skips the address search (same answer, only while the address index "
+                        "is unchanged). Logged as [perf] buf-bind-fast per frame. 0: every view is searched."},
+    "replay-prefetch": {"category": "Direct3D 12", "title": "Replay prefetches recorded commands",
+                "kind": "int", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
+                "note": "madeira-doge (willfaust/Madeira PR #632, 92520a5). N (1-64): the list replay and the pipeline pre-build pass "
+                        "prefetch the recorded command N ahead (PR #632 uses 12 for Path of Exile 2). 0: off."},
     "fence-chain-frag": {"category": "Direct3D 12", "title": "Fence chain 3 waits at the fragment stage",
                 "kind": "bool", "default": "0", "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"],
                 "note": "madeira-doge (willfaust/Madeira PR #632, 766bcb5). Only with fence-chain = 3. 1: a render pass waits at its "

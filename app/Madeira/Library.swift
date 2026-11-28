@@ -3528,6 +3528,17 @@ struct LibraryDetail: View {
                         Text("A root constant buffer inside the same buffer as the previous one reuses that lookup instead of searching all resources again, which takes CPU work off the game's render threads (from Madeira PR #632; the log shows [perf] root-cbv-fast hit rates). Turn it off if anything draws wrongly.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    // madeira-doge willfaust/Madeira PR #632 (92520a5): opt-in, madeira-d3d12 only
+                    Toggle("Faster index/vertex buffer lookup (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("buf-bind-fast") == "1" }, set: { setBCDKey("buf-bind-fast", $0 ? "1" : "") }))
+                    if bcd.value("buf-bind-fast") == "1" {
+                        Text("Each command list remembers the last eight buffers its index and vertex buffers were found in, so a new one inside them skips the search over all resources, which takes CPU work off the game's render threads (from Madeira PR #632; Path of Exile 2 spent 3-4% of each render thread on this search). The log shows [perf] buf-bind-fast hit rates. Turn it off if anything draws wrongly.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("Prefetch recorded commands during replay (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("replay-prefetch") == "12" }, set: { setBCDKey("replay-prefetch", $0 ? "12" : "") }))
+                    if bcd.value("replay-prefetch") == "12" {
+                        Text("The thread that replays the game's command lists asks the CPU to load the command 12 steps ahead while it works on the current one, so less time is spent waiting on memory (from Madeira PR #632, the value it recommends for Path of Exile 2). Changes nothing the GPU sees.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Toggle("More background pipeline builders (Direct3D 12, experimental)", isOn: Binding(get: { bcd.value("pso-async-threads") == "4" }, set: { setBCDKey("pso-async-threads", $0 ? "4" : "") }))
                     if bcd.value("pso-async-threads") == "4" {
                         Text("Four threads instead of two build new GPU pipelines in the background, so a burst of new effects (new area, first fight) shows up sooner with fewer hitches (from Madeira PR #632). Uses more CPU while compiling, so the phone can get warmer. Has an effect only when background pipeline building (pso-async) is on.")
